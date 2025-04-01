@@ -24,11 +24,10 @@ from tensorrt_llm.quantization.mode import (MODELOPT_FLOW_QUANTIZATIONS,
 from ..._common import default_net
 from ..._utils import pad_vocab_size
 from ...functional import (AllReduceFusionOp, AllReduceParams, Tensor, cast,
-                           recv, send)
+                           recv, send, LayerNormType)
 from ...layers import (Attention, AttentionMaskType, AttentionParams,
                        ColumnLinear, Embedding, GatedMLP, KeyValueCacheParams,
                        LoraParams, PositionEmbeddingType, RmsNorm)
-from ...lora_manager import LoraConfig, use_lora
 from ...mapping import Mapping
 from ...module import Module
 from ..modeling_utils import (DecoderLayerList, DecoderModelForCausalLM,
@@ -38,7 +37,6 @@ from .config import GemmaConfig
 if TYPE_CHECKING:
 
     from .config import HfConfigOrDir
-
 
 class GemmaDecoderLayer(Module):
 
@@ -56,13 +54,23 @@ class GemmaDecoderLayer(Module):
 
         q_scaling = 1.0
         max_attn_value = 0.0
+        qk_layernorm = False
+        rotary_base = config.rotary_base
 
         gemma2_config = config.gemma2_config()
+        gemma3_config = config.gemma3_config()
         if gemma2_config:
             q_scaling = math.sqrt(
                 gemma2_config.query_pre_attn_scalar) / math.sqrt(
                     config.head_size)
             max_attn_value = config.attn_logit_softcapping or 0.0
+        elif gemma3_config:
+            qk_layernorm = True
+            q_scaling = math.sqrt(
+                gemma3_config.query_pre_attn_scalar) / math.sqrt(
+                    config.head_size)
+            self.is_sliding = bool((layer_idx + 1) % gemma3_config.sliding_window_pattern)
+            rotary_base = config.rope_local_base_freq if self.is_sliding else config.rotary_base
 
         self.attention = Attention(
             local_layer_idx=self.local_layer_idx,
@@ -70,12 +78,14 @@ class GemmaDecoderLayer(Module):
             num_attention_heads=config.num_attention_heads,
             num_kv_heads=config.num_key_value_heads,
             attention_head_size=config.head_size,
+            qk_layernorm=qk_layernorm,
+            layernorm_type=LayerNormType.RmsNorm,
             max_position_embeddings=config.max_position_embeddings,
             dtype=config.dtype,
-            attention_mask_type=AttentionMaskType.causal,
+            attention_mask_type=AttentionMaskType.sliding_window_causal if self.is_sliding else AttentionMaskType.causal,
             bias=config.attn_bias,
             position_embedding_type=PositionEmbeddingType.rope_gpt_neox,
-            rotary_embedding_base=config.rotary_base,
+            rotary_embedding_base=rotary_base,
             rotary_embedding_scaling=config.rotary_scaling,
             tp_group=config.mapping.tp_group,
             tp_size=config.mapping.tp_size,
@@ -370,7 +380,3 @@ class GemmaForCausalLM(DecoderModelForCausalLM):
                 del hf_weights
         else:
             cls.assert_valid_quant_algo(quant_algo)
-
-    def use_lora(self, lora_config: LoraConfig) -> None:
-        return use_lora(
-            self, lora_config)  # Use the default trtllm->hf module mapping
