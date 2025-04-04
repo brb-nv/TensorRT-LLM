@@ -52,33 +52,14 @@ class GemmaDecoderLayer(Module):
         layers_range = config.mapping.pp_layers(config.num_hidden_layers)
         self.local_layer_idx = layer_idx - layers_range[0]
 
-        q_scaling = 1.0
-        max_attn_value = 0.0
-        qk_layernorm = False
-        rotary_base = config.rotary_base
-
-        gemma2_config = config.gemma2_config()
         gemma3_config = config.gemma3_config()
-        if gemma2_config:
-            assert False
-            q_scaling = math.sqrt(
-                gemma2_config.query_pre_attn_scalar) / math.sqrt(
-                    config.head_size)
-            max_attn_value = config.attn_logit_softcapping or 0.0
-        elif gemma3_config:
-            qk_layernorm = True
-            q_scaling = math.sqrt(
-                gemma3_config.query_pre_attn_scalar) / math.sqrt(
-                    config.head_size)
-            self.is_sliding = bool((layer_idx + 1) % gemma3_config.sliding_window_pattern)
-            rotary_base = config.rope_local_base_freq if self.is_sliding else config.rotary_base
-
-        print("*******************************************************************************")
-        print("[GemmaDecoderLayer] layer_idx: ", layer_idx)
-        print("[GemmaDecoderLayer] is_sliding: ", self.is_sliding)
-        print("[GemmaDecoderLayer] rotary_base: ", rotary_base)
-        print("[GemmaDecoderLayer] qk_layernorm: ", qk_layernorm)
-        print("[GemmaDecoderLayer] max_attn_value: ", max_attn_value)
+        qk_layernorm = True
+        max_attn_value = 0.0
+        q_scaling = math.sqrt(
+            gemma3_config.query_pre_attn_scalar) / math.sqrt(
+                config.head_size)
+        is_sliding = bool((layer_idx + 1) % gemma3_config.sliding_window_pattern)
+        rotary_base = config.rope_local_base_freq if is_sliding else config.rotary_base
 
         self.attention = Attention(
             local_layer_idx=self.local_layer_idx,
@@ -90,7 +71,7 @@ class GemmaDecoderLayer(Module):
             layernorm_type=LayerNormType.RmsNorm,
             max_position_embeddings=config.max_position_embeddings,
             dtype=config.dtype,
-            attention_mask_type=AttentionMaskType.sliding_window_causal if self.is_sliding else AttentionMaskType.causal,
+            attention_mask_type=AttentionMaskType.sliding_window_causal if is_sliding else AttentionMaskType.causal,
             bias=config.attn_bias,
             position_embedding_type=PositionEmbeddingType.rope_gpt_neox,
             rotary_embedding_base=rotary_base,
@@ -101,10 +82,8 @@ class GemmaDecoderLayer(Module):
             q_scaling=q_scaling,
             max_attn_value=max_attn_value,
         )
-        print("[GemmaDecoderLayer] attention: ", self.attention)
 
         mlp_hidden_size = config.hidden_size * 4 if config.intermediate_size is None else config.intermediate_size
-        print("[GemmaDecoderLayer] mlp_hidden_size: ", mlp_hidden_size)
 
         self.mlp = GatedMLP(hidden_size=config.hidden_size,
                             ffn_hidden_size=mlp_hidden_size,
@@ -114,29 +93,19 @@ class GemmaDecoderLayer(Module):
                             tp_group=config.mapping.tp_group,
                             tp_size=config.mapping.tp_size,
                             quant_mode=config.quant_mode)
-        print("[GemmaDecoderLayer] mlp: ", self.mlp)
 
-        if self.config.inter_layernorms:
-            self.pre_feedforward_layernorm = RmsNorm(
-                normalized_shape=config.hidden_size,
-                eps=config.norm_epsilon,
-                dtype=config.dtype)
-            self.post_feedforward_layernorm = RmsNorm(
-                normalized_shape=config.hidden_size,
-                eps=config.norm_epsilon,
-                dtype=config.dtype)
-        else:
-            assert False
-
-        print("[GemmaDecoderLayer] self.pre_feedforward_layernorm: ", self.pre_feedforward_layernorm)
-        print("[GemmaDecoderLayer] self.post_feedforward_layernorm: ", self.post_feedforward_layernorm)
+        self.pre_feedforward_layernorm = RmsNorm(
+            normalized_shape=config.hidden_size,
+            eps=config.norm_epsilon,
+            dtype=config.dtype)
+        self.post_feedforward_layernorm = RmsNorm(
+            normalized_shape=config.hidden_size,
+            eps=config.norm_epsilon,
+            dtype=config.dtype)
 
         self.post_layernorm = RmsNorm(normalized_shape=config.hidden_size,
                                       eps=config.norm_epsilon,
                                       dtype=config.dtype)
-        print("[GemmaDecoderLayer] self.post_layernorm: ", self.post_layernorm)
-        print("*******************************************************************************")
-
 
     def forward(self,
                 hidden_states: Tensor,
@@ -146,16 +115,9 @@ class GemmaDecoderLayer(Module):
                 attention_params: Optional[AttentionParams] = None,
                 lora_layer_params: Optional[LoraParams] = None,
                 next_layer_input_layernorm_args=None):
-        # assert not (
-        #     default_net().plugin_config.reduce_fusion and self.has_residual_mlp
-        # ), "Custom all reduce and residual mlp can't be enabled at the same time."
-        if default_net(
-        ).plugin_config.reduce_fusion and self.local_layer_idx > 0:
-            assert False
-            hidden_states, residual = hidden_states  #FIXME:AN need to check if appropriate residual value is hidden state is pulled out.
-        else:
-            residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
+
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
 
         attention_output = self.attention(
             hidden_states,
@@ -178,45 +140,13 @@ class GemmaDecoderLayer(Module):
         if use_cache:
             attention_output, presents = attention_output
 
-        if default_net().plugin_config.reduce_fusion:
-            assert False
-            hidden_states, residual = attention_output
-        else:
-            if self.config.inter_layernorms:
-                attention_output = self.post_layernorm(attention_output)
-            else:
-                assert False
-            hidden_states = residual + attention_output
-            residual = hidden_states
-            if self.config.inter_layernorms:
-                hidden_states = self.pre_feedforward_layernorm(hidden_states)
-            else:
-                assert False
-                hidden_states = self.post_layernorm(hidden_states)
-
-        if next_layer_input_layernorm_args is not None:
-            assert False
-            hidden_states = self.mlp(
-                hidden_states,
-                lora_layer_params=lora_layer_params,
-                all_reduce_params=AllReduceParams(
-                    fusion_op=AllReduceFusionOp.RESIDUAL_RMS_PREPOST_NORM
-                    if default_net().plugin_config.reduce_fusion else
-                    AllReduceFusionOp.NONE,
-                    residual=residual,
-                    norm_weight=next_layer_input_layernorm_args[0],
-                    norm_pre_residual_weight=self.post_feedforward_layernorm.
-                    weight.value,
-                    eps=next_layer_input_layernorm_args[1]))
-        else:
-            hidden_states = self.mlp(hidden_states,
-                                     lora_layer_params=lora_layer_params)
-
-            if self.config.inter_layernorms:
-                hidden_states = self.post_feedforward_layernorm(hidden_states)
-            else:
-                assert False
-            hidden_states = residual + hidden_states
+        attention_output = self.post_layernorm(attention_output)
+        hidden_states = residual + attention_output
+        residual = hidden_states
+        hidden_states = self.pre_feedforward_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states, lora_layer_params=lora_layer_params)
+        hidden_states = self.post_feedforward_layernorm(hidden_states)
+        hidden_states = residual + hidden_states
         if use_cache:
             return (hidden_states, presents)
         return hidden_states
