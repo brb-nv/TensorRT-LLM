@@ -862,6 +862,8 @@ class GenerationSession(object):
         self.debug_mode = debug_mode
         self.debug_tensors_to_save = debug_tensors_to_save
 
+        print("[GenerationSession] debug_tensors_to_save: ", self.debug_tensors_to_save)
+
         self.cuda_graph_mode = cuda_graph_mode
         # Optional inputs for dynamic decoder
         self.top_p_decay = None
@@ -3890,12 +3892,12 @@ class GenerationSession(object):
         return should_stop, next_step_tensors, tasks, context_lengths, host_context_lengths, attention_mask, context_logits, generation_logits, encoder_input_lengths
 
     def dump_debug_buffers(self, step: int) -> None:
-        if self.debug_tensors_to_save is not None:
-            # restricted written tensors according to filter
-            debug_tensor_names = copy.deepcopy(list(self.debug_buffer.keys()))
-            for k in debug_tensor_names:
-                if all([kk not in k for kk in self.debug_tensors_to_save]):
-                    self.debug_buffer.pop(k)
+        # if self.debug_tensors_to_save is not None:
+        #     # restricted written tensors according to filter
+        #     debug_tensor_names = copy.deepcopy(list(self.debug_buffer.keys()))
+        #     for k in debug_tensor_names:
+        #         if all([kk not in k for kk in self.debug_tensors_to_save]):
+        #             self.debug_buffer.pop(k)
 
         debug_dir = Path(
             f"tllm_debug/PP_{self.mapping.pp_rank}/TP_{self.mapping.tp_rank}/CP_{self.mapping.cp_rank}"
@@ -3905,15 +3907,16 @@ class GenerationSession(object):
         for name, t in self.debug_buffer.items():
             # convert tensor name to valid file name
             print("Saving: ", name)
-            fname = name.replace("/", ".")
-            t = torch_to_numpy(t.float())
-            np.save(debug_dir / f"{fname}-step{step}.npy", t)
+            print("Tensor: \n", torch_to_numpy(t.float()))
+            # fname = name.replace("/", ".")
+            # t = torch_to_numpy(t.float())
+            # np.save(debug_dir / f"{fname}-step{step}.npy", t)
 
-            txt_format = "%d" if t.dtype in [np.int32, np.int8] else '%.18e'
-            np.savetxt(
-                debug_dir / f"{fname}-step{step}.txt",
-                t.reshape(-1, t.shape[-1]),  # savetxt accepts 2 dims only
-                fmt=txt_format)
+            # txt_format = "%d" if t.dtype in [np.int32, np.int8] else '%.18e'
+            # np.savetxt(
+            #     debug_dir / f"{fname}-step{step}.txt",
+            #     t.reshape(-1, t.shape[-1]),  # savetxt accepts 2 dims only
+            #     fmt=txt_format)
 
     def decode_regular(self,
                        *,
