@@ -119,6 +119,7 @@ void TransformerBuffers::reshape(
     auto const maxInputLength = generationConfig.maxInputLength;
     auto const maxAttentionWindow = generationConfig.maxAttentionWindow;
 
+    printf("[TransformerBuffers::reshape] kvCacheReserve reserved for %d.\n", maxAttentionWindow);
     auto const kvCacheReserve = ITensor::makeShape(
         {batchSize, 2, modelConfig.getNbKvHeads(0), maxAttentionWindow, modelConfig.getSizePerHead()});
     auto const kvCacheShape

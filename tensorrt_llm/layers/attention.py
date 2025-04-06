@@ -1002,7 +1002,6 @@ class Attention(Module):
                 AttentionMaskType.causal, AttentionMaskType.bidirectional,
                 AttentionMaskType.bidirectionalglm,
                 AttentionMaskType.blocksparse,
-                AttentionMaskType.sliding_window_causal,
             ], 'Plugin only support masked MHA.'
 
             # KV cache scales.

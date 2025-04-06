@@ -1828,6 +1828,8 @@ class GenerationSession(object):
         else:
             assert False, "invalid max_attention_window_size!"
 
+        print("[generation.py] self.host_max_attention_window_sizes: ", self.host_max_attention_window_sizes)
+
         if sink_token_length is None:
             self.sink_token_length = 0
             self.host_sink_token_length = torch.zeros((1, ), dtype=torch.int32)

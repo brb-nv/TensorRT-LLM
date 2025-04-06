@@ -295,7 +295,8 @@ def add_common_args(parser):
     parser.add_argument(
         '--max_attention_window_size',
         type=int,
-        default=None,
+        default=[512, 512, 512, 512, 512, 2048, 512, 512, 512, 512, 512, 2048, 512, 512, 512, 512, 512, 2048, 512, 512, 512, 512, 512, 2048, 512, 512],
+        # default=None,
         nargs="+",
         help=
         'The attention window size that controls the sliding window attention / cyclic kv cache behavior'
