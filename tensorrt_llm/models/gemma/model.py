@@ -24,7 +24,7 @@ from tensorrt_llm.quantization.mode import (MODELOPT_FLOW_QUANTIZATIONS,
 from ..._common import default_net
 from ..._utils import pad_vocab_size
 from ...functional import (AllReduceFusionOp, AllReduceParams, Tensor, cast,
-                           recv, send, LayerNormType)
+                           recv, send, LayerNormType, constant_to_tensor_)
 from ...layers import (Attention, AttentionMaskType, AttentionParams,
                        ColumnLinear, Embedding, GatedMLP, KeyValueCacheParams,
                        LoraParams, PositionEmbeddingType, RmsNorm)
@@ -116,8 +116,11 @@ class GemmaDecoderLayer(Module):
                 lora_layer_params: Optional[LoraParams] = None,
                 next_layer_input_layernorm_args=None):
 
+        print_condition = (self.layer_idx == 0)
+
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
+        if print_condition: hidden_states.mark_output(f"attention_input_{self.layer_idx}", hidden_states.dtype)
 
         attention_output = self.attention(
             hidden_states,
@@ -139,14 +142,21 @@ class GemmaDecoderLayer(Module):
 
         if use_cache:
             attention_output, presents = attention_output
-
+        attention_output.mark_output(f"attention_output_{self.layer_idx}", attention_output.dtype)
         attention_output = self.post_layernorm(attention_output)
+        if print_condition: attention_output.mark_output(f"attention_output_post_layernorm_{self.layer_idx}", attention_output.dtype)
         hidden_states = residual + attention_output
+        if print_condition: hidden_states.mark_output(f"attention_output_with_residual_{self.layer_idx}", hidden_states.dtype)
+
         residual = hidden_states
         hidden_states = self.pre_feedforward_layernorm(hidden_states)
+        if print_condition: hidden_states.mark_output(f"mlp_input_{self.layer_idx}", hidden_states.dtype)
         hidden_states = self.mlp(hidden_states, lora_layer_params=lora_layer_params)
+        if print_condition: hidden_states.mark_output(f"mlp_output_{self.layer_idx}", hidden_states.dtype)
         hidden_states = self.post_feedforward_layernorm(hidden_states)
+        if print_condition: hidden_states.mark_output(f"mlp_output_post_layernorm_{self.layer_idx}", hidden_states.dtype)
         hidden_states = residual + hidden_states
+        if print_condition: hidden_states.mark_output(f"mlp_output_with_residual_{self.layer_idx}", hidden_states.dtype)
         if use_cache:
             return (hidden_states, presents)
         return hidden_states
@@ -190,8 +200,11 @@ class GemmaModel(Module):
 
         if self.mapping.is_first_pp_rank():
             hidden_states = self.vocab_embedding(input_ids, *ptuning_args)
-            hidden_states = cast(hidden_states * math.sqrt(self.hidden_size),
-                                 hidden_states.dtype)
+            hidden_states.mark_output('input_embeddings', hidden_states.dtype)
+            # Original Gemma impl casts the scaling factor to datatype of hidden states.
+            embedding_scale_factor = constant_to_tensor_(input=math.sqrt(self.hidden_size), dtype=hidden_states.dtype, to_array=False)
+            hidden_states = cast(hidden_states * embedding_scale_factor, hidden_states.dtype)
+            hidden_states.mark_output('input_embeddings_scaled', hidden_states.dtype)
         else:
             hidden_states = recv(hidden_states, self.mapping.prev_pp_rank())
         hidden_states = self.layers.forward(
@@ -208,6 +221,7 @@ class GemmaModel(Module):
 
         if self.mapping.is_last_pp_rank():
             hidden_states = self.ln_f(hidden_states)
+            hidden_states.mark_output('final_norm_outputs', hidden_states.dtype)
         else:
             hidden_states = send(hidden_states, self.mapping.next_pp_rank())
 
