@@ -142,7 +142,7 @@ class GemmaDecoderLayer(Module):
 
         if use_cache:
             attention_output, presents = attention_output
-        attention_output.mark_output(f"attention_output_{self.layer_idx}", attention_output.dtype)
+        if print_condition: attention_output.mark_output(f"attention_output_{self.layer_idx}", attention_output.dtype)
         attention_output = self.post_layernorm(attention_output)
         if print_condition: attention_output.mark_output(f"attention_output_post_layernorm_{self.layer_idx}", attention_output.dtype)
         hidden_states = residual + attention_output
