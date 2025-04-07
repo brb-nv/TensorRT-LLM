@@ -6028,13 +6028,20 @@ def rms_norm(input: Tensor,
         denom = varx + eps
         denom = denom.sqrt()
         fp32_y = fp32_input / denom
+        ###############################################
+        if num_groups > 1:
+            fp32_y = fp32_y.view(old_shape)
+        if weight is not None:
+            fp32_weight = cast(weight, "float32")
+            fp32_y = fp32_y * fp32_weight
+        ###############################################
         y = cast(fp32_y, input_dtype)
 
-    if num_groups > 1:
-        y = y.view(old_shape)
-
-    if weight is not None:
-        y = y * weight
+    #if num_groups > 1:
+    #    y = y.view(old_shape)
+    #
+    #if weight is not None:
+    #    y = y * weight
 
     return y
 
