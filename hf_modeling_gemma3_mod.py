@@ -102,7 +102,7 @@ class Gemma3TextScaledWordEmbedding(nn.Embedding):
 
     def forward(self, input_ids: torch.Tensor):
         input_embeddings = super().forward(input_ids)
-        print("[Gemma3TextScaledWordEmbedding] input_embeddings: \n", input_embeddings)
+        print("input_embeddings: \n", input_embeddings)
         return input_embeddings * self.embed_scale
 
 
@@ -437,7 +437,7 @@ class Gemma3DecoderLayer(nn.Module):
         residual = hidden_states
 
         hidden_states = self.input_layernorm(hidden_states)
-        if print_condition: print(f"attention_intput_{self.layer_idx}: \n", hidden_states)
+        if print_condition: print(f"attention_input_{self.layer_idx}: \n", hidden_states)
 
         # apply global RoPE to non-sliding layer only
         if self.self_attn.is_sliding:
@@ -694,7 +694,7 @@ class Gemma3TextModel(Gemma3PreTrainedModel):
 
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
-        print("[Gemma3TextModel] input_embeddings_scaled: \n", inputs_embeds)
+        print("input_embeddings_scaled: \n", inputs_embeds)
 
         if use_cache and past_key_values is None and not self.training:
             batch_size, seq_len, _ = inputs_embeds.shape

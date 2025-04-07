@@ -12,7 +12,7 @@ tokenizer = AutoTokenizer.from_pretrained(model_path)
 input_text = "The main cities in Italy are (Write a blog post)"
 input_tokens = tokenizer(input_text, return_tensors="pt")
 
-model = Gemma3ForCausalLM.from_pretrained(model_path, torch_dtype=torch.bfloat16).eval()
+model = Gemma3ForCausalLM.from_pretrained(model_path, torch_dtype=torch.float16).eval()
 
 output_tokens = model.generate(input_tokens["input_ids"], max_length=14, do_sample=False, num_beams=1, top_p=None, top_k=None, temperature=None)
 output_text = tokenizer.decode(output_tokens[0], skip_special_tokens=True)
