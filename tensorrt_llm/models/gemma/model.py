@@ -201,9 +201,9 @@ class GemmaModel(Module):
         if self.mapping.is_first_pp_rank():
             hidden_states = self.vocab_embedding(input_ids, *ptuning_args)
             hidden_states.mark_output('input_embeddings', hidden_states.dtype)
-            # Original Gemma impl casts the scaling factor to datatype of hidden states.
-            embedding_scale_factor = constant_to_tensor_(input=math.sqrt(self.hidden_size), dtype=hidden_states.dtype, to_array=False)
-            hidden_states = cast(hidden_states * embedding_scale_factor, hidden_states.dtype)
+            # # Original Gemma impl casts the scaling factor to datatype of hidden states.
+            # embedding_scale_factor = constant_to_tensor_(input=, dtype=hidden_states.dtype, to_array=False)
+            hidden_states = cast(hidden_states * math.sqrt(self.hidden_size), hidden_states.dtype)
             hidden_states.mark_output('input_embeddings_scaled', hidden_states.dtype)
         else:
             hidden_states = recv(hidden_states, self.mapping.prev_pp_rank())
