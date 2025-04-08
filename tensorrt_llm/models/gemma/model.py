@@ -74,13 +74,15 @@ class GemmaDecoderLayer(Module):
             attention_mask_type=AttentionMaskType.causal,
             bias=config.attn_bias,
             position_embedding_type=PositionEmbeddingType.rope_gpt_neox,
-            rotary_embedding_base=rotary_base,
+            rotary_embedding_base=config.rotary_base,
+            rotary_embedding_base_local=config.rope_local_base_freq,
             rotary_embedding_scaling=config.rotary_scaling,
             tp_group=config.mapping.tp_group,
             tp_size=config.mapping.tp_size,
             quant_mode=config.quant_mode,
             q_scaling=q_scaling,
             max_attn_value=max_attn_value,
+            is_local=is_sliding,
         )
 
         mlp_hidden_size = config.hidden_size * 4 if config.intermediate_size is None else config.intermediate_size

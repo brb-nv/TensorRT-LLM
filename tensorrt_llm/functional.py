@@ -5214,6 +5214,10 @@ def gpt_attention(
     cp_size: int = 1,
     cp_rank: int = 0,
     num_kv_heads_origin: int = -1,
+    rotary_embedding_base_local: float = 1.0,
+    rotary_inv_freq_local: Optional[Tensor] = None,
+    rotary_cos_sin_local: Optional[Tensor] = None,
+    is_local: bool = False,
 ) -> Tuple[Tensor, Optional[Tensor]]:
     '''
     Add an operation that performs the multi-head attention in GPT-like models.
@@ -5549,10 +5553,16 @@ def gpt_attention(
     rotary_embedding_dim = trt.PluginField(
         "rotary_embedding_dim", np.array(rotary_embedding_dim, dtype=np.int32),
         trt.PluginFieldType.INT32)
-    rotary_embedding_base = trt.PluginField(
-        "rotary_embedding_base",
-        np.array(rotary_embedding_base, dtype=np.float32),
-        trt.PluginFieldType.FLOAT32)
+    if not is_local:
+        rotary_embedding_base = trt.PluginField(
+            "rotary_embedding_base",
+            np.array(rotary_embedding_base, dtype=np.float32),
+            trt.PluginFieldType.FLOAT32)
+    else:
+        rotary_embedding_base = trt.PluginField(
+            "rotary_embedding_base",
+            np.array(rotary_embedding_base_local, dtype=np.float32),
+            trt.PluginFieldType.FLOAT32)
     rotary_embedding_scale_type = trt.PluginField(
         "rotary_embedding_scale_type",
         np.array(rotary_embedding_scale_type, dtype=np.int8),
@@ -5798,9 +5808,9 @@ def gpt_attention(
         plug_inputs += [attention_output_sf_scale]
 
     if rotary_inv_freq is not None:
-        plug_inputs += [rotary_inv_freq]
+        plug_inputs += [rotary_inv_freq if not is_local else rotary_inv_freq_local]
     if rotary_cos_sin is not None:
-        plug_inputs += [rotary_cos_sin]
+        plug_inputs += [rotary_cos_sin if not is_local else rotary_cos_sin_local]
 
     if alibi_slopes is not None:
         plug_inputs += [alibi_slopes]
