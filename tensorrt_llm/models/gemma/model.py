@@ -221,7 +221,7 @@ class GemmaModel(Module):
 
         if self.mapping.is_last_pp_rank():
             hidden_states = self.ln_f(hidden_states)
-            hidden_states.mark_output('final_norm_outputs', hidden_states.dtype)
+            hidden_states.mark_output('final_norm_output', hidden_states.dtype)
         else:
             hidden_states = send(hidden_states, self.mapping.next_pp_rank())
 

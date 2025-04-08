@@ -22,7 +22,6 @@ from dataclasses import dataclass, field
 from functools import reduce, wraps
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Union
-
 import numpy as np
 
 # isort: off
@@ -3899,24 +3898,22 @@ class GenerationSession(object):
         #         if all([kk not in k for kk in self.debug_tensors_to_save]):
         #             self.debug_buffer.pop(k)
 
-        debug_dir = Path(
-            f"tllm_debug/PP_{self.mapping.pp_rank}/TP_{self.mapping.tp_rank}/CP_{self.mapping.cp_rank}"
-        )
+        debug_dir = Path(f"tllm_debug/")
         debug_dir.mkdir(parents=True, exist_ok=True)
 
         for name, t in self.debug_buffer.items():
             # convert tensor name to valid file name
             print("Saving: ", name)
             print("Tensor: \n", torch_to_numpy(t.float()))
-            # fname = name.replace("/", ".")
-            # t = torch_to_numpy(t.float())
-            # np.save(debug_dir / f"{fname}-step{step}.npy", t)
+            fname = name.replace("/", ".")
+            t = torch_to_numpy(t.float())
+            np.save(debug_dir / f"{fname}-step{step}.npy", t)
 
-            # txt_format = "%d" if t.dtype in [np.int32, np.int8] else '%.18e'
-            # np.savetxt(
-            #     debug_dir / f"{fname}-step{step}.txt",
-            #     t.reshape(-1, t.shape[-1]),  # savetxt accepts 2 dims only
-            #     fmt=txt_format)
+            txt_format = "%d" if t.dtype in [np.int32, np.int8] else '%.18e'
+            np.savetxt(
+                debug_dir / f"{fname}-step{step}.txt",
+                t.reshape(-1, t.shape[-1]),  # savetxt accepts 2 dims only
+                fmt=txt_format)
 
     def decode_regular(self,
                        *,

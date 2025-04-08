@@ -24,6 +24,8 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Union
 
+import os
+import numpy as np
 import torch
 import torch.nn as nn
 
@@ -50,6 +52,13 @@ from .configuration_gemma3 import Gemma3Config, Gemma3TextConfig
 logger = logging.get_logger(__name__)
 _CONFIG_FOR_DOC = "Gemma3Config"
 
+hf_debug_path = "/home/bbuddharaju/scratch/TensorRT-LLM/hf_debug/"
+
+def save_tensor_to_npy(tensor, tensorname):
+    numpy_array = tensor.detach().cpu().numpy()
+    filename = tensorname + ".npy"
+    filepath = os.path.join(hf_debug_path, filename)
+    np.save(filepath, numpy_array)
 
 @dataclass
 class Gemma3CausalLMOutputWithPast(ModelOutput):
@@ -102,7 +111,7 @@ class Gemma3TextScaledWordEmbedding(nn.Embedding):
 
     def forward(self, input_ids: torch.Tensor):
         input_embeddings = super().forward(input_ids)
-        print("input_embeddings: \n", input_embeddings)
+        save_tensor_to_npy(input_embeddings, f"input_embeddings")
         return input_embeddings * self.embed_scale
 
 
@@ -437,7 +446,7 @@ class Gemma3DecoderLayer(nn.Module):
         residual = hidden_states
 
         hidden_states = self.input_layernorm(hidden_states)
-        if print_condition: print(f"attention_input_{self.layer_idx}: \n", hidden_states)
+        if print_condition: save_tensor_to_npy(hidden_states, f"attention_input_{self.layer_idx}")
 
         # apply global RoPE to non-sliding layer only
         if self.self_attn.is_sliding:
@@ -456,21 +465,22 @@ class Gemma3DecoderLayer(nn.Module):
             cache_position=cache_position,
             **kwargs,
         )
-        if print_condition: print(f"attention_output_{self.layer_idx}: \n", hidden_states)
+        if print_condition: save_tensor_to_npy(hidden_states, f"attention_output_{self.layer_idx}")
         hidden_states = self.post_attention_layernorm(hidden_states)
-        if print_condition: print(f"attention_output_post_layernorm_{self.layer_idx}: \n", hidden_states)
+        if print_condition: save_tensor_to_npy(hidden_states, f"attention_output_post_layernorm_{self.layer_idx}")
         hidden_states = residual + hidden_states
-        if print_condition: print(f"attention_output_with_residual_{self.layer_idx}: \n", hidden_states)
+        if print_condition: save_tensor_to_npy(hidden_states, f"attention_output_with_residual_{self.layer_idx}")
 
         residual = hidden_states
         hidden_states = self.pre_feedforward_layernorm(hidden_states)
-        if print_condition: print(f"mlp_input_{self.layer_idx}: \n", hidden_states)
+        if print_condition: save_tensor_to_npy(hidden_states, f"mlp_input_{self.layer_idx}")
+
         hidden_states = self.mlp(hidden_states)
-        if print_condition: print(f"mlp_output_{self.layer_idx}: \n", hidden_states)
+        if print_condition: save_tensor_to_npy(hidden_states, f"mlp_output_{self.layer_idx}")
         hidden_states = self.post_feedforward_layernorm(hidden_states)
-        if print_condition: print(f"mlp_output_post_layernorm_{self.layer_idx}: \n", hidden_states)
+        if print_condition: save_tensor_to_npy(hidden_states, f"mlp_output_post_layernorm_{self.layer_idx}")
         hidden_states = residual + hidden_states
-        if print_condition: print(f"mlp_output_with_residual_{self.layer_idx}: \n", hidden_states)
+        if print_condition: save_tensor_to_npy(hidden_states, f"mlp_output_with_residual_{self.layer_idx}")
 
         outputs = (hidden_states,)
 
@@ -694,7 +704,7 @@ class Gemma3TextModel(Gemma3PreTrainedModel):
 
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
-        print("input_embeddings_scaled: \n", inputs_embeds)
+        save_tensor_to_npy(inputs_embeds, f"input_embeddings_scaled")
 
         if use_cache and past_key_values is None and not self.training:
             batch_size, seq_len, _ = inputs_embeds.shape
@@ -784,7 +794,7 @@ class Gemma3TextModel(Gemma3PreTrainedModel):
                 all_self_attns += (layer_outputs[1],)
 
         hidden_states = self.norm(hidden_states)
-        print("final_norm_output: \n", hidden_states)
+        save_tensor_to_npy(hidden_states, f"final_norm_output")
 
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
