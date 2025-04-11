@@ -398,7 +398,7 @@ def _test_llm_multimodal_general(llm_venv,
 
     llm_engine_subdir = f"{data_type}" if enc_dec_model else ""
     # Phi4MM has both vision and audio. Engine build dumps to vision and audio dirs automatically by builder.
-    component_dir = "vision" if vision_model_type is not "phi-4-multimodal" else ""
+    component_dir = "vision" if vision_model_type != "phi-4-multimodal" else ""
     build_cmd = [
         f"{multimodal_example_root}/build_multimodal_engine.py",
         f"--output_dir={os.path.join(llm_engine_dir, llm_engine_subdir, component_dir)}",
@@ -462,11 +462,14 @@ def _test_llm_multimodal_general(llm_venv,
         f"{multimodal_example_root}/run.py",
         f"--engine_dir={llm_engine_dir}/{llm_engine_subdir}",
         f"--hf_model_dir={hf_model_dir}", "--max_new_tokens=30",
-        f"--batch_size={1}", "--check_accuracy",
-        f"--visual_engine_name={visual_engine}",
-        f"--audio_engine_name={audio_engine}", f"--image_path={image_path}",
-        f"--audio_path={audio_path}", "--enable_context_fmha_fp32_acc"
+        f"--batch_size={batch_size}", "--check_accuracy",
+        "--enable_context_fmha_fp32_acc"
     ]
+    if vision_model_type == 'phi-4-multimodal':
+        run_cmd.extend(["--visual_engine_name", f"{visual_engine}"])
+        run_cmd.extend(["--audio_engine_name", f"{audio_engine}"])
+        run_cmd.extend(["--image_path", f"{image_path}"])
+        run_cmd.extend(["--audio_path", f"{audio_path}"])
     if vision_model_type in ['llava', 'vila'] and batch_size > 1:
         # batch inference test
         if vision_model_type == 'vila':
