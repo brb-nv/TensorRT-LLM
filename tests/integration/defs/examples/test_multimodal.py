@@ -397,9 +397,11 @@ def _test_llm_multimodal_general(llm_venv,
         vit_batch_size = vit_batch_size * 32
 
     llm_engine_subdir = f"{data_type}" if enc_dec_model else ""
+    # Phi4MM has both vision and audio. Engine build dumps to vision and audio dirs automatically by builder.
+    component_dir = "vision" if vision_model_type is not "phi-4-multimodal" else ""
     build_cmd = [
         f"{multimodal_example_root}/build_multimodal_engine.py",
-        f"--output_dir={os.path.join(llm_engine_dir, llm_engine_subdir)}",
+        f"--output_dir={os.path.join(llm_engine_dir, llm_engine_subdir, component_dir)}",
         f"--model_type={vision_model_type}",
         f"--model_path={model_ckpt_path}",
         f"--max_batch_size={vit_batch_size}",
@@ -412,7 +414,7 @@ def _test_llm_multimodal_general(llm_venv,
         convert_cmd = [
             f"{script_root}/convert_checkpoint.py",
             f"--model_dir={model_ckpt_path}",
-            f"--output_dir={os.path.join(cmodel_dir, model_name, data_type, 'vision')}",
+            f"--output_dir={os.path.join(cmodel_dir, model_name, data_type, component_dir)}",
             f"--dtype={data_type}",
             f"--vision_tp_size={tp_size}",
         ]
@@ -420,8 +422,8 @@ def _test_llm_multimodal_general(llm_venv,
 
         build_cmd = [
             "trtllm-build",
-            f"--checkpoint_dir={os.path.join(cmodel_dir, model_name, data_type, 'vision')}",
-            f"--output_dir={os.path.join(llm_engine_dir, llm_engine_subdir)}",
+            f"--checkpoint_dir={os.path.join(cmodel_dir, model_name, data_type, component_dir)}",
+            f"--output_dir={os.path.join(llm_engine_dir, llm_engine_subdir, component_dir)}",
             f"--max_batch_size={vit_batch_size}",
             f"--remove_input_padding disable",
             f"--bert_attention_plugin disable",
