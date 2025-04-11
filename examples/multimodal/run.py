@@ -40,7 +40,7 @@ def print_result(model, input_text, output_text, args):
                 assert "characteristic | cat food, day | cat food, wet | cat treats" in output_text[
                     0][0].lower()
             elif model.model_type in [
-                    'blip2', 'neva', 'phi-3-vision', 'llava_next'
+                    'blip2', 'neva', 'phi-3-vision', 'llava_next', 'phi-4-multimodal'
             ]:
                 assert 'singapore' in output_text[0][0].lower()
             elif model.model_type == 'video-neva':
