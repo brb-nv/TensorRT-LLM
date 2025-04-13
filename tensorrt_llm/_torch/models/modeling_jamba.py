@@ -349,3 +349,14 @@ class JambaMambaDecoderLayer(DecoderLayer):
         hidden_states = self.feed_forward(hidden_states)
 
         return hidden_states
+
+
+@register_auto_model("JambaForCausalLM")
+class JambaForCausalLM(DecoderModelForCausalLM[JambaModel,
+                                                 PretrainedConfig]):
+
+    def __init__(self, model_config: ModelConfig[PretrainedConfig]):
+        super().__init__(JambaModel(model_config),
+                         config=model_config,
+                         hidden_size=model_config.pretrained_config.hidden_size,
+                         vocab_size=model_config.pretrained_config.vocab_size)

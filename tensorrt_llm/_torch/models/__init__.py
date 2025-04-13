@@ -3,6 +3,7 @@ import transformers
 from .modeling_auto import AutoModelForCausalLM
 from .modeling_bert import BertForSequenceClassification
 from .modeling_deepseekv3 import DeepseekV3ForCausalLM
+from .modeling_jamba import JambaForCausalLM
 from .modeling_llama import LlamaForCausalLM
 from .modeling_llava_next import LlavaNextModel
 from .modeling_mamba_hybrid import MambaHybridForCausalLM
@@ -21,6 +22,7 @@ __all__ = [
     "AutoModelForCausalLM",
     "BertForSequenceClassification",
     "DeepseekV3ForCausalLM",
+    "JambaForCausalLM",
     "LlamaForCausalLM",
     "LlavaNextModel",
     "MambaHybridForCausalLM",
