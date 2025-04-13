@@ -90,7 +90,7 @@ class JambaMambaMixer(nn.Module):
         self.in_proj = nn.Linear(self.hidden_size,
                                  self.intermediate_size * 2,
                                  bias=self.use_bias)
-        # selective projection used to make dt, B and C input dependant
+        # selective projection used to make dt, B and C input dependent
         self.x_proj = nn.Linear(self.intermediate_size,
                                 self.time_step_rank + self.ssm_state_size * 2,
                                 bias=False)
@@ -328,33 +328,24 @@ class JambaMambaDecoderLayer(DecoderLayer):
         self,
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        output_attentions: Optional[bool] = False,
-        output_router_logits: Optional[bool] = False,
-        cache_position: Optional[torch.LongTensor] = None,
-    ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor,
-                                                 torch.FloatTensor]]]:
+        residual: Optional[torch.Tensor],
+        **kwargs,
+    ) -> torch.FloatTensor:
 
-        residual = hidden_states
-
-        hidden_states = self.input_layernorm(hidden_states)
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+        else:
+            hidden_states, residual = self.input_layernorm(
+                hidden_states, residual)
 
         hidden_states = self.mamba(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
         )
 
-        # residual connection after mamba
-        hidden_states = residual + hidden_states
+        hidden_states, residual = self.pre_ff_layernorm(hidden_states, residual)
 
-        # feed-forward (experts/MLP)
-        residual = hidden_states
-        hidden_states = self.pre_ff_layernorm(hidden_states)
-        ff_outputs = self.feed_forward(hidden_states)
-        if isinstance(ff_outputs, tuple):
-            hidden_states, router_logits = ff_outputs
-        else:
-            hidden_states, router_logits = ff_outputs, None
-        hidden_states = residual + hidden_states
+        hidden_states = self.feed_forward(hidden_states)
 
         return hidden_states
