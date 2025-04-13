@@ -18,9 +18,6 @@ from transformers.models.jamba.configuration_jamba import JambaConfig
 # Copied from transformers.models.llama.modeling_llama.LlamaRMSNorm with Llama->Jamba
 class JambaRMSNorm(nn.Module):
     def __init__(self, hidden_size, eps=1e-6):
-        """
-        JambaRMSNorm is equivalent to T5LayerNorm
-        """
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
@@ -66,13 +63,6 @@ class JambaAttention(Attention):
 
 # Adapted from transformers.models.mamba.modeling_mamba.MambaMixer
 class JambaMambaMixer(nn.Module):
-    """
-    Compute ∆, A, B, C, and D the state space parameters and compute the `contextualized_states`.
-    A, D are input independent (see Mamba paper [1] Section 3.5.2 "Interpretation of A" for why A isn't selective)
-    ∆, B, C are input-dependent (this is a key difference between Mamba and the linear time invariant S4,
-    and is why Mamba is called **selective** state spaces)
-    """
-
     def __init__(self, config: JambaConfig, layer_idx):
         super().__init__()
         self.config = config
@@ -230,16 +220,6 @@ class JambaMLP(nn.Module):
 
 # Adapted from transformers.models.mixtral.modeling_mixtral.MixtralSparseMoeBlock with Mistral->Jamba
 class JambaSparseMoeBlock(nn.Module):
-    """
-    This implementation is
-    strictly equivalent to standard MoE with full capacity (no
-    dropped tokens). It's faster since it formulates MoE operations
-    in terms of block-sparse operations to accommodate imbalanced
-    assignments of tokens to experts, whereas standard MoE either
-    (1) drop tokens at the cost of reduced performance or (2) set
-    capacity factor to number of experts and thus waste computation
-    and memory on padding.
-    """
 
     def __init__(self, config: JambaConfig):
         super().__init__()
@@ -293,6 +273,7 @@ class JambaSparseMoeBlock(nn.Module):
 
 
 class JambaAttentionDecoderLayer(DecoderLayer):
+
     def __init__(self, config: ModelConfig[JambaConfig], layer_idx: int):
         super().__init__()
         num_experts = config.layers_num_experts[layer_idx]
@@ -314,24 +295,6 @@ class JambaAttentionDecoderLayer(DecoderLayer):
         use_cache: Optional[bool] = False,
         cache_position: Optional[torch.LongTensor] = None,
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
-        """
-        Args:
-            hidden_states (`torch.FloatTensor`): input to the layer of shape `(batch, seq_len, embed_dim)`
-            attention_mask (`torch.FloatTensor`, *optional*): attention mask of size
-                `(batch, sequence_length)` where padding elements are indicated by 0.
-            past_key_value (`HybridMambaAttentionDynamicCache`, *optional*): cached past key and value projection states
-            output_attentions (`bool`, *optional*):
-                Whether or not to return the attentions tensors of all attention layers. See `attentions` under
-                returned tensors for more detail.
-            output_router_logits (`bool`, *optional*):
-                Whether or not to return the logits of all the routers. They are useful for computing the router loss, and
-                should not be returned during inference.
-            use_cache (`bool`, *optional*):
-                If set to `True`, `past_key_values` key value states are returned and can be used to speed up decoding
-                (see `past_key_values`).
-            cache_position (`torch.LongTensor` of shape `(sequence_length)`, *optional*):
-                Indices depicting the position of the input sequence tokens in the sequence.
-        """
 
         residual = hidden_states
 
@@ -375,6 +338,7 @@ class JambaAttentionDecoderLayer(DecoderLayer):
 
 
 class JambaMambaDecoderLayer(DecoderLayer):
+
     def __init__(self, config: ModelConfig[JambaConfig], layer_idx: int):
         super().__init__()
         num_experts = config.layers_num_experts[layer_idx]
@@ -396,24 +360,6 @@ class JambaMambaDecoderLayer(DecoderLayer):
         use_cache: Optional[bool] = False,
         cache_position: Optional[torch.LongTensor] = None,
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
-        """
-        Args:
-            hidden_states (`torch.FloatTensor`): input to the layer of shape `(batch, seq_len, embed_dim)`
-            attention_mask (`torch.FloatTensor`, *optional*): attention mask of size
-                `(batch, sequence_length)` where padding elements are indicated by 0.
-            past_key_value (`HybridMambaAttentionDynamicCache`, *optional*): cached past key and value projection states
-            output_attentions (`bool`, *optional*):
-                Whether or not to return the attentions tensors of all attention layers. See `attentions` under
-                returned tensors for more detail.
-            output_router_logits (`bool`, *optional*):
-                Whether or not to return the logits of all the routers. They are useful for computing the router loss, and
-                should not be returned during inference.
-            use_cache (`bool`, *optional*):
-                If set to `True`, `past_key_values` key value states are returned and can be used to speed up decoding
-                (see `past_key_values`).
-            cache_position (`torch.LongTensor` of shape `(sequence_length)`, *optional*):
-                Indices depicting the position of the input sequence tokens in the sequence.
-        """
 
         residual = hidden_states
 
