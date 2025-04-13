@@ -134,3 +134,54 @@ def test_llm_commandr_plus_4gpus_summary(commandr_example_root,
     venv_mpi_check_call(
         llm_venv,
         ["mpirun", "-n", str(tp_size), "--allow-run-as-root"], summary_cmd)
+
+
+def test_llm_commandr_plus_4gpus_fp8_quantization(commandr_example_root,
+                                         llm_commandr_plus_model_root,
+                                        llm_venv, cmodel_dir, engine_dir,
+                                        llm_datasets_root,
+                                        llm_rouge_root, qformat="fp8",
+                                        batch_size=8, data_type="bfloat16"):
+    "run gemma quantization tests"
+    print("Convert checkpoint by modelopt...")
+    convert_cmd = [
+        f"{commandr_example_root}/../quantization/quantize.py",
+        f"--model_dir={llm_commandr_plus_model_root}",
+        f"--calib_dataset={llm_datasets_root}/cnn_dailymail",
+        f"--dtype={data_type}",
+        f"--qformat={qformat}",
+        f"--kv_cache_dtype={kv_cache_dtype}",
+        f"--output_dir={cmodel_dir}",
+    ]
+    venv_check_call(llm_venv, convert_cmd)
+
+    print("Build engines...")
+    build_cmd = [
+        "trtllm-build",
+        f"--checkpoint_dir={cmodel_dir}",
+        f"--output_dir={engine_dir}",
+        f"--gpt_attention_plugin={data_type}",
+        f"--gemm_plugin={data_type}",
+        "--max_beam_width=1",
+        "--max_input_len=3000",
+        "--max_seq_len=3100",
+        f"--max_batch_size={batch_size}",
+    ]
+
+    check_call(" ".join(build_cmd), shell=True, env=llm_venv._new_env)
+
+    threshold_score = 22
+    summary_cmd = [
+        f"{gemma_example_root}/../summarize.py",
+        "--test_trt_llm",
+        f"--hf_model_dir={llm_commandr_plus_model_root}",
+        f"--tokenizer_dir={llm_commandr_plus_model_root}",
+        f"--engine_dir={engine_dir}",
+        "--check_accuracy",
+        f"--tensorrt_llm_rouge1_threshold={threshold_score}",
+        "--max_ite=5",
+        f"--batch_size={batch_size}",
+        f"--dataset_dir={llm_datasets_root}",
+        f"--rouge_dir={llm_rouge_root}",
+    ]
+    venv_check_call(llm_venv, summary_cmd)
