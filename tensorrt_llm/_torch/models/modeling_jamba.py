@@ -1,16 +1,17 @@
-from typing import Optional, Tuple
+from typing import Optional
 
 import torch
-import torch.nn.functional as F
 from torch import nn
 from transformers.activations import ACT2FN
 from transformers.models.jamba.configuration_jamba import JambaConfig
-
 
 from ..attention_backend import AttentionMetadata
 from ..model_config import ModelConfig
 from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
+from ..modules.fused_moe import FusedMoE, RenormalizeMoeRoutingMethod
+from ..modules.gated_mlp import GatedMLP
+from ..modules.linear import Linear
 from ..modules.rms_norm import RMSNorm
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
                              register_auto_model)
@@ -176,93 +177,68 @@ class JambaMambaMixer(nn.Module):
         return self.slow_forward(hidden_states, attention_mask)
 
 
-# Copied from transformers.models.mistral.modeling_mistral.MistralMLP with Mistral->Jamba
-class JambaMLP(nn.Module):
+class JambaMLP(GatedMLP):
 
-    def __init__(self, config):
+    def __init__(self, model_config: ModelConfig[JambaConfig]):
+        config = model_config.pretrained_config
+        super().__init__(
+            hidden_size=config.hidden_size,
+            intermediate_size=config.intermediate_size,
+            bias=config.mlp_bias if hasattr(config, 'mlp_bias') else False,
+            dtype=config.torch_dtype,
+            config=model_config,
+        )
+
+
+class JambaMoE(nn.Module):
+
+    def __init__(
+        self,
+        model_config: ModelConfig[JambaConfig],
+        aux_stream: torch.cuda.Stream,
+    ):
         super().__init__()
-        self.config = config
-        self.hidden_size = config.hidden_size
-        self.intermediate_size = config.intermediate_size
-        self.gate_proj = nn.Linear(self.hidden_size,
-                                   self.intermediate_size,
-                                   bias=False)
-        self.up_proj = nn.Linear(self.hidden_size,
-                                 self.intermediate_size,
-                                 bias=False)
-        self.down_proj = nn.Linear(self.intermediate_size,
-                                   self.hidden_size,
-                                   bias=False)
-        self.act_fn = ACT2FN[config.hidden_act]
-
-    def forward(self, x):
-        down_proj = self.down_proj(
-            self.act_fn(self.gate_proj(x)) * self.up_proj(x))
-        return down_proj
-
-
-# Adapted from transformers.models.mixtral.modeling_mixtral.MixtralSparseMoeBlock with Mistral->Jamba
-class JambaSparseMoeBlock(nn.Module):
-
-    def __init__(self, config: JambaConfig):
-        super().__init__()
+        config = model_config.pretrained_config
         self.hidden_dim = config.hidden_size
         self.ffn_dim = config.intermediate_size
-        self.num_experts = config.num_experts
+        self.num_experts = config.num_local_experts
         self.top_k = config.num_experts_per_tok
+        self.enable_attention_dp = model_config.mapping.enable_attention_dp
 
-        self.router = nn.Linear(self.hidden_dim, self.num_experts, bias=False)
-        self.experts = nn.ModuleList(
-            [JambaMLP(config) for _ in range(self.num_experts)])
+        # moe gate (linear layer) only runs in half/full precision for now
+        self.gate = Linear(self.hidden_dim,
+                           self.num_experts,
+                           bias=False,
+                           dtype=config.torch_dtype,
+                           quant_config=None)
+
+        reduce_results = True
+
+        self.experts = FusedMoE(
+            num_experts=self.num_experts,
+            routing_method=RenormalizeMoeRoutingMethod(top_k=self.top_k),
+            hidden_size=self.hidden_dim,
+            intermediate_size=self.ffn_dim,
+            aux_stream=aux_stream,
+            dtype=config.torch_dtype,
+            reduce_results=reduce_results,
+            model_config=model_config)
 
     def forward(
-            self,
-            hidden_states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """ """
-        batch_size, sequence_length, hidden_dim = hidden_states.shape
-
-        hidden_states = hidden_states.view(-1, hidden_dim)
-        # router_logits: (batch * sequence_length, n_experts)
-        router_logits = self.router(hidden_states)
-        routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
-        routing_weights, selected_experts = torch.topk(routing_weights,
-                                                       self.top_k,
-                                                       dim=-1)
-        # we cast back to the input dtype
-        routing_weights = routing_weights.to(hidden_states.dtype)
-
-        final_hidden_states = torch.zeros(
-            (batch_size * sequence_length, hidden_dim),
-            dtype=hidden_states.dtype,
-            device=hidden_states.device)
-
-        # One hot encode the selected experts to create an expert mask
-        # this will be used to easily index which expert is going to be sollicitated
-        expert_mask = torch.nn.functional.one_hot(
-            selected_experts, num_classes=self.num_experts).permute(2, 1, 0)
-
-        # Loop over all available experts in the model and perform the computation on each expert
-        for expert_idx in range(self.num_experts):
-            expert_layer = self.experts[expert_idx]
-            idx, top_x = torch.where(expert_mask[expert_idx])
-
-            if top_x.shape[0] == 0:
-                continue
-
-            # Index the correct hidden states and compute the expert hidden state for
-            # the current expert. We need to make sure to multiply the output hidden
-            # states by `routing_weights` on the corresponding tokens (top-1 and top-2)
-            current_state = hidden_states[None, top_x].reshape(-1, hidden_dim)
-            current_hidden_states = expert_layer(
-                current_state) * routing_weights[top_x, idx, None]
-
-            # However `index_add_` only support torch tensors for indexing so we'll use
-            # the `top_x` tensor here.
-            final_hidden_states.index_add_(
-                0, top_x, current_hidden_states.to(hidden_states.dtype))
-        final_hidden_states = final_hidden_states.reshape(
-            batch_size, sequence_length, hidden_dim)
-        return final_hidden_states, router_logits
+        self,
+        hidden_states: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+    ) -> torch.Tensor:
+        all_rank_num_tokens = attn_metadata.all_rank_num_tokens
+        if self.enable_attention_dp and len(all_rank_num_tokens) > 1:
+            max_num_token = max(all_rank_num_tokens)
+            hidden_states = torch.nn.functional.pad(
+                hidden_states,
+                (0, 0, 0, max_num_token - hidden_states.shape[0]))
+        router_logits = self.gate(hidden_states)
+        final_hidden_states = self.experts(hidden_states, router_logits,
+                                           all_rank_num_tokens)
+        return final_hidden_states
 
 
 class JambaAttentionDecoderLayer(DecoderLayer):
@@ -271,7 +247,7 @@ class JambaAttentionDecoderLayer(DecoderLayer):
         super().__init__()
         config = model_config.pretrained_config
         self.self_attn = JambaAttention(model_config, layer_idx)
-        self.feed_forward = JambaMLP(config)
+        self.feed_forward = JambaMLP(model_config)
         self.input_layernorm = RMSNorm(hidden_size=config.hidden_size,
                                        eps=config.rms_norm_eps,
                                        dtype=config.torch_dtype)
@@ -311,13 +287,18 @@ class JambaAttentionDecoderLayer(DecoderLayer):
 
 class JambaMambaDecoderLayer(DecoderLayer):
 
-    def __init__(self, config: ModelConfig[JambaConfig], layer_idx: int,
-                 is_moe: bool):
+    def __init__(self, model_config: ModelConfig[JambaConfig], layer_idx: int,
+                 aux_stream: torch.cuda.Stream):
         super().__init__()
+        config = model_config.pretrained_config
         self.mamba = JambaMambaMixer(config=config, layer_idx=layer_idx)
 
-        ffn_layer_class = JambaSparseMoeBlock if is_moe else JambaMLP
-        self.feed_forward = ffn_layer_class(config)
+        is_moe = (layer_idx -
+                  config.expert_layer_offset) % config.expert_layer_period == 0
+        if is_moe:
+            self.feed_forward = JambaMoE(model_config, aux_stream)
+        else:
+            self.feed_forward = JambaMLP(model_config)
         self.input_layernorm = RMSNorm(hidden_size=config.hidden_size,
                                        eps=config.rms_norm_eps,
                                        dtype=config.torch_dtype)
@@ -368,15 +349,13 @@ class JambaModel(DecoderModel):
 
         decoder_layers = []
         for layer_idx in range(config.num_hidden_layers):
-            if (layer_idx -
-                    config.attn_layer_offset) % config.attn_layer_period == 0:
+            is_attention = (layer_idx - config.attn_layer_offset
+                            ) % config.attn_layer_period == 0
+            if is_attention:
                 curr_layer = JambaAttentionDecoderLayer(model_config, layer_idx)
             else:
-                curr_layer = JambaMambaDecoderLayer(
-                    config,
-                    layer_idx,
-                    is_moe=(layer_idx - config.expert_layer_offset) %
-                    config.expert_layer_period == 0)
+                curr_layer = JambaMambaDecoderLayer(model_config, layer_idx,
+                                                    self.aux_stream)
             decoder_layers.append(curr_layer)
         self.layers = nn.ModuleList(decoder_layers)
 
