@@ -6,12 +6,14 @@ from torch import nn
 from transformers.activations import ACT2FN
 from transformers.models.jamba.configuration_jamba import JambaConfig
 
-from tensorrt_llm._torch.attention_backend import AttentionMetadata
-from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.modules.attention import Attention
-from tensorrt_llm._torch.modules.decoder_layer import DecoderLayer
-
+from transformers import PretrainedConfig
+from tensorrt_llm.functional import PositionEmbeddingType
+from ..attention_backend import AttentionMetadata
+from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
+from ..model_config import ModelConfig
+from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
+from ..modules.rotary_embedding import RotaryEmbedding
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
                              register_auto_model)
 
@@ -35,6 +37,19 @@ class JambaRMSNorm(nn.Module):
     def extra_repr(self):
         return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
 
+class JambaRotaryEmbedding(RotaryEmbedding):
+
+    def __init__(self,
+                 config: PretrainedConfig,
+                 device: Optional[torch.device] = None):
+        head_dim = config.hidden_size // config.num_attention_heads
+        super().__init__(config,
+                         head_dim=head_dim,
+                         num_attention_heads=config.num_attention_heads,
+                         max_position_embeddings=config.max_position_embeddings,
+                         device=device,
+                         rope_type="default")
+
 
 class JambaAttention(Attention):
 
@@ -57,7 +72,7 @@ class JambaAttention(Attention):
                          num_key_value_heads=config.num_key_value_heads,
                          max_position_embeddings=config.max_position_embeddings,
                          bias=False,
-                         rotary_emb=MixtralRotaryEmbedding(config),
+                         rotary_emb=JambaRotaryEmbedding(config),
                          pos_embd_params=pos_embd_params,
                          layer_idx=layer_idx,
                          dtype=config.torch_dtype,
@@ -274,10 +289,10 @@ class JambaSparseMoeBlock(nn.Module):
 
 class JambaAttentionDecoderLayer(DecoderLayer):
 
-    def __init__(self, config: ModelConfig[JambaConfig], layer_idx: int):
+    def __init__(self, model_config: ModelConfig[JambaConfig], layer_idx: int):
         super().__init__()
-        config.layers_num_experts[layer_idx]
-        self.self_attn = JambaAttention(config, layer_idx)
+        config = model_config.pretrained_config
+        self.self_attn = JambaAttention(model_config, layer_idx)
         self.feed_forward = JambaMLP(config)
         self.input_layernorm = JambaRMSNorm(config.hidden_size,
                                             eps=config.rms_norm_eps)
@@ -371,23 +386,21 @@ class JambaModel(DecoderModel):
 
         decoder_layers = []
         for layer_idx in range(config.num_hidden_layers):
-            print("config: ", config)
             if (layer_idx -
                     config.attn_layer_offset) % config.attn_layer_period == 0:
-                curr_layer = JambaAttentionDecoderLayer(model_config, layer_idx,
-                                                        self.aux_stream)
+                curr_layer = JambaAttentionDecoderLayer(model_config, layer_idx)
             else:
                 curr_layer = JambaMambaDecoderLayer(
-                    model_config,
+                    config,
                     layer_idx,
                     is_moe=(layer_idx - config.expert_layer_offset) %
                     config.expert_layer_period == 0)
             decoder_layers.append(curr_layer)
         self.layers = nn.ModuleList(decoder_layers)
 
-        self.norm = RMSNorm(hidden_size=config.hidden_size,
-                            eps=config.rms_norm_eps,
-                            dtype=config.torch_dtype)
+        self.norm = JambaRMSNorm(hidden_size=config.hidden_size,
+                                 eps=config.rms_norm_eps,
+                                 dtype=config.torch_dtype)
 
     def forward(
         self,
