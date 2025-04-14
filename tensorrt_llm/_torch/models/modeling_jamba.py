@@ -10,9 +10,11 @@ from tensorrt_llm._torch.attention_backend import AttentionMetadata
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.modules.attention import Attention
 from tensorrt_llm._torch.modules.decoder_layer import DecoderLayer
+
+from ..modules.decoder_layer import DecoderLayer
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
                              register_auto_model)
-from ..modules.decoder_layer import DecoderLayer
+
 
 # Copied from transformers.models.llama.modeling_llama.LlamaRMSNorm with Llama->Jamba
 class JambaRMSNorm(nn.Module):
@@ -274,7 +276,7 @@ class JambaAttentionDecoderLayer(DecoderLayer):
 
     def __init__(self, config: ModelConfig[JambaConfig], layer_idx: int):
         super().__init__()
-        num_experts = config.layers_num_experts[layer_idx]
+        config.layers_num_experts[layer_idx]
         self.self_attn = JambaAttention(config, layer_idx)
         self.feed_forward = JambaMLP(config)
         self.input_layernorm = JambaRMSNorm(config.hidden_size,
@@ -314,12 +316,12 @@ class JambaAttentionDecoderLayer(DecoderLayer):
 
 class JambaMambaDecoderLayer(DecoderLayer):
 
-    def __init__(self, config: ModelConfig[JambaConfig], layer_idx: int):
+    def __init__(self, config: ModelConfig[JambaConfig], layer_idx: int,
+                 is_moe: bool):
         super().__init__()
-        num_experts = config.layers_num_experts[layer_idx]
         self.mamba = JambaMambaMixer(config=config, layer_idx=layer_idx)
 
-        ffn_layer_class = JambaSparseMoeBlock if num_experts > 1 else JambaMLP
+        ffn_layer_class = JambaSparseMoeBlock if is_moe else JambaMLP
         self.feed_forward = ffn_layer_class(config)
         self.input_layernorm = JambaRMSNorm(config.hidden_size,
                                             eps=config.rms_norm_eps)
@@ -369,10 +371,17 @@ class JambaModel(DecoderModel):
 
         decoder_layers = []
         for layer_idx in range(config.num_hidden_layers):
-            # if :
-            #     curr_layer = JambaAttentionDecoderLayer(model_config, layer_idx, self.aux_stream)
-            # else:
-            #
+            print("config: ", config)
+            if (layer_idx -
+                    config.attn_layer_offset) % config.attn_layer_period == 0:
+                curr_layer = JambaAttentionDecoderLayer(model_config, layer_idx,
+                                                        self.aux_stream)
+            else:
+                curr_layer = JambaMambaDecoderLayer(
+                    model_config,
+                    layer_idx,
+                    is_moe=(layer_idx - config.expert_layer_offset) %
+                    config.expert_layer_period == 0)
             decoder_layers.append(curr_layer)
         self.layers = nn.ModuleList(decoder_layers)
 
@@ -410,8 +419,7 @@ class JambaModel(DecoderModel):
 
 
 @register_auto_model("JambaForCausalLM")
-class JambaForCausalLM(DecoderModelForCausalLM[JambaModel,
-                                                 JambaConfig]):
+class JambaForCausalLM(DecoderModelForCausalLM[JambaModel, JambaConfig]):
 
     def __init__(self, model_config: ModelConfig[JambaConfig]):
         super().__init__(JambaModel(model_config),
