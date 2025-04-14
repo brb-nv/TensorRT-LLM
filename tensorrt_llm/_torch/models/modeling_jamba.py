@@ -9,7 +9,6 @@ from transformers.models.jamba.configuration_jamba import JambaConfig
 from transformers import PretrainedConfig
 from tensorrt_llm.functional import PositionEmbeddingType
 from ..attention_backend import AttentionMetadata
-from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
 from ..model_config import ModelConfig
 from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
@@ -37,19 +36,6 @@ class JambaRMSNorm(nn.Module):
     def extra_repr(self):
         return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
 
-class JambaRotaryEmbedding(RotaryEmbedding):
-
-    def __init__(self,
-                 config: PretrainedConfig,
-                 device: Optional[torch.device] = None):
-        head_dim = config.hidden_size // config.num_attention_heads
-        super().__init__(config,
-                         head_dim=head_dim,
-                         num_attention_heads=config.num_attention_heads,
-                         max_position_embeddings=config.max_position_embeddings,
-                         device=device,
-                         rope_type="default")
-
 
 class JambaAttention(Attention):
 
@@ -59,21 +45,14 @@ class JambaAttention(Attention):
         layer_idx: Optional[int] = None,
     ):
         config = model_config.pretrained_config
-        if model_config.fuse_pos_embd:
-            pos_embd_params = PositionalEmbeddingParams(
-                type=PositionEmbeddingType.rope_gpt_neox,
-                rope=RopeParams.from_config(config),
-            )
-        else:
-            pos_embd_params = None
-
+        # Note: Jamba does not use positional embeddings.
         super().__init__(hidden_size=config.hidden_size,
                          num_attention_heads=config.num_attention_heads,
                          num_key_value_heads=config.num_key_value_heads,
                          max_position_embeddings=config.max_position_embeddings,
                          bias=False,
-                         rotary_emb=JambaRotaryEmbedding(config),
-                         pos_embd_params=pos_embd_params,
+                         rotary_emb=None,
+                         pos_embd_params=None,
                          layer_idx=layer_idx,
                          dtype=config.torch_dtype,
                          config=model_config)
@@ -399,8 +378,7 @@ class JambaModel(DecoderModel):
         self.layers = nn.ModuleList(decoder_layers)
 
         self.norm = JambaRMSNorm(hidden_size=config.hidden_size,
-                                 eps=config.rms_norm_eps,
-                                 dtype=config.torch_dtype)
+                                 eps=config.rms_norm_eps)
 
     def forward(
         self,
