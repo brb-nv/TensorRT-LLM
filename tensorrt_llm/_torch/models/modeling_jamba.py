@@ -17,26 +17,6 @@ from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
                              register_auto_model)
 
 
-# Copied from transformers.models.llama.modeling_llama.LlamaRMSNorm with Llama->Jamba
-class JambaRMSNorm(nn.Module):
-
-    def __init__(self, hidden_size, eps=1e-6):
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(hidden_size))
-        self.variance_epsilon = eps
-
-    def forward(self, hidden_states):
-        input_dtype = hidden_states.dtype
-        hidden_states = hidden_states.to(torch.float32)
-        variance = hidden_states.pow(2).mean(-1, keepdim=True)
-        hidden_states = hidden_states * torch.rsqrt(variance +
-                                                    self.variance_epsilon)
-        return self.weight * hidden_states.to(input_dtype)
-
-    def extra_repr(self):
-        return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
-
-
 class JambaAttention(Attention):
 
     def __init__(
@@ -108,12 +88,15 @@ class JambaMambaMixer(nn.Module):
                                   self.hidden_size,
                                   bias=self.use_bias)
 
-        self.dt_layernorm = JambaRMSNorm(self.time_step_rank,
-                                         eps=config.rms_norm_eps)
-        self.b_layernorm = JambaRMSNorm(self.ssm_state_size,
-                                        eps=config.rms_norm_eps)
-        self.c_layernorm = JambaRMSNorm(self.ssm_state_size,
-                                        eps=config.rms_norm_eps)
+        self.dt_layernorm = RMSNorm(hidden_size=self.time_step_rank,
+                                    eps=config.rms_norm_eps,
+                                    dtype=config.torch_dtype)
+        self.b_layernorm = RMSNorm(hidden_size=self.ssm_state_size,
+                                    eps=config.rms_norm_eps,
+                                    dtype=config.torch_dtype)
+        self.c_layernorm = RMSNorm(hidden_size=self.ssm_state_size,
+                                        eps=config.rms_norm_eps,
+                                    dtype=config.torch_dtype)
 
     # fmt: off
     def slow_forward(self, input_states, attention_mask: Optional[torch.LongTensor] = None):
@@ -400,12 +383,3 @@ class JambaForCausalLM(DecoderModelForCausalLM[JambaModel, JambaConfig]):
                          config=model_config,
                          hidden_size=model_config.pretrained_config.hidden_size,
                          vocab_size=model_config.pretrained_config.vocab_size)
-
-
-##########################################################
-# TODO:
-# 1) Replace MLP
-# 2) Replace RMSNorm
-# 3) Replace FusedMoE
-# 4) Mamba --> Need to figure the right way to support Mamba
-##########################################################
