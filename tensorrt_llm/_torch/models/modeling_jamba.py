@@ -6,13 +6,12 @@ from torch import nn
 from transformers.activations import ACT2FN
 from transformers.models.jamba.configuration_jamba import JambaConfig
 
-from transformers import PretrainedConfig
-from tensorrt_llm.functional import PositionEmbeddingType
+
 from ..attention_backend import AttentionMetadata
 from ..model_config import ModelConfig
 from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
-from ..modules.rotary_embedding import RotaryEmbedding
+from ..modules.rms_norm import RMSNorm
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
                              register_auto_model)
 
@@ -273,10 +272,12 @@ class JambaAttentionDecoderLayer(DecoderLayer):
         config = model_config.pretrained_config
         self.self_attn = JambaAttention(model_config, layer_idx)
         self.feed_forward = JambaMLP(config)
-        self.input_layernorm = JambaRMSNorm(config.hidden_size,
-                                            eps=config.rms_norm_eps)
-        self.pre_ff_layernorm = JambaRMSNorm(config.hidden_size,
-                                             eps=config.rms_norm_eps)
+        self.input_layernorm = RMSNorm(hidden_size=config.hidden_size,
+                                       eps=config.rms_norm_eps,
+                                       dtype=config.torch_dtype)
+        self.pre_ff_layernorm = RMSNorm(hidden_size=config.hidden_size,
+                                        eps=config.rms_norm_eps,
+                                        dtype=config.torch_dtype)
 
     def forward(
         self,
@@ -317,10 +318,12 @@ class JambaMambaDecoderLayer(DecoderLayer):
 
         ffn_layer_class = JambaSparseMoeBlock if is_moe else JambaMLP
         self.feed_forward = ffn_layer_class(config)
-        self.input_layernorm = JambaRMSNorm(config.hidden_size,
-                                            eps=config.rms_norm_eps)
-        self.pre_ff_layernorm = JambaRMSNorm(config.hidden_size,
-                                             eps=config.rms_norm_eps)
+        self.input_layernorm = RMSNorm(hidden_size=config.hidden_size,
+                                       eps=config.rms_norm_eps,
+                                       dtype=config.torch_dtype)
+        self.pre_ff_layernorm = RMSNorm(hidden_size=config.hidden_size,
+                                        eps=config.rms_norm_eps,
+                                        dtype=config.torch_dtype)
 
     def forward(
         self,
@@ -377,8 +380,9 @@ class JambaModel(DecoderModel):
             decoder_layers.append(curr_layer)
         self.layers = nn.ModuleList(decoder_layers)
 
-        self.norm = JambaRMSNorm(hidden_size=config.hidden_size,
-                                 eps=config.rms_norm_eps)
+        self.norm = RMSNorm(hidden_size=config.hidden_size,
+                            eps=config.rms_norm_eps,
+                            dtype=config.torch_dtype)
 
     def forward(
         self,
@@ -422,6 +426,7 @@ class JambaForCausalLM(DecoderModelForCausalLM[JambaModel, JambaConfig]):
 ##########################################################
 # TODO:
 # 1) Replace MLP
-# 2) Replace FusedMoE
-# 3) Mamba --> Need to figure the right way to support Mamba
+# 2) Replace RMSNorm
+# 3) Replace FusedMoE
+# 4) Mamba --> Need to figure the right way to support Mamba
 ##########################################################
