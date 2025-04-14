@@ -10,7 +10,9 @@ from tensorrt_llm._torch.attention_backend import AttentionMetadata
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.modules.attention import Attention
 from tensorrt_llm._torch.modules.decoder_layer import DecoderLayer
-
+from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
+                             register_auto_model)
+from ..modules.decoder_layer import DecoderLayer
 
 # Copied from transformers.models.llama.modeling_llama.LlamaRMSNorm with Llama->Jamba
 class JambaRMSNorm(nn.Module):
@@ -36,7 +38,7 @@ class JambaAttention(Attention):
 
     def __init__(
         self,
-        model_config: ModelConfig[PretrainedConfig],
+        model_config: ModelConfig[JambaConfig],
         layer_idx: Optional[int] = None,
     ):
         config = model_config.pretrained_config
@@ -307,7 +309,7 @@ class JambaAttentionDecoderLayer(DecoderLayer):
 
         hidden_states = self.feed_forward(hidden_states)
 
-        return hidden_states
+        return hidden_states, residual
 
 
 class JambaMambaDecoderLayer(DecoderLayer):
@@ -328,7 +330,7 @@ class JambaMambaDecoderLayer(DecoderLayer):
         self,
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
-        residual: Optional[torch.Tensor],
+        residual: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.FloatTensor:
 
@@ -348,15 +350,79 @@ class JambaMambaDecoderLayer(DecoderLayer):
 
         hidden_states = self.feed_forward(hidden_states)
 
+        return hidden_states, residual
+
+
+class JambaModel(DecoderModel):
+
+    def __init__(self, model_config: ModelConfig[JambaConfig]):
+        super().__init__(model_config)
+        config = model_config.pretrained_config
+        self.padding_idx = config.pad_token_id
+        self.vocab_size = config.vocab_size
+        self.aux_stream = torch.cuda.Stream()
+
+        self.embed_tokens = nn.Embedding(config.vocab_size,
+                                         config.hidden_size,
+                                         config.pad_token_id,
+                                         dtype=config.torch_dtype)
+
+        decoder_layers = []
+        for layer_idx in range(config.num_hidden_layers):
+            # if :
+            #     curr_layer = JambaAttentionDecoderLayer(model_config, layer_idx, self.aux_stream)
+            # else:
+            #
+            decoder_layers.append(curr_layer)
+        self.layers = nn.ModuleList(decoder_layers)
+
+        self.norm = RMSNorm(hidden_size=config.hidden_size,
+                            eps=config.rms_norm_eps,
+                            dtype=config.torch_dtype)
+
+    def forward(
+        self,
+        attn_metadata: AttentionMetadata,
+        input_ids: Optional[torch.LongTensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        if (input_ids is None) ^ (inputs_embeds is not None):
+            raise ValueError(
+                "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
+            )
+
+        if inputs_embeds is None:
+            inputs_embeds = self.embed_tokens(input_ids)
+
+        hidden_states = inputs_embeds
+
+        residual = None
+        for decoder_layer in self.layers:
+            hidden_states, residual = decoder_layer(position_ids=position_ids,
+                                                    hidden_states=hidden_states,
+                                                    attn_metadata=attn_metadata,
+                                                    residual=residual)
+
+        hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
 
 @register_auto_model("JambaForCausalLM")
 class JambaForCausalLM(DecoderModelForCausalLM[JambaModel,
-                                                 PretrainedConfig]):
+                                                 JambaConfig]):
 
-    def __init__(self, model_config: ModelConfig[PretrainedConfig]):
+    def __init__(self, model_config: ModelConfig[JambaConfig]):
         super().__init__(JambaModel(model_config),
                          config=model_config,
                          hidden_size=model_config.pretrained_config.hidden_size,
                          vocab_size=model_config.pretrained_config.vocab_size)
+
+
+##########################################################
+# TODO:
+# 1) Replace MLP
+# 2) Replace FusedMoE
+# 3) Mamba --> Need to figure the right way to support Mamba
+##########################################################
