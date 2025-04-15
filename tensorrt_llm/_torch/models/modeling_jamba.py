@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Dict, Optional
 
 import torch
 from torch import nn
@@ -184,7 +184,7 @@ class JambaMoE(nn.Module):
         config = model_config.pretrained_config
         self.hidden_dim = config.hidden_size
         self.ffn_dim = config.intermediate_size
-        self.num_experts = config.num_local_experts
+        self.num_experts = config.num_experts
         self.top_k = config.num_experts_per_tok
         self.enable_attention_dp = model_config.mapping.enable_attention_dp
 
@@ -383,3 +383,35 @@ class JambaForCausalLM(DecoderModelForCausalLM[JambaModel, JambaConfig]):
                          config=model_config,
                          hidden_size=model_config.pretrained_config.hidden_size,
                          vocab_size=model_config.pretrained_config.vocab_size)
+
+    def load_weights(self, weights: Dict):
+
+        def filter_weights(prefix, weights: Dict):
+            result = {}
+            for k, v in weights.items():
+                if k.startswith(prefix):
+                    new_k = k[len(prefix) + 1:]
+                    result[new_k] = v
+            return result
+
+        params_map = {
+            'qkv_proj': ['q_proj', 'k_proj', 'v_proj'],
+        }
+
+        for name, module in self.named_modules():
+            if len(module._parameters) > 0:
+                names = name.split('.')
+                if names[-1] in params_map:
+                    module_weights = []
+                    for new_name in params_map[names[-1]]:
+                        module_weights.append(
+                            filter_weights('.'.join(names[:-1] + [new_name]),
+                                           weights))
+                    module.load_weights(weights=module_weights)
+                else:
+                    module_weights = filter_weights(name, weights)
+                    if hasattr(module, 'load_weights'):
+                        module.load_weights(weights=[module_weights])
+                    else:
+                        for n, p in module.named_parameters():
+                            p.data.copy_(module_weights[n][:])
