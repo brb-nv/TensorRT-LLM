@@ -488,7 +488,9 @@ class DecoderModelForCausalLM(nn.Module,
 
     def load_weights(self, weights: Dict):
         tp_size = self.model_config.mapping.tp_size
-        head_dim = self.config.hidden_size // self.config.num_attention_heads
+        head_dim = getattr(
+            self.config, 'head_dim',
+            self.config.hidden_size // self.config.num_attention_heads)
 
         def filter_weights(prefix, weights: Dict):
             result = {}
@@ -544,7 +546,11 @@ class DecoderModelForCausalLM(nn.Module,
                     else:
                         for n, p in module._parameters.items():
                             if p is not None:
-                                p.data.copy_(module_weights[n][:])
+                                # Hack for Gemma3 RMSNorm.
+                                if 'norm' in names[-1]:
+                                    p.data.copy_(module_weights[n][:] + 1)
+                                else:
+                                    p.data.copy_(module_weights[n][:])
 
     def infer_max_seq_len(self) -> int:
         # Modified from tensorrt_llm/builder.py _init_max_seq_len

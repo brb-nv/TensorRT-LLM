@@ -34,26 +34,26 @@ class Attention(nn.Module):
         dtype: torch.dtype = None,
         dense_bias: Optional[bool] = None,
         config: Optional[ModelConfig] = None,
+        qk_layernorm: bool = False,
+        q_scaling: float = 1.0,
     ):
         super().__init__()
         self.layer_idx = layer_idx
 
         self.hidden_size = hidden_size
         self.num_heads = num_attention_heads
-        self.head_dim = self.hidden_size // self.num_heads
+        self.head_dim = getattr(config.pretrained_config, 'head_dim',
+                                hidden_size // num_attention_heads)
         self.num_key_value_heads = num_key_value_heads
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.max_position_embeddings = max_position_embeddings
         self.pos_embd_params = pos_embd_params
         self.dense_bias = dense_bias
+        self.qk_layernorm = qk_layernorm
+        self.q_scaling = q_scaling
 
         if dense_bias is None:
             self.dense_bias = bias
-
-        if (self.head_dim * self.num_heads) != self.hidden_size:
-            raise ValueError(
-                f"hidden_size must be divisible by num_heads (got `hidden_size`: {self.hidden_size}"
-                f" and `num_heads`: {self.num_heads}).")
 
         # tensor parallel
         config = config or ModelConfig()
@@ -90,7 +90,7 @@ class Attention(nn.Module):
             skip_create_weights=config.skip_create_weights,
         )
         self.o_proj = Linear(
-            self.hidden_size,
+            self.num_heads * self.head_dim,
             self.hidden_size,
             bias=self.dense_bias,
             dtype=dtype,
@@ -99,6 +99,14 @@ class Attention(nn.Module):
             quant_config=config.get_quant_config(),
             skip_create_weights=config.skip_create_weights,
         )
+
+        if self.qk_layernorm:
+            self.q_norm = RMSNorm(hidden_size=self.head_dim,
+                                eps=config.pretrained_config.rms_norm_eps,
+                                dtype=config.pretrained_config.torch_dtype)
+            self.k_norm = RMSNorm(hidden_size=self.head_dim,
+                                eps=config.pretrained_config.rms_norm_eps,
+                                dtype=config.pretrained_config.torch_dtype)
         self.quant_config = config.get_quant_config()
         self.attn_backend = config.attn_backend
         self.pos_embd_params = pos_embd_params
@@ -143,6 +151,7 @@ class Attention(nn.Module):
             self.num_key_value_heads,
             pos_embd_params=self.pos_embd_params,
             quant_config=self.quant_config,
+            q_scaling=self.q_scaling,
         )
 
     def create_weights(self):
@@ -183,6 +192,15 @@ class Attention(nn.Module):
                 qkv = qkv + qkv_lora
 
         q, k, v = qkv, None, None
+        if self.qk_layernorm:
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size],
+                                    dim=-1)
+            # `q_norm` is shared across all attention heads.
+            q = q.reshape(-1, self.head_dim)
+            q = self.q_norm(q)
+            q = q.reshape(-1, self.num_heads * self.head_dim)
+            k = self.k_norm(k)
+            qkv = torch.cat([q, k, v], dim=-1)
 
         if self.apply_rotary_emb and position_ids is not None:
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size],
