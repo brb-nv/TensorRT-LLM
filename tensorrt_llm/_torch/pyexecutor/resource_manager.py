@@ -157,6 +157,11 @@ class KVCacheManager(BaseResourceManager):
 
         self.max_attention_window = max_attention_window if kv_cache_type == CacheTypeCpp.SELF else self.max_seq_len
 
+        # max_attention_window_vec = [512, 512, 512, 512, 512, 32768, 512, 512, 512, 512, 512, 32768, 512, 512, 512, 512, 512, 32768, 512, 512, 512, 512, 512, 32768, 512, 512]
+        # for i in range(len(max_attention_window_vec)):
+        #     max_attention_window_vec[i] = min(max_attention_window_vec[i], self.max_attention_window)
+        # print("max_attention_window_vec: ", max_attention_window_vec)
+
         # Note that this stream is unused for now. Will be used for copying to host
         # when that feature is enabled.
         self._stream = torch.cuda.Stream()
