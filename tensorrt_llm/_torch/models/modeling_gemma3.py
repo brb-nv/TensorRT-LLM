@@ -26,25 +26,24 @@ class Gemma3Attention(Attention):
         self,
         model_config: ModelConfig[Gemma3TextConfig],
         layer_idx: Optional[int] = None,
+        is_sliding: bool = False,
     ):
         config = model_config.pretrained_config
-        if getattr(config, "rope_scaling", None) is not None:
-            pos_embd_params = PositionalEmbeddingParams(
-                type=PositionEmbeddingType.from_string(
-                    config.rope_scaling["type"]),
-                rope=RopeParams.from_config(config),
-            )
-        else:
-            pos_embd_params = PositionalEmbeddingParams(
-                type=PositionEmbeddingType.rope_gpt_neox,
-                rope=RopeParams.from_config(config),
-            )
+        pos_embd_params = PositionalEmbeddingParams(
+            type=PositionEmbeddingType.rope_gpt_neox,
+            rope=RopeParams.from_config(config),
+        )
+        # TODO: Need to incorporate these into the attention class.
+        # q_scaling = math.sqrt(config.query_pre_attn_scalar) / math.sqrt(config.head_size)
+        # qk_layernorm = True
+        # layernorm_type=LayerNormType.RmsNorm
+        # rope_theta_local = 10000
         super().__init__(
             hidden_size=config.hidden_size,
             num_attention_heads=config.num_attention_heads,
             num_key_value_heads=config.num_key_value_heads,
             max_position_embeddings=config.max_position_embeddings,
-            bias=True,
+            bias=False,
             pos_embd_params=pos_embd_params,
             layer_idx=layer_idx,
             dtype=config.torch_dtype,
@@ -75,12 +74,20 @@ class Gemma3DecoderLayer(DecoderLayer):
             dtype=config.torch_dtype,
             config=model_config,
         )
+
         self.input_layernorm = RMSNorm(hidden_size=config.hidden_size,
                                        eps=config.rms_norm_eps,
                                        dtype=config.torch_dtype)
         self.post_attention_layernorm = RMSNorm(hidden_size=config.hidden_size,
                                                 eps=config.rms_norm_eps,
                                                 dtype=config.torch_dtype)
+        self.pre_feedforward_layernorm = RMSNorm(hidden_size=config.hidden_size,
+                                                 eps=config.rms_norm_eps,
+                                                 dtype=config.torch_dtype)
+        self.post_feedforward_layernorm = RMSNorm(
+            hidden_size=config.hidden_size,
+            eps=config.rms_norm_eps,
+            dtype=config.torch_dtype)
 
     def forward(
         self,
@@ -90,25 +97,27 @@ class Gemma3DecoderLayer(DecoderLayer):
         residual: Optional[torch.Tensor],
         **kwargs,
     ) -> torch.Tensor:
-        if residual is None:
-            residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
-        else:
-            hidden_states, residual = self.input_layernorm(
-                hidden_states, residual)
 
-        # Self Attention
+        residual = hidden_states
+
+        hidden_states = self.input_layernorm(hidden_states)
         hidden_states = self.self_attn(
             position_ids=position_ids,
             hidden_states=hidden_states,
             attn_metadata=attn_metadata,
             **kwargs,
         )
+        hidden_states = self.post_attention_layernorm(hidden_states)
 
-        # Fully Connected
-        hidden_states, residual = self.post_attention_layernorm(
-            hidden_states, residual)
+        hidden_states = residual + hidden_states
+        residual = hidden_states
+
+        hidden_states = self.pre_feedforward_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
+        hidden_states = self.post_feedforward_layernorm(hidden_states)
+
+        hidden_states = residual + hidden_states
+
         return hidden_states, residual
 
 
@@ -117,6 +126,7 @@ class Gemma3TextModel(DecoderModel):
     def __init__(self, model_config: ModelConfig[Gemma3TextConfig]):
         super().__init__(model_config)
         config = self.model_config
+        self.hidden_size = config.pretrained_config.hidden_size
         self.padding_idx = config.pretrained_config.pad_token_id
 
         self.embed_tokens = Embedding(
@@ -153,21 +163,21 @@ class Gemma3TextModel(DecoderModel):
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
 
-        hidden_states = inputs_embeds
+        hidden_states = (inputs_embeds * torch.sqrt(self.hidden_size)).to(
+            self.dtype)
 
-        residual = None
         for decoder_layer in self.layers:
-            hidden_states, residual = decoder_layer(position_ids=position_ids,
-                                                    hidden_states=hidden_states,
-                                                    attn_metadata=attn_metadata,
-                                                    residual=residual)
+            hidden_states = decoder_layer(position_ids=position_ids,
+                                          hidden_states=hidden_states,
+                                          attn_metadata=attn_metadata)
 
-        hidden_states, _ = self.norm(hidden_states, residual)
+        hidden_states = self.norm(hidden_states)
         return hidden_states
 
 
 @register_auto_model("Gemma3ForCausalLM")
-class Gemma3ForCausalLM(DecoderModelForCausalLM[Gemma3TextModel, Gemma3TextConfig]):
+class Gemma3ForCausalLM(DecoderModelForCausalLM[Gemma3TextModel,
+                                                Gemma3TextConfig]):
 
     def __init__(
         self,
