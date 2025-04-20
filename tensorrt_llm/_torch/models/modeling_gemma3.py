@@ -1,3 +1,4 @@
+import math
 from typing import Optional, Tuple
 
 import torch
@@ -94,7 +95,7 @@ class Gemma3DecoderLayer(DecoderLayer):
         position_ids: torch.LongTensor,
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
-        residual: Optional[torch.Tensor],
+        residual: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
 
@@ -118,7 +119,7 @@ class Gemma3DecoderLayer(DecoderLayer):
 
         hidden_states = residual + hidden_states
 
-        return hidden_states, residual
+        return hidden_states
 
 
 class Gemma3TextModel(DecoderModel):
@@ -161,10 +162,10 @@ class Gemma3TextModel(DecoderModel):
             )
 
         if inputs_embeds is None:
-            inputs_embeds = self.embed_tokens(input_ids)
+            inputs_embeds = self.embed_tokens(input_ids) * math.sqrt(
+                self.hidden_size)
 
-        hidden_states = (inputs_embeds * torch.sqrt(self.hidden_size)).to(
-            self.dtype)
+        hidden_states = inputs_embeds.to(self.dtype)
 
         for decoder_layer in self.layers:
             hidden_states = decoder_layer(position_ids=position_ids,
