@@ -30,15 +30,14 @@ class Gemma3Attention(Attention):
         is_sliding: bool = False,
     ):
         config = model_config.pretrained_config
+        rope_params = RopeParams.from_config(config)
+        if is_sliding:
+            rope_params.theta = 10000
         pos_embd_params = PositionalEmbeddingParams(
             type=PositionEmbeddingType.rope_gpt_neox,
-            rope=RopeParams.from_config(config),
+            rope=rope_params,
         )
-        # TODO: Need to incorporate these into the attention class.
-        # q_scaling = math.sqrt(config.query_pre_attn_scalar) / math.sqrt(config.head_size)
-        # qk_layernorm = True
-        # layernorm_type=LayerNormType.RmsNorm
-        # rope_theta_local = 10000
+        q_scaling = math.sqrt(config.query_pre_attn_scalar) / math.sqrt(config.head_dim)
         super().__init__(
             hidden_size=config.hidden_size,
             num_attention_heads=config.num_attention_heads,
@@ -50,6 +49,8 @@ class Gemma3Attention(Attention):
             dtype=config.torch_dtype,
             dense_bias=False,
             config=model_config,
+            qk_layernorm=True,
+            q_scaling=q_scaling,
         )
 
 
@@ -63,9 +64,11 @@ class Gemma3DecoderLayer(DecoderLayer):
         super().__init__()
         self.layer_idx = layer_idx
         config = model_config.pretrained_config
+        is_sliding = bool((layer_idx + 1) % config.sliding_window_pattern)
         self.self_attn = Gemma3Attention(
             model_config,
             layer_idx=layer_idx,
+            is_sliding=is_sliding,
         )
 
         self.mlp = GatedMLP(
