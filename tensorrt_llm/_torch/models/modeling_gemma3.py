@@ -102,26 +102,33 @@ class Gemma3DecoderLayer(DecoderLayer):
         **kwargs,
     ) -> torch.Tensor:
 
+        print_condition = (self.layer_idx == 0)
+
         residual = hidden_states
 
         hidden_states = self.input_layernorm(hidden_states)
+        if print_condition: print(f"TRTLLM: attention_input_{self.layer_idx}:\n{hidden_states}")
         hidden_states = self.self_attn(
             position_ids=position_ids,
             hidden_states=hidden_states,
             attn_metadata=attn_metadata,
             **kwargs,
         )
+        if print_condition: print(f"TRTLLM: attention_output_{self.layer_idx}:\n{hidden_states}")
         hidden_states = self.post_attention_layernorm(hidden_states)
-
+        if print_condition: print(f"TRTLLM: attention_output_post_layernorm_{self.layer_idx}:\n{hidden_states}")
         hidden_states = residual + hidden_states
+        if print_condition: print(f"TRTLLM: attention_output_with_residual_{self.layer_idx}:\n{hidden_states}")
         residual = hidden_states
 
         hidden_states = self.pre_feedforward_layernorm(hidden_states)
+        if print_condition: print(f"TRTLLM: mlp_input_{self.layer_idx}:\n{hidden_states}")
         hidden_states = self.mlp(hidden_states)
+        if print_condition: print(f"TRTLLM: mlp_output_{self.layer_idx}:\n{hidden_states}")
         hidden_states = self.post_feedforward_layernorm(hidden_states)
-
+        if print_condition: print(f"TRTLLM: mlp_output_post_layernorm_{self.layer_idx}:\n{hidden_states}")
         hidden_states = residual + hidden_states
-
+        if print_condition: print(f"TRTLLM: mlp_output_with_residual_{self.layer_idx}:\n{hidden_states}")
         return hidden_states
 
 
@@ -165,8 +172,10 @@ class Gemma3TextModel(DecoderModel):
             )
 
         if inputs_embeds is None:
-            inputs_embeds = self.embed_tokens(input_ids) * math.sqrt(
-                self.hidden_size)
+            inputs_embeds = self.embed_tokens(input_ids)
+            print(f"TRTLLM: input_embeds:\n{inputs_embeds}")
+            inputs_embeds = inputs_embeds * math.sqrt(self.hidden_size)
+            print(f"TRTLLM: input_embeds_scaled:\n{inputs_embeds}")
 
         hidden_states = inputs_embeds.to(self.dtype)
 
@@ -176,6 +185,7 @@ class Gemma3TextModel(DecoderModel):
                                           attn_metadata=attn_metadata)
 
         hidden_states = self.norm(hidden_states)
+        print(f"TRTLLM: final_norm_output:\n{hidden_states}")
         return hidden_states
 
 
