@@ -1,9 +1,12 @@
 import math
+import os
+import numpy as np
 from typing import Optional, Tuple
 
 import torch
 from torch import nn
 from transformers import Gemma3TextConfig
+from transformers.activations import ACT2FN
 
 from tensorrt_llm.functional import PositionEmbeddingType
 
@@ -14,12 +17,20 @@ from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.gated_mlp import GatedMLP
-from ..modules.linear import TensorParallelMode
+from ..modules.linear import Linear, TensorParallelMode
 from ..modules.rms_norm import RMSNorm
 from ..pipeline_interface import PipelineInterface
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
                              register_auto_model)
 
+trtllm_debug_path = "/home/bbuddharaju/scratch/TensorRT-LLM/trtllm_debug/"
+
+def save_tensor_to_npy(tensorname, tensor):
+    numpy_array = tensor.detach().cpu().float().numpy()
+    filename = tensorname + ".npy"
+    filepath = os.path.join(trtllm_debug_path, filename)
+    np.save(filepath, numpy_array)
+    # print(f"TRTLLM: {tensorname}:\n{tensor}")
 
 class Gemma3Attention(Attention):
 
@@ -54,6 +65,23 @@ class Gemma3Attention(Attention):
         )
 
 
+class Gemma3MLP(nn.Module):
+    def __init__(self, config: Gemma3TextConfig):
+        super().__init__()
+        self.config = config
+        self.hidden_size = config.hidden_size
+        self.intermediate_size = config.intermediate_size
+        self.dtype = config.torch_dtype
+        self.gate_proj = Linear(self.hidden_size, self.intermediate_size, bias=False, dtype=self.dtype)
+        self.up_proj = Linear(self.hidden_size, self.intermediate_size, bias=False, dtype=self.dtype)
+        self.down_proj = Linear(self.intermediate_size, self.hidden_size, bias=False, dtype=self.dtype)
+        self.act_fn = ACT2FN[config.hidden_activation]
+
+    def forward(self, x):
+        down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+        return down_proj
+
+
 class Gemma3DecoderLayer(DecoderLayer):
 
     def __init__(
@@ -71,13 +99,7 @@ class Gemma3DecoderLayer(DecoderLayer):
             is_sliding=is_sliding,
         )
 
-        self.mlp = GatedMLP(
-            hidden_size=config.hidden_size,
-            intermediate_size=config.intermediate_size,
-            bias=config.mlp_bias if hasattr(config, 'mlp_bias') else False,
-            dtype=config.torch_dtype,
-            config=model_config,
-        )
+        self.mlp = Gemma3MLP(config)
 
         self.input_layernorm = RMSNorm(hidden_size=config.hidden_size,
                                        eps=config.rms_norm_eps,
@@ -107,28 +129,28 @@ class Gemma3DecoderLayer(DecoderLayer):
         residual = hidden_states
 
         hidden_states = self.input_layernorm(hidden_states)
-        if print_condition: print(f"TRTLLM: attention_input_{self.layer_idx}:\n{hidden_states}")
+        if print_condition: save_tensor_to_npy(f"attention_input_{self.layer_idx}", hidden_states)
         hidden_states = self.self_attn(
             position_ids=position_ids,
             hidden_states=hidden_states,
             attn_metadata=attn_metadata,
             **kwargs,
         )
-        if print_condition: print(f"TRTLLM: attention_output_{self.layer_idx}:\n{hidden_states}")
+        if print_condition: save_tensor_to_npy(f"attention_output_{self.layer_idx}", hidden_states)
         hidden_states = self.post_attention_layernorm(hidden_states)
-        if print_condition: print(f"TRTLLM: attention_output_post_layernorm_{self.layer_idx}:\n{hidden_states}")
+        if print_condition: save_tensor_to_npy(f"attention_output_post_layernorm_{self.layer_idx}", hidden_states)
         hidden_states = residual + hidden_states
-        if print_condition: print(f"TRTLLM: attention_output_with_residual_{self.layer_idx}:\n{hidden_states}")
+        if print_condition: save_tensor_to_npy(f"attention_output_with_residual_{self.layer_idx}", hidden_states)
         residual = hidden_states
 
         hidden_states = self.pre_feedforward_layernorm(hidden_states)
-        if print_condition: print(f"TRTLLM: mlp_input_{self.layer_idx}:\n{hidden_states}")
+        if print_condition: save_tensor_to_npy(f"mlp_input_{self.layer_idx}", hidden_states)
         hidden_states = self.mlp(hidden_states)
-        if print_condition: print(f"TRTLLM: mlp_output_{self.layer_idx}:\n{hidden_states}")
+        if print_condition: save_tensor_to_npy(f"mlp_output_{self.layer_idx}", hidden_states)
         hidden_states = self.post_feedforward_layernorm(hidden_states)
-        if print_condition: print(f"TRTLLM: mlp_output_post_layernorm_{self.layer_idx}:\n{hidden_states}")
+        if print_condition: save_tensor_to_npy(f"mlp_output_post_layernorm_{self.layer_idx}", hidden_states)
         hidden_states = residual + hidden_states
-        if print_condition: print(f"TRTLLM: mlp_output_with_residual_{self.layer_idx}:\n{hidden_states}")
+        if print_condition: save_tensor_to_npy(f"mlp_output_with_residual_{self.layer_idx}", hidden_states)
         return hidden_states
 
 
@@ -173,9 +195,9 @@ class Gemma3TextModel(DecoderModel):
 
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
-            print(f"TRTLLM: input_embeds:\n{inputs_embeds}")
+            save_tensor_to_npy(f"input_embeddings", inputs_embeds)
             inputs_embeds = inputs_embeds * math.sqrt(self.hidden_size)
-            print(f"TRTLLM: input_embeds_scaled:\n{inputs_embeds}")
+            save_tensor_to_npy(f"input_embeddings_scaled", inputs_embeds)
 
         hidden_states = inputs_embeds.to(self.dtype)
 
@@ -185,7 +207,7 @@ class Gemma3TextModel(DecoderModel):
                                           attn_metadata=attn_metadata)
 
         hidden_states = self.norm(hidden_states)
-        print(f"TRTLLM: final_norm_output:\n{hidden_states}")
+        save_tensor_to_npy(f"final_norm_output", hidden_states)
         return hidden_states
 
 
