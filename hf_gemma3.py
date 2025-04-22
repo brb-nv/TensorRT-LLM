@@ -12,8 +12,8 @@ tokenizer = AutoTokenizer.from_pretrained(model_path)
 input_text = "Hello, how are you?"
 input_tokens = tokenizer(input_text, return_tensors="pt")
 
-model = Gemma3ForCausalLM.from_pretrained(model_path, torch_dtype=torch.float16).eval()
+model = Gemma3ForCausalLM.from_pretrained(model_path, torch_dtype=torch.bfloat16).eval()
 
-output_tokens = model.generate(input_tokens["input_ids"], max_length=100, do_sample=False, num_beams=1, top_p=None, top_k=None, temperature=None)
+output_tokens = model.generate(input_tokens["input_ids"], max_length=512, do_sample=False, num_beams=1, top_p=None, top_k=None, temperature=None)
 output_text = tokenizer.decode(output_tokens[0], skip_special_tokens=True)
 print(output_text)

@@ -37,9 +37,9 @@ class RMSNorm(nn.Module):
                                       flashinfer_rmsnorm)
             if isinstance(residual, torch.Tensor):
                 flashinfer_fused_add_rmsnorm(hidden_states, residual,
-                                             self.weight + 1.0, self.variance_epsilon)
+                                             self.weight, self.variance_epsilon)
             else:
-                hidden_states = flashinfer_rmsnorm(hidden_states, self.weight + 1.0,
+                hidden_states = flashinfer_rmsnorm(hidden_states, self.weight,
                                                    self.variance_epsilon)
         else:
             input_dtype = hidden_states.dtype
@@ -50,7 +50,7 @@ class RMSNorm(nn.Module):
             variance = hidden_states.pow(2).mean(-1, keepdim=True)
             hidden_states = hidden_states * torch.rsqrt(variance +
                                                         self.variance_epsilon)
-            hidden_states = (self.weight + 1.0) * hidden_states.to(input_dtype)
+            hidden_states = self.weight * hidden_states.to(input_dtype)
 
         if residual is ...:
             return hidden_states
