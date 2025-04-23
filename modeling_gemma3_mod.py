@@ -57,11 +57,11 @@ _CONFIG_FOR_DOC = "Gemma3Config"
 hf_debug_path = "/home/bbuddharaju/scratch/TensorRT-LLM/hf_debug/"
 
 def save_tensor_to_npy(tensor, tensorname):
-    # numpy_array = tensor.detach().cpu().numpy()
-    # filename = tensorname + ".npy"
-    # filepath = os.path.join(hf_debug_path, filename)
-    # np.save(filepath, numpy_array)
-    print(f"HF: {tensorname}:\n{tensor}")
+    numpy_array = tensor.detach().cpu().float().numpy()
+    filename = tensorname + ".npy"
+    filepath = os.path.join(hf_debug_path, filename)
+    np.save(filepath, numpy_array)
+    # print(f"HF: {tensorname}:\n{tensor}")
 
 @dataclass
 class Gemma3CausalLMOutputWithPast(ModelOutput):
