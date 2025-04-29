@@ -93,6 +93,10 @@ public:
         enqueueParams.beam_width = beam_width;
         enqueueParams.num_requests = max_num_requests;
 
+        printf("[thop::attentionOp::prepare] enqueueParams.max_attention_window_size: %d\n", enqueueParams.max_attention_window_size);
+        printf("[thop::attentionOp::prepare] enqueueParams.cyclic_attention_window_size: %d\n", enqueueParams.cyclic_attention_window_size);
+        printf("[thop::attentionOp::prepare] enqueueParams.max_cyclic_attention_window_size: %d\n", enqueueParams.max_cyclic_attention_window_size);
+
         op.prepareEnqueueGeneration<T, KVBlockArray>(enqueueParams);
 
         // Always reserve SemaphoreArray (for multi-block mode) as MMHA may enable multi-block mode when shared memory
@@ -107,6 +111,10 @@ public:
             = op.getWorkspaceSizeForContext(op.mType, max_num_requests, op.mMaxContextLength, 0, num_tokens);
         size_t const generation_workspace_size
             = op.getWorkspaceSizeForGeneration(op.mType, max_num_requests, max_attention_window_size, num_gen_tokens);
+
+        printf("[thop::attentionOp::getWorkspaceSize] max_attention_window_size: %zu\n", max_attention_window_size);
+        printf("[thop::attentionOp::getWorkspaceSize] context_workspace_size: %zu\n", context_workspace_size);
+        printf("[thop::attentionOp::getWorkspaceSize] generation_workspace_size: %zu\n", generation_workspace_size);
 
         return std::max(context_workspace_size, generation_workspace_size);
     }
@@ -184,9 +192,11 @@ public:
         // the kv_cache capacity.
         int const max_attention_window_size
             = beam_width == 1 ? attention_window_size : cache_indirection.value().size(2);
+        printf("[thop::attentionOp::run] max_attention_window_size: %d\n", max_attention_window_size);
         // The cyclic_attention_window_size will determine the cyclic kv cache position of new tokens.
         // Note that this cyclic_attention_window_size might be smaller than the actual kv cache capactity.
         int const cyclic_attention_window_size = attention_window_size;
+        printf("[thop::attentionOp::run] cyclic_attention_window_size: %d\n", cyclic_attention_window_size);
         bool const can_use_one_more_block = beam_width > 1;
 
         int max_blocks_per_sequence = op.useKVCache() ? kv_cache_block_offsets.value().size(-1) : 0;
@@ -248,6 +258,10 @@ public:
         common_enqueue_params.context_lengths = context_lengths_ptr;
         common_enqueue_params.host_context_lengths = host_context_lengths.data_ptr<int32_t>();
         common_enqueue_params.workspace = workspace_ptr;
+
+        printf("[thop::attentionOp::run] common_enqueue_params.max_attention_window_size: %d\n", common_enqueue_params.max_attention_window_size);
+        printf("[thop::attentionOp::run] common_enqueue_params.cyclic_attention_window_size: %d\n", common_enqueue_params.cyclic_attention_window_size);
+        printf("[thop::attentionOp::run] common_enqueue_params.max_cyclic_attention_window_size: %d\n", common_enqueue_params.max_cyclic_attention_window_size);
 
         if (is_context) // context stage
         {
@@ -417,6 +431,7 @@ torch::Tensor attention(torch::Tensor q, torch::optional<torch::Tensor> k, torch
     runner->beam_width = beam_width;
     runner->max_num_requests = max_num_requests;
     runner->attention_window_size = attention_window_size;
+    printf("[thop::attentionOp::attention] runner->attention_window_size: %d\n", runner->attention_window_size);
     runner->sink_token_length = sink_token_length;
 
     auto op = std::make_shared<AttentionOp>();
@@ -428,6 +443,7 @@ torch::Tensor attention(torch::Tensor q, torch::optional<torch::Tensor> k, torch
     op->mNumKVHeads = num_kv_heads;
     op->mHeadSize = head_size;
     op->mMaskType = static_cast<tensorrt_llm::kernels::AttentionMaskType>(int32_t(mask_type));
+    printf("[thop::attentionOp::attention] op->mMaskType: %d\n", op->mMaskType);
     op->mKVCacheQuantMode = tensorrt_llm::common::QuantMode(uint32_t(quant_mode));
     op->mUseKVCache = use_kv_cache;
     op->mPagedKVCache = op->mPagedKVCache && use_kv_cache; // update mPagedKVCache based on use_kv_cache
@@ -516,6 +532,7 @@ torch::Tensor attention(torch::Tensor q, torch::optional<torch::Tensor> k, torch
 
     int32_t const max_attention_window_size
         = beam_width == 1 ? attention_window_size : cache_indirection.value().size(2);
+    printf("[thop::attentionOp::attention] max_attention_window_size: %d\n", max_attention_window_size);
     int64_t const workspace_size = runner->getWorkspaceSize(*op, num_tokens, max_attention_window_size, num_gen_tokens);
     TLLM_LOG_TRACE("Expected workspace size is %ld bytes", workspace_size);
     torch::Tensor workspace;
@@ -542,6 +559,7 @@ torch::Tensor attention(torch::Tensor q, torch::optional<torch::Tensor> k, torch
 
     if ((num_contexts > 0) && (attn_input_type != AttentionInputType::GenerationOnly))
     {
+        printf("[thop::attentionOp::attention] Call to context runner. num_contexts: %d\n", num_contexts);
         auto seq_offset = 0;
         auto token_offset = 0;
         runner->run(*op,
@@ -556,7 +574,7 @@ torch::Tensor attention(torch::Tensor q, torch::optional<torch::Tensor> k, torch
 
     if ((num_generations > 0) && (attn_input_type != AttentionInputType::ContextOnly))
     {
-
+        printf("[thop::attentionOp::attention] Call to generation runner. num_generations: %d\n", num_generations);
         auto seq_offset = num_contexts;
         auto token_offset = is_gen_only ? 0 : num_ctx_tokens;
         runner->run(*op,

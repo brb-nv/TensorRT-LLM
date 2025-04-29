@@ -197,6 +197,7 @@ struct MHARunnerFixedParams
      */
     MHARunnerFixedParams& setAttentionMaskType(std::int8_t maskType)
     {
+        printf("[fused_multihead_attention_common.h::setAttentionMaskType] Called with maskType: %d\n", maskType);
         switch (maskType)
         {
         case 0: // tensorrt_llm::kernels::AttentionMaskType::PADDING
@@ -206,6 +207,7 @@ struct MHARunnerFixedParams
             attentionMaskType = ContextAttentionMaskType::CAUSAL;
             break;
         case 2: // tensorrt_llm::kernels::AttentionMaskType::SLIDING_WINDOW_CAUSAL
+            printf("[fused_multihead_attention_common.h::setAttentionMaskType] Setting attentionMaskType to SLIDING_WINDOW_CAUSAL\n");
             attentionMaskType = ContextAttentionMaskType::SLIDING_WINDOW_CAUSAL;
             break;
         // NOTE: For BIDIRECTIONAL, BIDIRECTIONALGLM, BLOCKSPARSE context phase, CAUSAL mask is used

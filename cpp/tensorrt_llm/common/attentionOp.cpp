@@ -1236,6 +1236,8 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
     size_t const kv_seq_length = (isCrossAttention() ? params.cross_kv_length : params.input_seq_length);
     size_t const attention_mask_size
         = mEnableContextFMHA ? 0 : sizeof(T) * params.batch_size * params.input_seq_length * kv_seq_length;
+    printf("[common::attentionOp.cpp::enqueueContext] attention_mask_size: %zu\n", attention_mask_size);
+    printf("[common::attentionOp.cpp::enqueueContext] mEnableContextFMHA: %d\n", mEnableContextFMHA);
     size_t const cu_seqlens_size = sizeof(int) * (params.batch_size + 1);
     size_t const rotary_inv_freq_size = sizeof(float) * params.batch_size * mRotaryEmbeddingDim / 2;
     size_t q_buf_2_size = 0;
@@ -1442,6 +1444,7 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
         }
 
         bool const enablePagedKVContextFMHA = mPagedKVCache && mPagedContextFMHA;
+        printf("[common::attentionOp.cpp::enqueueContext] enablePagedKVContextFMHA: %d\n", enablePagedKVContextFMHA);
         TLLM_CHECK_WITH_INFO(!(mKVCacheQuantMode.hasInt8KvCache() && enablePagedKVContextFMHA),
             "Paged Context FMHA doesn't work with int8 kv cache currently.");
         TLLM_CHECK_WITH_INFO(!(params.sink_token_length > 0 && enablePagedKVContextFMHA),
@@ -1481,6 +1484,7 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
         preprocessingParams.max_kv_seq_len = max_kv_seq_len;
         preprocessingParams.cyclic_kv_cache_len
             = isCrossAttention() ? params.cross_kv_length : params.cyclic_attention_window_size;
+        printf("[common::attentionOp.cpp::enqueueContext] params.cyclic_attention_window_size: %d\n", params.cyclic_attention_window_size);
         preprocessingParams.sink_token_len = params.sink_token_length;
         preprocessingParams.token_num = params.num_tokens;
         preprocessingParams.remove_padding = mRemovePadding;
@@ -1562,6 +1566,7 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
         // Disable sliding window attention when it is not needed.
         fmhaParams.slidingWindowSize
             = (mDenseContextFMHA || isCrossAttention()) ? max_kv_seq_len : params.cyclic_attention_window_size;
+        printf("[common::attentionOp.cpp::enqueueContext] fmhaParams.slidingWindowSize: %d\n", fmhaParams.slidingWindowSize);
         fmhaParams.totalQSeqLen = params.num_tokens;
         // TODO: set it correctly for contiguous kv buffer (cross-attention).
         fmhaParams.totalKvSeqLen = isCrossAttention() ? params.num_encoder_tokens : params.num_tokens;
@@ -1595,6 +1600,7 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
         fmhaParams.forceFp32Acc = mFMHAForceFP32Acc;
 
         // Run the fmha kernel.
+        printf("[common::attentionOp.cpp::enqueueContext] Call to mFmhaDispatcher->run()\n");
         mFmhaDispatcher->run(fmhaParams);
         sync_check_cuda_error(stream);
 
@@ -2389,6 +2395,7 @@ int AttentionOp::initialize() noexcept
 
         // setting attention mask type based on the mask type
         fmhaParams.setAttentionMaskType(static_cast<std::int8_t>(mMaskType));
+        printf("[common::attentionOp::initialize] mMaskType: %d\n", mMaskType);
 
         if (isCrossAttention())
         {

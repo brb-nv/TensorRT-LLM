@@ -6,10 +6,14 @@ from typing import List
 import pytest
 import torch
 
+import tensorrt_llm
 from tensorrt_llm._torch.attention_backend.interface import \
     PredefinedAttentionMask
 from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
-
+from tensorrt_llm._torch.metadata import KVCacheParams
+from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
+from tensorrt_llm.bindings.executor import KvCacheConfig
+from tensorrt_llm.mapping import Mapping
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     """
@@ -85,7 +89,7 @@ def calculate_ref_result(q: torch.Tensor,
         # Compute attention scores
         attn_weights = torch.matmul(q, k.transpose(1, 2)) / math.sqrt(head_dim)
 
-        if mask_type == PredefinedAttentionMask.CAUSAL:
+        if mask_type == PredefinedAttentionMask.SLIDING_WINDOW_CAUSAL:
             # For sliding window attention, we block tokens that are too far away from the current token.
             seq_len = q.shape[1]
             causal_mask = torch.zeros(seq_len, seq_len, dtype=torch.bool, device=q.device)
@@ -161,6 +165,41 @@ def _run_test_for_backend(backend_name, num_heads, num_kv_heads, num_layers,
 
     # NOTE: set up metadata, refer to tensorrt_llm/_torch/pyexecutor/model_engine.py
     # all layers share the same metadata
+    # num_blocks = 16
+    # tokens_per_block = 128
+    # max_seq_len = tokens_per_block * num_blocks
+    # mapping = Mapping(world_size=1, tp_size=1, rank=0)
+
+    # if dtype == torch.float16:
+    #     kv_cache_dtype = tensorrt_llm.bindings.DataType.HALF
+    # elif dtype == torch.bfloat16:
+    #     kv_cache_dtype = tensorrt_llm.bindings.DataType.BF16
+    # else:
+    #     raise ValueError("Invalid dtype for unit test")
+
+    # kv_cache_config = KvCacheConfig(max_tokens=num_blocks *
+    #                                 tokens_per_block)
+    # if dtype == torch.float16:
+    #     kv_cache_dtype = tensorrt_llm.bindings.DataType.HALF
+    # elif dtype == torch.bfloat16:
+    #     kv_cache_dtype = tensorrt_llm.bindings.DataType.BF16
+    # else:
+    #     raise ValueError("Invalid dtype for unit test")
+
+    # kv_cache_manager = KVCacheManager(
+    #     kv_cache_config,
+    #     tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
+    #     num_layers=num_layers,
+    #     num_kv_heads=num_kv_heads,
+    #     head_dim=head_dim,
+    #     tokens_per_block=tokens_per_block,
+    #     max_seq_len=max_seq_len,
+    #     max_batch_size=1,
+    #     mapping=mapping,
+    #     dtype=kv_cache_dtype,
+    # )
+    # kv_cache_manager.add_dummy_requests(request_ids, token_nums)
+
     attn_metadata = AttentionCls.Metadata(
         max_num_requests=len(context_sequence_lengths),
         max_num_tokens=8192,
@@ -250,6 +289,6 @@ if __name__ == "__main__":
                           device=device,
                           dtype=dtype,
                           context_sequence_lengths=context_sequence_lengths,
-                          mask_type=PredefinedAttentionMask.CAUSAL,
+                          mask_type=PredefinedAttentionMask.SLIDING_WINDOW_CAUSAL,
                           accuracy=(1e-2, 1e-2),
                           attention_window_size=4)

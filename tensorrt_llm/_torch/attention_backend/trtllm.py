@@ -282,6 +282,8 @@ class TrtllmAttentionWrapper:
                 mask_type = AttentionMaskType.causal
             elif attention_mask == PredefinedAttentionMask.FULL:
                 mask_type = AttentionMaskType.padding
+            elif attention_mask == PredefinedAttentionMask.SLIDING_WINDOW_CAUSAL:
+                mask_type = AttentionMaskType.sliding_window_causal
             else:
                 raise ValueError("Unexpected attention mask type")
         else:
@@ -310,6 +312,8 @@ class TrtllmAttentionWrapper:
                 mask_type = AttentionMaskType.causal
             elif attention_mask == PredefinedAttentionMask.FULL:
                 mask_type = AttentionMaskType.padding
+            elif attention_mask == PredefinedAttentionMask.SLIDING_WINDOW_CAUSAL:
+                mask_type = AttentionMaskType.sliding_window_causal
             else:
                 raise ValueError("Unexpected attention mask type")
 

@@ -476,6 +476,7 @@ class PredefinedAttentionMask(str, Enum):
     """
     CAUSAL = "causal"
     FULL = "full"
+    SLIDING_WINDOW_CAUSAL = "sliding_window_causal"
 
 
 # May extend to custom attention mask type
