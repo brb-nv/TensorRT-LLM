@@ -641,6 +641,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         latent_cache: Optional[torch.Tensor] = None,
         q_pe: Optional[torch.Tensor] = None,
         mrope_config: Optional[dict] = None,
+        attention_window_size: Optional[int] = None,
         **kwargs,
     ) -> torch.Tensor:
         assert isinstance(
@@ -665,11 +666,11 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                     "FP8 attention.")
 
         num_seqs = metadata.num_seqs
-        ################# HARDCODING FOR GEMMA3 #################
-        sliding_window_pattern = 6
-        is_sliding = bool((self.layer_idx + 1) % sliding_window_pattern)
-        attention_window_size = min(512, metadata.max_seq_len) if is_sliding else metadata.max_seq_len
-        ################# HARDCODING FOR GEMMA3 #################
+        # ################# HARDCODING FOR GEMMA3 #################
+        # sliding_window_pattern = 6
+        # is_sliding = bool((self.layer_idx + 1) % sliding_window_pattern)
+        # attention_window_size = min(512, metadata.max_seq_len) if is_sliding else metadata.max_seq_len
+        # ################# HARDCODING FOR GEMMA3 #################
         self.wrapper.plan(
             tokens_per_block=metadata.tokens_per_block,
             max_num_requests=metadata.max_num_requests,
