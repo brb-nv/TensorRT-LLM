@@ -243,7 +243,7 @@ def _run_test_for_backend(backend_name, num_heads, num_kv_heads, num_layers,
                                           head_dim,
                                           sequence_lengths,
                                           mask_type=mask_type,
-                                          attention_window_size=attention_window_size)
+                                          attention_window_size=attention_window_size+1)
 
         # Compare results
         print(f"{backend_name} output mean: {result.abs().mean().item()}")
