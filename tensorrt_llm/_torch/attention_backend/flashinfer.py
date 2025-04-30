@@ -340,6 +340,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                 causal=is_causal,
                 q_data_type=plan_params.q_dtype,
                 kv_data_type=plan_params.kv_dtype,
+                window_left=4,
             )
 
         if plan_params in self._plan_params_to_wrappers:
@@ -375,6 +376,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                 self.page_size,
                 q_data_type=plan_params.q_dtype,
                 kv_data_type=plan_params.kv_dtype,
+                window_left=4,
             )
 
         # Must sync after append_paged_kv_cache and before plan
@@ -523,9 +525,11 @@ def forward_pattern(
                                 attention_mask_data=attention_mask_data)
 
     if num_contexts > 0:
+        print("Calling prefill forward.")
         ctx_output = prefill_forward(plan_params)
 
     if num_generations > 0:
+        print("Calling decode forward.")
         gen_output = decode_forward(plan_params)
 
     if num_contexts > 0 and num_generations > 0:

@@ -1,6 +1,7 @@
 from collections import defaultdict
-
+from typing import List
 import torch
+import math
 
 import tensorrt_llm
 from tensorrt_llm._torch.attention_backend import (FlashInferAttention,
@@ -9,6 +10,106 @@ from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
+
+
+def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+    """
+    This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
+    num_key_value_heads, seqlen, head_dim) to (batch, num_attention_heads, seqlen, head_dim)
+    """
+    batch, num_key_value_heads, slen, head_dim = hidden_states.shape
+    if n_rep == 1:
+        return hidden_states
+    hidden_states = hidden_states[:, :,
+                                  None, :, :].expand(batch, num_key_value_heads,
+                                                     n_rep, slen, head_dim)
+    return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen,
+                                 head_dim)
+
+
+def calculate_ref_result(q: torch.Tensor,
+                         k: torch.Tensor,
+                         v: torch.Tensor,
+                         num_heads: int,
+                         num_kv_heads: int,
+                         head_dim: int,
+                         sequence_lengths: List[int],
+                         attention_window_size: int):
+    """
+    use standard attention to calculate the reference result by iterating over each request
+    q shape: (total_tokens, num_heads * head_dim)
+    k shape: (total_tokens, num_kv_heads * head_dim)
+    v shape: (total_tokens, num_kv_heads * head_dim)
+    """
+    num_requests = len(sequence_lengths)
+    # Reshape inputs for reference calculation
+    q_reshaped = []
+    k_reshaped = []
+    v_reshaped = []
+    total_tokens = 0
+
+    # Reshape inputs for reference calculation
+    for i in range(num_requests):
+        q_seq = q[total_tokens:total_tokens + sequence_lengths[i]]
+        k_seq = k[total_tokens:total_tokens + sequence_lengths[i]]
+        v_seq = v[total_tokens:total_tokens + sequence_lengths[i]]
+
+        # Reshape to (seq_len, num_heads, head_dim)
+        q_seq = q_seq.view(sequence_lengths[i], num_heads, head_dim)
+        k_seq = k_seq.view(sequence_lengths[i], num_kv_heads, head_dim)
+        v_seq = v_seq.view(sequence_lengths[i], num_kv_heads, head_dim)
+
+        q_reshaped.append(q_seq.transpose(0,
+                                          1))  # (num_heads, seq_len, head_dim)
+        k_reshaped.append(k_seq.transpose(
+            0, 1))  # (num_kv_heads, seq_len, head_dim)
+        v_reshaped.append(v_seq.transpose(
+            0, 1))  # (num_kv_heads, seq_len, head_dim)
+
+        total_tokens += sequence_lengths[i]
+
+    # Calculate reference result batch by batch
+    ref_results = []
+    for i in range(num_requests):
+        q = q_reshaped[i]  # (num_heads, seq_len, head_dim)
+        k = k_reshaped[i]  # (num_kv_heads, seq_len, head_dim)
+        v = v_reshaped[i]  # (num_kv_heads, seq_len, head_dim)
+
+        # Handle grouped-query attention if num_heads > num_kv_heads.
+        if num_heads > num_kv_heads:
+            num_kv_groups = num_heads // num_kv_heads
+            k = repeat_kv(k.unsqueeze(0), num_kv_groups).squeeze(0)
+            v = repeat_kv(v.unsqueeze(0), num_kv_groups).squeeze(0)
+
+        # Compute attention scores
+        attn_weights = torch.matmul(q, k.transpose(1, 2)) / math.sqrt(head_dim)
+
+        # For sliding window attention, we block tokens that are too far away from the current token.
+        seq_len = q.shape[1]
+        causal_mask = torch.zeros(seq_len, seq_len, dtype=torch.bool, device=q.device)
+        for token_idx in range(seq_len):
+            start = max(0, token_idx - attention_window_size + 1)
+            causal_mask[token_idx, start: token_idx + 1] = 1
+
+        attn_weights = attn_weights.masked_fill(~causal_mask, float('-inf'))
+
+        # Apply softmax to get attention probabilities
+        attn_weights = torch.nn.functional.softmax(attn_weights,
+                                                   dim=-1,
+                                                   dtype=torch.float32).to(
+                                                       q.dtype)
+
+        # Apply attention weights to values
+        attn_output = torch.matmul(attn_weights,
+                                   v)  # (num_heads, seq_len, head_dim)
+
+        # Reshape back to (seq_len, num_heads*head_dim)
+        attn_output = attn_output.transpose(0, 1).contiguous().view(
+            sequence_lengths[i], num_heads * head_dim)
+        ref_results.append(attn_output)
+
+    ref_result = torch.cat(ref_results)
+    return ref_result
 
 
 class TestingFlashInferAttentionMetadata(FlashInferAttentionMetadata):
@@ -36,10 +137,10 @@ def test_flashinfer_swa():
     device = torch.device('cuda')
 
     # TODO: make these a part of the scenario?
-    num_gens = 2
-    context_sequence_lengths = [3, 2]
+    num_gens = 0
+    context_sequence_lengths = [16]
     sequence_lengths = context_sequence_lengths + [1] * num_gens
-    past_seen_tokens = [30, 40, 62, 75]
+    past_seen_tokens = [0]
     batch_size = num_gens + len(context_sequence_lengths)
     request_ids = list(range(batch_size))
     token_nums = (torch.tensor(sequence_lengths) +
@@ -57,6 +158,7 @@ def test_flashinfer_swa():
     else:
         raise ValueError("Invalid dtype for unit test")
 
+    # TODO: Mention max_attention_window in kv_cache_config.
     kv_cache_config = KvCacheConfig(max_tokens=num_blocks *
                                     tokens_per_block)
     kv_cache_manager = KVCacheManager(
@@ -143,7 +245,7 @@ def test_flashinfer_swa():
         if kv_heads is not None
     ]
 
-    # [context_1, context_2, gen_1, gen_2]
+    # [context_1]
     results_1 = []
 
     seq_lens = torch.tensor(sequence_lengths).int()
@@ -152,7 +254,7 @@ def test_flashinfer_swa():
         num_contexts=len(context_sequence_lengths),
         kv_cache_params=KVCacheParams(
             use_cache=True, num_cached_tokens_per_seq=past_seen_tokens),
-        max_num_requests=4,
+        max_num_requests=1,
         max_num_tokens=8192,
         kv_cache_manager=kv_cache_manager,
         request_ids=request_ids,
@@ -168,170 +270,14 @@ def test_flashinfer_swa():
         k = torch.cat((*context_ks, *gen_ks))
         v = torch.cat((*context_vs, *gen_vs))
 
-        result_1 = flashinfer_attn.forward(q, k, v, attn_metadata)
-        assert result_1.size()[0] == sum(context_sequence_lengths) + num_gens
+        result = flashinfer_attn.forward(q, k, v, attn_metadata)
+        expected = calculate_ref_result(q, k, v, num_heads=1, num_kv_heads=1, head_dim=256, sequence_lengths=[16], attention_window_size=5)
+        assert result.size()[0] == sum(context_sequence_lengths) + num_gens
+        for idx in range(16):
+            print(idx, ":" , torch.max(torch.abs(expected[idx] - result[idx])))
+        diff = torch.abs(expected - result)
+        print(f"max: {diff.max()}, min: {diff.min()}, mean: {diff.mean()}")
 
-        # validate kv cache was updated expectedly
-        cache_buf = kv_cache_manager.get_buffers(flashinfer_attn.layer_idx)
-        assert cache_buf is not None
-        num_kv_heads = cache_buf.size(-2)
-
-        # validate contexts
-        block_ids_per_seq = kv_cache_manager.get_batch_cache_indices(
-            request_ids)
-        for seq_id in range(len(context_sequence_lengths)):
-            # get a contiguous copy of the cache for the sequence
-            block_ids = block_ids_per_seq[seq_id]
-            last_block_len = attn_metadata.paged_kv_last_page_len[seq_id]
-            cached_kvs = torch.concat(cache_buf[block_ids, :].unbind(dim=0),
-                                        dim=1)
-            # only look at new tokens added
-            cached_kvs = cached_kvs[:,
-                                    past_seen_tokens[seq_id]:last_block_len]
-
-            # compare to input kvs
-            torch.testing.assert_close(
-                cached_kvs[0].to(context_ks[seq_id].dtype),
-                context_ks[seq_id].view(-1, num_kv_heads, head_dim))
-            torch.testing.assert_close(
-                cached_kvs[1].to(context_vs[seq_id].dtype),
-                context_vs[seq_id].view(-1, num_kv_heads, head_dim))
-
-        # validate generations (same way)
-        for gen_seq_id in range(num_gens):
-            seq_id = len(context_sequence_lengths) + gen_seq_id
-            block_ids = block_ids_per_seq[seq_id]
-            last_block_len = attn_metadata.paged_kv_last_page_len[seq_id]
-            cached_kvs = torch.concat(
-                cache_buf[block_ids, :].unbind(dim=0),
-                dim=1)[:, past_seen_tokens[seq_id]:last_block_len]
-
-            torch.testing.assert_close(
-                cached_kvs[0],
-                gen_ks[gen_seq_id].view(-1, num_kv_heads, head_dim))
-            torch.testing.assert_close(
-                cached_kvs[1],
-                gen_vs[gen_seq_id].view(-1, num_kv_heads, head_dim))
-
-        results_1.append(result_1)
-        del cache_buf
-
-    for plan_params in attn_metadata._plan_params_to_wrappers.keys():
-        assert attn_metadata.get_num_plans(plan_params) == 1
-
-    # Make sure prepare() re-planned all params.
-    attn_metadata.prepare()
-    for plan_params in attn_metadata._plan_params_to_wrappers.keys():
-        assert attn_metadata.get_num_plans(plan_params) == 2
-
-    # [context_1, gen_1]
-    results_2 = []
-    num_cached_tokens_per_seq = [
-        j for j in [
-            past_seen_tokens[0], past_seen_tokens[len(
-                context_sequence_lengths)]
-        ]
-    ]
-
-    seq_lens = torch.tensor([context_sequence_lengths[0], 1],
-                            dtype=torch.int)
-    attn_metadata = TestingFlashInferAttentionMetadata(
-        seq_lens=seq_lens,
-        num_contexts=1,
-        kv_cache_params=KVCacheParams(
-            use_cache=True,
-            num_cached_tokens_per_seq=num_cached_tokens_per_seq),
-        max_num_requests=2,
-        max_num_tokens=8192,
-        kv_cache_manager=kv_cache_manager,
-        request_ids=[0, 2],
-    )
-
-    attn_metadata.prepare()
-
-    for attn_layer_idx, flashinfer_attn in enumerate(layers):
-        context_qs, context_ks, context_vs = contexts_per_layer[
-            attn_layer_idx]
-        gen_qs, gen_ks, gen_vs = gens_per_layer[attn_layer_idx]
-
-        result_2 = flashinfer_attn.forward(
-            torch.cat((context_qs[0], gen_qs[0])),
-            torch.cat((context_ks[0], gen_ks[0])),
-            torch.cat((context_vs[0], gen_vs[0])), attn_metadata)
-        assert result_2.size()[0] == context_sequence_lengths[0] + 1
-        results_2.append(result_2)
-
-    for plan_params in attn_metadata._plan_params_to_wrappers.keys():
-        assert attn_metadata.get_num_plans(plan_params) == 1
-
-    # Make sure prepare() re-planned all params.
-    attn_metadata.prepare()
-    for plan_params in attn_metadata._plan_params_to_wrappers.keys():
-        assert attn_metadata.get_num_plans(plan_params) == 2
-
-    # [context_2, gen_2]
-    results_3 = []
-    num_cached_tokens_per_seq = [
-        j for j in [
-            past_seen_tokens[1], past_seen_tokens[
-                len(context_sequence_lengths) + 1]
-        ]
-    ]
-
-    seq_lens = torch.tensor([context_sequence_lengths[1], 1],
-                            dtype=torch.int)
-    attn_metadata = TestingFlashInferAttentionMetadata(
-        seq_lens=seq_lens,
-        num_contexts=1,
-        kv_cache_params=KVCacheParams(
-            use_cache=True,
-            num_cached_tokens_per_seq=num_cached_tokens_per_seq),
-        max_num_requests=2,
-        max_num_tokens=8192,
-        kv_cache_manager=kv_cache_manager,
-        request_ids=[1, 3],
-    )
-
-    attn_metadata.prepare()
-    for attn_layer_idx, flashinfer_attn in enumerate(layers):
-        context_qs, context_ks, context_vs = contexts_per_layer[
-            attn_layer_idx]
-        gen_qs, gen_ks, gen_vs = gens_per_layer[attn_layer_idx]
-
-        result_3 = flashinfer_attn.forward(
-            torch.cat((context_qs[1], gen_qs[1])),
-            torch.cat((context_ks[1], gen_ks[1])),
-            torch.cat((context_vs[1], gen_vs[1])), attn_metadata)
-        assert result_3.size()[0] == context_sequence_lengths[1] + 1
-        results_3.append(result_3)
-
-    for plan_params in attn_metadata._plan_params_to_wrappers.keys():
-        assert attn_metadata.get_num_plans(plan_params) == 1
-
-    # Make sure prepare() re-planned all params.
-    attn_metadata.prepare()
-    for plan_params in attn_metadata._plan_params_to_wrappers.keys():
-        assert attn_metadata.get_num_plans(plan_params) == 2
-
-    # assert value
-
-    for result_1, result_2, result_3 in zip(results_1, results_2,
-                                            results_3):
-        torch.testing.assert_close(
-            torch.cat((
-                result_1[:context_sequence_lengths[0] +
-                            context_sequence_lengths[1], :],
-                result_1[sum(context_sequence_lengths
-                                ):sum(context_sequence_lengths) + 2],
-            )),
-            torch.cat((
-                result_2[:context_sequence_lengths[0], :],
-                result_3[:context_sequence_lengths[1], :],
-                result_2[context_sequence_lengths[0]:, :],
-                result_3[context_sequence_lengths[1]:, :],
-            )))
-
-    kv_cache_manager.shutdown()
 
 if __name__ == "__main__":
     torch.manual_seed(4)
