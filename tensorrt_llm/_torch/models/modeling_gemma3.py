@@ -1,8 +1,8 @@
 import math
 import os
-import numpy as np
 from typing import Optional, Tuple
 
+import numpy as np
 import torch
 from torch import nn
 from transformers import Gemma3TextConfig
@@ -16,7 +16,6 @@ from ..model_config import ModelConfig
 from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
-from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import Linear, TensorParallelMode
 from ..modules.rms_norm import RMSNorm
 from ..pipeline_interface import PipelineInterface
@@ -25,12 +24,14 @@ from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
 
 trtllm_debug_path = "/home/bbuddharaju/scratch/TensorRT-LLM/trtllm_debug/"
 
+
 def save_tensor_to_npy(tensorname, tensor):
     numpy_array = tensor.detach().cpu().float().numpy()
     filename = tensorname + ".npy"
     filepath = os.path.join(trtllm_debug_path, filename)
     np.save(filepath, numpy_array)
     # print(f"TRTLLM: {tensorname}:\n{tensor}")
+
 
 class Gemma3Attention(Attention):
 
@@ -48,7 +49,8 @@ class Gemma3Attention(Attention):
             type=PositionEmbeddingType.rope_gpt_neox,
             rope=rope_params,
         )
-        q_scaling = math.sqrt(config.query_pre_attn_scalar) / math.sqrt(config.head_dim)
+        q_scaling = math.sqrt(config.query_pre_attn_scalar) / math.sqrt(
+            config.head_dim)
         super().__init__(
             hidden_size=config.hidden_size,
             num_attention_heads=config.num_attention_heads,
@@ -66,19 +68,30 @@ class Gemma3Attention(Attention):
 
 
 class Gemma3MLP(nn.Module):
+
     def __init__(self, config: Gemma3TextConfig):
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
         self.dtype = config.torch_dtype
-        self.gate_proj = Linear(self.hidden_size, self.intermediate_size, bias=False, dtype=self.dtype)
-        self.up_proj = Linear(self.hidden_size, self.intermediate_size, bias=False, dtype=self.dtype)
-        self.down_proj = Linear(self.intermediate_size, self.hidden_size, bias=False, dtype=self.dtype)
+        self.gate_proj = Linear(self.hidden_size,
+                                self.intermediate_size,
+                                bias=False,
+                                dtype=self.dtype)
+        self.up_proj = Linear(self.hidden_size,
+                              self.intermediate_size,
+                              bias=False,
+                              dtype=self.dtype)
+        self.down_proj = Linear(self.intermediate_size,
+                                self.hidden_size,
+                                bias=False,
+                                dtype=self.dtype)
         self.act_fn = ACT2FN[config.hidden_activation]
 
     def forward(self, x):
-        down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+        down_proj = self.down_proj(
+            self.act_fn(self.gate_proj(x)) * self.up_proj(x))
         return down_proj
 
 
@@ -129,28 +142,44 @@ class Gemma3DecoderLayer(DecoderLayer):
         residual = hidden_states
 
         hidden_states = self.input_layernorm(hidden_states)
-        if print_condition: save_tensor_to_npy(f"attention_input_{self.layer_idx}", hidden_states)
+        if print_condition:
+            save_tensor_to_npy(f"attention_input_{self.layer_idx}",
+                               hidden_states)
         hidden_states = self.self_attn(
             position_ids=position_ids,
             hidden_states=hidden_states,
             attn_metadata=attn_metadata,
             **kwargs,
         )
-        if print_condition: save_tensor_to_npy(f"attention_output_{self.layer_idx}", hidden_states)
+        if print_condition:
+            save_tensor_to_npy(f"attention_output_{self.layer_idx}",
+                               hidden_states)
         hidden_states = self.post_attention_layernorm(hidden_states)
-        if print_condition: save_tensor_to_npy(f"attention_output_post_layernorm_{self.layer_idx}", hidden_states)
+        if print_condition:
+            save_tensor_to_npy(
+                f"attention_output_post_layernorm_{self.layer_idx}",
+                hidden_states)
         hidden_states = residual + hidden_states
-        if print_condition: save_tensor_to_npy(f"attention_output_with_residual_{self.layer_idx}", hidden_states)
+        if print_condition:
+            save_tensor_to_npy(
+                f"attention_output_with_residual_{self.layer_idx}",
+                hidden_states)
         residual = hidden_states
 
         hidden_states = self.pre_feedforward_layernorm(hidden_states)
-        if print_condition: save_tensor_to_npy(f"mlp_input_{self.layer_idx}", hidden_states)
+        if print_condition:
+            save_tensor_to_npy(f"mlp_input_{self.layer_idx}", hidden_states)
         hidden_states = self.mlp(hidden_states)
-        if print_condition: save_tensor_to_npy(f"mlp_output_{self.layer_idx}", hidden_states)
+        if print_condition:
+            save_tensor_to_npy(f"mlp_output_{self.layer_idx}", hidden_states)
         hidden_states = self.post_feedforward_layernorm(hidden_states)
-        if print_condition: save_tensor_to_npy(f"mlp_output_post_layernorm_{self.layer_idx}", hidden_states)
+        if print_condition:
+            save_tensor_to_npy(f"mlp_output_post_layernorm_{self.layer_idx}",
+                               hidden_states)
         hidden_states = residual + hidden_states
-        if print_condition: save_tensor_to_npy(f"mlp_output_with_residual_{self.layer_idx}", hidden_states)
+        if print_condition:
+            save_tensor_to_npy(f"mlp_output_with_residual_{self.layer_idx}",
+                               hidden_states)
         return hidden_states
 
 

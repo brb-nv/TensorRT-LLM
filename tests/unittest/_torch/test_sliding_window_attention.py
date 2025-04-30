@@ -1,9 +1,6 @@
 import math
-import random
-from dataclasses import dataclass
 from typing import List
 
-import pytest
 import torch
 
 from tensorrt_llm._torch.attention_backend.interface import \
@@ -26,12 +23,8 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
                                  head_dim)
 
 
-def calculate_ref_result(q: torch.Tensor,
-                         k: torch.Tensor,
-                         v: torch.Tensor,
-                         num_heads: int,
-                         num_kv_heads: int,
-                         head_dim: int,
+def calculate_ref_result(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+                         num_heads: int, num_kv_heads: int, head_dim: int,
                          sequence_lengths: List[int],
                          mask_type: PredefinedAttentionMask,
                          attention_window_size: int):
@@ -88,10 +81,13 @@ def calculate_ref_result(q: torch.Tensor,
         if mask_type == PredefinedAttentionMask.CAUSAL:
             # For sliding window attention, we block tokens that are too far away from the current token.
             seq_len = q.shape[1]
-            causal_mask = torch.zeros(seq_len, seq_len, dtype=torch.bool, device=q.device)
+            causal_mask = torch.zeros(seq_len,
+                                      seq_len,
+                                      dtype=torch.bool,
+                                      device=q.device)
             for token_idx in range(seq_len):
                 start = max(0, token_idx - attention_window_size + 1)
-                causal_mask[token_idx, start: token_idx + 1] = 1
+                causal_mask[token_idx, start:token_idx + 1] = 1
 
             attn_weights = attn_weights.masked_fill(~causal_mask, float('-inf'))
 
@@ -188,23 +184,25 @@ def _run_test_for_backend(backend_name, num_heads, num_kv_heads, num_layers,
         # qkv_at_layer shape (num_tokens, (num_heads + 2 * num_kv_heads) * head_dim)
         qkv_at_layer = torch.cat((q_at_layer, k_at_layer, v_at_layer), dim=-1)
 
-        result = layers[layer_idx].forward(qkv_at_layer,
-                                           None,
-                                           None,
-                                           attn_metadata,
-                                           attention_mask=mask_type,
-                                           attention_window_size=attention_window_size)
+        result = layers[layer_idx].forward(
+            qkv_at_layer,
+            None,
+            None,
+            attn_metadata,
+            attention_mask=mask_type,
+            attention_window_size=attention_window_size)
 
         # Calculate reference result for validation
-        ref_result = calculate_ref_result(q_at_layer,
-                                          k_at_layer,
-                                          v_at_layer,
-                                          num_heads,
-                                          num_kv_heads,
-                                          head_dim,
-                                          sequence_lengths,
-                                          mask_type=mask_type,
-                                          attention_window_size=attention_window_size+1)
+        ref_result = calculate_ref_result(
+            q_at_layer,
+            k_at_layer,
+            v_at_layer,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            sequence_lengths,
+            mask_type=mask_type,
+            attention_window_size=attention_window_size + 1)
 
         # Compare results
         print(f"{backend_name} output mean: {result.abs().mean().item()}")

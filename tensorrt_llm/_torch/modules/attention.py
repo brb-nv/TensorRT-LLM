@@ -102,11 +102,11 @@ class Attention(nn.Module):
 
         if self.qk_layernorm:
             self.q_norm = RMSNorm(hidden_size=self.head_dim,
-                                eps=config.pretrained_config.rms_norm_eps,
-                                dtype=config.pretrained_config.torch_dtype)
+                                  eps=config.pretrained_config.rms_norm_eps,
+                                  dtype=config.pretrained_config.torch_dtype)
             self.k_norm = RMSNorm(hidden_size=self.head_dim,
-                                eps=config.pretrained_config.rms_norm_eps,
-                                dtype=config.pretrained_config.torch_dtype)
+                                  eps=config.pretrained_config.rms_norm_eps,
+                                  dtype=config.pretrained_config.torch_dtype)
         self.quant_config = config.get_quant_config()
         self.attn_backend = config.attn_backend
         self.pos_embd_params = pos_embd_params
@@ -193,7 +193,7 @@ class Attention(nn.Module):
         q, k, v = qkv, None, None
         if self.qk_layernorm:
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size],
-                                    dim=-1)
+                                dim=-1)
             # `q_norm` is shared across all attention heads.
             q = q.reshape(-1, self.head_dim)
             q = self.q_norm(q)

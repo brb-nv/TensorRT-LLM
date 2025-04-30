@@ -192,7 +192,9 @@ class TrtllmAttentionWrapper:
         self.max_num_requests = max_num_requests
         self.max_context_length = max_context_length
         self.attention_window_size = attention_window_size
-        print(f"[TrtllmAttentionWrapper::plan] layer_idx: {self.layer_idx}, attention_window_size: {self.attention_window_size}")
+        print(
+            f"[TrtllmAttentionWrapper::plan] layer_idx: {self.layer_idx}, attention_window_size: {self.attention_window_size}"
+        )
         self.sink_token_length = sink_token_length
         self.beam_width = beam_width
         self.sequence_length = sequence_length
@@ -313,7 +315,8 @@ class TrtllmAttentionWrapper:
             else:
                 raise ValueError("Unexpected attention mask type")
 
-        print("[TrtllmAttentionWrapper::run] attention_window_size: ", self.attention_window_size)
+        print("[TrtllmAttentionWrapper::run] attention_window_size: ",
+              self.attention_window_size)
         output = torch.ops.trtllm.attention(
             q,
             k,
@@ -669,7 +672,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         ################# HARDCODING FOR GEMMA3 #################
         sliding_window_pattern = 6
         is_sliding = bool((self.layer_idx + 1) % sliding_window_pattern)
-        attention_window_size = min(512, metadata.max_seq_len) if is_sliding else metadata.max_seq_len
+        attention_window_size = min(
+            512, metadata.max_seq_len) if is_sliding else metadata.max_seq_len
         ################# HARDCODING FOR GEMMA3 #################
         self.wrapper.plan(
             tokens_per_block=metadata.tokens_per_block,

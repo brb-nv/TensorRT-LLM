@@ -1,8 +1,16 @@
 import argparse
-import numpy as np
 import os
 
-tensornames = ["input_embeddings", "input_embeddings_scaled", "attention_input_0", "attention_output_0", "attention_output_post_layernorm_0", "attention_output_with_residual_0", "mlp_input_0", "mlp_output_0", "mlp_output_post_layernorm_0", "mlp_output_with_residual_0", "final_norm_output"]
+import numpy as np
+
+tensornames = [
+    "input_embeddings", "input_embeddings_scaled", "attention_input_0",
+    "attention_output_0", "attention_output_post_layernorm_0",
+    "attention_output_with_residual_0", "mlp_input_0", "mlp_output_0",
+    "mlp_output_post_layernorm_0", "mlp_output_with_residual_0",
+    "final_norm_output"
+]
+
 
 def main():
     parser = argparse.ArgumentParser()
