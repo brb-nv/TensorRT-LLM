@@ -11,7 +11,8 @@ from transformers.activations import ACT2FN
 from tensorrt_llm.functional import PositionEmbeddingType
 
 from ..attention_backend import AttentionMetadata
-from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
+from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams, PredefinedAttentionMask
+from ..distributed import AllReduceParams
 from ..model_config import ModelConfig
 from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
@@ -41,16 +42,20 @@ class Gemma3Attention(Attention):
         layer_idx: Optional[int] = None,
         is_sliding: bool = False,
     ):
+        self.is_sliding = is_sliding
         config = model_config.pretrained_config
         rope_params = RopeParams.from_config(config)
+        self.attention_window_size = None
         if is_sliding:
             rope_params.theta = 10000
+            self.attention_window_size = config.sliding_window
         pos_embd_params = PositionalEmbeddingParams(
             type=PositionEmbeddingType.rope_gpt_neox,
             rope=rope_params,
         )
         q_scaling = math.sqrt(config.query_pre_attn_scalar) / math.sqrt(
             config.head_dim)
+        # print(f"[Gemma3Attention::__init__] layer_idx: {layer_idx}, attention_window_size: {self.attention_window_size}")
         super().__init__(
             hidden_size=config.hidden_size,
             num_attention_heads=config.num_attention_heads,
@@ -65,6 +70,31 @@ class Gemma3Attention(Attention):
             qk_layernorm=True,
             q_scaling=q_scaling,
         )
+
+    def forward(
+        self,
+        position_ids: Optional[torch.LongTensor],
+        hidden_states: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        attention_mask: PredefinedAttentionMask = PredefinedAttentionMask.
+        CAUSAL,
+        mrope_config: Optional[dict] = None,
+        all_reduce_params: Optional[AllReduceParams] = None,
+        lora_params: Optional[dict] = None,
+        **kwargs,
+    ) -> torch.Tensor:
+
+        attention_window_size = self.attention_window_size or attn_metadata.max_seq_len
+        # print(f"layer_idx: {self.layer_idx}, attention_window_size: {attention_window_size}")
+        return super().forward(position_ids=position_ids,
+                               hidden_states=hidden_states,
+                               attn_metadata=attn_metadata,
+                               attention_mask=attention_mask,
+                               mrope_config=mrope_config,
+                               all_reduce_params=all_reduce_params,
+                               lora_params=lora_params,
+                               attention_window_size=attention_window_size,
+                               **kwargs)
 
 
 class Gemma3MLP(nn.Module):

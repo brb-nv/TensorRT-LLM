@@ -662,6 +662,10 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         )
         assert not metadata.is_cross, "TRT-LLM Attention does not support cross attention yet."
 
+        # print(f"[TrtllmAttention::forward] attention_window_size: {attention_window_size}")
+        if attention_window_size is None:
+            assert False, "attention_window_size is None"
+
         use_paged_context_fmha = (
             metadata.runtime_features.chunked_prefill
             or metadata.runtime_features.cache_reuse
@@ -669,12 +673,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         ) if metadata.runtime_features else False
 
         num_seqs = metadata.num_seqs
-        ################# HARDCODING FOR GEMMA3 #################
-        sliding_window_pattern = 6
-        is_sliding = bool((self.layer_idx + 1) % sliding_window_pattern)
-        attention_window_size = min(
-            512, metadata.max_seq_len) if is_sliding else metadata.max_seq_len
-        ################# HARDCODING FOR GEMMA3 #################
         self.wrapper.plan(
             tokens_per_block=metadata.tokens_per_block,
             max_num_requests=metadata.max_num_requests,
