@@ -23,16 +23,6 @@ from ..pipeline_interface import PipelineInterface
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
                              register_auto_model)
 
-trtllm_debug_path = "/home/bbuddharaju/scratch/TensorRT-LLM/trtllm_debug/"
-
-
-def save_tensor_to_npy(tensorname, tensor):
-    numpy_array = tensor.detach().cpu().float().numpy()
-    filename = tensorname + ".npy"
-    filepath = os.path.join(trtllm_debug_path, filename)
-    np.save(filepath, numpy_array)
-    # print(f"TRTLLM: {tensorname}:\n{tensor}")
-
 
 class Gemma3Attention(Attention):
 
@@ -55,7 +45,6 @@ class Gemma3Attention(Attention):
         )
         q_scaling = math.sqrt(config.query_pre_attn_scalar) / math.sqrt(
             config.head_dim)
-        # print(f"[Gemma3Attention::__init__] layer_idx: {layer_idx}, attention_window_size: {self.attention_window_size}")
         super().__init__(
             hidden_size=config.hidden_size,
             num_attention_heads=config.num_attention_heads,
@@ -85,7 +74,6 @@ class Gemma3Attention(Attention):
     ) -> torch.Tensor:
 
         attention_window_size = self.attention_window_size or attn_metadata.max_seq_len
-        # print(f"layer_idx: {self.layer_idx}, attention_window_size: {attention_window_size}")
         return super().forward(position_ids=position_ids,
                                hidden_states=hidden_states,
                                attn_metadata=attn_metadata,
@@ -167,49 +155,22 @@ class Gemma3DecoderLayer(DecoderLayer):
         **kwargs,
     ) -> torch.Tensor:
 
-        print_condition = (self.layer_idx == 0)
-
         residual = hidden_states
-
         hidden_states = self.input_layernorm(hidden_states)
-        if print_condition:
-            save_tensor_to_npy(f"attention_input_{self.layer_idx}",
-                               hidden_states)
         hidden_states = self.self_attn(
             position_ids=position_ids,
             hidden_states=hidden_states,
             attn_metadata=attn_metadata,
             **kwargs,
         )
-        if print_condition:
-            save_tensor_to_npy(f"attention_output_{self.layer_idx}",
-                               hidden_states)
         hidden_states = self.post_attention_layernorm(hidden_states)
-        if print_condition:
-            save_tensor_to_npy(
-                f"attention_output_post_layernorm_{self.layer_idx}",
-                hidden_states)
         hidden_states = residual + hidden_states
-        if print_condition:
-            save_tensor_to_npy(
-                f"attention_output_with_residual_{self.layer_idx}",
-                hidden_states)
         residual = hidden_states
-
         hidden_states = self.pre_feedforward_layernorm(hidden_states)
-        if print_condition:
-            save_tensor_to_npy(f"mlp_input_{self.layer_idx}", hidden_states)
         hidden_states = self.mlp(hidden_states)
-        if print_condition:
-            save_tensor_to_npy(f"mlp_output_{self.layer_idx}", hidden_states)
         hidden_states = self.post_feedforward_layernorm(hidden_states)
-        if print_condition:
-            save_tensor_to_npy(f"mlp_output_post_layernorm_{self.layer_idx}",
-                               hidden_states)
         hidden_states = residual + hidden_states
-        if print_condition:
-            save_tensor_to_npy(f"mlp_output_with_residual_{self.layer_idx}",
-                               hidden_states)
+
         return hidden_states
 
 
@@ -254,9 +215,7 @@ class Gemma3TextModel(DecoderModel):
 
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
-            save_tensor_to_npy(f"input_embeddings", inputs_embeds)
             inputs_embeds = inputs_embeds * math.sqrt(self.hidden_size)
-            save_tensor_to_npy(f"input_embeddings_scaled", inputs_embeds)
 
         hidden_states = inputs_embeds.to(self.dtype)
 
@@ -266,7 +225,6 @@ class Gemma3TextModel(DecoderModel):
                                           attn_metadata=attn_metadata)
 
         hidden_states = self.norm(hidden_states)
-        save_tensor_to_npy(f"final_norm_output", hidden_states)
         return hidden_states
 
 
