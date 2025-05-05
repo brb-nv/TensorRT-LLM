@@ -191,7 +191,7 @@ class TrtllmAttentionWrapper:
         self.tokens_per_block = tokens_per_block
         self.max_num_requests = max_num_requests
         self.max_context_length = max_context_length
-        self.attention_window_size = attention_window_size
+        self.attention_window_size = attention_window_size or max_sequence_length
         self.sink_token_length = sink_token_length
         self.beam_width = beam_width
         self.sequence_length = sequence_length
