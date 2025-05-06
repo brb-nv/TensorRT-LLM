@@ -41,7 +41,7 @@ def add_multimodal_arguments(parser):
                             'fuyu', 'pix2struct', 'neva', 'kosmos-2',
                             'video-neva', 'phi-3-vision', 'phi-4-multimodal',
                             'mllama', 'internvl', 'qwen2_vl',
-                            'internlm-xcomposer2', 'qwen2_audio'
+                            'internlm-xcomposer2', 'qwen2_audio', 'pixtral'
                         ],
                         help="Model type")
     parser.add_argument(

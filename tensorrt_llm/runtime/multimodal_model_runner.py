@@ -612,7 +612,7 @@ class MultimodalModelRunner:
         elif self.model_type in [
                 'phi-3-vision', 'pix2struct', 'llava_next', 'llava', 'fuyu',
                 'kosmos-2', 'mllama', 'llava_onevision', 'qwen2_vl',
-                'phi-4-multimodal'
+                'phi-4-multimodal', 'pixtral'
         ]:
             self.processor = AutoProcessor.from_pretrained(
                 self.args.hf_model_dir, trust_remote_code=True, num_crops=16)
@@ -924,6 +924,11 @@ class MultimodalModelRunner:
         elif self.model_type == "fuyu":
             while len(image["image_patches"]) < self.args.batch_size:
                 image["image_patches"].append(image["image_patches"][0])
+        elif self.model_type == 'pixtral':
+            input = image
+            image = torch.stack(input['pixel_values'], dim=0)
+            num_h_tokens = (image.shape[-2] - 1) // 16 + 1
+            num_w_tokens = (image.shape[-1] - 1) // 16 + 1
 
         profiler.start("Vision encoder")
         visual_features, visual_atts, model_runner_input = None, None, None
@@ -1115,6 +1120,12 @@ class MultimodalModelRunner:
             input_ids = self.ptuning_setup_llava_next(visual_features,
                                                       pre_prompt, post_prompt)
             length = input_ids.shape[1]
+        elif self.model_type == 'pixtral':
+            input_ids = self.ptuning_setup_pixtral(visual_features,
+                                                   pre_prompt, post_prompt,
+                                                   num_h_tokens, num_w_tokens)
+            visual_features = visual_features.repeat(self.args.batch_size, 1, 1)
+            length = input_ids.shape[1]
         elif self.model_type == 'mllama':
             pre_input_ids = self.tokenizer(pre_prompt,
                                            return_tensors="pt",
@@ -1208,7 +1219,7 @@ class MultimodalModelRunner:
                 torch.int32)
 
         if self.model_type in [
-                'fuyu', 'kosmos-2', 'phi-3-vision', 'llava_next'
+                'fuyu', 'kosmos-2', 'phi-3-vision', 'llava_next', 'pixtral'
         ]:
             return input_ids, input_lengths, [
                 visual_features
@@ -1989,6 +2000,22 @@ class MultimodalModelRunner:
         input_ids = torch.tensor(input_ids)
         return input_ids
 
+    def ptuning_setup_pixtral(self, visual_features, pre_prompt,
+                              post_prompt, num_h_tokens, num_w_tokens):
+        assert visual_features.shape[1] == num_h_tokens * num_w_tokens
+        fake_prompt_ids = []
+        for i in range(num_h_tokens):
+            fake_ids = list(
+                range(self.model_config.vocab_size + num_w_tokens * i,
+                      self.model_config.vocab_size + num_w_tokens * (i + 1)))
+            fake_prompt_ids.extend(fake_ids + [12 if i < num_h_tokens - 1 else 13])
+        input_ids = self.tokenizer.encode(
+            pre_prompt[0]) + fake_prompt_ids + self.tokenizer.encode(
+                post_prompt[0])
+        input_ids = [input_ids] * len(pre_prompt)
+        input_ids = torch.tensor(input_ids)
+        return input_ids
+
     def ptuning_setup_phi3(self, visual_features, audio_features, input_ids,
                            num_img_tokens, num_aud_tokens):
         fake_prompt_id = torch.arange(
@@ -2429,7 +2456,7 @@ class MultimodalModelRunner:
                 raw_image = [raw_image]
             image = self.processor(raw_image)
 
-        elif self.model_type in ['llava', 'fuyu', 'kosmos-2']:
+        elif self.model_type in ['llava', 'fuyu', 'kosmos-2', 'pixtral']:
             if self.model_type == "llava":
                 pre_prompt = "A chat between a curious user and an artificial intelligence assistant. The assistant gives helpful, detailed, and polite answers to the user's questions. USER: "
                 post_prompt = " ASSISTANT:"
@@ -2449,16 +2476,23 @@ class MultimodalModelRunner:
                 post_prompt = None
                 if input_text is None:
                     input_text = "<grounding>An image of"
+            elif self.model_type == "pixtral":
+                pre_prompt = "<s>[INST]What is shown in this image?"
+                if input_text is None:
+                    input_text = ""
 
             if self.model_type not in ['fuyu', 'kosmos-2']:
-                post_prompt = " ASSISTANT:"
+                if self.model_type == 'pixtral':
+                    post_prompt = "[/INST]"
+                else:
+                    post_prompt = " ASSISTANT:"
                 if isinstance(input_text, list):
                     post_prompt = [input + post_prompt for input in input_text]
                 else:
                     post_prompt = input_text + post_prompt
             else:
                 post_prompt = None
-            if self.model_type in ['fuyu', 'kosmos-2']:
+            if self.model_type in ['fuyu', 'kosmos-2', 'pixtral']:
                 image = self.processor(text=input_text,
                                        images=raw_image,
                                        return_tensors='pt')
@@ -2526,7 +2560,7 @@ class MultimodalModelRunner:
             post_prompt = [post_prompt] * self.args.batch_size
         if self.model_type not in [
                 'fuyu', 'pix2struct', 'kosmos-2', 'vila', 'phi-3-vision',
-                'phi-4-multimodal', 'llava_next', 'internvl', 'llava_onevision'
+                'phi-4-multimodal', 'llava_next', 'internvl', 'llava_onevision', 'pixtral'
         ]:
             if image is not None:
                 if image.dim() == 5:
