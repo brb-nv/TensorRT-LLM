@@ -142,6 +142,8 @@ class MultimodalEngineBuilder:
             build_qwen2_vl_engine(args)
         elif args.model_type == 'qwen2_audio':
             build_qwen2_audio_engine(args)
+        elif args.model_type == "pixtral":
+            build_pixtral_engine(args)
         else:
             raise RuntimeError(f"Invalid model type {args.model_type}")
 
@@ -1577,3 +1579,46 @@ def build_qwen2_audio_engine(args):
                          'num_mul_bins': args.num_mul_bins,
                          'max_mel_seq_len': args.max_mel_seq_len
                      })
+
+
+def build_pixtral_engine(args):
+    processor = AutoProcessor.from_pretrained(args.model_path)
+    raw_image = Image.new('RGB', [1024, 1024])  # dummy image
+    image = processor(text="dummy", images=raw_image,
+                        return_tensors="pt")['pixel_values'][0][0].to(
+                            args.device, torch.bfloat16).unsqueeze(0)   # [1, 3, H, W]
+
+    class PixtralVisionWrapper(torch.nn.Module):
+
+        def __init__(self, tower, projector, feature_layer):
+            super().__init__()
+            self.tower = tower
+            self.projector = projector
+            self.feature_layer = feature_layer
+
+        def forward(self, image):
+            all_hidden_states = self.tower(
+                image, output_hidden_states=True).hidden_states
+            features = all_hidden_states[self.feature_layer]
+            return self.projector(features)
+
+    hf_config = AutoConfig.from_pretrained(args.model_path)
+    hf_config.vision_config._attn_implementation = "eager"
+    model = LlavaForConditionalGeneration.from_pretrained(
+        args.model_path, torch_dtype=torch.bfloat16, config=hf_config)
+    wrapper = PixtralVisionWrapper(
+        model.vision_tower.to(args.device),
+        model.multi_modal_projector.to(args.device),
+        model.config.vision_feature_layer)
+
+    export_onnx(wrapper, image,
+                f'{args.output_dir}/onnx',
+                input_names=['input'],
+                output_names=['output'],
+                dynamic_axes={'input': {0: 'batch', 2: 'height', 3: 'width'}})
+    build_trt_engine(args.model_type,
+                     [[3, 16, 16], [3, 512, 512], [3, 1024, 1024]],
+                     f'{args.output_dir}/onnx',
+                     args.output_dir,
+                     args.max_batch_size,
+                     dtype=torch.bfloat16)
