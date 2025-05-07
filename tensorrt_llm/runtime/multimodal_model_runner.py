@@ -771,6 +771,7 @@ class MultimodalModelRunner:
                     enable_context_fmha_fp32_acc,
                     multi_block_mode=self.args.multi_block_mode,
                 )
+                logger.info(f'LLM initialization complete')
                 self.model_config = self.model.session._model_config
             elif self.cpp_e2e:
                 logger.info(

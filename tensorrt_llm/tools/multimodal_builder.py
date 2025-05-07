@@ -1693,7 +1693,7 @@ def build_pixtral_engine(args):
     wrapper = PixtralVisionWrapper(vision_tower, mm_projector)
 
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
-    part_name = 'visual_engine'
+    part_name = 'vision'
     onnx_dir = f"{args.output_dir}/{part_name}/onnx"
 
     export_onnx(wrapper,
