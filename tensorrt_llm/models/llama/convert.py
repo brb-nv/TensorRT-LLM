@@ -469,6 +469,9 @@ def load_hf_llama(model_dir: str, load_model_on_cpu: bool = False):
         )
         return model.llm
 
+    import pdb
+    pdb.set_trace()
+
     hf_config = AutoConfig.from_pretrained(model_dir, trust_remote_code=True)
     model_cls = AutoModelForCausalLM
     if hf_config.model_type == "llava":
