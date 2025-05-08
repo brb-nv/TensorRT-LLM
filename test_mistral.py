@@ -5,6 +5,7 @@ from PIL import Image
 from transformers import AutoProcessor
 
 from tensorrt_llm.runtime.session import Session, TensorInfo
+from tensorrt_llm.runtime.model_runner_cpp import ModelRunnerCpp
 from tensorrt_llm._utils import (str_dtype_to_torch, str_dtype_to_trt,
                                  torch_dtype_to_trt, trt_dtype_to_torch)
 
@@ -25,13 +26,13 @@ raw_image = Image.open(requests.get(url, stream=True).raw)
 
 model_path = "/home/bbuddharaju/scratch/random/hf_models/Mistral-Small-3.1-24B-Instruct-2503/"
 processor = AutoProcessor.from_pretrained(model_path)
-inputs = processor(text="dummy", images=[raw_image], return_tensors="pt").to(
+inputs = processor(text="<s>[INST][IMG]What is the image?[/INST]", images=[raw_image], return_tensors="pt").to(
     str_dtype_to_torch(precision))
 
 dtype = str_dtype_to_torch(precision)
 d_min = torch.finfo(dtype).min
-pixel_values = torch.full((1, 3, 1540, 1540), fill_value=0, dtype=dtype, device="cuda")
-attention_mask = torch.full((1, 110, 110), fill_value=d_min, dtype=dtype, device="cuda")
+pixel_values = torch.full((1, 3, 1540, 1540), fill_value=0, dtype=dtype, device="cuda")     # image_size from config -> 1540.
+attention_mask = torch.full((1, 110, 110), fill_value=d_min, dtype=dtype, device="cuda")    # patch_size from config -> 14.
 
 _pixel_values = inputs["pixel_values"].to(device="cuda", dtype=dtype)
 h, w = _pixel_values.shape[-2:]
@@ -57,5 +58,39 @@ stream.synchronize()
 image_embeds = visual_outputs["encoder_output"]
 image_embeds = image_embeds.reshape(55, 55, -1)[:h // 28, :w // 28].flatten(0, 1)
 
-print(image_embeds.shape)
+print(image_embeds.shape)   # torch.Size([1504, 5120])
 print(image_embeds)
+
+# From get_visual_features() in multimodal_model_runner.py.
+image_atts = torch.ones(image_embeds.size()[:-1], dtype=torch.long).to(device="cuda")
+
+# # From modeling_mistral3.py.
+input_ids = inputs["input_ids"].to(device="cuda")
+# image_token_index = 10
+# special_image_mask = (input_ids == image_token_index).unsqueeze(-1)  # torch.Size([1, 1545, 1])
+# special_image_mask = special_image_mask.expand_as(inputs_embeds).to(inputs_embeds.device)   # torch.Size([1, 1545, 5120])
+# image_features = image_features.to(inputs_embeds.device, inputs_embeds.dtype)   # torch.Size([1504, 5120])
+# inputs_embeds = inputs_embeds.masked_scatter(special_image_mask, image_features)    # torch.Size([1, 1545, 5120])
+
+
+llm_engine_dir = "/home/bbuddharaju/scratch/TensorRT-LLM/mistral_mm_eng/llm/"
+model = ModelRunnerCpp.from_dir(
+    llm_engine_dir,
+    rank=0,
+    debug_mode=False,
+)
+model_config = model.model_config
+output_ids = model.generate(
+    input_ids,
+    input_position_ids=None,
+    mrope_params=None,
+    encoder_input_features=None,
+    sampling_config=None,
+    max_new_tokens=15,
+    end_id=2,
+    pad_id=2,
+    num_beams=1,
+    output_sequence_lengths=False,
+    return_dict=False,
+    mm_embedding_offloading=False)
+print("output_ids: ", output_ids)
