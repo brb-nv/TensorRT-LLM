@@ -1586,14 +1586,20 @@ def build_pixtral_engine(args):
     raw_image = Image.new('RGB', [1540, 1540])  # dummy image
 
     inputs = processor(text="dummy", images=[raw_image], return_tensors="pt")
-    pixel_values = inputs["pixel_values"].to(args.device, torch.bfloat16)    # (1, 3, 1540, 1540)
-    attention_mask = torch.zeros(1, 1540 // 14, 1540 // 14).to(
-        args.device, torch.bfloat16)    # (1, 110, 110)
+    pixel_values = inputs["pixel_values"].to(
+        args.device, torch.bfloat16)  # (1, 3, 1540, 1540)
+    attention_mask = torch.zeros(1, 1540 // 14,
+                                 1540 // 14).to(args.device,
+                                                torch.bfloat16)  # (1, 110, 110)
 
-    from transformers.models.pixtral.modeling_pixtral import apply_rotary_pos_emb
+    from transformers.models.pixtral.modeling_pixtral import \
+        apply_rotary_pos_emb
 
     @torch.no_grad
-    def attn_forward(self, hidden_states, attention_mask, position_embeddings,
+    def attn_forward(self,
+                     hidden_states,
+                     attention_mask,
+                     position_embeddings,
                      output_attentions=False):
         batch, patches, _ = hidden_states.size()
 
@@ -1601,9 +1607,12 @@ def build_pixtral_engine(args):
         k = self.k_proj(hidden_states)
         v = self.v_proj(hidden_states)
 
-        q = q.view(batch, patches, self.num_heads, self.head_dim).transpose(1, 2)
-        k = k.view(batch, patches, self.num_heads, self.head_dim).transpose(1, 2)
-        v = v.view(batch, patches, self.num_heads, self.head_dim).transpose(1, 2)
+        q = q.view(batch, patches, self.num_heads,
+                   self.head_dim).transpose(1, 2)
+        k = k.view(batch, patches, self.num_heads,
+                   self.head_dim).transpose(1, 2)
+        v = v.view(batch, patches, self.num_heads,
+                   self.head_dim).transpose(1, 2)
         cos, sin = position_embeddings
         q, k = apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=0)
 
@@ -1616,7 +1625,7 @@ def build_pixtral_engine(args):
 
     @torch.no_grad
     def vision_tower_forward(self, pixel_values, attention_mask):
-        patch_embeds = self.patch_conv(pixel_values)    # (bs, c, h, w)
+        patch_embeds = self.patch_conv(pixel_values)  # (bs, c, h, w)
 
         patch_embeds = patch_embeds.flatten(2).transpose(1, 2)  # (bs, h*w, c)
         attention_mask = attention_mask.flatten(1)  # (bs, h*w)
@@ -1626,13 +1635,12 @@ def build_pixtral_engine(args):
         position_embeddings = self.patch_positional_embedding(
             patch_embeds, position_ids)
 
-        out = self.transformer(
-            patch_embeds,
-            attention_mask=attention_mask,
-            position_embeddings=position_embeddings,
-            output_hidden_states=False,
-            output_attentions=False,
-            return_dict=False)[0]
+        out = self.transformer(patch_embeds,
+                               attention_mask=attention_mask,
+                               position_embeddings=position_embeddings,
+                               output_hidden_states=False,
+                               output_attentions=False,
+                               return_dict=False)[0]
         return out
 
     @torch.no_grad
@@ -1640,7 +1648,8 @@ def build_pixtral_engine(args):
         h, w = attention_mask.shape[-2:]
         bs, n, d = image_features.shape
         image_grid = image_features.view(bs, h, w, d).permute(0, 3, 1, 2)
-        image_features = torch.nn.functional.unfold(image_grid, 2, stride=2).transpose(1, 2)
+        image_features = torch.nn.functional.unfold(image_grid, 2,
+                                                    stride=2).transpose(1, 2)
         image_features = self.merging_layer(image_features)
         return image_features
 
@@ -1665,24 +1674,27 @@ def build_pixtral_engine(args):
             return out
 
     from transformers import Mistral3ForConditionalGeneration
-    model = Mistral3ForConditionalGeneration.from_pretrained(
-        args.model_path, torch_dtype="auto")
+    model = Mistral3ForConditionalGeneration.from_pretrained(args.model_path,
+                                                             torch_dtype="auto")
     vision_tower = model.vision_tower
     mm_projector = model.multi_modal_projector
 
     height = width = 1540 // 14
-    mesh = torch.meshgrid(torch.arange(height), torch.arange(width), indexing="ij")
+    mesh = torch.meshgrid(torch.arange(height),
+                          torch.arange(width),
+                          indexing="ij")
     h_grid, v_grid = torch.stack(mesh, dim=-1).chunk(2, -1)
-    ids = h_grid[..., 0] * width + v_grid[..., 0]   # (110, 110)
+    ids = h_grid[..., 0] * width + v_grid[..., 0]  # (110, 110)
     vision_tower.register_buffer("position_ids", ids)
 
-    from transformers.models.pixtral.modeling_pixtral import (
-        PixtralAttention, PixtralVisionModel)
+    from transformers.models.pixtral.modeling_pixtral import (PixtralAttention,
+                                                              PixtralVisionModel
+                                                              )
     PixtralAttention.forward = attn_forward
     PixtralVisionModel.forward = vision_tower_forward
 
     from transformers.models.mistral3.modeling_mistral3 import (
-        Mistral3PatchMerger, Mistral3MultiModalProjector)
+        Mistral3MultiModalProjector, Mistral3PatchMerger)
     Mistral3PatchMerger.forward = patch_merger_forward
     Mistral3MultiModalProjector.forward = mm_projector_forward
 
@@ -1701,8 +1713,13 @@ def build_pixtral_engine(args):
                 onnx_dir=onnx_dir,
                 input_names=['input', 'attention_mask'],
                 dynamic_axes={
-                    'input': {0: "batch"},
-                    'attention_mask': {0: "batch"}})
+                    'input': {
+                        0: "batch"
+                    },
+                    'attention_mask': {
+                        0: "batch"
+                    }
+                })
     build_trt_engine(
         args.model_type,
         input_sizes=[[list(pixel_values.shape[1:]) for _ in range(3)],

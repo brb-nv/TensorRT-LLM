@@ -618,7 +618,8 @@ class MultimodalModelRunner:
                 self.args.hf_model_dir, trust_remote_code=True, num_crops=16)
 
         elif 'pixtral' in self.model_type:
-            self.processor = AutoProcessor.from_pretrained(self.args.hf_model_dir)
+            self.processor = AutoProcessor.from_pretrained(
+                self.args.hf_model_dir)
 
         elif 'internlm' in self.model_type:
             image_size = 490
@@ -907,12 +908,18 @@ class MultimodalModelRunner:
             # Shape of pixel values from the processor varies with the raw image.
             # So we create a new tensor with a fixed shape as expected by the vision
             # encoder and create a corresponding attention mask.
-            image_size = 1540 # From model's vision config.
-            patch_size = 14 # From model's vision config.
+            image_size = 1540  # From model's vision config.
+            patch_size = 14  # From model's vision config.
             d_min = torch.finfo(dtype).min
             num_patches = (image_size // patch_size)
-            image = torch.full((1, 3, image_size, image_size), fill_value=0, dtype=dtype, device="cuda")
-            attention_mask = torch.full((1, num_patches, num_patches), fill_value=d_min, dtype=dtype, device="cuda")
+            image = torch.full((1, 3, image_size, image_size),
+                               fill_value=0,
+                               dtype=dtype,
+                               device="cuda")
+            attention_mask = torch.full((1, num_patches, num_patches),
+                                        fill_value=d_min,
+                                        dtype=dtype,
+                                        device="cuda")
             h, w = pixel_values.shape[-2:]
             image[..., :h, :w] = pixel_values
             attention_mask[..., :h // patch_size, :w // patch_size] = 0
@@ -1134,7 +1141,8 @@ class MultimodalModelRunner:
             length = input_ids.shape[1]
 
         elif self.model_type == 'pixtral':
-            visual_features = visual_features.reshape(55, 55, -1)[:h // 28, :w // 28].flatten(0, 1)
+            visual_features = visual_features.reshape(
+                55, 55, -1)[:h // 28, :w // 28].flatten(0, 1)
             input_ids = self.ptuning_setup_pixtral(input_ids=input_ids)
             length = input_ids.shape[1]
 
@@ -2009,8 +2017,8 @@ class MultimodalModelRunner:
     def ptuning_setup_pixtral(self, input_ids):
         # input_ids obtained from processor has token_ids for text as well as image tokens
         # where each image token is represented the same image_token_index (10 for this model).
-        image_token_index = 10 # From model's config.
-        vocab_size = 131072 # From model's text config.
+        image_token_index = 10  # From model's config.
+        vocab_size = 131072  # From model's text config.
         # Replace all image tokens with a unique token_id > text_vacab_size.
         # This shall be used to lookup the prompt table.
         replacer = vocab_size
@@ -2582,7 +2590,8 @@ class MultimodalModelRunner:
             post_prompt = [post_prompt] * self.args.batch_size
         if self.model_type not in [
                 'fuyu', 'pix2struct', 'kosmos-2', 'vila', 'phi-3-vision',
-                'phi-4-multimodal', 'llava_next', 'internvl', 'llava_onevision', 'pixtral'
+                'phi-4-multimodal', 'llava_next', 'internvl', 'llava_onevision',
+                'pixtral'
         ]:
             if image is not None:
                 if image.dim() == 5:
