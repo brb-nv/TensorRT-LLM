@@ -21,7 +21,9 @@ with open(encoder_path + "/visual_encoder.engine", "rb") as f:
     engine_buffer = f.read()
 encoder_session = Session.from_serialized_engine(engine_buffer)
 
-url = 'https://www.ilankelman.org/stopsigns/australia.jpg'
+# url = 'https://www.ilankelman.org/stopsigns/australia.jpg'
+# url = 'https://storage.googleapis.com/sfr-vision-language-research/LAVIS/assets/merlion.png'
+url = 'https://huggingface.co/microsoft/kosmos-2-patch14-224/resolve/main/snowman.png'
 raw_image = Image.open(requests.get(url, stream=True).raw)
 
 model_path = "/home/bbuddharaju/scratch/random/hf_models/Mistral-Small-3.1-24B-Instruct-2503/"
@@ -38,6 +40,9 @@ _pixel_values = inputs["pixel_values"].to(device="cuda", dtype=dtype)
 h, w = _pixel_values.shape[-2:]
 pixel_values[..., :h, :w] = _pixel_values
 attention_mask[..., :h // 14, :w // 14] = 0
+
+# model_runner_input ---> pixel_values
+# other_vision_inputs ---> attention_mask
 
 visual_features = {"input": pixel_values, "attention_mask": attention_mask}
 tensor_info = [
@@ -60,9 +65,6 @@ image_embeds = image_embeds.reshape(55, 55, -1)[:h // 28, :w // 28].flatten(0, 1
 
 print(image_embeds.shape)   # torch.Size([1504, 5120])
 print(image_embeds)
-
-# From get_visual_features() in multimodal_model_runner.py.
-image_atts = torch.ones(image_embeds.size()[:-1], dtype=torch.long).to(device="cuda")
 
 # # From modeling_mistral3.py.
 input_ids = inputs["input_ids"].to(device="cuda")
