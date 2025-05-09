@@ -73,6 +73,22 @@ input_ids = inputs["input_ids"].to(device="cuda")
 # inputs_embeds = inputs_embeds.masked_scatter(special_image_mask, image_features)    # torch.Size([1, 1545, 5120])
 
 
+import numpy as np
+vocab_size = 131072
+
+# Replace all image tokens with a unique token_id > text_vacab_size. This shall be used to lookup the prompt table.
+image_token_index = 10
+replacer = vocab_size
+for i in range(len(input_ids[0])):
+    if input_ids[0][i] == image_token_index:
+        input_ids[0][i] = replacer
+        print("replacer: ", replacer)
+        replacer += 1
+
+prompt_tasks = ",".join(np.arange(1, dtype=np.int32).astype(str))
+prompt_table = image_embeds
+prompt_table = prompt_table.view(1, -1, prompt_table.shape[-1])
+
 llm_engine_dir = "/home/bbuddharaju/scratch/TensorRT-LLM/mistral_mm_eng/llm/"
 model = ModelRunnerCpp.from_dir(
     llm_engine_dir,
@@ -80,7 +96,7 @@ model = ModelRunnerCpp.from_dir(
     debug_mode=False,
 )
 model_config = model.model_config
-output_ids = model.generate(
+generated_ids = model.generate(
     input_ids,
     input_position_ids=None,
     mrope_params=None,
@@ -90,7 +106,10 @@ output_ids = model.generate(
     end_id=2,
     pad_id=2,
     num_beams=1,
+    prompt_table=prompt_table,
+    prompt_tasks=prompt_tasks,
     output_sequence_lengths=False,
     return_dict=False,
     mm_embedding_offloading=False)
-print("output_ids: ", output_ids)
+generated_text = processor.batch_decode(generated_ids[0], skip_special_tokens=True, clean_up_tokenization_spaces=False)
+print("generated_text: ", generated_text)
