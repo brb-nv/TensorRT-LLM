@@ -1708,7 +1708,7 @@ def build_pixtral_engine(args):
         input_sizes=[[list(pixel_values.shape[1:]) for _ in range(3)],
                      [list(attention_mask.shape[1:]) for _ in range(3)]],
         onnx_dir=onnx_dir,
-        engine_dir=f"{args.output_dir}/{part_name}",
+        engine_dir=args.output_dir,
         max_batch_size=args.max_batch_size,
-        engine_name=f"visual_encoder.engine",
+        engine_name=f"model.engine",
         dtype=torch.bfloat16)
