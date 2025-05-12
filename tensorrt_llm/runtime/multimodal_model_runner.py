@@ -413,6 +413,12 @@ class MultimodalModelRunner:
             if self.num_frames is None:
                 self.num_frames = 8
             assert self.args.video_path is None or self.args.image_path is None
+        if self.model_type == "pixtral":
+            hf_config = AutoConfig.from_pretrained(self.args.hf_model_dir)
+            self.image_size = hf_config.vision_config.image_size
+            self.patch_size = hf_config.vision_config.patch_size
+            self.vocab_size = hf_config.text_config.vocab_size
+            self.image_token_index = hf_config.image_token_index
 
         self.audio_input_names = self.audio_output_names = None
         if self.model_type == "mllama":
@@ -908,8 +914,8 @@ class MultimodalModelRunner:
             # Shape of pixel values from the processor varies with the raw image.
             # So we create a new tensor with a fixed shape as expected by the vision
             # encoder and create a corresponding attention mask.
-            image_size = 1540  # From model's vision config.
-            patch_size = 14  # From model's vision config.
+            image_size = self.image_size
+            patch_size = self.patch_size
             d_min = torch.finfo(dtype).min
             num_patches = (image_size // patch_size)
             image = torch.full((1, 3, image_size, image_size),
@@ -2017,8 +2023,8 @@ class MultimodalModelRunner:
     def ptuning_setup_pixtral(self, input_ids):
         # input_ids obtained from processor has token_ids for text as well as image tokens
         # where each image token is represented the same image_token_index (10 for this model).
-        image_token_index = 10  # From model's config.
-        vocab_size = 131072  # From model's text config.
+        image_token_index = self.image_token_index
+        vocab_size = self.vocab_size
         # Replace all image tokens with a unique token_id > text_vacab_size.
         # This shall be used to lookup the prompt table.
         replacer = vocab_size
