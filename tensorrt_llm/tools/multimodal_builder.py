@@ -1583,14 +1583,16 @@ def build_qwen2_audio_engine(args):
 
 def build_pixtral_engine(args):
     processor = AutoProcessor.from_pretrained(args.model_path)
-    raw_image = Image.new('RGB', [1540, 1540])  # dummy image
+    hf_config = AutoConfig.from_pretrained(args.model_path)
+    vision_config = hf_config.vision_config
+    raw_image = Image.new('RGB', [vision_config.image_size, vision_config.image_size])  # dummy image
 
     inputs = processor(text="dummy", images=[raw_image], return_tensors="pt")
     pixel_values = inputs["pixel_values"].to(
-        args.device, torch.bfloat16)  # (1, 3, 1540, 1540)
-    attention_mask = torch.zeros(1, 1540 // 14,
-                                 1540 // 14).to(args.device,
-                                                torch.bfloat16)  # (1, 110, 110)
+        args.device, torch.bfloat16)
+    attention_mask = torch.zeros(1, vision_config.image_size // vision_config.patch_size,
+                                  vision_config.image_size // vision_config.patch_size).to(args.device,
+                                                torch.bfloat16)
 
     from transformers.models.pixtral.modeling_pixtral import \
         apply_rotary_pos_emb
@@ -1679,12 +1681,12 @@ def build_pixtral_engine(args):
     vision_tower = model.vision_tower
     mm_projector = model.multi_modal_projector
 
-    height = width = 1540 // 14
+    height = width = vision_config.image_size // vision_config.patch_size
     mesh = torch.meshgrid(torch.arange(height),
                           torch.arange(width),
                           indexing="ij")
     h_grid, v_grid = torch.stack(mesh, dim=-1).chunk(2, -1)
-    ids = h_grid[..., 0] * width + v_grid[..., 0]  # (110, 110)
+    ids = h_grid[..., 0] * width + v_grid[..., 0]
     vision_tower.register_buffer("position_ids", ids)
 
     from transformers.models.pixtral.modeling_pixtral import (PixtralAttention,
