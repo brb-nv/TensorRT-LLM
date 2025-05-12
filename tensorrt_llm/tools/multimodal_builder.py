@@ -1585,14 +1585,16 @@ def build_pixtral_engine(args):
     processor = AutoProcessor.from_pretrained(args.model_path)
     hf_config = AutoConfig.from_pretrained(args.model_path)
     vision_config = hf_config.vision_config
-    raw_image = Image.new('RGB', [vision_config.image_size, vision_config.image_size])  # dummy image
+    raw_image = Image.new(
+        'RGB',
+        [vision_config.image_size, vision_config.image_size])  # dummy image
 
     inputs = processor(text="dummy", images=[raw_image], return_tensors="pt")
-    pixel_values = inputs["pixel_values"].to(
-        args.device, torch.bfloat16)
-    attention_mask = torch.zeros(1, vision_config.image_size // vision_config.patch_size,
-                                  vision_config.image_size // vision_config.patch_size).to(args.device,
-                                                torch.bfloat16)
+    pixel_values = inputs["pixel_values"].to(args.device, torch.bfloat16)
+    attention_mask = torch.zeros(
+        1, vision_config.image_size // vision_config.patch_size,
+        vision_config.image_size // vision_config.patch_size).to(
+            args.device, torch.bfloat16)
 
     from transformers.models.pixtral.modeling_pixtral import \
         apply_rotary_pos_emb
