@@ -799,7 +799,7 @@ def multimodal_model_root(request, llm_venv):
     elif 'Llama-3.2' in tllm_model_name:
         models_root = os.path.join(llm_models_root(), 'llama-3.2-models')
     elif 'Mistral-Small' in tllm_model_name:
-        models_root = "/home/bbuddharaju/scratch/random/hf_models/"
+        models_root = "/home/bbuddharaju/scratch/llm-models/"
 
     multimodal_model_root = os.path.join(models_root, tllm_model_name)
 
