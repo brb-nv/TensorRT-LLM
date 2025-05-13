@@ -419,6 +419,7 @@ class MultimodalModelRunner:
             self.patch_size = hf_config.vision_config.patch_size
             self.vocab_size = hf_config.text_config.vocab_size
             self.image_token_index = hf_config.image_token_index
+            self.spatial_merge_size = hf_config.vision_config.spatial_merge_size
 
         self.audio_input_names = self.audio_output_names = None
         if self.model_type == "mllama":
@@ -1147,8 +1148,12 @@ class MultimodalModelRunner:
             length = input_ids.shape[1]
 
         elif self.model_type == 'pixtral':
+            relevant_patch_size = self.patch_size * self.spatial_merge_size
+            output_img_size = self.image_size // relevant_patch_size
             visual_features = visual_features.reshape(
-                55, 55, -1)[:h // 28, :w // 28].flatten(0, 1)
+                output_img_size, output_img_size,
+                -1)[:h // relevant_patch_size, :w //
+                    relevant_patch_size].flatten(0, 1)
             input_ids = self.ptuning_setup_pixtral(input_ids=input_ids)
             length = input_ids.shape[1]
 
