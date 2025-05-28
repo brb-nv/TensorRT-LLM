@@ -23,7 +23,7 @@ import torch
 from peft import LoraConfig as PeftLoraConfig
 from peft import get_peft_model
 from transformers import AutoModelForCausalLM
-
+from typing import List
 # isort: on
 
 
@@ -257,6 +257,69 @@ def test_nemotron_nas_lora() -> None:
     assert similar(outputs[0].outputs[0].text, outputs[1].outputs[0].text)
 
 
+def test_fp8_with_bf16_lora(
+    model_dir: str,
+    hf_modules: List[str],
+    trtllm_modules: List[str],
+    num_loras: int = 2,
+    max_lora_rank: int = 8,
+) -> None:
+    from tensorrt_llm._torch.llm import LLM
+
+    quant_config = QuantConfig(quant_algo=QuantAlgo.FP8,
+                            kv_cache_quant_algo=QuantAlgo.FP8)
+
+    # Set up temporary directory for LoRA adapters
+    with tempfile.TemporaryDirectory() as lora_dir:
+        print("Creating dummy LoRAs...")
+
+        model = AutoModelForCausalLM.from_pretrained(
+            model_dir,
+            torch_dtype=torch.bfloat16,
+            device_map="auto",
+            trust_remote_code=True,
+        )
+
+        peft_lora_config = PeftLoraConfig(r=max_lora_rank,
+                                     target_modules=hf_modules,
+                                     bias="none",
+                                     task_type="CAUSAL_LM")
+
+        lora_paths = []
+        for i in range(num_loras):
+            lora_model = get_peft_model(model, peft_lora_config)
+            for param in lora_model.parameters():
+                param.data.zero_()
+            lora_path = f"{lora_dir}/lora_{i}"
+            lora_model.save_pretrained(lora_path)
+            lora_paths.append(lora_path)
+
+        trtllm_lora_config = LoraConfig(lora_dir=lora_paths,
+                                 lora_target_modules=trtllm_modules,
+                                 max_lora_rank=max_lora_rank)
+
+        llm = LLM(model_dir,
+                  quant_config=quant_config,
+                  fast_build=True,
+                  lora_config=trtllm_lora_config)
+
+        prompts = [
+            "Write a function that calculates the Fibonacci sequence.",
+            "Convert this C++ code to Python: int x = 0; x++;",
+        ]
+
+        lora_req1 = LoRARequest("lora-1", 0, lora_paths[0])
+        lora_req2 = LoRARequest("lora-2", 1, lora_paths[1])
+        lora_requests = [lora_req1, lora_req2]
+        sampling_params = SamplingParams(max_tokens=200)
+
+        outputs = llm.generate(prompts,
+                               sampling_params,
+                               lora_request=lora_requests)
+
+        assert len(outputs) == 2
+
+
 @skip_gpu_memory_less_than_80gb
 def test_codellama_fp8_with_bf16_lora() -> None:
     from tensorrt_llm._torch.llm import LLM
@@ -318,3 +381,12 @@ def test_codellama_fp8_with_bf16_lora() -> None:
                                lora_request=lora_requests)
 
         assert len(outputs) == 2
+
+
+def test_gemma3_fp8_with_bf16_lora() -> None:
+
+    model_dir = f"{llm_models_root()}/gemma/gemma-3-1b-it/"
+    trtllm_modules = ['attn_q', 'attn_k', 'attn_v']
+    hf_modules = ["q_proj", "k_proj", "v_proj"]
+
+    test_fp8_with_bf16_lora(model_dir=model_dir, hf_modules=hf_modules, trtllm_modules=trtllm_modules, num_loras=2, max_lora_rank=8)

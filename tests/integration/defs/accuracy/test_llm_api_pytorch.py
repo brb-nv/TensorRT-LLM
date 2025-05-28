@@ -389,6 +389,36 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm)
 
+    @skip_pre_ada
+    @parametrize_with_ids("torch_compile", [False, True])
+    @parametrize_with_ids("attn_backend", ["TRTLLM", "FLASHINFER"])
+    @parametrize_with_ids("fp8kv", [False, True])
+    def test_fp8(self, fp8kv, attn_backend, torch_compile):
+        quant_config = QuantConfig(QuantAlgo.FP8)
+        pytorch_config = PyTorchConfig(
+            torch_compile_enabled=torch_compile,
+            torch_compile_fullgraph=True,
+            cuda_graph_padding_enabled=torch_compile,
+            cuda_graph_batch_sizes=[4],
+            attn_backend=attn_backend,
+            disable_overlap_scheduler=torch_compile,
+        )
+        if fp8kv:
+            quant_config.kv_cache_quant_algo = QuantAlgo.FP8
+            pytorch_config.kv_cache_dtype = "fp8"
+        llm = LLM(
+            f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct-FP8",
+            quant_config=quant_config,
+            pytorch_backend_config=pytorch_config)
+        assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
+        if fp8kv:
+            assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
+        with llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
 
 class TestMixtral8x7B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "mistralai/Mixtral-8x7B-v0.1"
