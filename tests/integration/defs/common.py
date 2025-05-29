@@ -16,6 +16,7 @@ import copy
 import os
 import platform
 import re
+from contextlib import contextmanager
 from difflib import SequenceMatcher
 from pathlib import Path
 
@@ -844,6 +845,19 @@ def test_multi_lora_support(
     venv_check_call(llm_venv, run_cmd)
 
 
+@contextmanager
+def set_env(key, value):
+    old_value = os.environ.get(key)
+    os.environ[key] = value
+    try:
+        yield
+    finally:
+        if old_value is None:
+            del os.environ[key]
+        else:
+            os.environ[key] = old_value
+
+
 def get_dummy_spec_decoding_heads(hf_model_dir,
                                   save_dir,
                                   mode='medusa',
@@ -879,12 +893,11 @@ def get_dummy_spec_decoding_heads(hf_model_dir,
     tokenizer = transformers.AutoTokenizer.from_pretrained(hf_model_dir)
     tokenizer.pad_token_id = tokenizer.eos_token_id
 
-    # Create a dummy trainer. Use CPU to avoid issues related to distributed training with torch.
+    # Create a dummy trainer and limit the number of visible devices during its construction to avoid issues related to distributed training with torch.
     # We don't do any real training anyway.
-    trainer_args = transformers.TrainingArguments(use_cpu=True)
-    trainer = transformers.Trainer(model=model,
-                                   tokenizer=tokenizer,
-                                   args=trainer_args)
+    with set_env("CUDA_VISIBLE_DEVICES", "0"):
+        trainer = transformers.Trainer(model=model, tokenizer=tokenizer)
+
     trainer._move_model_to_device(model, 'cuda')
 
     # Enable HF checkpointing so that the saved model will contain the speculative decoding module.
