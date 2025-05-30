@@ -846,16 +846,17 @@ def test_multi_lora_support(
 
 
 @contextmanager
-def set_env(key, value):
+def set_env_if_missing(key, value):
     old_value = os.environ.get(key)
-    os.environ[key] = value
+    if old_value is None:
+        print(f"[set_env_if_missing][W]: Setting missing env variable {key} to {value}.")
+        os.environ[key] = value
     try:
         yield
     finally:
         if old_value is None:
+            print(f"[set_env_if_missing][W]: Deleting temporarily set env variable {key}.")
             del os.environ[key]
-        else:
-            os.environ[key] = old_value
 
 
 def get_dummy_spec_decoding_heads(hf_model_dir,
@@ -893,9 +894,10 @@ def get_dummy_spec_decoding_heads(hf_model_dir,
     tokenizer = transformers.AutoTokenizer.from_pretrained(hf_model_dir)
     tokenizer.pad_token_id = tokenizer.eos_token_id
 
-    # Create a dummy trainer and limit the number of visible devices during its construction to avoid issues related to distributed training with torch.
-    # We don't do any real training anyway.
-    with set_env("CUDA_VISIBLE_DEVICES", "0"):
+    # We unset WORLD_SIZE while running tests in specific cluster nodes to
+    # deal with a bug in transformers library. Trainer initialization here
+    # will fail if WORLD_SIZE is unset. So, we set it to 1 temporarily here.
+    with set_env_if_missing("WORLD_SIZE", "1"):
         trainer = transformers.Trainer(model=model, tokenizer=tokenizer)
 
     trainer._move_model_to_device(model, 'cuda')
