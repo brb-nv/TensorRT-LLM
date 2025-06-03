@@ -3,8 +3,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 from transformers import (AutoProcessor, AutoTokenizer, PretrainedConfig,
-                          PreTrainedModel, Qwen2_5_VLForConditionalGeneration,
-                          Qwen2VLForConditionalGeneration)
+                          PreTrainedModel, Gemma3ForConditionalGeneration)
 
 from ...functional import RopeEmbeddingUtils, RotaryScalingType
 from ...inputs import (ExtraProcessedInputs, InputProcessor, TextPrompt,
@@ -18,7 +17,7 @@ from .modeling_multimodal_utils import fuse_input_embeds
 from .modeling_utils import register_auto_model
 
 
-class Gemma3InputProcessorBase(InputProcessor):
+class Gemma3InputProcessor(InputProcessor):
 
     def __init__(self, model_path: str, model_config: PretrainedConfig,
                  tokenizer: AutoTokenizer):
@@ -38,7 +37,7 @@ class Gemma3InputProcessorBase(InputProcessor):
 
     @classmethod
     def get_model_class(cls) -> type[PreTrainedModel]:
-        raise NotImplementedError()
+        raise Gemma3ForConditionalGeneration
 
     @classmethod
     def get_rope_index(
@@ -343,14 +342,9 @@ class Gemma3InputProcessorBase(InputProcessor):
         }
 
 
-class Gemma3InputProcessor(Gemma3InputProcessorBase):
-
-    @classmethod
-    def get_model_class(cls):
-        return Gemma3ForConditionalGeneration
-
-
-class Gemma3ModelBase(PreTrainedModel):
+@register_auto_model("Gemma3ForConditionalGeneration")
+@register_input_processor(Gemma3InputProcessor)
+class Gemma3Model(PreTrainedModel):
 
     def __init__(
         self,
@@ -435,9 +429,3 @@ class Gemma3ModelBase(PreTrainedModel):
             mrope_config=mrope_config)
         logger.debug(f'output shape: {output_prob.shape}')
         return output_prob
-
-
-@register_auto_model("Gemma3ForConditionalGeneration")
-@register_input_processor(Gemma3InputProcessor)
-class Gemma3Model(Gemma3ModelBase):
-    pass
