@@ -8,14 +8,16 @@ from tensorrt_llm.inputs import (ALL_SUPPORTED_MULTIMODAL_MODELS,
                                  default_multimodal_input_loader)
 
 example_images = [
-    "https://huggingface.co/datasets/YiYiXu/testing-images/resolve/main/seashore.png",
-    "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/diffusers/inpaint.png",
-    "https://huggingface.co/datasets/Sayali9141/traffic_signal_images/resolve/main/61.jpg",
+    "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/bee.jpg",
+    # "https://huggingface.co/datasets/YiYiXu/testing-images/resolve/main/seashore.png",
+    # "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/diffusers/inpaint.png",
+    # "https://huggingface.co/datasets/Sayali9141/traffic_signal_images/resolve/main/61.jpg",
 ]
 example_image_prompts = [
-    "Describe the natural environment in the image.",
-    "Describe the object and the weather condition in the image.",
-    "Describe the traffic condition on the road in the image.",
+    "Describe the image in detail.",
+    # "Describe the natural environment in the image.",
+    # "Describe the object and the weather condition in the image.",
+    # "Describe the traffic condition on the road in the image.",
 ]
 example_videos = [
     "https://huggingface.co/datasets/Efficient-Large-Model/VILA-inference-demos/resolve/main/OAI-sora-tokyo-walk.mp4",

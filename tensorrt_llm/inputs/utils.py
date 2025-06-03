@@ -214,6 +214,7 @@ PLACEHOLDER_PLACEMENT_MAP = {
     "llama4": MultimodalPlaceholderPlacement.BEFORE_TEXT,
     "mllama": MultimodalPlaceholderPlacement.BEFORE_TEXT,
     "hyperclovax_vlm": MultimodalPlaceholderPlacement.AFTER_TEXT,
+    "gemma3": MultimodalPlaceholderPlacement.BEFORE_TEXT,
 }
 assert len(PLACEHOLDER_PLACEMENT_MAP) == len(ALL_SUPPORTED_MULTIMODAL_MODELS)
 
