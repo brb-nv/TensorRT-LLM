@@ -1,386 +1,238 @@
 import copy
-from typing import Any, Dict, List, Optional, Tuple
+import os
+from typing import List, Optional, Tuple
 
 import torch
-from transformers import (AutoProcessor, AutoTokenizer, PretrainedConfig,
-                          PreTrainedModel, Gemma3ForConditionalGeneration)
+import torch.nn as nn
+from transformers import (AutoConfig, AutoModel, AutoProcessor, Gemma3Config,
+                          PretrainedConfig, PreTrainedModel)
+from transformers.modeling_utils import load_sharded_checkpoint
+from transformers.models.gemma3.modeling_gemma3 import \
+    Gemma3MultiModalProjector
 
-from ...functional import RopeEmbeddingUtils, RotaryScalingType
+from ..._utils import nvtx_range
 from ...inputs import (ExtraProcessedInputs, InputProcessor, TextPrompt,
                        register_input_processor)
+from ...llmapi.utils import download_hf_model
 from ...logger import logger
 from ...sampling_params import SamplingParams
 from ..attention_backend import AttentionMetadata
 from ..model_config import ModelConfig
 from .modeling_auto import AutoModelForCausalLM
+from .modeling_siglip import SiglipVisionModel
 from .modeling_multimodal_utils import fuse_input_embeds
-from .modeling_utils import register_auto_model
+from .modeling_utils import ModelConfig, filter_weights, register_auto_model
 
 
 class Gemma3InputProcessor(InputProcessor):
 
-    def __init__(self, model_path: str, model_config: PretrainedConfig,
-                 tokenizer: AutoTokenizer):
-        self.model_config = model_config
+    def __init__(self, model_path, model_config, tokenizer):
         self.tokenizer = tokenizer
         self.processor = AutoProcessor.from_pretrained(model_path,
-                                                       use_fast=False)
+                                                       use_fast=True)
+        self.model_config = model_config
 
-        # NOTE: Using attn_implementation='flash_attention_2' to avoid the issue of vision model's GPU OOM.
-        model = self.get_model_class().from_pretrained(
-            model_path,
-            torch_dtype=model_config.torch_dtype,
-            attn_implementation='flash_attention_2')
         self.device = 'cuda'
-        self.visual = model.visual.to(self.device)
-        self._post_init_()
 
-    @classmethod
-    def get_model_class(cls) -> type[PreTrainedModel]:
-        raise Gemma3ForConditionalGeneration
+        # Determine the actual local path for model files
+        if os.path.isdir(model_path):
+            local_model_path = model_path
+        else:
+            local_model_path = download_hf_model(model_path)
 
-    @classmethod
-    def get_rope_index(
-        cls,
-        model_config: PretrainedConfig,
-        input_ids: Optional[torch.LongTensor] = None,
-        image_grid_thw: Optional[torch.LongTensor] = None,
-        video_grid_thw: Optional[torch.LongTensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        second_per_grid_ts: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Calculate the 3D rope index based on image and video's temporal, height and width in LLM.
+        # Partially load the model to reduce memory usage(Vision tower and multi-modal projector)
+        hf_model_config = AutoConfig.from_pretrained(local_model_path)
+        self.dtype = hf_model_config.text_config.torch_dtype
+        module_dict = nn.ModuleDict({
+            "vision_tower":
+            AutoModel.from_config(hf_model_config.vision_config),
+            "multi_modal_projector":
+            Gemma3MultiModalProjector(hf_model_config)
+        })
+        missing_keys, _ = load_sharded_checkpoint(module_dict,
+                                                  local_model_path,
+                                                  strict=False)
+        assert len(missing_keys) == 0, f"Missing keys: {missing_keys}"
+        hf_vision_tower = module_dict["vision_tower"].to(self.dtype)
+        hf_mm_projector = module_dict["multi_modal_projector"].to(
+            self.dtype).to(self.device)
 
-        This is a generalized implementation that can be used by both Qwen2VL and Qwen2_5_VL models.
-        The main difference between the two implementations is how temporal position IDs are calculated.
+        # Use TRTLLM vision tower(CLIPVisionModel)
+        vision_model_config = ModelConfig(
+            pretrained_config=model_config.vision_config, attn_backend="TRTLLM")
+        self.vision_tower = SiglipVisionModel(vision_model_config).to(
+            self.device).to(self.dtype)
+        self.vision_tower.load_weights(hf_vision_tower.state_dict())
 
-        Args:
-            model_config: The model configuration
-            input_ids: Indices of input sequence tokens in the vocabulary
-            image_grid_thw: The temporal, height and width of feature shape of each image in LLM
-            video_grid_thw: The temporal, height and width of feature shape of each video in LLM
-            attention_mask: Mask to avoid performing attention on padding token indices
-            second_per_grid_ts: The time interval (in seconds) for each grid along the temporal dimension
+        # Use HF multi-modal projector
+        self.mm_projector = hf_mm_projector
 
-        Returns:
-            position_ids: A tensor of shape (3, batch_size, sequence_length)
-            mrope_position_deltas: A tensor of shape (batch_size)
-        """
-        spatial_merge_size = model_config.vision_config.spatial_merge_size
-        image_token_id = model_config.image_token_id
-        video_token_id = model_config.video_token_id
-        vision_start_token_id = model_config.vision_start_token_id
-        mrope_position_deltas = []
+    @nvtx_range("[Vision] preprocess")
+    def _preprocess(self, images):
+        return [
+            self.processor(text="dummy",
+                           images=image,
+                           do_rescale=not isinstance(image, torch.Tensor),
+                           return_tensors="pt",
+                           device=self.device)['pixel_values'][0].to(
+                               self.device) for image in images
+        ]
 
-        # Handle case with no vision inputs
-        if image_grid_thw is None and video_grid_thw is None:
-            if attention_mask is not None:
-                position_ids = attention_mask.long().cumsum(-1) - 1
-                position_ids.masked_fill_(attention_mask == 0, 1)
-                position_ids = position_ids.unsqueeze(0).expand(3, -1, -1).to(
-                    input_ids.device)
-                max_position_ids = position_ids.max(0, keepdim=False)[0].max(
-                    -1, keepdim=True)[0]
-                mrope_position_deltas = max_position_ids + 1 - attention_mask.shape[
-                    -1]
-            else:
-                position_ids = (torch.arange(input_ids.shape[1],
-                                             device=input_ids.device).view(
-                                                 1, 1, -1).expand(
-                                                     3, input_ids.shape[0], -1))
-                mrope_position_deltas = torch.zeros(
-                    [input_ids.shape[0], 1],
-                    device=input_ids.device,
-                    dtype=input_ids.dtype,
-                )
-            return position_ids, mrope_position_deltas
-
-        # Handle case with vision inputs
-        total_input_ids = input_ids
-        if attention_mask is None:
-            attention_mask = torch.ones_like(total_input_ids)
-
-        position_ids = torch.ones(
-            3,
-            input_ids.shape[0],
-            input_ids.shape[1],
-            dtype=input_ids.dtype,
-            device=input_ids.device,
+    @nvtx_range("[Vision] process")
+    def _process(self, pixel_values):
+        attn_metadata = self.vision_tower.prepare_attn_metadata(
+            pixel_values.shape[0])
+        image_features: Tuple[torch.Tensor] = self.vision_tower(
+            pixel_values,
+            attn_metadata=attn_metadata,
         )
+        selected_image_feature = image_features[-2][:, 1:]
+        image_features = self.mm_projector(selected_image_feature)
+        return image_features.reshape(-1, image_features.shape[-1])
 
-        image_index, video_index = 0, 0
-        attention_mask = attention_mask.to(total_input_ids.device)
+    @nvtx_range("[Vision] postprocess")
+    def _postprocess(self, input_ids, mm_features):
+        # Define model specific variables here before shared logic
+        mm_tokens = torch.tensor([self.model_config.image_token_index
+                                  ]).to(input_ids.device)
+        model_hidden_size = self.model_config.text_config.hidden_size
+        vocab_size = self.model_config.text_config.vocab_size
+        start_len = end_len = 0  # for llava, need not append start/end token around each image token
+        # End model specific variables
 
-        for i, input_ids in enumerate(total_input_ids):
-            input_ids = input_ids[attention_mask[i] == 1]
-            image_nums, video_nums = 0, 0
-            vision_start_indices = torch.argwhere(
-                input_ids == vision_start_token_id).squeeze(1)
-            vision_tokens = input_ids[vision_start_indices + 1]
-            image_nums = (vision_tokens == image_token_id).sum()
-            video_nums = (vision_tokens == video_token_id).sum()
-            input_tokens = input_ids.tolist()
-            llm_pos_ids_list: list = []
-            st = 0
-            remain_images, remain_videos = image_nums, video_nums
+        ## find mm token positions in input_ids
+        mm_token_positions = torch.where(torch.isin(input_ids, mm_tokens))[0]
+        num_medias = num_mm_tokens = len(mm_token_positions)
+        if num_medias > 1 and isinstance(mm_features, torch.Tensor):
+            mm_features = list(
+                mm_features.split(mm_features.shape[0] // num_medias))
 
-            for _ in range(image_nums + video_nums):
-                if image_token_id in input_tokens and remain_images > 0:
-                    ed_image = input_tokens.index(image_token_id, st)
-                else:
-                    ed_image = len(input_tokens) + 1
-                if video_token_id in input_tokens and remain_videos > 0:
-                    ed_video = input_tokens.index(video_token_id, st)
-                else:
-                    ed_video = len(input_tokens) + 1
+        if isinstance(mm_features, torch.Tensor):
+            # 1 prompt + 1 media
+            # "split" means what a single mm_token in the input_ids should represent
+            # image: one split --> one frame
+            # video: one split --> N frames
+            num_frames, mm_feature_length, mm_hidden_dim = mm_features.shape
+            mm_lengths_per_split = [mm_feature_length * num_frames]
+            mm_lengths_per_frame = [mm_feature_length]
+        elif isinstance(mm_features, list):
+            # 1 prompt + N media
+            num_frames = len(mm_features) if mm_features[0].dim() == 2 else sum(
+                [f.shape[0] for f in mm_features])
+            mm_lengths_per_split = [
+                f.shape[0] if f.dim() == 2 else f.shape[0] * f.shape[1]
+                for f in mm_features
+            ]
+            mm_lengths_per_frame = [
+                f.shape[0] if f.dim() == 2 else f.shape[1] for f in mm_features
+            ]
+            mm_hidden_dim = mm_features[0].shape[-1]
+            mm_features = torch.cat(mm_features, dim=0)
+        else:
+            raise ValueError(
+                f"Invalid multimodal features type: {type(mm_features)}")
+        mm_total_length = sum(mm_lengths_per_split)
+        assert mm_hidden_dim == model_hidden_size, "Multimodal embedding_dim must match model hidden_size"
 
-                if ed_image < ed_video:
-                    t, h, w = (
-                        image_grid_thw[image_index][0],
-                        image_grid_thw[image_index][1],
-                        image_grid_thw[image_index][2],
-                    )
-                    second_per_grid_t = 0
-                    image_index += 1
-                    remain_images -= 1
-                    ed = ed_image
-                else:
-                    t, h, w = (
-                        video_grid_thw[video_index][0],
-                        video_grid_thw[video_index][1],
-                        video_grid_thw[video_index][2],
-                    )
-                    if second_per_grid_ts is not None:
-                        second_per_grid_t = second_per_grid_ts[video_index]
-                    else:
-                        second_per_grid_t = 1.0
-                    video_index += 1
-                    remain_videos -= 1
-                    ed = ed_video
+        ## split input_ids into segments by isolating mm tokens
+        mm_split_positions = torch.cat(
+            [mm_token_positions, mm_token_positions + 1]).unique()
+        input_ids_splits = list(input_ids.tensor_split(mm_split_positions.cpu(
+        )))  # len(input_ids_splits) = num_segments after mm tokens are isolated
+        mm_ids_splits = list(
+            torch.arange(vocab_size,
+                         vocab_size + mm_total_length,
+                         device=input_ids.device).split(mm_lengths_per_split)
+        )  # len(mm_ids_splits) = num_mm_segments
 
-                llm_grid_t, llm_grid_h, llm_grid_w = (
-                    t.item(),
-                    h.item() // spatial_merge_size,
-                    w.item() // spatial_merge_size,
-                )
-                text_len = ed - st
+        for i, mm_ids in enumerate(mm_ids_splits):
+            mm_ids = mm_ids.reshape(-1, mm_lengths_per_frame[i])
+            mm_ids_splits[i] = mm_ids.flatten()
 
-                st_idx = llm_pos_ids_list[-1].max() + 1 if len(
-                    llm_pos_ids_list) > 0 else 0
-                llm_pos_ids_list.append(
-                    torch.arange(text_len).view(1, -1).expand(3, -1) + st_idx)
+        ## replace mm token ids with the expanded out-of-vocab ids
+        mm_split_idx = 0
+        for i, split in enumerate(input_ids_splits):
+            if torch.isin(split, mm_tokens).any().item():
+                input_ids_splits[i] = mm_ids_splits[mm_split_idx]
+                mm_split_idx += 1
+        assert mm_split_idx == len(
+            mm_ids_splits), "All mm_ids_splits should be consumed"
 
-                # Calculate temporal position IDs based on model type
-                if hasattr(model_config.vision_config, 'tokens_per_second'):
-                    # Qwen2_5_VL style temporal position calculation
-                    range_tensor = torch.arange(llm_grid_t).view(-1, 1)
-                    expanded_range = range_tensor.expand(
-                        -1, llm_grid_h * llm_grid_w)
-                    time_tensor = expanded_range * second_per_grid_t * model_config.vision_config.tokens_per_second
-                    t_index = time_tensor.long().flatten()
-                else:
-                    # Qwen2VL style temporal position calculation
-                    t_index = torch.arange(llm_grid_t).view(-1, 1).expand(
-                        -1, llm_grid_h * llm_grid_w).flatten()
-
-                h_index = torch.arange(llm_grid_h).view(1, -1, 1).expand(
-                    llm_grid_t, -1, llm_grid_w).flatten()
-                w_index = torch.arange(llm_grid_w).view(1, 1, -1).expand(
-                    llm_grid_t, llm_grid_h, -1).flatten()
-
-                llm_pos_ids_list.append(
-                    torch.stack([t_index, h_index, w_index]) + text_len +
-                    st_idx)
-                st = ed + llm_grid_t * llm_grid_h * llm_grid_w
-
-            if st < len(input_tokens):
-                st_idx = llm_pos_ids_list[-1].max() + 1 if len(
-                    llm_pos_ids_list) > 0 else 0
-                text_len = len(input_tokens) - st
-                llm_pos_ids_list.append(
-                    torch.arange(text_len).view(1, -1).expand(3, -1) + st_idx)
-
-            llm_positions = torch.cat(llm_pos_ids_list, dim=1).reshape(3, -1)
-            position_ids[..., i, attention_mask[i] == 1] = llm_positions.to(
-                position_ids.device)
-            mrope_position_deltas.append(llm_positions.max() + 1 -
-                                         len(total_input_ids[i]))
-
-        mrope_position_deltas = torch.tensor(
-            mrope_position_deltas, device=input_ids.device).unsqueeze(1)
-        return position_ids, mrope_position_deltas
-
-    def _post_init_(self):
-        _, rotary_cos_sin = RopeEmbeddingUtils.create_sinusoidal_positions_for_attention_plugin(
-            num_pos=self.model_config.max_position_embeddings,
-            dim=int(self.model_config.hidden_size /
-                    self.model_config.num_attention_heads),
-            theta=float(self.model_config.rope_theta),
-            scale_type=RotaryScalingType.mrope)
-        self.rotary_cos_sin = torch.from_numpy(rotary_cos_sin).to(self.device)
-        self.rotary_cos_sin = self.rotary_cos_sin.reshape(
-            self.model_config.max_position_embeddings,
-            int(self.model_config.hidden_size /
-                self.model_config.num_attention_heads / 2), 2)
-
-        self.cos_ori = self.rotary_cos_sin[:, :, 0]
-        self.sin_ori = self.rotary_cos_sin[:, :, 1]
-
-    def _preprocess(self, text: dict[str, any], mm_data: dict[str, any],
-                    mm_processor_kwargs: Dict[str, Any]):
-        return self.processor(text=[text],
-                              images=mm_data.get("image", None),
-                              videos=mm_data.get("video", None),
-                              padding=True,
-                              return_tensors='pt',
-                              **mm_processor_kwargs)
-
-    def _process(self, pixel_values: torch.Tensor,
-                 pixel_values_videos: torch.Tensor,
-                 image_grid_thw: torch.Tensor,
-                 video_grid_thw: torch.Tensor) -> torch.Tensor:
-        embeds = []
-
-        if pixel_values is not None:
-            pixel_values = pixel_values.to(self.visual.dtype)
-            embeds.append(self.visual(pixel_values, grid_thw=image_grid_thw))
-
-        if pixel_values_videos is not None:
-            pixel_values_videos = pixel_values_videos.to(self.visual.dtype)
-            embeds.append(
-                self.visual(pixel_values_videos, grid_thw=video_grid_thw))
-
-        if embeds:
-            return torch.cat(embeds, dim=1)
-        return None
-
-    def _postprocess(self, input_ids: torch.LongTensor) -> torch.LongTensor:
-        # NOTE: Qwen2-VL's input processor is doing all the work for fusing input_ids with mm_tokens. So, we just replace mm_tokens with expanded out-of-vocab ids
-
-        masks = (input_ids == self.model_config.image_token_id) | (
-            input_ids == self.model_config.vision_token_id) | (
-                input_ids == self.model_config.video_token_id)
-        cumulative_counts = masks.cumsum(dim=-1)
-        values = (self.model_config.vocab_size - 1) + cumulative_counts
-        input_ids[masks] = values[masks]
-        return input_ids
-
-    def get_mrope_config(
-            self,
-            input_ids: torch.LongTensor,
-            image_grid_thw: torch.LongTensor,
-            video_grid_thw: torch.LongTensor,
-            attention_mask: torch.Tensor,
-            second_per_grid_ts: torch.Tensor = None) -> dict[str, torch.Tensor]:
-        mrope_position_ids, mrope_position_deltas = self.__class__.get_rope_index(
-            self.model_config, input_ids, image_grid_thw, video_grid_thw,
-            attention_mask, second_per_grid_ts)
-
-        mrope_position_ids = mrope_position_ids.transpose(1, 0)
-        mrope_position_ids_padding = torch.zeros(
-            mrope_position_ids.shape[:-1] +
-            (self.model_config.max_position_embeddings, ),
-            dtype=torch.int32,
+        ## concat text & mm input_ids, wrap mm feature in prompt tuning config
+        fused_input_ids = torch.cat(input_ids_splits).to(
             device=input_ids.device)
-        mrope_position_ids_padding[:, :, :mrope_position_ids.
-                                   shape[-1]] = mrope_position_ids
-        cos = self.cos_ori[mrope_position_ids_padding]
-        sin = self.sin_ori[mrope_position_ids_padding]
+        fused_length = len(input_ids) + mm_total_length + num_frames * (
+            start_len + end_len) - num_medias
+        assert len(
+            fused_input_ids
+        ) == fused_length, f"Fused input_ids length {len(fused_input_ids)} should match the sum of text and multimodal embedding lengths {fused_length}"
 
-        mrope_section = [16, 24, 24]
-        cos = torch.cat([
-            m[:, i % 3] for i, m in enumerate(cos.split(mrope_section, dim=-1))
-        ],
-                        dim=-1).unsqueeze(-1)
-        sin = torch.cat([
-            m[:, i % 3] for i, m in enumerate(sin.split(mrope_section, dim=-1))
-        ],
-                        dim=-1).unsqueeze(-1)
-        concat_cos_sin = torch.concatenate((cos, sin), axis=-1)
-        concat_cos_sin = concat_cos_sin.reshape(concat_cos_sin.shape[0], -1)
-        mrope_config = {}
-        mrope_config['mrope_rotary_cos_sin'] = concat_cos_sin
-        mrope_config['mrope_position_deltas'] = mrope_position_deltas
-        return mrope_config
+        # [num_frames, feature_length, hidden_dim] -> [num_frames * feature_length, hidden_dim]
+        mm_features = mm_features.view(-1, mm_features.shape[-1])
+        return fused_input_ids, mm_features
 
     @torch.inference_mode()
     def __call__(
-        self,
-        inputs: TextPrompt,
-        sampling_params: SamplingParams,
+        self, inputs: TextPrompt, sampling_params: SamplingParams
     ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
-        text_prompt, mm_data, mm_processor_kwargs = inputs.get("prompt"), \
-                        inputs.get("multi_modal_data", {}), inputs.get("mm_processor_kwargs", {})
+        text_prompt, mm_data = inputs.get("prompt"), inputs.get(
+            "multi_modal_data", {})
+        assert 'image' in mm_data
 
-        # NOTE: Since we are passed in Tensor images, we don't need to rescale them.
-        mm_processor_kwargs['do_rescale'] = False
-        processed_inputs = self._preprocess(text_prompt, mm_data,
-                                            mm_processor_kwargs).to(self.device)
-        if mm_data:
-            mm_features = self._process(
-                processed_inputs.get('pixel_values', None),
-                processed_inputs.get('pixel_values_videos', None),
-                processed_inputs.get('image_grid_thw', None),
-                processed_inputs.get('video_grid_thw', None))
-        else:
-            mm_features = None
+        input_ids = self.tokenizer(
+            text_prompt, return_tensors="pt").input_ids[0].to(self.device)
 
-        input_ids = processed_inputs['input_ids']
-
-        mrope_config = self.get_mrope_config(
-            input_ids, processed_inputs.get('image_grid_thw', None),
-            processed_inputs.get('video_grid_thw', None),
-            processed_inputs.get('attention_mask', None),
-            processed_inputs.get('second_per_grid_ts', None))
-
-        fused_input_ids = self._postprocess(input_ids[0])
-
+        mm_tensor = self._preprocess(mm_data['image'])
+        mm_features = torch.stack(
+            [self._process(tensor) for tensor in mm_tensor])
+        fused_input_ids, mm_features = self._postprocess(input_ids, mm_features)
         return fused_input_ids.to(torch.int32).tolist(), {
-            "mm_embedding": mm_features,
-            "mrope_config": mrope_config
+            "mm_embedding": mm_features
         }
 
 
 @register_auto_model("Gemma3ForConditionalGeneration")
 @register_input_processor(Gemma3InputProcessor)
 class Gemma3Model(PreTrainedModel):
+    config_class = Gemma3Config
 
-    def __init__(
-        self,
-        model_config: ModelConfig[PretrainedConfig],
-        *args,
-        **kwargs,
-    ) -> None:
-        model_config.pretrained_config.rope_scaling['type'] = 'mrope'
+    def __init__(self, model_config: ModelConfig[PretrainedConfig], *args,
+                 **kwargs) -> None:
         config = model_config.pretrained_config
-
-        assert model_config.attn_backend == 'TRTLLM', "Gemma3 only supports TRTLLM backend now"
         super().__init__(config)
-
-        self.model_config = model_config
         if hasattr(self, "llm"):
             return
 
         llm_model_config = copy.deepcopy(model_config)
-        llm_model_config.pretrained_config.architectures = ["Gemma3ForCausalLM"]
+        llm_model_config.pretrained_config = model_config.pretrained_config.text_config
+
+        # TODO Remove these when MistralConfig is natively supported
+        llm_model_config.pretrained_config.attention_bias = False
+        llm_model_config.pretrained_config.rope_scaling = None
+        llm_model_config.pretrained_config.mlp_bias = False
+
         self.llm = AutoModelForCausalLM.from_config(llm_model_config)
+
+        self.model_config = model_config
         self.vocab_size = config.vocab_size
-        self.model_dtype = getattr(config, "torch_dtype", torch.float16)
+        self.model_dtype = getattr(config.text_config, "torch_dtype",
+                                   torch.float16)
         logger.info(f"{self.dtype=} {self.model_dtype=}")
+
         self.post_config()
         self.is_loaded = True
 
     def load_weights(self, weights):
+
+        weights = filter_weights("language_model", weights)
         self.llm.load_weights(weights)
+
+    def post_config(self):
+        self.config = self.llm.config
+        self.model_config.pretrained_config = self.llm.config
 
     def infer_max_seq_len(self) -> int:
         return self.llm.infer_max_seq_len()
-
-    def post_config(self):
-        # use llm.config as config for pytorch model engine
-        self.config = self.llm.config
-        self.model_config.pretrained_config = self.llm.config
 
     @torch.inference_mode()
     def forward(
@@ -388,44 +240,23 @@ class Gemma3Model(PreTrainedModel):
         attn_metadata: AttentionMetadata,
         input_ids: Optional[torch.LongTensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
-        input_embeds: Optional[torch.Tensor] = None,
-        return_context_logits: bool = False,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        return_context_logits: Optional[bool] = False,
         **kwargs,
     ) -> torch.Tensor:
-        """
-        VLM forward logic with inflight batching support.
-        """
         num_context_requests, num_generation_requests = attn_metadata.num_contexts, attn_metadata.num_generations
-        logger.debug(
-            f"num_context_requests: {num_context_requests}, num_generation_requests: {num_generation_requests}"
-        )
+        logger.debug(f"{num_context_requests=}, {num_generation_requests=}")
 
         mm_embed = kwargs.get("multi_modal_data", [])
-
-        error_msg = "Number of multimodal features (if provided) should be equal to number of context requests"
         assert mm_embed == [] or len(
-            mm_embed) == num_context_requests, error_msg
+            mm_embed
+        ) == num_context_requests, "Number of multimodal features (if provided) should be equal to number of context requests"
 
-        input_ids, input_embeds = fuse_input_embeds(self.llm.model.embed_tokens,
-                                                    input_ids, mm_embed)
+        input_ids, inputs_embeds = fuse_input_embeds(
+            self.llm.model.embed_tokens, input_ids, mm_embed)
+        logits = self.llm.forward(attn_metadata, input_ids, position_ids,
+                                  inputs_embeds, return_context_logits)
+        return logits
 
-        mrope_config = kwargs.get("mrope_config", {})
-        if mrope_config:
-            if mrope_rotary_cos_sin := mrope_config.get('mrope_rotary_cos_sin'):
-                mrope_config['mrope_rotary_cos_sin'] = torch.cat(
-                    mrope_rotary_cos_sin, dim=0)
 
-            if mrope_position_deltas := mrope_config.get(
-                    'mrope_position_deltas'):
-                mrope_config['mrope_position_deltas'] = torch.cat(
-                    mrope_position_deltas, dim=0)
-
-        output_prob = self.llm.forward(
-            attn_metadata=attn_metadata,
-            input_ids=input_ids,
-            position_ids=position_ids,
-            inputs_embeds=input_embeds,
-            return_context_logits=return_context_logits,
-            mrope_config=mrope_config)
-        logger.debug(f'output shape: {output_prob.shape}')
-        return output_prob
+AutoModel.register(Gemma3Config, Gemma3Model)
