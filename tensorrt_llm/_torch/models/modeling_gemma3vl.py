@@ -22,6 +22,7 @@ from .modeling_auto import AutoModelForCausalLM
 from .modeling_siglip import SiglipVisionModel
 from .modeling_multimodal_utils import fuse_input_embeds
 from .modeling_utils import ModelConfig, filter_weights, register_auto_model
+from .modeling_gemma3 import Gemma3ForCausalLM
 
 
 class Gemma3InputProcessor(InputProcessor):
@@ -206,15 +207,11 @@ class Gemma3Model(PreTrainedModel):
         llm_model_config = copy.deepcopy(model_config)
         llm_model_config.pretrained_config = model_config.pretrained_config.text_config
 
-        # TODO Remove these when MistralConfig is natively supported
-        llm_model_config.pretrained_config.attention_bias = False
-        llm_model_config.pretrained_config.rope_scaling = None
-        llm_model_config.pretrained_config.mlp_bias = False
-
-        self.llm = AutoModelForCausalLM.from_config(llm_model_config)
+        llm_model_config.pretrained_config.torch_dtype = torch.bfloat16 # Harcoding for Gemma3 VLM.
+        self.llm = Gemma3ForCausalLM(llm_model_config)
 
         self.model_config = model_config
-        self.vocab_size = config.vocab_size
+        # self.vocab_size = config.vocab_size
         self.model_dtype = getattr(config.text_config, "torch_dtype",
                                    torch.float16)
         logger.info(f"{self.dtype=} {self.model_dtype=}")

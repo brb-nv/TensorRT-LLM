@@ -46,6 +46,7 @@ class Gemma3Attention(Attention):
         )
         q_scaling = math.sqrt(config.query_pre_attn_scalar) / math.sqrt(
             config.head_dim)
+        assert config.torch_dtype == torch.bfloat16, "Expected dtype is bfloat16."
         super().__init__(
             hidden_size=config.hidden_size,
             num_attention_heads=config.num_attention_heads,
@@ -121,6 +122,7 @@ class Gemma3MLP(nn.Module):
         self.config = config
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
+        assert config.torch_dtype == torch.bfloat16, "Expected dtype is bfloat16."
         self.dtype = config.torch_dtype
         self.gate_proj = Linear(self.hidden_size,
                                 self.intermediate_size,
@@ -161,6 +163,7 @@ class Gemma3DecoderLayer(DecoderLayer):
 
         self.mlp = Gemma3MLP(config)
 
+        assert config.torch_dtype == torch.bfloat16, "Expected dtype is bfloat16."
         self.input_layernorm = RMSNorm(hidden_size=config.hidden_size,
                                        eps=config.rms_norm_eps,
                                        dtype=config.torch_dtype)
@@ -225,6 +228,7 @@ class Gemma3TextModel(DecoderModel):
                 layer_idx,
             ) for layer_idx in range(config.pretrained_config.num_hidden_layers)
         ])
+        assert config.pretrained_config.torch_dtype == torch.bfloat16, "Expected dtype is bfloat16."
         self.norm = RMSNorm(hidden_size=config.pretrained_config.hidden_size,
                             eps=config.pretrained_config.rms_norm_eps,
                             dtype=config.pretrained_config.torch_dtype)
@@ -246,6 +250,7 @@ class Gemma3TextModel(DecoderModel):
             inputs_embeds = self.embed_tokens(input_ids)
             inputs_embeds = inputs_embeds * math.sqrt(self.hidden_size)
 
+        assert self.dtype == torch.bfloat16, "Expected dtype is bfloat16."
         hidden_states = inputs_embeds.to(self.dtype)
 
         for decoder_layer in self.layers:
