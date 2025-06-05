@@ -185,8 +185,8 @@ class Gemma3InputProcessor(InputProcessor):
         text_prompt, mm_data, mm_processor_kwargs = inputs.get("prompt"), inputs.get(
             "multi_modal_data", {}), inputs.get("mm_processor_kwargs", {})
         mm_features = self._process(mm_processor_kwargs["pixel_values"])
-        fused_input_ids, mm_features = self._postprocess(input_ids, mm_features)
-        return fused_input_ids.to(torch.int32).tolist(), {
+        # TODO: Need to figure why [0] must be passed. How should a batch work?
+        return mm_processor_kwargs["input_ids"][0].to(torch.int32).tolist(), {
             "mm_embedding": mm_features
         }
 
@@ -244,12 +244,16 @@ class Gemma3Model(PreTrainedModel):
         logger.debug(f"{num_context_requests=}, {num_generation_requests=}")
 
         mm_embed = kwargs.get("multi_modal_data", [])
+        print("[Gemma3Model::forward] mm_embed: ", mm_embed)
         assert mm_embed == [] or len(
             mm_embed
         ) == num_context_requests, "Number of multimodal features (if provided) should be equal to number of context requests"
 
         input_ids, inputs_embeds = fuse_input_embeds(
-            self.llm.model.embed_tokens, input_ids, mm_embed)
+            embedding_layer=self.llm.model.embed_tokens,
+            input_ids=input_ids,
+            mm_embeds=mm_embed,
+            mm_token_ids=torch.tensor([262144]).to(input_ids.device))
         logits = self.llm.forward(attn_metadata, input_ids, position_ids,
                                   inputs_embeds, return_context_logits)
         return logits
