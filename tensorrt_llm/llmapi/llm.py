@@ -313,14 +313,22 @@ class LLM:
                 and not self._on_trt_backend):
             sampling_params.max_tokens = 1
 
+        print("[generate_async] BEFORE prompt_inputs: ", inputs)
         inputs = prompt_inputs(inputs)
+        print("[generate_async] AFTER prompt_inputs: ", inputs)
 
-        if not inputs.get("prompt") and inputs.get(
-                "prompt_token_ids") and inputs.get(
-                    "multi_modal_data") and not isinstance(
-                        self.input_processor, DefaultInputProcessor):
+        print("[generate_async] inputs.get('prompt'): ", inputs.get('prompt'))
+        print("[generate_async] inputs.get('prompt_token_ids'): ", inputs.get('prompt_token_ids'))
+        print("[generate_async] inputs.get('multi_modal_data'): ", inputs.get('multi_modal_data'))
+        print("[generate_async] inputs.get('mm_processor_kwargs'): ", inputs.get('mm_processor_kwargs'))
+
+        if inputs.get("prompt") is None and \
+            inputs.get("prompt_token_ids") is not None and \
+            inputs.get("multi_modal_data") is not None and \
+            not isinstance(self.input_processor, DefaultInputProcessor):
             # VLMs need to process/tokenize the prompt in their own way
             prompt = self.tokenizer.decode(inputs['prompt_token_ids'])
+            print("[generate_async] decoded_prompt: ", prompt)
             inputs = TextPrompt(
                 prompt=prompt,
                 multi_modal_data=inputs.get("multi_modal_data"),

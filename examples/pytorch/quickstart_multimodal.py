@@ -9,14 +9,16 @@ from tensorrt_llm.inputs import (INPUT_FORMATTER_MAP, default_image_loader,
                                  default_video_loader)
 
 example_images = [
-    "https://huggingface.co/datasets/YiYiXu/testing-images/resolve/main/seashore.png",
-    "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/diffusers/inpaint.png",
-    "https://huggingface.co/datasets/Sayali9141/traffic_signal_images/resolve/main/61.jpg",
+    "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/bee.jpg",
+    # "https://huggingface.co/datasets/YiYiXu/testing-images/resolve/main/seashore.png",
+    # "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/diffusers/inpaint.png",
+    # "https://huggingface.co/datasets/Sayali9141/traffic_signal_images/resolve/main/61.jpg",
 ]
 example_image_prompts = [
-    "Describe the natural environment in the image.",
-    "Describe the object and the weather condition in the image.",
-    "Describe the traffic condition on the road in the image.",
+    "Describe the image in detail.",
+    # "Describe the natural environment in the image.",
+    # "Describe the object and the weather condition in the image.",
+    # "Describe the traffic condition on the road in the image.",
 ]
 example_videos = [
     "https://huggingface.co/datasets/Efficient-Large-Model/VILA-inference-demos/resolve/main/OAI-sora-tokyo-walk.mp4",
@@ -35,6 +37,14 @@ def prepare_multimodal_inputs(model_dir: str,
                               media: List[str],
                               image_data_format: str = "pt",
                               num_frames: int = 8) -> List[Dict[str, Any]]:
+
+    print("[prepare_multimodal_inputs] model_dir: ", model_dir)
+    print("[prepare_multimodal_inputs] model_type: ", model_type)
+    print("[prepare_multimodal_inputs] modality: ", modality)
+    print("[prepare_multimodal_inputs] prompts: ", prompts)
+    print("[prepare_multimodal_inputs] media: ", media)
+    print("[prepare_multimodal_inputs] image_data_format: ", image_data_format)
+    print("[prepare_multimodal_inputs] num_frames: ", num_frames)
 
     inputs = []
     if modality == "image":

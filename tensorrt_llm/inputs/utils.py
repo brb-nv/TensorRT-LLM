@@ -274,6 +274,43 @@ def format_qwen2_vl_input(model_dir, inputs):
     return inputs
 
 
+def format_gemma3_input(model_dir, inputs):
+    """
+    This function formats the input for the Gemma3 VL model.
+
+    Arguments:
+        model_dir: The directory of the model to load any preprocessor.
+        inputs: The list of inputs to format.
+
+    Returns:
+        A list of dictionaries where "prompt" data is modified to a TextPrompt that combines text prompt and multimodal data.
+    """
+    processor = AutoProcessor.from_pretrained(model_dir)
+
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image", "image": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/bee.jpg"},
+                {"type": "text", "text": "Describe this image in detail."}
+            ]
+        }
+    ]
+
+    inputs = processor.apply_chat_template(
+        messages, add_generation_prompt=True, tokenize=True,
+        return_dict=True, return_tensors="pt"
+    ).to('cuda', dtype=torch.bfloat16)
+    input_dict = {}
+    input_dict["prompt_token_ids"] = inputs["input_ids"]
+    input_dict["token_type_ids"] = inputs["token_type_ids"]
+    input_dict["multi_modal_data"] = {
+        "image": inputs["pixel_values"]
+    }
+    input_dict["attention_mask"] = inputs["attention_mask"]
+    return input_dict
+
+
 def default_image_loader(prompts: List[str],
                          images: Union[List[List[str]], List[str]],
                          image_data_format: str = "pt"):
@@ -324,5 +361,5 @@ INPUT_FORMATTER_MAP = {
     "qwen2_vl": format_qwen2_vl_input,
     "qwen2_5_vl": format_qwen2_vl_input,
     "llama4": format_generic_input,
-    "gemma3": format_generic_input,     # TODO: Make this specific to gemma3.
+    "gemma3": format_generic_input,
 }

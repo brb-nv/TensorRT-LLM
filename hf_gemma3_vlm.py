@@ -3,7 +3,7 @@ from PIL import Image
 import requests
 import torch
 
-model_path = "/home/bbuddharaju/scratch/random/hf_models/gemma-3-27b-it/"
+model_path = "/home/bbuddharaju/scratch/random/hf_models/gemma-3-4b-it/"
 
 model = Gemma3ForConditionalGeneration.from_pretrained(
     model_path, device_map="auto"
@@ -12,10 +12,10 @@ model = Gemma3ForConditionalGeneration.from_pretrained(
 processor = AutoProcessor.from_pretrained(model_path)
 
 messages = [
-    {
-        "role": "system",
-        "content": [{"type": "text", "text": "You are a helpful assistant."}]
-    },
+    #{
+    #    "role": "system",
+    #    "content": [{"type": "text", "text": "You are a helpful assistant."}]
+    #},
     {
         "role": "user",
         "content": [

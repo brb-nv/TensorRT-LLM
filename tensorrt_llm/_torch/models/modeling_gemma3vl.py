@@ -70,6 +70,7 @@ class Gemma3InputProcessor(InputProcessor):
 
     @nvtx_range("[Vision] preprocess")
     def _preprocess(self, images):
+        print("[Gemma3InputProcessor] _preprocess: ", images)
         return [
             self.processor(text="dummy",
                            images=image,
