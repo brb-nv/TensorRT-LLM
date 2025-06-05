@@ -287,6 +287,8 @@ def format_gemma3_input(model_dir, inputs):
     """
     processor = AutoProcessor.from_pretrained(model_dir)
 
+    # TODO: Figure how to use multimodal data here. It's already in 'pt' format and autoprocessor complains.
+    # Hardcoding for now.
     messages = [
         {
             "role": "user",
@@ -297,18 +299,20 @@ def format_gemma3_input(model_dir, inputs):
         }
     ]
 
-    inputs = processor.apply_chat_template(
+    processor_output = processor.apply_chat_template(
         messages, add_generation_prompt=True, tokenize=True,
         return_dict=True, return_tensors="pt"
     ).to('cuda', dtype=torch.bfloat16)
-    input_dict = {}
-    input_dict["prompt_token_ids"] = inputs["input_ids"]
-    input_dict["token_type_ids"] = inputs["token_type_ids"]
-    input_dict["multi_modal_data"] = {
-        "image": inputs["pixel_values"]
-    }
-    input_dict["attention_mask"] = inputs["attention_mask"]
-    return input_dict
+
+    result_dict = {}
+    result_dict["prompt"] = inputs[0]["prompt"]
+    result_dict["multimodal_data"] = {"image": [processor_output["pixel_values"]]}
+    result_dict["mm_processor_kwargs"] = {}
+    result_dict["mm_processor_kwargs"]["input_ids"] = processor_output["input_ids"]
+    result_dict["mm_processor_kwargs"]["attention_mask"] = processor_output["attention_mask"]
+    result_dict["mm_processor_kwargs"]["token_type_ids"] = processor_output["token_type_ids"]
+    result_dict["mm_processor_kwargs"]["pixel_values"] = processor_output["pixel_values"]
+    return [result_dict]
 
 
 def default_image_loader(prompts: List[str],
@@ -361,5 +365,5 @@ INPUT_FORMATTER_MAP = {
     "qwen2_vl": format_qwen2_vl_input,
     "qwen2_5_vl": format_qwen2_vl_input,
     "llama4": format_generic_input,
-    "gemma3": format_generic_input,
+    "gemma3": format_gemma3_input,
 }

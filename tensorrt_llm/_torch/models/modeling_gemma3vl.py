@@ -58,12 +58,15 @@ class Gemma3InputProcessor(InputProcessor):
         hf_mm_projector = module_dict["multi_modal_projector"].to(
             self.dtype).to(self.device)
 
-        # Use TRTLLM vision tower(CLIPVisionModel)
-        vision_model_config = ModelConfig(
-            pretrained_config=model_config.vision_config, attn_backend="TRTLLM")
-        self.vision_tower = SiglipVisionModel(vision_model_config).to(
-            self.device).to(self.dtype)
-        self.vision_tower.load_weights(hf_vision_tower.state_dict())
+        # # Use TRTLLM vision tower(CLIPVisionModel)
+        # vision_model_config = ModelConfig(
+        #     pretrained_config=model_config.vision_config, attn_backend="TRTLLM")
+        # self.vision_tower = SiglipVisionModel(vision_model_config).to(
+        #     self.device).to(self.dtype)
+        # self.vision_tower.load_weights(hf_vision_tower.state_dict())
+
+        # Use HF vision tower for debugging. Needs to be replaced with TRTLLM vision tower.
+        self.vision_tower = hf_vision_tower.to(self.device)
 
         # Use HF multi-modal projector
         self.mm_projector = hf_mm_projector
@@ -82,15 +85,17 @@ class Gemma3InputProcessor(InputProcessor):
 
     @nvtx_range("[Vision] process")
     def _process(self, pixel_values):
-        attn_metadata = self.vision_tower.prepare_attn_metadata(
-            pixel_values.shape[0])
+        # assert pixel_values.dim() == 4, "pixel_values should be a 4D tensor"
+        # assert pixel_values.shape[0] == 1, "pixel_values should have batch size 1"
+        # attn_metadata = self.vision_tower.prepare_attn_metadata(pixel_values.shape[0])
         image_features: Tuple[torch.Tensor] = self.vision_tower(
             pixel_values,
-            attn_metadata=attn_metadata,
-        )
-        selected_image_feature = image_features[-2][:, 1:]
-        image_features = self.mm_projector(selected_image_feature)
-        return image_features.reshape(-1, image_features.shape[-1])
+            # attn_metadata=attn_metadata,
+        ).last_hidden_state
+        print("[Gemma3InputProcessor::_process] vision_tower output:", image_features.shape, image_features)
+        image_features = self.mm_projector(image_features)
+        print("[Gemma3InputProcessor::_process] mm_projector output:", image_features.shape, image_features)
+        return image_features
 
     @nvtx_range("[Vision] postprocess")
     def _postprocess(self, input_ids, mm_features):
@@ -177,16 +182,9 @@ class Gemma3InputProcessor(InputProcessor):
     def __call__(
         self, inputs: TextPrompt, sampling_params: SamplingParams
     ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
-        text_prompt, mm_data = inputs.get("prompt"), inputs.get(
-            "multi_modal_data", {})
-        assert 'image' in mm_data
-
-        input_ids = self.tokenizer(
-            text_prompt, return_tensors="pt").input_ids[0].to(self.device)
-
-        mm_tensor = self._preprocess(mm_data['image'])
-        mm_features = torch.stack(
-            [self._process(tensor) for tensor in mm_tensor])
+        text_prompt, mm_data, mm_processor_kwargs = inputs.get("prompt"), inputs.get(
+            "multi_modal_data", {}), inputs.get("mm_processor_kwargs", {})
+        mm_features = self._process(mm_processor_kwargs["pixel_values"])
         fused_input_ids, mm_features = self._postprocess(input_ids, mm_features)
         return fused_input_ids.to(torch.int32).tolist(), {
             "mm_embedding": mm_features
