@@ -210,7 +210,7 @@ class Gemma3Model(PreTrainedModel):
         self.llm = Gemma3ForCausalLM(llm_model_config)
 
         self.model_config = model_config
-        # self.vocab_size = config.vocab_size
+        self.vocab_size = config.text_config.vocab_size
         self.model_dtype = getattr(config.text_config, "torch_dtype",
                                    torch.float16)
         logger.info(f"{self.dtype=} {self.model_dtype=}")
