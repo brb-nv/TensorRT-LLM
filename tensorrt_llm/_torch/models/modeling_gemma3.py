@@ -83,7 +83,9 @@ class Gemma3Attention(Attention):
         **kwargs,
     ) -> torch.Tensor:
 
-        attention_window_size = self.attention_window_size or attn_metadata.max_seq_len
+        # TODO: Use window_left in FlashInfer to enable SWA.
+        max_seq_len = 32768         # Hardcoding as fashinfer's metadata doesn't have this.
+        attention_window_size = self.attention_window_size or max_seq_len
         return super().forward(position_ids=position_ids,
                                hidden_states=hidden_states,
                                attn_metadata=attn_metadata,
