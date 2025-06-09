@@ -312,9 +312,6 @@ def format_gemma3_input(model_dir, inputs):
     result_dict["mm_processor_kwargs"]["attention_mask"] = processor_output["attention_mask"]
     result_dict["mm_processor_kwargs"]["token_type_ids"] = processor_output["token_type_ids"]
     result_dict["mm_processor_kwargs"]["pixel_values"] = processor_output["pixel_values"]
-
-    print("[HAIDER] processor_output[token_type_ids]: ", processor_output["token_type_ids"])
-
     return [result_dict]
 
 

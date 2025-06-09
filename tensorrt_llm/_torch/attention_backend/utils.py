@@ -5,7 +5,7 @@ from . import IS_FLASHINFER_AVAILABLE
 from .interface import AttentionBackend, MLAParams, PositionalEmbeddingParams
 from .trtllm import TrtllmAttention
 from .vanilla import VanillaAttention
-import torch
+
 
 def get_attention_backend(backend_name: str) -> Type[AttentionBackend]:
     if backend_name == "VANILLA":
@@ -77,43 +77,3 @@ def create_attention(
         skip_create_weights_in_init=skip_create_weights_in_init,
         attention_chunk_size=attention_chunk_size,
     )
-
-def create_bidirectional_mm_mask(
-    kv_len, ctx_len, mm_token_type_ids
-):
-    print("CALL TO create_bidirectional_mm_mask.")
-    print("kv_len: ", kv_len)
-    print("ctx_len: ", ctx_len)
-    print("mm_token_type_ids: ", mm_token_type_ids)
-    mask_i = torch.tril(
-        torch.full((ctx_len, kv_len), True, device="cuda"),
-        diagonal=(kv_len - ctx_len),
-    )
-
-    # Apply bidirectional mask on images if token type ids are provided.
-    if mm_token_type_ids is not None:
-        token_type_mask = mm_token_type_ids.unsqueeze(0) == mm_token_type_ids.unsqueeze(1)
-        token_type_mask[mm_token_type_ids == 0] = False  # if text token do not change anything.
-        token_type_mask = token_type_mask.to('cuda', dtype=torch.bool)
-
-        # Calculate token_type_mask (left, right, top, bottom) to match mask_i's shape.
-        # We pad with zeros such that the padded stuff corresponds to text.
-        pad_rows = mask_i.shape[0] - token_type_mask.shape[0]
-        pad_cols = mask_i.shape[1] - token_type_mask.shape[1]
-        padding = (0, pad_cols, 0, pad_rows)
-        token_type_mask_padded = torch.nn.functional.pad(token_type_mask, padding, mode='constant', value=0)
-
-        mask_i = token_type_mask_padded | mask_i
-
-    # if attention_mask is not None:
-    #     causal_mask = causal_mask.clone()  # copy to contiguous memory for in-place edit
-    #     mask_length = attention_mask.shape[-1]
-
-    #     # Then apply padding mask (will mask pad tokens)
-    #     padding_mask = causal_mask[:, :, :, :mask_length] + attention_mask[:, None, None, :].to(causal_mask.device)
-    #     padding_mask = padding_mask == 0
-    #     causal_mask[:, :, :, :mask_length] = causal_mask[:, :, :, :mask_length].masked_fill(
-    #         padding_mask, False
-    #     )
-
-    return mask_i
