@@ -73,7 +73,6 @@ class Gemma3InputProcessor(InputProcessor):
 
     @nvtx_range("[Vision] preprocess")
     def _preprocess(self, images):
-        print("[Gemma3InputProcessor] _preprocess: ", images)
         return [
             self.processor(text="dummy",
                            images=image,
@@ -85,8 +84,6 @@ class Gemma3InputProcessor(InputProcessor):
 
     @nvtx_range("[Vision] process")
     def _process(self, pixel_values):
-        # assert pixel_values.dim() == 4, "pixel_values should be a 4D tensor"
-        # assert pixel_values.shape[0] == 1, "pixel_values should have batch size 1"
         # attn_metadata = self.vision_tower.prepare_attn_metadata(pixel_values.shape[0])
         image_features: Tuple[torch.Tensor] = self.vision_tower(
             pixel_values,
@@ -244,7 +241,6 @@ class Gemma3Model(PreTrainedModel):
         logger.debug(f"{num_context_requests=}, {num_generation_requests=}")
 
         mm_embed = kwargs.get("multi_modal_data", [])
-        print("[Gemma3Model::forward] mm_embed: ", mm_embed)
         assert mm_embed == [] or len(
             mm_embed
         ) == num_context_requests, "Number of multimodal features (if provided) should be equal to number of context requests"
