@@ -453,8 +453,13 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
                 metadata: FlashInferAttentionMetadata,
                 *,
                 attention_mask: AttentionMask = PredefinedAttentionMask.CAUSAL,
+                attention_mask_data: Optional[torch.Tensor],
                 **kwargs) -> torch.Tensor:
-        if attention_mask == PredefinedAttentionMask.CAUSAL:
+        if attention_mask_data is not None:
+            print("[FlashInferAttention::forward] Received attention_mask_data of shape ", attention_mask_data.shape)
+            attention_mask_type = int(AttentionMaskType.custom_mask)
+            attention_mask_data = attention_mask_data.flatten()
+        elif attention_mask == PredefinedAttentionMask.CAUSAL:
             attention_mask_type = int(AttentionMaskType.causal)
             attention_mask_data = None
         elif attention_mask == PredefinedAttentionMask.FULL:

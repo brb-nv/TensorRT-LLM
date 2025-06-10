@@ -86,6 +86,31 @@ class Gemma3Attention(Attention):
         # TODO: Use window_left in FlashInfer to enable SWA.
         max_seq_len = 32768         # Hardcoding as fashinfer's metadata doesn't have this.
         attention_window_size = self.attention_window_size or max_seq_len
+        attention_mask_data = None
+        if hidden_states.size(0) > 1:
+            curr_seq_len = hidden_states.size(0)
+            attention_mask_data = torch.tril(torch.ones(curr_seq_len, curr_seq_len)).bool().to('cuda')
+            # Hardcoding for debugging.
+            if hidden_states.size(0) == 274:
+                mm_token_type_ids = torch.tensor([
+                    0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+                    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+                    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+                    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+                    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+                    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+                    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+                    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+                    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+                    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+                    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0,
+                    0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+                ]).to(dtype=torch.int32)
+                token_type_mask = mm_token_type_ids.unsqueeze(0) == mm_token_type_ids.unsqueeze(1)
+                token_type_mask[mm_token_type_ids == 0] = False  # if text token do not change anything.
+                token_type_mask = token_type_mask.to('cuda', dtype=torch.bool)
+                attention_mask_data = token_type_mask | attention_mask_data
+                print("attention_mask_data.sum(dim=-1): ", attention_mask_data.sum(dim=-1))
         return super().forward(position_ids=position_ids,
                                hidden_states=hidden_states,
                                attn_metadata=attn_metadata,
@@ -94,6 +119,7 @@ class Gemma3Attention(Attention):
                                all_reduce_params=all_reduce_params,
                                lora_params=lora_params,
                                attention_window_size=attention_window_size,
+                               attention_mask_data=attention_mask_data,
                                **kwargs)
 
     def apply_qk_norm(self, q, k):
@@ -249,8 +275,12 @@ class Gemma3TextModel(DecoderModel):
             )
 
         if inputs_embeds is None:
+            print("[Gemma3TextModel] inputs_embeds is None. Must be decode with input_ids ", input_ids)
             inputs_embeds = self.embed_tokens(input_ids)
             inputs_embeds = inputs_embeds * math.sqrt(self.hidden_size)
+        else:
+            curr_seq_len = inputs_embeds.size(0)
+            print("[Gemma3TextModel] inputs_embeds is NOT None. Must be prefill of seq_len ", curr_seq_len)
 
         assert self.dtype == torch.bfloat16, "Expected dtype is bfloat16."
         hidden_states = inputs_embeds.to(self.dtype)
