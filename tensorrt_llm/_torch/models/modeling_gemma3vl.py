@@ -254,6 +254,17 @@ class Gemma3Model(PreTrainedModel):
             input_ids=input_ids,
             mm_embeds=mm_embed,
             mm_token_ids=torch.tensor([262144]).to(input_ids.device))
+        # ##################################################################
+        # if len(mm_embed):
+        #     ref_tensor = torch.load('multimodal_embeds.pt')
+        #     print("ref_tensor shape: ", ref_tensor.shape)
+        #     print("inputs_embed shape: ", inputs_embeds.shape)
+        #     diff = torch.abs(ref_tensor - inputs_embeds)
+        #     max_diff = torch.max(diff)
+        #     mean_diff = torch.mean(diff)
+        #     print(f"[inputs_embeds] Max difference: {max_diff.item()}")
+        #     print(f"[inputs_embeds] Mean difference: {mean_diff.item()}")
+        # ##################################################################
         logits = self.llm.forward(attn_metadata, input_ids, position_ids,
                                   inputs_embeds, return_context_logits)
         return logits

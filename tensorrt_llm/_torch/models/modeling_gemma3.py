@@ -6,6 +6,8 @@ from torch import nn
 from tqdm import tqdm
 from transformers import Gemma3TextConfig
 from transformers.activations import ACT2FN
+import os
+import numpy as np
 
 from tensorrt_llm.functional import PositionEmbeddingType
 
@@ -24,6 +26,14 @@ from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
                              duplicate_kv_weight, filter_weights,
                              register_auto_model)
 
+trtllm_debug_path = "/home/bbuddharaju/scratch/TensorRT-LLM/trtllm_debug/"
+
+def save_tensor_to_npy(tensorname, tensor):
+    numpy_array = tensor.detach().cpu().float().numpy()
+    filename = tensorname + ".npy"
+    filepath = os.path.join(trtllm_debug_path, filename)
+    np.save(filepath, numpy_array)
+    # print(f"TRTLLM: {tensorname}:\n{tensor}")
 
 class Gemma3Attention(Attention):
 
@@ -184,25 +194,36 @@ class Gemma3DecoderLayer(DecoderLayer):
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
         residual: Optional[torch.Tensor] = None,
+        is_prefill=False,
         **kwargs,
     ) -> torch.Tensor:
 
+        print_condition = (is_prefill and self.layer_idx == 0)
+
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
+        if print_condition: save_tensor_to_npy(f"attention_input_{self.layer_idx}", hidden_states)
         hidden_states = self.self_attn(
             position_ids=position_ids,
             hidden_states=hidden_states,
             attn_metadata=attn_metadata,
             **kwargs,
         )
+        if print_condition: save_tensor_to_npy(f"attention_output_{self.layer_idx}", hidden_states)
         hidden_states = self.post_attention_layernorm(hidden_states)
+        if print_condition: save_tensor_to_npy(f"attention_output_post_layernorm_{self.layer_idx}", hidden_states)
         hidden_states = residual + hidden_states
+        if print_condition: save_tensor_to_npy(f"attention_output_with_residual_{self.layer_idx}", hidden_states)
+
         residual = hidden_states
         hidden_states = self.pre_feedforward_layernorm(hidden_states)
+        if print_condition: save_tensor_to_npy(f"mlp_input_{self.layer_idx}", hidden_states)
         hidden_states = self.mlp(hidden_states)
+        if print_condition: save_tensor_to_npy(f"mlp_output_{self.layer_idx}", hidden_states)
         hidden_states = self.post_feedforward_layernorm(hidden_states)
+        if print_condition: save_tensor_to_npy(f"mlp_output_post_layernorm_{self.layer_idx}", hidden_states)
         hidden_states = residual + hidden_states
-
+        if print_condition: save_tensor_to_npy(f"mlp_output_with_residual_{self.layer_idx}", hidden_states)
         return hidden_states
 
 
@@ -246,19 +267,28 @@ class Gemma3TextModel(DecoderModel):
                 "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
             )
 
+        is_prefill = False
         if inputs_embeds is None:
+            is_prefill = False
             inputs_embeds = self.embed_tokens(input_ids)
             inputs_embeds = inputs_embeds * math.sqrt(self.hidden_size)
+        else:
+            ref_tensor = torch.load('multimodal_embeds.pt').squeeze(dim=0)
+            inputs_embeds = ref_tensor.clone().to(inputs_embeds.device)
+            is_prefill = True
 
+        if is_prefill: save_tensor_to_npy(f"input_embeddings_scaled", inputs_embeds)
         assert self.dtype == torch.bfloat16, "Expected dtype is bfloat16."
         hidden_states = inputs_embeds.to(self.dtype)
 
         for decoder_layer in self.layers:
             hidden_states = decoder_layer(position_ids=position_ids,
                                           hidden_states=hidden_states,
-                                          attn_metadata=attn_metadata)
+                                          attn_metadata=attn_metadata,
+                                          is_prefill=is_prefill)
 
         hidden_states = self.norm(hidden_states)
+        if is_prefill: save_tensor_to_npy(f"final_norm_output", hidden_states)
         return hidden_states
 
 
