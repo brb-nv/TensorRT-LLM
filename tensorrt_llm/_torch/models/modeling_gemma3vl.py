@@ -7,8 +7,7 @@ import torch.nn as nn
 from transformers import (AutoConfig, AutoModel, AutoProcessor, Gemma3Config,
                           PretrainedConfig, PreTrainedModel)
 from transformers.modeling_utils import load_sharded_checkpoint
-from transformers.models.gemma3.modeling_gemma3 import \
-    Gemma3MultiModalProjector
+from transformers.models.gemma3.modeling_gemma3 import Gemma3MultiModalProjector
 
 from ..._utils import nvtx_range
 from ...inputs import (ExtraProcessedInputs, InputProcessor, TextPrompt,
@@ -18,20 +17,17 @@ from ...logger import logger
 from ...sampling_params import SamplingParams
 from ..attention_backend import AttentionMetadata
 from ..model_config import ModelConfig
-from .modeling_auto import AutoModelForCausalLM
-from .modeling_siglip import SiglipVisionModel
+from .modeling_gemma3 import Gemma3ForCausalLM
 from .modeling_multimodal_utils import fuse_input_embeds
 from .modeling_utils import ModelConfig, filter_weights, register_auto_model
-from .modeling_gemma3 import Gemma3ForCausalLM
 
 
 class Gemma3InputProcessor(InputProcessor):
 
     def __init__(self, model_path, model_config, tokenizer, trust_remote_code):
         self.tokenizer = tokenizer
-        self.processor = AutoProcessor.from_pretrained(model_path,
-                                                       trust_remote_code=trust_remote_code,
-                                                       use_fast=True)
+        self.processor = AutoProcessor.from_pretrained(
+            model_path, trust_remote_code=trust_remote_code, use_fast=True)
         self.model_config = model_config
 
         self.device = 'cuda'
@@ -55,7 +51,8 @@ class Gemma3InputProcessor(InputProcessor):
                                                   local_model_path,
                                                   strict=False)
         assert len(missing_keys) == 0, f"Missing keys: {missing_keys}"
-        hf_vision_tower = module_dict["vision_tower"].to(self.dtype).to(self.device)
+        hf_vision_tower = module_dict["vision_tower"].to(self.dtype).to(
+            self.device)
         hf_mm_projector = module_dict["multi_modal_projector"].to(
             self.dtype).to(self.device)
 
@@ -68,39 +65,54 @@ class Gemma3InputProcessor(InputProcessor):
     @nvtx_range("[Vision] preprocess")
     def _preprocess(self, inputs):
         # TODO: Replace this with using prompt from inputs.
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image", "image": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/bee.jpg"},
-                    {"type": "text", "text": "Describe this image in detail."}
-                ]
-            }
-        ]
+        messages = [{
+            "role":
+            "user",
+            "content": [{
+                "type":
+                "image",
+                "image":
+                "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/bee.jpg"
+            }, {
+                "type": "text",
+                "text": "Describe this image in detail."
+            }]
+        }]
 
         processor_output = self.processor.apply_chat_template(
-            messages, add_generation_prompt=True, tokenize=True,
-            return_dict=True, return_tensors="pt"
-        ).to('cuda', dtype=torch.bfloat16)
+            messages,
+            add_generation_prompt=True,
+            tokenize=True,
+            return_dict=True,
+            return_tensors="pt").to('cuda', dtype=torch.bfloat16)
 
         print("[_preprocess] inputs: ", inputs)
 
         result_dict = {}
         result_dict["prompt"] = inputs["prompt"]
-        result_dict["multimodal_data"] = {"image": [processor_output["pixel_values"]]}
+        result_dict["multimodal_data"] = {
+            "image": [processor_output["pixel_values"]]
+        }
         result_dict["mm_processor_kwargs"] = {}
-        result_dict["mm_processor_kwargs"]["input_ids"] = processor_output["input_ids"]
-        result_dict["mm_processor_kwargs"]["attention_mask"] = processor_output["attention_mask"]
-        result_dict["mm_processor_kwargs"]["token_type_ids"] = processor_output["token_type_ids"]
-        result_dict["mm_processor_kwargs"]["pixel_values"] = processor_output["pixel_values"]
+        result_dict["mm_processor_kwargs"]["input_ids"] = processor_output[
+            "input_ids"]
+        result_dict["mm_processor_kwargs"]["attention_mask"] = processor_output[
+            "attention_mask"]
+        result_dict["mm_processor_kwargs"]["token_type_ids"] = processor_output[
+            "token_type_ids"]
+        result_dict["mm_processor_kwargs"]["pixel_values"] = processor_output[
+            "pixel_values"]
         return [result_dict]
 
     @nvtx_range("[Vision] process")
     def _process(self, pixel_values):
-        image_features: Tuple[torch.Tensor] = self.vision_tower(pixel_values).last_hidden_state
-        print("[Gemma3InputProcessor::_process] vision_tower output:", image_features.shape, image_features)
+        image_features: Tuple[torch.Tensor] = self.vision_tower(
+            pixel_values).last_hidden_state
+        print("[Gemma3InputProcessor::_process] vision_tower output:",
+              image_features.shape, image_features)
         image_features = self.mm_projector(image_features)
-        print("[Gemma3InputProcessor::_process] mm_projector output:", image_features.shape, image_features)
+        print("[Gemma3InputProcessor::_process] mm_projector output:",
+              image_features.shape, image_features)
         return image_features
 
     @torch.inference_mode()
@@ -108,10 +120,13 @@ class Gemma3InputProcessor(InputProcessor):
         self, inputs: TextPrompt, sampling_params: SamplingParams
     ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
         preprocess_outputs = self._preprocess(inputs)
-        pixel_values = preprocess_outputs[0]["mm_processor_kwargs"]["pixel_values"]
+        pixel_values = preprocess_outputs[0]["mm_processor_kwargs"][
+            "pixel_values"]
         input_ids = preprocess_outputs[0]["mm_processor_kwargs"]["input_ids"]
         mm_features = self._process(pixel_values)
-        return input_ids[0].to(torch.int32).tolist(), {"mm_embedding": mm_features}
+        return input_ids[0].to(torch.int32).tolist(), {
+            "mm_embedding": mm_features
+        }
 
 
 @register_auto_model("Gemma3ForConditionalGeneration")
@@ -129,7 +144,7 @@ class Gemma3Model(PreTrainedModel):
         llm_model_config = copy.deepcopy(model_config)
         llm_model_config.pretrained_config = model_config.pretrained_config.text_config
 
-        llm_model_config.pretrained_config.torch_dtype = torch.bfloat16 # Harcoding for Gemma3 VLM.
+        llm_model_config.pretrained_config.torch_dtype = torch.bfloat16  # Harcoding for Gemma3 VLM.
         self.llm = Gemma3ForCausalLM(llm_model_config)
 
         self.model_config = model_config
@@ -167,7 +182,6 @@ class Gemma3Model(PreTrainedModel):
         logger.debug(f"{num_context_requests=}, {num_generation_requests=}")
 
         mm_embed = kwargs.get("multi_modal_data", [])
-        print("[Gemma3Model::forward] mm_embed: ", mm_embed)
         assert mm_embed == [] or len(
             mm_embed
         ) == num_context_requests, "Number of multimodal features (if provided) should be equal to number of context requests"

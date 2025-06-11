@@ -240,7 +240,7 @@ def retrieve_multimodal_placeholder(model_type: str, modality: str,
             return "<|image|>"
         elif model_type in SUPPORTED_LLAVA_IMAGE_MODEL_GROUP:
             return "<image>"
-        elif model_type in SUPPORTED_GEMMA_MODEL_GROUP:   # @B: Double-check this.
+        elif model_type in SUPPORTED_GEMMA_MODEL_GROUP:  # @B: Double-check this.
             return "<image>"
         elif model_type in SUPPORTED_HYPERCLOVAX_MODEL_GROUP:
             return '<im_end>\n<|im_start|>user (mime) \n{"type": "image/jpeg", "filename": ""}<|im_end|>\n' + \
