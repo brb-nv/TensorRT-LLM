@@ -68,10 +68,11 @@ class Gemma3InputProcessor(InputProcessor):
             "multi_modal_data", {})
         assert 'image' in mm_data
         processor_output = self.processor(text=text_prompt,
-                                images=mm_data["image"][0],
-                                return_dict=True,
-                                return_tensors="pt",
-                                device=self.device).to('cuda', dtype=torch.bfloat16)
+                                          images=mm_data["image"][0],
+                                          return_dict=True,
+                                          return_tensors="pt",
+                                          device=self.device).to(
+                                              'cuda', dtype=torch.bfloat16)
         result_dict = {}
         result_dict["prompt"] = inputs["prompt"]
         result_dict["multimodal_data"] = {
@@ -170,7 +171,8 @@ class Gemma3Model(PreTrainedModel):
             embedding_layer=self.llm.model.embed_tokens,
             input_ids=input_ids,
             mm_embeds=mm_embed,
-            mm_token_ids=torch.tensor([self.image_token_index]).to(input_ids.device))
+            mm_token_ids=torch.tensor([self.image_token_index
+                                       ]).to(input_ids.device))
         logits = self.llm.forward(attn_metadata, input_ids, position_ids,
                                   inputs_embeds, return_context_logits)
         return logits

@@ -69,8 +69,7 @@ def fuse_input_embeds(
     text_token_indices = torch.where(text_token_mask)[0]
     mm_token_indices = torch.where(mm_token_mask)[0]
 
-    text_embed = embedding_layer(
-        input_ids[text_token_indices])
+    text_embed = embedding_layer(input_ids[text_token_indices])
     input_embeds = torch.empty(input_ids.shape[0],
                                mm_embed.shape[-1],
                                device=text_embed.device,

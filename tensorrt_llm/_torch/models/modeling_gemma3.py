@@ -27,6 +27,7 @@ from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
 
 
 class Gemma3TextScaledWordEmbedding(Embedding):
+
     def __init__(
         self,
         vocab_size: int,
@@ -48,6 +49,7 @@ class Gemma3TextScaledWordEmbedding(Embedding):
 
     def forward(self, input_ids):
         return super().forward(input_ids) * self.embed_scale
+
 
 class Gemma3Attention(Attention):
 
