@@ -25,11 +25,11 @@ from .modeling_utils import ModelConfig, filter_weights, register_auto_model
 class Gemma3InputProcessor(InputProcessor):
 
     def __init__(self, model_path, model_config, tokenizer, trust_remote_code):
+
         self.tokenizer = tokenizer
         self.processor = AutoProcessor.from_pretrained(
             model_path, trust_remote_code=trust_remote_code, use_fast=True)
         self.model_config = model_config
-
         self.device = 'cuda'
 
         # Determine the actual local path for model files
@@ -56,7 +56,7 @@ class Gemma3InputProcessor(InputProcessor):
         hf_mm_projector = module_dict["multi_modal_projector"].to(
             self.dtype).to(self.device)
 
-        # Use HF vision tower for debugging. To be replaced with TRTLLM vision tower.
+        # Use HF vision tower. To be replaced with TRTLLM vision tower.
         self.vision_tower = hf_vision_tower
 
         # Use HF multi-modal projector
@@ -64,7 +64,6 @@ class Gemma3InputProcessor(InputProcessor):
 
     @nvtx_range("[Vision] preprocess")
     def _preprocess(self, inputs):
-        print("[_preprocess] inputs: ", inputs)
         text_prompt, mm_data = inputs.get("prompt"), inputs.get(
             "multi_modal_data", {})
         assert 'image' in mm_data
@@ -91,11 +90,7 @@ class Gemma3InputProcessor(InputProcessor):
     def _process(self, pixel_values):
         image_features: Tuple[torch.Tensor] = self.vision_tower(
             pixel_values).last_hidden_state
-        print("[Gemma3InputProcessor::_process] vision_tower output:",
-              image_features.shape, image_features)
         image_features = self.mm_projector(image_features)
-        print("[Gemma3InputProcessor::_process] mm_projector output:",
-              image_features.shape, image_features)
         return image_features
 
     @torch.inference_mode()
