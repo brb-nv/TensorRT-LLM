@@ -27,9 +27,10 @@ from .modeling_gemma3 import Gemma3ForCausalLM
 
 class Gemma3InputProcessor(InputProcessor):
 
-    def __init__(self, model_path, model_config, tokenizer):
+    def __init__(self, model_path, model_config, tokenizer, trust_remote_code):
         self.tokenizer = tokenizer
         self.processor = AutoProcessor.from_pretrained(model_path,
+                                                       trust_remote_code=trust_remote_code,
                                                        use_fast=True)
         self.model_config = model_config
 
@@ -72,127 +73,56 @@ class Gemma3InputProcessor(InputProcessor):
         self.mm_projector = hf_mm_projector
 
     @nvtx_range("[Vision] preprocess")
-    def _preprocess(self, images):
-        print("[Gemma3InputProcessor] _preprocess: ", images)
-        return [
-            self.processor(text="dummy",
-                           images=image,
-                           do_rescale=not isinstance(image, torch.Tensor),
-                           return_tensors="pt",
-                           device=self.device)['pixel_values'][0].to(
-                               self.device) for image in images
+    def _preprocess(self, inputs):
+        # TODO: Replace this with using prompt from inputs.
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/bee.jpg"},
+                    {"type": "text", "text": "Describe this image in detail."}
+                ]
+            }
         ]
+
+        processor_output = self.processor.apply_chat_template(
+            messages, add_generation_prompt=True, tokenize=True,
+            return_dict=True, return_tensors="pt"
+        ).to('cuda', dtype=torch.bfloat16)
+
+        print("[_preprocess] inputs: ", inputs)
+
+        result_dict = {}
+        result_dict["prompt"] = inputs["prompt"]
+        result_dict["multimodal_data"] = {"image": [processor_output["pixel_values"]]}
+        result_dict["mm_processor_kwargs"] = {}
+        result_dict["mm_processor_kwargs"]["input_ids"] = processor_output["input_ids"]
+        result_dict["mm_processor_kwargs"]["attention_mask"] = processor_output["attention_mask"]
+        result_dict["mm_processor_kwargs"]["token_type_ids"] = processor_output["token_type_ids"]
+        result_dict["mm_processor_kwargs"]["pixel_values"] = processor_output["pixel_values"]
+        return [result_dict]
 
     @nvtx_range("[Vision] process")
     def _process(self, pixel_values):
-        # assert pixel_values.dim() == 4, "pixel_values should be a 4D tensor"
-        # assert pixel_values.shape[0] == 1, "pixel_values should have batch size 1"
-        # attn_metadata = self.vision_tower.prepare_attn_metadata(pixel_values.shape[0])
-        image_features: Tuple[torch.Tensor] = self.vision_tower(
-            pixel_values,
-            # attn_metadata=attn_metadata,
-        ).last_hidden_state
+        image_features: Tuple[torch.Tensor] = self.vision_tower(pixel_values).last_hidden_state
         print("[Gemma3InputProcessor::_process] vision_tower output:", image_features.shape, image_features)
         image_features = self.mm_projector(image_features)
         print("[Gemma3InputProcessor::_process] mm_projector output:", image_features.shape, image_features)
         return image_features
 
-    @nvtx_range("[Vision] postprocess")
-    def _postprocess(self, input_ids, mm_features):
-        # Define model specific variables here before shared logic
-        mm_tokens = torch.tensor([self.model_config.image_token_index
-                                  ]).to(input_ids.device)
-        model_hidden_size = self.model_config.text_config.hidden_size
-        vocab_size = self.model_config.text_config.vocab_size
-        start_len = end_len = 0  # for llava, need not append start/end token around each image token
-        # End model specific variables
-
-        ## find mm token positions in input_ids
-        mm_token_positions = torch.where(torch.isin(input_ids, mm_tokens))[0]
-        num_medias = num_mm_tokens = len(mm_token_positions)
-        if num_medias > 1 and isinstance(mm_features, torch.Tensor):
-            mm_features = list(
-                mm_features.split(mm_features.shape[0] // num_medias))
-
-        if isinstance(mm_features, torch.Tensor):
-            # 1 prompt + 1 media
-            # "split" means what a single mm_token in the input_ids should represent
-            # image: one split --> one frame
-            # video: one split --> N frames
-            num_frames, mm_feature_length, mm_hidden_dim = mm_features.shape
-            mm_lengths_per_split = [mm_feature_length * num_frames]
-            mm_lengths_per_frame = [mm_feature_length]
-        elif isinstance(mm_features, list):
-            # 1 prompt + N media
-            num_frames = len(mm_features) if mm_features[0].dim() == 2 else sum(
-                [f.shape[0] for f in mm_features])
-            mm_lengths_per_split = [
-                f.shape[0] if f.dim() == 2 else f.shape[0] * f.shape[1]
-                for f in mm_features
-            ]
-            mm_lengths_per_frame = [
-                f.shape[0] if f.dim() == 2 else f.shape[1] for f in mm_features
-            ]
-            mm_hidden_dim = mm_features[0].shape[-1]
-            mm_features = torch.cat(mm_features, dim=0)
-        else:
-            raise ValueError(
-                f"Invalid multimodal features type: {type(mm_features)}")
-        mm_total_length = sum(mm_lengths_per_split)
-        assert mm_hidden_dim == model_hidden_size, "Multimodal embedding_dim must match model hidden_size"
-
-        ## split input_ids into segments by isolating mm tokens
-        mm_split_positions = torch.cat(
-            [mm_token_positions, mm_token_positions + 1]).unique()
-        input_ids_splits = list(input_ids.tensor_split(mm_split_positions.cpu(
-        )))  # len(input_ids_splits) = num_segments after mm tokens are isolated
-        mm_ids_splits = list(
-            torch.arange(vocab_size,
-                         vocab_size + mm_total_length,
-                         device=input_ids.device).split(mm_lengths_per_split)
-        )  # len(mm_ids_splits) = num_mm_segments
-
-        for i, mm_ids in enumerate(mm_ids_splits):
-            mm_ids = mm_ids.reshape(-1, mm_lengths_per_frame[i])
-            mm_ids_splits[i] = mm_ids.flatten()
-
-        ## replace mm token ids with the expanded out-of-vocab ids
-        mm_split_idx = 0
-        for i, split in enumerate(input_ids_splits):
-            if torch.isin(split, mm_tokens).any().item():
-                input_ids_splits[i] = mm_ids_splits[mm_split_idx]
-                mm_split_idx += 1
-        assert mm_split_idx == len(
-            mm_ids_splits), "All mm_ids_splits should be consumed"
-
-        ## concat text & mm input_ids, wrap mm feature in prompt tuning config
-        fused_input_ids = torch.cat(input_ids_splits).to(
-            device=input_ids.device)
-        fused_length = len(input_ids) + mm_total_length + num_frames * (
-            start_len + end_len) - num_medias
-        assert len(
-            fused_input_ids
-        ) == fused_length, f"Fused input_ids length {len(fused_input_ids)} should match the sum of text and multimodal embedding lengths {fused_length}"
-
-        # [num_frames, feature_length, hidden_dim] -> [num_frames * feature_length, hidden_dim]
-        mm_features = mm_features.view(-1, mm_features.shape[-1])
-        return fused_input_ids, mm_features
-
     @torch.inference_mode()
     def __call__(
         self, inputs: TextPrompt, sampling_params: SamplingParams
     ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
-        text_prompt, mm_data, mm_processor_kwargs = inputs.get("prompt"), inputs.get(
-            "multi_modal_data", {}), inputs.get("mm_processor_kwargs", {})
-        mm_features = self._process(mm_processor_kwargs["pixel_values"])
-        # TODO: Need to figure why [0] must be passed. How should a batch work?
-        return mm_processor_kwargs["input_ids"][0].to(torch.int32).tolist(), {
-            "mm_embedding": mm_features
-        }
+        preprocess_outputs = self._preprocess(inputs)
+        pixel_values = preprocess_outputs[0]["mm_processor_kwargs"]["pixel_values"]
+        input_ids = preprocess_outputs[0]["mm_processor_kwargs"]["input_ids"]
+        mm_features = self._process(pixel_values)
+        return input_ids[0].to(torch.int32).tolist(), {"mm_embedding": mm_features}
 
 
 @register_auto_model("Gemma3ForConditionalGeneration")
-@register_input_processor(Gemma3InputProcessor)
+@register_input_processor(Gemma3InputProcessor, model_type="gemma3")
 class Gemma3Model(PreTrainedModel):
     config_class = Gemma3Config
 

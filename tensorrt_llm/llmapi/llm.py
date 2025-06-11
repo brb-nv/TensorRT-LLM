@@ -319,7 +319,9 @@ class LLM:
                 and not self._on_trt_backend):
             sampling_params.max_tokens = 1
 
+        print("[generate_async] BEFORE prompt_inputs: ", inputs)
         inputs = prompt_inputs(inputs)
+        print("[generate_async] AFTER prompt_inputs: ", inputs)
 
         if inputs.get("prompt") is None and \
             inputs.get("prompt_token_ids") is not None and \

@@ -180,6 +180,7 @@ NOTE:
 """
 
 SUPPORTED_QWEN_MODEL_GROUP = ["qwen2_vl", "qwen2_5_vl"]
+SUPPORTED_GEMMA_MODEL_GROUP = ["gemma3"]
 SUPPORTED_LLAMA_MODEL_GROUP = ["mllama", "llama4"]
 SUPPORTED_LLAVA_IMAGE_MODEL_GROUP = ["llava_llama", "llava_next"]
 SUPPORTED_LLAVA_VIDEO_MODEL_GROUP = ["llava_llama"]
@@ -188,7 +189,8 @@ SUPPORTED_HYPERCLOVAX_MODEL_GROUP = ["hyperclovax_vlm"]
 ALL_SUPPORTED_IMAGE_MODELS = SUPPORTED_QWEN_MODEL_GROUP \
     + SUPPORTED_LLAMA_MODEL_GROUP \
     + SUPPORTED_LLAVA_IMAGE_MODEL_GROUP \
-    + SUPPORTED_HYPERCLOVAX_MODEL_GROUP
+    + SUPPORTED_HYPERCLOVAX_MODEL_GROUP \
+    + SUPPORTED_GEMMA_MODEL_GROUP
 
 ALL_SUPPORTED_VIDEO_MODELS = SUPPORTED_QWEN_MODEL_GROUP \
     + SUPPORTED_LLAVA_VIDEO_MODEL_GROUP
@@ -237,6 +239,8 @@ def retrieve_multimodal_placeholder(model_type: str, modality: str,
         elif model_type in SUPPORTED_LLAMA_MODEL_GROUP:
             return "<|image|>"
         elif model_type in SUPPORTED_LLAVA_IMAGE_MODEL_GROUP:
+            return "<image>"
+        elif model_type in SUPPORTED_GEMMA_MODEL_GROUP:   # @B: Double-check this.
             return "<image>"
         elif model_type in SUPPORTED_HYPERCLOVAX_MODEL_GROUP:
             return '<im_end>\n<|im_start|>user (mime) \n{"type": "image/jpeg", "filename": ""}<|im_end|>\n' + \
