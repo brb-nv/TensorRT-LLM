@@ -384,7 +384,6 @@ class PyTorchModelEngine(ModelEngine):
         self._disable_overlap_scheduler = self.pytorch_backend_config.disable_overlap_scheduler
         self._torch_compile_backend = None
         self.dtype = self.model.config.torch_dtype
-        assert self.dtype == torch.bfloat16, "Expected dtype is bfloat16."
         self._init_model_capacity()
 
         self.guided_decoder: Optional[GuidedDecoder] = None

@@ -108,7 +108,7 @@ class Gemma3InputProcessor(InputProcessor):
 
 
 @register_auto_model("Gemma3ForConditionalGeneration")
-@register_input_processor(Gemma3InputProcessor, model_type="gemma3", out_of_tree=True)
+@register_input_processor(Gemma3InputProcessor, model_type="gemma3")
 class Gemma3Model(PreTrainedModel):
     config_class = Gemma3Config
 
