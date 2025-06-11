@@ -119,10 +119,12 @@ class Gemma3Model(PreTrainedModel):
         if hasattr(self, "llm"):
             return
 
+        self.image_token_index = config.image_token_index
+
         llm_model_config = copy.deepcopy(model_config)
         llm_model_config.pretrained_config = model_config.pretrained_config.text_config
 
-        llm_model_config.pretrained_config.torch_dtype = torch.bfloat16  # Harcoding for Gemma3 VLM.
+        llm_model_config.pretrained_config.torch_dtype = torch.bfloat16
         self.llm = Gemma3ForCausalLM(llm_model_config)
 
         self.model_config = model_config
@@ -168,7 +170,7 @@ class Gemma3Model(PreTrainedModel):
             embedding_layer=self.llm.model.embed_tokens,
             input_ids=input_ids,
             mm_embeds=mm_embed,
-            mm_token_ids=torch.tensor([262144]).to(input_ids.device))
+            mm_token_ids=torch.tensor([self.image_token_index]).to(input_ids.device))
         logits = self.llm.forward(attn_metadata, input_ids, position_ids,
                                   inputs_embeds, return_context_logits)
         return logits

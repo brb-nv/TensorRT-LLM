@@ -69,9 +69,8 @@ def fuse_input_embeds(
     text_token_indices = torch.where(text_token_mask)[0]
     mm_token_indices = torch.where(mm_token_mask)[0]
 
-    gemma3_text_scaling = 2560**0.5
     text_embed = embedding_layer(
-        input_ids[text_token_indices]) * gemma3_text_scaling
+        input_ids[text_token_indices])
     input_embeds = torch.empty(input_ids.shape[0],
                                mm_embed.shape[-1],
                                device=text_embed.device,
