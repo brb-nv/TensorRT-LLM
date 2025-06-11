@@ -55,19 +55,12 @@ class Gemma3InputProcessor(InputProcessor):
                                                   local_model_path,
                                                   strict=False)
         assert len(missing_keys) == 0, f"Missing keys: {missing_keys}"
-        hf_vision_tower = module_dict["vision_tower"].to(self.dtype)
+        hf_vision_tower = module_dict["vision_tower"].to(self.dtype).to(self.device)
         hf_mm_projector = module_dict["multi_modal_projector"].to(
             self.dtype).to(self.device)
 
-        # # Use TRTLLM vision tower(CLIPVisionModel)
-        # vision_model_config = ModelConfig(
-        #     pretrained_config=model_config.vision_config, attn_backend="TRTLLM")
-        # self.vision_tower = SiglipVisionModel(vision_model_config).to(
-        #     self.device).to(self.dtype)
-        # self.vision_tower.load_weights(hf_vision_tower.state_dict())
-
-        # Use HF vision tower for debugging. Needs to be replaced with TRTLLM vision tower.
-        self.vision_tower = hf_vision_tower.to(self.device)
+        # Use HF vision tower for debugging. To be replaced with TRTLLM vision tower.
+        self.vision_tower = hf_vision_tower
 
         # Use HF multi-modal projector
         self.mm_projector = hf_mm_projector
@@ -184,17 +177,6 @@ class Gemma3Model(PreTrainedModel):
             input_ids=input_ids,
             mm_embeds=mm_embed,
             mm_token_ids=torch.tensor([262144]).to(input_ids.device))
-        # ##################################################################
-        # if len(mm_embed):
-        #     ref_tensor = torch.load('multimodal_embeds.pt')
-        #     print("ref_tensor shape: ", ref_tensor.shape)
-        #     print("inputs_embed shape: ", inputs_embeds.shape)
-        #     diff = torch.abs(ref_tensor - inputs_embeds)
-        #     max_diff = torch.max(diff)
-        #     mean_diff = torch.mean(diff)
-        #     print(f"[inputs_embeds] Max difference: {max_diff.item()}")
-        #     print(f"[inputs_embeds] Mean difference: {mean_diff.item()}")
-        # ##################################################################
         logits = self.llm.forward(attn_metadata, input_ids, position_ids,
                                   inputs_embeds, return_context_logits)
         return logits
