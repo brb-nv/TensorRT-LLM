@@ -64,30 +64,15 @@ class Gemma3InputProcessor(InputProcessor):
 
     @nvtx_range("[Vision] preprocess")
     def _preprocess(self, inputs):
-        # TODO: Replace this with using prompt from inputs.
-        messages = [{
-            "role":
-            "user",
-            "content": [{
-                "type":
-                "image",
-                "image":
-                "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/bee.jpg"
-            }, {
-                "type": "text",
-                "text": "Describe this image in detail."
-            }]
-        }]
-
-        processor_output = self.processor.apply_chat_template(
-            messages,
-            add_generation_prompt=True,
-            tokenize=True,
-            return_dict=True,
-            return_tensors="pt").to('cuda', dtype=torch.bfloat16)
-
         print("[_preprocess] inputs: ", inputs)
-
+        text_prompt, mm_data = inputs.get("prompt"), inputs.get(
+            "multi_modal_data", {})
+        assert 'image' in mm_data
+        processor_output = self.processor(text=text_prompt,
+                                images=mm_data["image"][0],
+                                return_dict=True,
+                                return_tensors="pt",
+                                device=self.device).to('cuda', dtype=torch.bfloat16)
         result_dict = {}
         result_dict["prompt"] = inputs["prompt"]
         result_dict["multimodal_data"] = {
@@ -96,8 +81,6 @@ class Gemma3InputProcessor(InputProcessor):
         result_dict["mm_processor_kwargs"] = {}
         result_dict["mm_processor_kwargs"]["input_ids"] = processor_output[
             "input_ids"]
-        result_dict["mm_processor_kwargs"]["attention_mask"] = processor_output[
-            "attention_mask"]
         result_dict["mm_processor_kwargs"]["token_type_ids"] = processor_output[
             "token_type_ids"]
         result_dict["mm_processor_kwargs"]["pixel_values"] = processor_output[
@@ -130,7 +113,7 @@ class Gemma3InputProcessor(InputProcessor):
 
 
 @register_auto_model("Gemma3ForConditionalGeneration")
-@register_input_processor(Gemma3InputProcessor, model_type="gemma3")
+@register_input_processor(Gemma3InputProcessor, model_type="gemma3", out_of_tree=True)
 class Gemma3Model(PreTrainedModel):
     config_class = Gemma3Config
 
