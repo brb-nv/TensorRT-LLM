@@ -187,7 +187,7 @@ template <typename T, int BLOCK_SIZE, int K_DIM, int ROPE_DIM, typename KVCacheB
 __global__ void applyMLARopeAndAssignQKVKernelOptContext(T* q_ptr, T* k_ptr, T const* fuse_buf, KVCacheBuffer kv_cache,
     float2 const* cos_sin_cache, size_t head_num, int head_size, int c_k, int* cu_q_seqlens,
     int32_t const* kv_cache_lengths, uint32_t max_input_seq_len, KvCacheDataType cache_type,
-    float const* quant_scale_kv)
+    float const* quant_scale_kv, int32_t const* helix_position_offsets)
 {
 
     // Constants.
@@ -233,7 +233,8 @@ __global__ void applyMLARopeAndAssignQKVKernelOptContext(T* q_ptr, T* k_ptr, T c
             local_token_idx = std::min(local_token_idx, cache_seq_len - 1);
             int const global_token_idx = local_token_idx + global_token_offset;
 
-            auto const position_id = local_token_idx;
+            auto const position_id
+                = helix_position_offsets ? helix_position_offsets[global_token_idx] : local_token_idx;
             float2 const* rotary_coef_cache_buffer
                 = cos_sin_cache + static_cast<size_t>(ROPE_DIM) * position_id + (head_dim_idx / 2);
 
@@ -335,7 +336,7 @@ __global__ void applyMLARopeAndAssignQKVKernelGeneration(T* qkv_output, T* q_pe,
     int* seqQOffset, uint32_t* fmha_tile_counter, int32_t const* kv_cache_lengths, int* seqKVOffsets, int q_pe_ld,
     int q_pe_stride, KvCacheDataType cache_type, float* bmm1_scale, float* bmm2_scale, float const* quant_scale_o,
     float const* quant_scale_q, float const* quant_scale_kv, float const* dequant_scale_q,
-    float const* dequant_scale_kv, float host_bmm1_scale)
+    float const* dequant_scale_kv, float host_bmm1_scale, int32_t const* helix_position_offsets)
 {
 
     // Constants.
@@ -408,8 +409,9 @@ __global__ void applyMLARopeAndAssignQKVKernelGeneration(T* qkv_output, T* q_pe,
 
             if (valid_token)
             {
-
-                auto const position_id = kv_cache_lengths[batch_idx] - seq_len + local_token_idx;
+                auto const position_id
+                    = (helix_position_offsets != nullptr ? helix_position_offsets[global_token_idx]
+                                                         : kv_cache_lengths[batch_idx] - seq_len + local_token_idx);
                 float2 const* rotary_coef_cache_buffer
                     = cos_sin_cache + static_cast<size_t>(ROPE_DIM) * position_id + (head_dim_idx / 2);
 
@@ -927,7 +929,7 @@ void invokeMLARopeContext(MlaParams<T>& params, KVCacheBuffer kv_cache_buffer, c
     applyMLARopeAndAssignQKVKernelOptContext<T, 256, 512, 64, KVCacheBuffer><<<grid, 256, 0, stream>>>(params.q_buf,
         params.k_buf, params.latent_cache, kv_cache_buffer, params.cos_sin_cache, params.head_num, head_size,
         params.meta.kv_lora_rank, params.cu_q_seqlens, params.cache_seq_lens, params.max_input_seq_len,
-        params.cache_type, params.quant_scale_kv);
+        params.cache_type, params.quant_scale_kv, params.helix_position_offsets);
 }
 
 template <typename T>
@@ -992,7 +994,7 @@ void invokeMLARopeGeneration(MlaParams<T>& params, KVCacheBuffer kv_cache_buffer
         params.seqQOffset, params.fmha_tile_counter, params.cache_seq_lens, params.cu_kv_seqlens, params.q_pe_ld,
         params.q_pe_stride, params.cache_type, params.bmm1_scale, params.bmm2_scale, params.quant_scale_o,
         params.quant_scale_q, params.quant_scale_kv, params.dequant_scale_q, params.dequant_scale_kv,
-        params.host_bmm1_scale);
+        params.host_bmm1_scale, params.helix_position_offsets);
 }
 
 template <typename T, typename TCache>
