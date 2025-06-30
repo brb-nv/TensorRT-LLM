@@ -507,7 +507,7 @@ class Deepseekv3MoE(nn.Module):
         return shared_tp_size, shared_output_scale
 
     def compute_routed_output(self, hidden_states, hidden_states_fp4,
-                              all_rank_num_tokens, do_finalize):
+                              all_tp_rank_num_tokens, do_finalize):
         # max-throughput
         use_dp_padding = False
         if self.use_dp and self.mapping.tp_size > 1:
@@ -517,12 +517,12 @@ class Deepseekv3MoE(nn.Module):
                 hidden_states = allgather(hidden_states,
                                           self.mapping,
                                           dim=0,
-                                          sizes=all_rank_num_tokens)
+                                          sizes=all_tp_rank_num_tokens)
             elif not isinstance(self.experts, (CutlassFusedMoE, WideEPMoE)) or (
                     not self.experts.has_fp8_qdq and self.experts.has_nvfp4):
                 # Use padding when not using the cutlass path or when x_sf in self.experts is not None
                 use_dp_padding = True
-                max_num_token = max(all_rank_num_tokens)
+                max_num_token = max(all_tp_rank_num_tokens)
                 hidden_states = torch.nn.functional.pad(
                     hidden_states,
                     (0, 0, 0, max_num_token - hidden_states.shape[0]))
@@ -534,7 +534,7 @@ class Deepseekv3MoE(nn.Module):
             router_logits,
             do_finalize=do_finalize,
             output_dtype=hidden_states.dtype,
-            all_rank_num_tokens=all_rank_num_tokens,
+            all_tp_rank_num_tokens=all_tp_rank_num_tokens,
             use_dp_padding=use_dp_padding,
         )
 
@@ -544,7 +544,7 @@ class Deepseekv3MoE(nn.Module):
         self,
         hidden_states: torch.Tensor,
         hidden_states_fp4: Optional[Fp4QuantizedTensor] = None,
-        all_rank_num_tokens: Optional[list[int]] = None,
+        all_tp_rank_num_tokens: Optional[list[int]] = None,
         final_all_reduce_params: Optional[AllReduceParams] = None,
         do_finalize: Optional[bool] = True,
     ) -> torch.Tensor:
@@ -561,7 +561,7 @@ class Deepseekv3MoE(nn.Module):
         def _compute_routed_output():
             routed_output = self.compute_routed_output(hidden_states,
                                                        hidden_states_fp4,
-                                                       all_rank_num_tokens,
+                                                       all_tp_rank_num_tokens,
                                                        do_finalize)
             return routed_output
 
@@ -600,15 +600,28 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         self.top_k = config.num_experts_per_tok
 
         self.mapping = model_config.mapping
-        mapping = self.mapping
 
         self.self_attn = DeepseekV3Attention(
             model_config,
             layer_idx=layer_idx,
             aux_stream=aux_stream_dict[AuxStreamType.Attention])
-        self.enable_attention_dp = mapping.enable_attention_dp
+        self.enable_attention_dp = self.mapping.enable_attention_dp
 
-        self.mlp_tp_size = mapping.tp_size
+        if self.mapping.has_cp_helix():
+            # after attention, Helix CP GPUs become TP GPUs
+            new_mapping = Mapping(
+                world_size=self.mapping.world_size,
+                rank=self.mapping.rank,
+                gpus_per_node=self.mapping.gpus_per_node,
+                cp_size=1,
+                cp_config=None,
+                tp_size=self.mapping.tp_size * self.mapping.cp_size,
+                pp_size=self.mapping.pp_size,
+                auto_parallel=False,
+                enable_attention_dp=self.mapping.enable_attention_dp)
+            self.mapping = new_mapping
+
+        self.mlp_tp_size = self.mapping.tp_size
 
         self.fusion_config = EagerFusionConfig()
         self.enable_fusion = os.environ.get(
@@ -620,7 +633,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
             model_config, layer_idx)
         self.is_nvfp4 = quant_config.layer_quant_mode.has_nvfp4()
 
-        has_tp = mapping.has_tp()
+        has_tp = self.mapping.has_tp()
 
         if (config.n_routed_experts is not None
                 and layer_idx >= config.first_k_dense_replace
@@ -673,7 +686,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                                                 eps=config.rms_norm_eps,
                                                 dtype=config.torch_dtype)
         self.layer_idx = layer_idx
-        self.allreduce = AllReduce(mapping=model_config.mapping,
+        self.allreduce = AllReduce(mapping=self.mapping,
                                    strategy=model_config.allreduce_strategy,
                                    dtype=config.torch_dtype)
         self.moe_allreduce = MoEAllReduce(self.mapping)
@@ -773,7 +786,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
             return self.mlp(
                 hidden_states,
                 hidden_states_fp4,
-                all_rank_num_tokens=attn_metadata.all_rank_num_tokens,
+                all_tp_rank_num_tokens=attn_metadata.all_tp_rank_num_tokens,
                 final_all_reduce_params=AllReduceParams(
                     enable_allreduce=not (self.fusion_config.POST_MOE_FUSION
                                           or self.mapping.tp_size == 1)),
@@ -933,7 +946,7 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
         hidden_states: torch.Tensor,
         embed_tokens: Embedding,
         attn_metadata: AttentionMetadata,
-        all_rank_num_tokens: Optional[List[int]] = None,
+        all_tp_rank_num_tokens: Optional[List[int]] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
 
@@ -974,7 +987,7 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
         # MoE
         hidden_states = self.mlp(
             hidden_states,
-            all_rank_num_tokens=all_rank_num_tokens,
+            all_tp_rank_num_tokens=all_tp_rank_num_tokens,
             final_all_reduce_params=AllReduceParams(
                 enable_allreduce=not (self.fusion_config.POST_MOE_FUSION
                                       or self.mapping.tp_size == 1)),

@@ -113,7 +113,7 @@ void TrtllmGenGemmRunner::run(int32_t m, int32_t n, int32_t k, void const* a, fl
 
     auto const err = gemm.run(config, workspace, gemmData, static_cast<void*>(stream), multiProcessorCount);
 
-    TLLM_CHECK_WITH_INFO(err == 0, "Error occurred when running GEMM!");
+    TLLM_CHECK_WITH_INFO(err == 0, "Error occurred when running GEMM: %d", err);
 }
 
 void TrtllmGenGemmRunner::run(int32_t m, int32_t n, int32_t k, void const* a, void const* b, void* c, float* cScale,
@@ -138,7 +138,7 @@ void TrtllmGenGemmRunner::selectGemmConfig(int32_t m, int32_t n, int32_t k)
 
     std::vector<int32_t> sortedIndices = mPassingConfigIndices;
     std::sort(sortedIndices.begin(), sortedIndices.end(),
-        [&configs](int32_t idx0, int32_t idx1)
+        [&configs, &gemmData](int32_t idx0, int32_t idx1)
         {
             auto const& optionsA = configs[idx0].mOptions;
             auto const& optionsB = configs[idx1].mOptions;
@@ -159,6 +159,12 @@ void TrtllmGenGemmRunner::selectGemmConfig(int32_t m, int32_t n, int32_t k)
             if (optionsA.mNumSlicesForSplitK != optionsB.mNumSlicesForSplitK)
             {
                 return optionsA.mNumSlicesForSplitK > optionsB.mNumSlicesForSplitK;
+            }
+
+            // then by tileN, if N is large enough
+            if (gemmData.mProblemDimensions.mN > 256 && optionsA.mTileN != optionsB.mTileN)
+            {
+                return optionsA.mTileN > optionsB.mTileN;
             }
 
             return true;

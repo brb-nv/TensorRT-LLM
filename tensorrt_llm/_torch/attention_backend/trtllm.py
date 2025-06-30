@@ -169,6 +169,7 @@ class TrtllmAttentionWrapper:
         mla_context_paged_kv: Optional[torch.Tensor] = None,
         mla_context_kv_cache_block_offsets: Optional[torch.Tensor] = None,
         softmax_stats_tensor: Optional[torch.Tensor] = None,
+        helix_position_offsets: Optional[torch.Tensor] = None,
         **kwargs,
     ):
         """
@@ -204,6 +205,7 @@ class TrtllmAttentionWrapper:
             mla_context_paged_kv (torch.Tensor): The paged KV cache for MLA context, for kv cache reuse/chunked context.
             mla_context_kv_cache_block_offsets (torch.Tensor): The block offsets for the paged KV cache for MLA context, for kv cache reuse/chunked context.
             softmax_stats_tensor (torch.Tensor): The tensor to store the softmax statistics (max/sum)
+            helix_position_offsets (torch.Tensor): The tensor to store the helix position offsets, with shape (num_tokens) on GPU.
         """
         self.layer_idx = layer_idx
         self.tokens_per_block = tokens_per_block
@@ -240,6 +242,7 @@ class TrtllmAttentionWrapper:
         self.mla_context_paged_kv = mla_context_paged_kv
         self.mla_context_kv_cache_block_offsets = mla_context_kv_cache_block_offsets
         self.softmax_stats_tensor = softmax_stats_tensor
+        self.helix_position_offsets = helix_position_offsets
 
         if max_sequence_length > self.rope_params.max_positions:
             self.rope_params.max_positions = max_sequence_length
@@ -374,6 +377,82 @@ class TrtllmAttentionWrapper:
             # output is provided, expect output_sf be provided as well if has NVFP4 output.
             assert out_dtype is None or out_dtype != torch.uint8 or output_sf is not None
 
+        # TODO remove this
+        # INSERT_YOUR_CODE
+        def _print_param(name, value):
+            if value is None:
+                print(f"{name}: None")
+            elif torch.is_tensor(value):
+                flat = value.flatten()
+                vals = flat[:4].tolist()
+                print(
+                    f"{name}: Tensor(shape={tuple(value.shape)}, dtype={value.dtype}, first4={vals})"
+                )
+            else:
+                print(f"{name}: {value}")
+
+        # _print_param("q", q)
+        # _print_param("k", k)
+        # _print_param("v", v)
+        # _print_param("output", output)
+        # _print_param("output_sf", output_sf)
+        # _print_param("out_dtype", out_dtype)
+        # _print_param("self.workspace", self.workspace)
+        # _print_param("self.sequence_length", self.sequence_length)
+        # _print_param("self.host_past_key_value_lengths",
+        #              self.host_past_key_value_lengths)
+        # _print_param("self.context_lengths", self.context_lengths)
+        # _print_param("self.host_context_lengths", self.host_context_lengths)
+        # _print_param("self.host_request_types", self.host_request_types)
+        # _print_param("self.kv_cache_block_offsets", self.kv_cache_block_offsets)
+        # _print_param("self.host_kv_cache_block_offsets",
+        #              self.host_kv_cache_block_offsets)
+        # _print_param("self.host_kv_cache_pool_pointers",
+        #              self.host_kv_cache_pool_pointers)
+        # _print_param("self.host_kv_cache_pool_mapping",
+        #              self.host_kv_cache_pool_mapping)
+        # _print_param("self.cache_indirection", self.cache_indirection)
+        # _print_param("self.kv_scale_orig_quant", self.kv_scale_orig_quant)
+        # _print_param("self.kv_scale_quant_orig", self.kv_scale_quant_orig)
+        # _print_param(
+        #     "self.out_scale_sf",
+        #     getattr(self, "out_scale_sf", None)
+        #     if self.use_nvfp4_output else getattr(self, "out_scale", None))
+        # _print_param("self.rotary_inv_freq", self.rotary_inv_freq)
+        # _print_param("self.rotary_cos_sin", self.rotary_cos_sin)
+        # _print_param("self.latent_cache", getattr(self, "latent_cache", None))
+        # _print_param("self.q_pe", getattr(self, "q_pe", None))
+        # _print_param("self.block_ids_per_seq", self.block_ids_per_seq)
+        # _print_param("is_fused_qkv", is_fused_qkv)
+        # _print_param("update_kv_cache", update_kv_cache)
+        # _print_param("self.predicted_tokens_per_seq",
+        #              self.predicted_tokens_per_seq)
+        # _print_param("self.layer_idx", self.layer_idx)
+        # _print_param("self.num_heads", self.num_heads)
+        # _print_param("self.num_kv_heads", self.num_kv_heads)
+        # _print_param("self.head_size", self.head_size)
+        # _print_param("self.tokens_per_block", self.tokens_per_block)
+        # _print_param("self.max_num_requests", self.max_num_requests)
+        # _print_param("self.max_context_length", self.max_context_length)
+        # _print_param("self.attention_window_size", self.attention_window_size)
+        # _print_param("self.sink_token_length", self.sink_token_length)
+        # _print_param("self.beam_width", self.beam_width)
+        # _print_param("mask_type", mask_type)
+        # _print_param("self.quant_mode", self.quant_mode)
+        # _print_param("self.q_scaling", self.q_scaling)
+        # _print_param("self.position_embedding_type",
+        #              self.position_embedding_type)
+        # _print_param("self.rotary_embedding_dim", self.rotary_embedding_dim)
+        # _print_param("self.rotary_embedding_base", self.rotary_embedding_base)
+        # _print_param("self.rotary_embedding_scale_type",
+        #              self.rotary_embedding_scale_type)
+        # _print_param("self.rotary_embedding_scale", self.rotary_embedding_scale)
+        # _print_param("self.rotary_embedding_short_m_scale",
+        #              self.rotary_embedding_short_m_scale)
+        # _print_param("self.rotary_embedding_long_m_scale",
+        #              self.rotary_embedding_long_m_scale)
+        # _print_param("self.rotary_embedding_max_positions",
+        #              self.rotary_embedding_max_positions)
         torch.ops.trtllm.attention_inplace(
             q,
             k,
@@ -433,12 +512,13 @@ class TrtllmAttentionWrapper:
             self.qk_nope_head_dim,
             self.qk_rope_head_dim,
             self.v_head_dim,
-            self.mrope_rotary_cos_sin,
-            self.mrope_position_deltas,
-            self.mla_context_paged_kv,
-            self.mla_context_kv_cache_block_offsets,
             self.attention_chunk_size,
-            self.softmax_stats_tensor,
+            [
+                self.mrope_rotary_cos_sin, self.mrope_position_deltas,
+                self.mla_context_paged_kv,
+                self.mla_context_kv_cache_block_offsets,
+                self.softmax_stats_tensor, self.helix_position_offsets
+            ],
         )
 
         # reset the planned states (especially tensors) to avoid memory leak
@@ -954,6 +1034,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         mla_context_paged_kv: Optional[torch.Tensor] = None,
         mla_context_kv_cache_block_offsets: Optional[torch.Tensor] = None,
         softmax_stats_tensor: Optional[torch.Tensor] = None,
+        helix_position_offsets: Optional[torch.Tensor] = None,
         output: Optional[torch.Tensor] = None,
         output_sf: Optional[torch.Tensor] = None,
         **kwargs,
@@ -1021,6 +1102,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             mla_context_kv_cache_block_offsets=
             mla_context_kv_cache_block_offsets,
             softmax_stats_tensor=softmax_stats_tensor,
+            helix_position_offsets=helix_position_offsets,
         )
         out_dtype = None
         if out_scale is not None:

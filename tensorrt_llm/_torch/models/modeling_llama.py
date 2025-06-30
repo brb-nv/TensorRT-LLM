@@ -291,13 +291,13 @@ class Llama4MoE(nn.Module):
         self.moe_event = [torch.cuda.Event(), torch.cuda.Event()]
         self.aux_stream = aux_stream
 
-    def compute_routed_output(self, hidden_states, all_rank_num_tokens,
+    def compute_routed_output(self, hidden_states, all_tp_rank_num_tokens,
                               cutlass_min_latency_mode):
         use_dp_padding = False
         if self.enable_attention_dp and self.mapping.tp_size > 1:
             # Use padding here to keep the behavior unchanged
             use_dp_padding = True
-            max_num_token_across_dp_ranks = max(all_rank_num_tokens)
+            max_num_token_across_dp_ranks = max(all_tp_rank_num_tokens)
             hidden_states = torch.nn.functional.pad(
                 hidden_states,
                 (0, 0, 0,
@@ -307,7 +307,7 @@ class Llama4MoE(nn.Module):
             hidden_states,
             router_logits,
             do_finalize=not cutlass_min_latency_mode,
-            all_rank_num_tokens=all_rank_num_tokens,
+            all_tp_rank_num_tokens=all_tp_rank_num_tokens,
             use_dp_padding=use_dp_padding,
         )
         return routed_output
@@ -315,7 +315,7 @@ class Llama4MoE(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        all_rank_num_tokens=None,
+        all_tp_rank_num_tokens=None,
         final_all_reduce_params: Optional[AllReduceParams] = None,
         cutlass_min_latency_mode: Optional[bool] = False,
     ) -> torch.Tensor:
@@ -323,7 +323,7 @@ class Llama4MoE(nn.Module):
         # This design is mainly for low latency use case. Need to improve for max throughput use case.
         fn0 = lambda: self.shared_expert(hidden_states)
         fn1 = lambda: self.compute_routed_output(
-            hidden_states, all_rank_num_tokens, cutlass_min_latency_mode)
+            hidden_states, all_tp_rank_num_tokens, cutlass_min_latency_mode)
         shared_output, routed_output = maybe_execute_in_parallel(
             fn0, fn1, self.moe_event[0], self.moe_event[1], self.aux_stream)
         if cutlass_min_latency_mode:
@@ -478,7 +478,7 @@ class Llama4DecoderLayer(DecoderLayer):
 
         hidden_states = self.feed_forward(
             hidden_states,
-            all_rank_num_tokens=attn_metadata.all_rank_num_tokens,
+            all_tp_rank_num_tokens=attn_metadata.all_tp_rank_num_tokens,
             final_all_reduce_params=AllReduceParams(enable_allreduce=not (
                 self.fusion_config.POST_MOE_FUSION
                 or self.fusion_config.POST_MLP_FUSION

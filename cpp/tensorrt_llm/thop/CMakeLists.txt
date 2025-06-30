@@ -39,6 +39,7 @@ add_library(
   mlaPreprocessOp.cpp
   allgatherOp.cpp
   allreduceOp.cpp
+  alltoallOp.cpp
   attentionOp.cpp
   causalConv1dOp.cpp
   convertSpecDecodingMaskToPackedMaskOp.cpp
@@ -61,6 +62,7 @@ add_library(
   fusedTopkSoftmax.cpp
   gatherTreeOp.cpp
   groupRmsNormOp.cpp
+  helixPostProcessOp.cpp
   llama4MinLatency.cpp
   logitsBitmaskOp.cpp
   mambaConv1dOp.cpp

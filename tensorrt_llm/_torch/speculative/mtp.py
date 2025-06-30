@@ -203,7 +203,7 @@ class MTPSpecMetadata(SpecMetadata):
         # MTP vanilla worker uses total max_draft_tokens input tokens in generation phase,
         # while MTP Eagle worker uses (max_draft_tokens + 1) input tokens in the 1st draft
         # forward and only one input token in the following draft forward.
-        # This num_tokens is used to set the all_rank_num_tokens for attention dp.
+        # This num_tokens is used to set the all_tp_rank_num_tokens for attention dp.
         if not self.spec_dec_mode.is_mtp_eagle():
             self.num_tokens -= self.num_generations
 
@@ -1138,7 +1138,7 @@ class MTPEagleWorker(MTPWorker):
             if i == 0:
                 hidden_states = mtp_layers[0](
                     embed_tokens=embed_tokens,
-                    all_rank_num_tokens=spec_metadata.all_rank_num_tokens,
+                    all_tp_rank_num_tokens=spec_metadata.all_tp_rank_num_tokens,
                     **inputs)
                 start_ids_gen = (spec_metadata.batch_indices_cuda[:num_gens] *
                                  (self.mtp_num_modules + 1)).long()
@@ -1148,10 +1148,11 @@ class MTPEagleWorker(MTPWorker):
                 gather_ids = torch.concat(
                     [last_tokens_idx[:num_contexts], gather_ids_gen], dim=0)
             else:
-                hidden_states = mtp_layers[0](embed_tokens=embed_tokens,
-                                              all_rank_num_tokens=spec_metadata.
-                                              subseq_all_rank_num_tokens,
-                                              **inputs)
+                hidden_states = mtp_layers[0](
+                    embed_tokens=embed_tokens,
+                    all_tp_rank_num_tokens=spec_metadata.
+                    subseq_all_rank_num_tokens,
+                    **inputs)
                 # All of the seq_len are 1, use batch_indices_cuda as gather_ids
                 gather_ids = spec_metadata.batch_indices_cuda[:batch_size]
             logits = mtp_layers[0].shared_head(hidden_states[gather_ids],
