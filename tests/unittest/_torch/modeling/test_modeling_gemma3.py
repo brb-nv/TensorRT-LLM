@@ -4,12 +4,9 @@ from dataclasses import dataclass
 
 import torch
 from parameterized import parameterized
-
 from transformers import Gemma3Config
 from transformers import Gemma3ForCausalLM as HFGemma3ForCausalLM
 from transformers.cache_utils import HybridCache
-
-from utils.llm_data import llm_models_root
 
 import tensorrt_llm
 from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
@@ -20,42 +17,39 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 
-GEMMA3_1B_SINGLE_LAYER_CONFIG = {
-  "architectures": [
-    "Gemma3ForCausalLM"
-  ],
-  "attention_bias": False,
-  "attention_dropout": 0.0,
-  "attn_logit_softcapping": None,
-  "bos_token_id": 2,
-  "cache_implementation": "hybrid",
-  "eos_token_id": [
-    1,
-    106
-  ],
-  "final_logit_softcapping": None,
-  "head_dim": 256,
-  "hidden_activation": "gelu_pytorch_tanh",
-  "hidden_size": 1152,
-  "initializer_range": 0.02,
-  "intermediate_size": 6912,
-  "max_position_embeddings": 32768,
-  "model_type": "gemma3_text",
-  "num_attention_heads": 4,
-  "num_hidden_layers": 26,           # Modified for testing.
-  "num_key_value_heads": 1,
-  "pad_token_id": 0,
-  "query_pre_attn_scalar": 256,
-  "rms_norm_eps": 1e-06,
-  "rope_local_base_freq": 10000,
-  "rope_scaling": None,
-  "rope_theta": 1000000,
-  "sliding_window": 4,              # Modified for testing.
-  "sliding_window_pattern": 6,      # Modified for testing.
-  "torch_dtype": "bfloat16",
-  "transformers_version": "4.50.0.dev0",
-  "use_cache": True,
-  "vocab_size": 262144
+# This is copied from https://huggingface.co/google/gemma-3-1b-it/blob/main/config.json.
+# Updated to have 1 local layer and 1 global layer. Sliding window size updated to 4.
+GEMMA3_1B_MINI_CONFIG = {
+    "architectures": ["Gemma3ForCausalLM"],
+    "attention_bias": False,
+    "attention_dropout": 0.0,
+    "attn_logit_softcapping": None,
+    "bos_token_id": 2,
+    "cache_implementation": "hybrid",
+    "eos_token_id": [1, 106],
+    "final_logit_softcapping": None,
+    "head_dim": 256,
+    "hidden_activation": "gelu_pytorch_tanh",
+    "hidden_size": 1152,
+    "initializer_range": 0.02,
+    "intermediate_size": 6912,
+    "max_position_embeddings": 32768,
+    "model_type": "gemma3_text",
+    "num_attention_heads": 4,
+    "num_hidden_layers": 2,  # Modified for testing.
+    "num_key_value_heads": 1,
+    "pad_token_id": 0,
+    "query_pre_attn_scalar": 256,
+    "rms_norm_eps": 1e-06,
+    "rope_local_base_freq": 10000,
+    "rope_scaling": None,
+    "rope_theta": 1000000,
+    "sliding_window": 4,  # Modified for testing.
+    "sliding_window_pattern": 2,  # Modified for testing.
+    "torch_dtype": "bfloat16",
+    "transformers_version": "4.50.0.dev0",
+    "use_cache": True,
+    "vocab_size": 262144
 }
 
 
@@ -71,7 +65,7 @@ class TestGemma3(unittest.TestCase):
 
     def test_gemma3_sanity(self):
 
-        config_dict = deepcopy(GEMMA3_1B_SINGLE_LAYER_CONFIG)
+        config_dict = deepcopy(GEMMA3_1B_MINI_CONFIG)
         gemma3_config = Gemma3Config.from_dict(config_dict)
 
         dtype = gemma3_config.torch_dtype
@@ -108,11 +102,11 @@ class TestGemma3(unittest.TestCase):
             raise ValueError("Invalid dtype")
 
         mapping = Mapping(world_size=1, tp_size=1, rank=0)
-        # @B: Should we mention max_attention_window in the config?
         kv_cache_config = KvCacheConfig(enable_block_reuse=False,
                                         enable_partial_reuse=False,
                                         copy_on_partial_reuse=False,
-                                        max_tokens=num_blocks * tokens_per_block)
+                                        max_tokens=num_blocks *
+                                        tokens_per_block)
         kv_cache_manager = KVCacheManager(
             kv_cache_config,
             tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
@@ -156,17 +150,17 @@ class TestGemma3(unittest.TestCase):
         with torch.inference_mode():
             attn_metadata.prepare()
             logits = gemma3.forward(input_ids=input_ids,
-                                     position_ids=position_ids,
-                                     attn_metadata=attn_metadata)
+                                    position_ids=position_ids,
+                                    attn_metadata=attn_metadata)
 
         self.assertEqual(len(past_seen_tokens), logits.shape[0])
 
         with torch.inference_mode():
             attn_metadata.prepare()
             logits = gemma3.forward(input_ids=input_ids,
-                                     position_ids=position_ids,
-                                     attn_metadata=attn_metadata,
-                                     return_context_logits=True)
+                                    position_ids=position_ids,
+                                    attn_metadata=attn_metadata,
+                                    return_context_logits=True)
         self.assertEqual(input_ids.shape, logits.shape[:-1])
 
         kv_cache_manager.shutdown()
@@ -185,7 +179,7 @@ class TestGemma3(unittest.TestCase):
         metadata_cls = get_attention_backend(backend).Metadata
 
         torch.random.manual_seed(0)
-        config_dict = deepcopy(GEMMA3_1B_SINGLE_LAYER_CONFIG)
+        config_dict = deepcopy(GEMMA3_1B_MINI_CONFIG)
         gemma3_config = Gemma3Config.from_dict(config_dict)
         dtype = gemma3_config.torch_dtype
         device = torch.device('cuda')
@@ -200,8 +194,11 @@ class TestGemma3(unittest.TestCase):
 
         hf_gemma3 = HFGemma3ForCausalLM(gemma3_config).to(dtype).to(
             device).eval()
-        # TODO: Change max_cache_len to max_seq_len once test is refined.
-        hf_cache = HybridCache(config=gemma3_config, max_batch_size=batch_size, max_cache_len=10, device=device, dtype=dtype)
+        hf_cache = HybridCache(config=gemma3_config,
+                               max_batch_size=batch_size,
+                               max_cache_len=10,
+                               device=device,
+                               dtype=dtype)
 
         model_config = ModelConfig(pretrained_config=gemma3_config,
                                    attn_backend=backend)
@@ -216,11 +213,11 @@ class TestGemma3(unittest.TestCase):
             raise ValueError("Invalid dtype")
 
         mapping = Mapping(world_size=1, tp_size=1, rank=0)
-        # @B: Should we mention max_attention_window in the config?
         kv_cache_config = KvCacheConfig(enable_block_reuse=False,
                                         enable_partial_reuse=False,
                                         copy_on_partial_reuse=False,
-                                        max_tokens=num_blocks * tokens_per_block)
+                                        max_tokens=num_blocks *
+                                        tokens_per_block)
         kv_cache_manager = KVCacheManager(
             kv_cache_config,
             tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
@@ -233,11 +230,10 @@ class TestGemma3(unittest.TestCase):
             mapping=mapping,
             dtype=kv_cache_dtype,
         )
-        # context
+        # Context phase.
         input_ids = torch.tensor([100, 200, 300, 400, 500, 600, 700, 800],
                                  dtype=torch.int32,
                                  device=device)
-
         num_cached_tokens_per_seq = [0]
         request_ids = [1]
         token_nums = [input_ids.size(-1)]
@@ -257,31 +253,32 @@ class TestGemma3(unittest.TestCase):
             request_ids=request_ids,
             prompt_lens=prompt_lens,
         )
-        # Note: no CUDA graphs for prefill, the graph runner is built for
-        # decoding only.
         position_ids = [torch.arange(0, input_ids.size(-1), dtype=torch.int32)]
         position_ids = torch.cat(position_ids).unsqueeze(0).cuda()
 
         with torch.inference_mode():
             attn_metadata.prepare()
             logits = gemma3.forward(input_ids=input_ids,
-                                     position_ids=position_ids,
-                                     attn_metadata=attn_metadata)
+                                    position_ids=position_ids,
+                                    attn_metadata=attn_metadata)
             ref = hf_gemma3.forward(input_ids=input_ids.unsqueeze(0),
-                                     position_ids=position_ids,
-                                     past_key_values=hf_cache,
-                                     use_cache=True)
+                                    position_ids=position_ids,
+                                    past_key_values=hf_cache,
+                                    use_cache=True)
             torch.testing.assert_close(logits,
                                        ref.logits[:, -1].float(),
                                        atol=0.1,
                                        rtol=0.1)
-            print("[test_gemma3_allclose_to_hf] max prefill diff: ", torch.max(torch.abs(logits - ref.logits[:, -1].float())))
-            print("[test_gemma3_allclose_to_hf] mean prefill diff: ", torch.mean(torch.abs(logits - ref.logits[:, -1].float())))
+            print("[test_gemma3_allclose_to_hf] max prefill diff: ",
+                  torch.max(torch.abs(logits - ref.logits[:, -1].float())))
+            print("[test_gemma3_allclose_to_hf] mean prefill diff: ",
+                  torch.mean(torch.abs(logits - ref.logits[:, -1].float())))
 
         # gen
         gen_input_ids = torch.tensor([900], dtype=torch.int, device=device)
-        num_cached_tokens_per_seq = [input_ids.size(-1)]    # value: 8.
-        print("[test_gemma3_allclose_to_hf] num_cached_tokens_per_seq: ", num_cached_tokens_per_seq)
+        num_cached_tokens_per_seq = [input_ids.size(-1)]
+        print("[test_gemma3_allclose_to_hf] num_cached_tokens_per_seq: ",
+              num_cached_tokens_per_seq)
 
         attn_metadata = metadata_cls(
             seq_lens=torch.tensor([gen_input_ids.size(-1)], dtype=torch.int),
@@ -305,20 +302,23 @@ class TestGemma3(unittest.TestCase):
         with torch.inference_mode():
             attn_metadata.prepare()
             logits = gemma3.forward(input_ids=gen_input_ids,
-                                     position_ids=gen_position_ids,
-                                     attn_metadata=attn_metadata)
+                                    position_ids=gen_position_ids,
+                                    attn_metadata=attn_metadata)
             ref = hf_gemma3.forward(input_ids=gen_input_ids.unsqueeze(0),
-                                     position_ids=gen_position_ids,
-                                     past_key_values=hf_cache,
-                                     use_cache=True,
-                                     cache_position=torch.IntTensor([8]).to(device),
-                                     last_cache_position=9)
-            print("[test_gemma3_allclose_to_hf] max gen diff: ", torch.max(torch.abs(logits - ref.logits[:, -1].float())))
-            print("[test_gemma3_allclose_to_hf] mean gen diff: ", torch.mean(torch.abs(logits - ref.logits[:, -1].float())))
+                                    position_ids=gen_position_ids,
+                                    past_key_values=hf_cache,
+                                    use_cache=True,
+                                    cache_position=torch.IntTensor(
+                                        [input_ids.size(-1)]).to(device),
+                                    last_cache_position=input_ids.size(-1) + 1)
+            print("[test_gemma3_allclose_to_hf] max gen diff: ",
+                  torch.max(torch.abs(logits - ref.logits[:, -1].float())))
+            print("[test_gemma3_allclose_to_hf] mean gen diff: ",
+                  torch.mean(torch.abs(logits - ref.logits[:, -1].float())))
 
             torch.testing.assert_close(logits,
-                                    ref.logits[:, -1].float(),
-                                    atol=0.1,
-                                    rtol=0.1)
+                                       ref.logits[:, -1].float(),
+                                       atol=0.1,
+                                       rtol=0.1)
 
         kv_cache_manager.shutdown()

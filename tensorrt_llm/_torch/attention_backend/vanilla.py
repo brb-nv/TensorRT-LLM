@@ -1,5 +1,5 @@
-from typing import Optional
 import math
+from typing import Optional
 
 import torch
 import torch.nn.functional as F
@@ -41,14 +41,19 @@ def generate_causal_mask(batch_size: int, target_length: int,
 
 
 def generate_sliding_window_mask_new(batch_size: int, target_length: int,
-                                    cache_position:torch.Tensor, device: torch.device,
-                                    attention_window_size: int):
+                                     cache_position: torch.Tensor,
+                                     device: torch.device,
+                                     attention_window_size: int):
     # TRTLLM's sliding window attention is inclusive.
     effective_window_size = attention_window_size + 1
-    attention_mask_1 = torch.arange(target_length, device=device).unsqueeze(0) <= cache_position.unsqueeze(-1)
-    attention_mask_2 = torch.arange(target_length, device=device).unsqueeze(0) > cache_position.unsqueeze(-1) - effective_window_size
+    attention_mask_1 = torch.arange(
+        target_length,
+        device=device).unsqueeze(0) <= cache_position.unsqueeze(-1)
+    attention_mask_2 = torch.arange(target_length, device=device).unsqueeze(
+        0) > cache_position.unsqueeze(-1) - effective_window_size
     attention_mask = attention_mask_1 & attention_mask_2
-    attention_mask = attention_mask[None, None, :, :].expand(batch_size, 1, -1, -1)
+    attention_mask = attention_mask[None,
+                                    None, :, :].expand(batch_size, 1, -1, -1)
     return attention_mask
 
 
@@ -82,8 +87,12 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
         q_scaling: Optional[float] = None,
         **kwargs,
     ):
-        super().__init__(layer_idx, num_heads, head_dim, num_kv_heads=num_kv_heads,
-                         quant_config=quant_config, **kwargs)
+        super().__init__(layer_idx,
+                         num_heads,
+                         head_dim,
+                         num_kv_heads=num_kv_heads,
+                         quant_config=quant_config,
+                         **kwargs)
         self.num_key_value_groups = self.num_heads // self.num_kv_heads
         self.q_scaling = q_scaling
 
@@ -101,8 +110,14 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
 
         return k_out[:, :seq_len, :, :], v_out[:, :seq_len, :, :]
 
-    def _single_request_forward(self, q, k, v, attention_mask: AttentionMask,
-                                kv_cache_tensor, past_seen_token, cache_idx,
+    def _single_request_forward(self,
+                                q,
+                                k,
+                                v,
+                                attention_mask: AttentionMask,
+                                kv_cache_tensor,
+                                past_seen_token,
+                                cache_idx,
                                 attention_window_size: Optional[int] = None):
 
         bsz = 1
@@ -147,9 +162,9 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
         if attention_mask == PredefinedAttentionMask.CAUSAL:
             # Create custom sliding window mask as sdpa doesn't natively support it.
             if attention_window_size is not None:
-                attn_mask = generate_sliding_window_mask_new(bsz, target_seq_len,
-                                                         cache_position, q.device,
-                                                         attention_window_size)
+                attn_mask = generate_sliding_window_mask_new(
+                    bsz, target_seq_len, cache_position, q.device,
+                    attention_window_size)
             elif past_seen_token == 0:
                 is_causal = True
             elif q_len != 1:
@@ -166,11 +181,17 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
             qk_scale = 1 / (math.sqrt(self.head_dim) * self.q_scaling)
 
         print(f"[VanillaAttention] q: {q.shape} \n {q}")
-        print(f"[VanillaAttention] key_states: {key_states.shape} \n {key_states}")
-        print(f"[VanillaAttention] value_states: {value_states.shape} \n {value_states}")
+        print(
+            f"[VanillaAttention] key_states: {key_states.shape} \n {key_states}"
+        )
+        print(
+            f"[VanillaAttention] value_states: {value_states.shape} \n {value_states}"
+        )
         print(f"[VanillaAttention] is_causal: {is_causal}")
         if attn_mask is not None:
-            print(f"[VanillaAttention] attn_mask: {attn_mask.shape} \n {attn_mask}")
+            print(
+                f"[VanillaAttention] attn_mask: {attn_mask.shape} \n {attn_mask}"
+            )
         else:
             print("[VanillaAttention] attn_mask: None")
         print(f"[VanillaAttention] qk_scale: {qk_scale}")
@@ -184,7 +205,9 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
             scale=qk_scale,
         )
 
-        print(f"[VanillaAttention] attn_output: {attn_output.shape} \n {attn_output}")
+        print(
+            f"[VanillaAttention] attn_output: {attn_output.shape} \n {attn_output}"
+        )
 
         attn_output = attn_output.squeeze(0)
         return attn_output
@@ -309,12 +332,9 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
             past_seen_token = past_seen_tokens[i]
             cache_idx = cache_indices[i]
 
-            attn_output = self._single_request_forward(single_q, single_k,
-                                                       single_v, attention_mask,
-                                                       kv_cache_tensor,
-                                                       past_seen_token,
-                                                       cache_idx,
-                                                       attention_window_size)
+            attn_output = self._single_request_forward(
+                single_q, single_k, single_v, attention_mask, kv_cache_tensor,
+                past_seen_token, cache_idx, attention_window_size)
             attn_outputs.append(attn_output)
 
             offset += seq_len
