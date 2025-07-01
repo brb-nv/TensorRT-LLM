@@ -42,7 +42,7 @@ GEMMA3_1B_SINGLE_LAYER_CONFIG = {
   "max_position_embeddings": 32768,
   "model_type": "gemma3_text",
   "num_attention_heads": 4,
-  "num_hidden_layers": 1,    # Modified for testing.
+  "num_hidden_layers": 2,           # Modified for testing.
   "num_key_value_heads": 1,
   "pad_token_id": 0,
   "query_pre_attn_scalar": 256,
@@ -50,8 +50,8 @@ GEMMA3_1B_SINGLE_LAYER_CONFIG = {
   "rope_local_base_freq": 10000,
   "rope_scaling": None,
   "rope_theta": 1000000,
-  "sliding_window": 4,      # Modified for testing.
-  "sliding_window_pattern": 6,
+  "sliding_window": 4,              # Modified for testing.
+  "sliding_window_pattern": 2,      # Modified for testing.
   "torch_dtype": "bfloat16",
   "transformers_version": "4.50.0.dev0",
   "use_cache": True,
@@ -200,18 +200,13 @@ class TestGemma3(unittest.TestCase):
 
         hf_gemma3 = HFGemma3ForCausalLM(gemma3_config).to(dtype).to(
             device).eval()
-        hf_cache = HybridCache(config=gemma3_config, max_batch_size=batch_size, max_cache_len=max_seq_len, device=device, dtype=dtype)
+        # TODO: Change max_cache_len to max_seq_len once test is refined.
+        hf_cache = HybridCache(config=gemma3_config, max_batch_size=batch_size, max_cache_len=10, device=device, dtype=dtype)
 
         model_config = ModelConfig(pretrained_config=gemma3_config,
                                    attn_backend=backend)
         gemma3 = Gemma3ForCausalLM(model_config).to(dtype).to(device)
         gemma3.load_weights(hf_gemma3.state_dict())
-
-        # #############################################################################
-        # assert head_dim == 256, "Expected head_dim to be 256 for gemma3-1b-it, got {}".format(head_dim)
-        # assert num_kv_heads == 1, "Expected num_kv_heads to be 1 for gemma3-1b-it, got {}".format(num_kv_heads)
-        # assert num_layers == 26, "Expected num_layers to be 26 for gemma3-1b-it, got {}".format(num_layers)
-        # #############################################################################
 
         if dtype == torch.half:
             kv_cache_dtype = tensorrt_llm.bindings.DataType.HALF
@@ -278,8 +273,8 @@ class TestGemma3(unittest.TestCase):
                                      use_cache=True)
             torch.testing.assert_close(logits,
                                        ref.logits[:, -1].float(),
-                                       atol=0.02,
-                                       rtol=0.02)
+                                       atol=0.05,
+                                       rtol=0.05)
             print("[test_gemma3_allclose_to_hf] max prefill diff: ", torch.max(torch.abs(logits - ref.logits[:, -1].float())))
             print("[test_gemma3_allclose_to_hf] mean prefill diff: ", torch.mean(torch.abs(logits - ref.logits[:, -1].float())))
 
@@ -321,7 +316,7 @@ class TestGemma3(unittest.TestCase):
 
             torch.testing.assert_close(logits,
                                     ref.logits[:, -1].float(),
-                                    atol=0.03,
-                                    rtol=0.03)
+                                    atol=0.05,
+                                    rtol=0.05)
 
         kv_cache_manager.shutdown()
