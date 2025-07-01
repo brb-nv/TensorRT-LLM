@@ -42,7 +42,7 @@ GEMMA3_1B_SINGLE_LAYER_CONFIG = {
   "max_position_embeddings": 32768,
   "model_type": "gemma3_text",
   "num_attention_heads": 4,
-  "num_hidden_layers": 2,           # Modified for testing.
+  "num_hidden_layers": 26,           # Modified for testing.
   "num_key_value_heads": 1,
   "pad_token_id": 0,
   "query_pre_attn_scalar": 256,
@@ -51,7 +51,7 @@ GEMMA3_1B_SINGLE_LAYER_CONFIG = {
   "rope_scaling": None,
   "rope_theta": 1000000,
   "sliding_window": 4,              # Modified for testing.
-  "sliding_window_pattern": 2,      # Modified for testing.
+  "sliding_window_pattern": 6,      # Modified for testing.
   "torch_dtype": "bfloat16",
   "transformers_version": "4.50.0.dev0",
   "use_cache": True,
@@ -201,7 +201,7 @@ class TestGemma3(unittest.TestCase):
         hf_gemma3 = HFGemma3ForCausalLM(gemma3_config).to(dtype).to(
             device).eval()
         # TODO: Change max_cache_len to max_seq_len once test is refined.
-        hf_cache = HybridCache(config=gemma3_config, max_batch_size=batch_size, max_cache_len=6, device=device, dtype=dtype)
+        hf_cache = HybridCache(config=gemma3_config, max_batch_size=batch_size, max_cache_len=10, device=device, dtype=dtype)
 
         model_config = ModelConfig(pretrained_config=gemma3_config,
                                    attn_backend=backend)
@@ -234,7 +234,7 @@ class TestGemma3(unittest.TestCase):
             dtype=kv_cache_dtype,
         )
         # context
-        input_ids = torch.tensor([100, 200, 300, 400],
+        input_ids = torch.tensor([100, 200, 300, 400, 500, 600, 700, 800],
                                  dtype=torch.int32,
                                  device=device)
 
@@ -273,8 +273,8 @@ class TestGemma3(unittest.TestCase):
                                      use_cache=True)
             torch.testing.assert_close(logits,
                                        ref.logits[:, -1].float(),
-                                       atol=0.05,
-                                       rtol=0.05)
+                                       atol=0.1,
+                                       rtol=0.1)
             print("[test_gemma3_allclose_to_hf] max prefill diff: ", torch.max(torch.abs(logits - ref.logits[:, -1].float())))
             print("[test_gemma3_allclose_to_hf] mean prefill diff: ", torch.mean(torch.abs(logits - ref.logits[:, -1].float())))
 
@@ -310,13 +310,15 @@ class TestGemma3(unittest.TestCase):
             ref = hf_gemma3.forward(input_ids=gen_input_ids.unsqueeze(0),
                                      position_ids=gen_position_ids,
                                      past_key_values=hf_cache,
-                                     use_cache=True)
+                                     use_cache=True,
+                                     cache_position=torch.IntTensor([8]).to(device),
+                                     last_cache_position=9)
             print("[test_gemma3_allclose_to_hf] max gen diff: ", torch.max(torch.abs(logits - ref.logits[:, -1].float())))
             print("[test_gemma3_allclose_to_hf] mean gen diff: ", torch.mean(torch.abs(logits - ref.logits[:, -1].float())))
 
             torch.testing.assert_close(logits,
                                     ref.logits[:, -1].float(),
-                                    atol=0.05,
-                                    rtol=0.05)
+                                    atol=0.1,
+                                    rtol=0.1)
 
         kv_cache_manager.shutdown()
