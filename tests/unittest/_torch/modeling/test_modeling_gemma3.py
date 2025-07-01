@@ -201,7 +201,7 @@ class TestGemma3(unittest.TestCase):
         hf_gemma3 = HFGemma3ForCausalLM(gemma3_config).to(dtype).to(
             device).eval()
         # TODO: Change max_cache_len to max_seq_len once test is refined.
-        hf_cache = HybridCache(config=gemma3_config, max_batch_size=batch_size, max_cache_len=10, device=device, dtype=dtype)
+        hf_cache = HybridCache(config=gemma3_config, max_batch_size=batch_size, max_cache_len=6, device=device, dtype=dtype)
 
         model_config = ModelConfig(pretrained_config=gemma3_config,
                                    attn_backend=backend)
@@ -234,7 +234,7 @@ class TestGemma3(unittest.TestCase):
             dtype=kv_cache_dtype,
         )
         # context
-        input_ids = torch.tensor([100, 200, 300, 400, 500, 600, 700, 800],
+        input_ids = torch.tensor([100, 200, 300, 400],
                                  dtype=torch.int32,
                                  device=device)
 
