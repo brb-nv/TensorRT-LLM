@@ -267,8 +267,8 @@ class TestGemma3(unittest.TestCase):
                                     use_cache=True)
             torch.testing.assert_close(logits,
                                        ref.logits[:, -1].float(),
-                                       atol=0.1,
-                                       rtol=0.1)
+                                       atol=0.05,
+                                       rtol=0.05)
             print("[test_gemma3_allclose_to_hf] max prefill diff: ",
                   torch.max(torch.abs(logits - ref.logits[:, -1].float())))
             print("[test_gemma3_allclose_to_hf] mean prefill diff: ",
@@ -318,7 +318,7 @@ class TestGemma3(unittest.TestCase):
 
             torch.testing.assert_close(logits,
                                        ref.logits[:, -1].float(),
-                                       atol=0.1,
-                                       rtol=0.1)
+                                       atol=0.05,
+                                       rtol=0.05)
 
         kv_cache_manager.shutdown()
