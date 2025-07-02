@@ -63,6 +63,36 @@ class Scenario:
 
 class TestGemma3(unittest.TestCase):
 
+    def get_kv_cache_manager(self, dtype: torch.dtype, config: Gemma3Config,
+                             tokens_per_block: int, max_seq_len: int,
+                             batch_size: int, num_blocks: int):
+        if dtype == torch.half:
+            kv_cache_dtype = tensorrt_llm.bindings.DataType.HALF
+        elif dtype == torch.bfloat16:
+            kv_cache_dtype = tensorrt_llm.bindings.DataType.BF16
+        else:
+            raise ValueError("Invalid dtype")
+
+        mapping = Mapping(world_size=1, tp_size=1, rank=0)
+        kv_cache_config = KvCacheConfig(enable_block_reuse=False,
+                                        enable_partial_reuse=False,
+                                        copy_on_partial_reuse=False,
+                                        max_tokens=num_blocks *
+                                        tokens_per_block)
+        kv_cache_manager = KVCacheManager(
+            kv_cache_config,
+            tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
+            num_layers=config.num_hidden_layers,
+            num_kv_heads=config.num_key_value_heads,
+            head_dim=config.head_dim,
+            tokens_per_block=tokens_per_block,
+            max_seq_len=max_seq_len,
+            max_batch_size=batch_size,
+            mapping=mapping,
+            dtype=kv_cache_dtype,
+        )
+        return kv_cache_manager
+
     def test_gemma3_sanity(self):
 
         config_dict = deepcopy(GEMMA3_1B_MINI_CONFIG)
@@ -88,37 +118,15 @@ class TestGemma3(unittest.TestCase):
 
         num_blocks = 100
         tokens_per_block = 128
-        head_dim = gemma3.config.hidden_size // gemma3.config.num_attention_heads
-        num_layers = gemma3.config.num_hidden_layers
-        num_kv_heads = gemma3.config.num_key_value_heads
         max_seq_len = num_blocks * tokens_per_block
         batch_size = len(context_sequence_lengths) + 2
-
-        if dtype == torch.half:
-            kv_cache_dtype = tensorrt_llm.bindings.DataType.HALF
-        elif dtype == torch.bfloat16:
-            kv_cache_dtype = tensorrt_llm.bindings.DataType.BF16
-        else:
-            raise ValueError("Invalid dtype")
-
-        mapping = Mapping(world_size=1, tp_size=1, rank=0)
-        kv_cache_config = KvCacheConfig(enable_block_reuse=False,
-                                        enable_partial_reuse=False,
-                                        copy_on_partial_reuse=False,
-                                        max_tokens=num_blocks *
-                                        tokens_per_block)
-        kv_cache_manager = KVCacheManager(
-            kv_cache_config,
-            tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
-            num_layers=num_layers,
-            num_kv_heads=num_kv_heads,
-            head_dim=head_dim,
+        kv_cache_manager = self.get_kv_cache_manager(
+            dtype=dtype,
+            config=gemma3_config,
             tokens_per_block=tokens_per_block,
             max_seq_len=max_seq_len,
-            max_batch_size=batch_size,
-            mapping=mapping,
-            dtype=kv_cache_dtype,
-        )
+            batch_size=batch_size,
+            num_blocks=num_blocks)
         kv_cache_manager.add_dummy_requests(request_ids, token_nums)
 
         metadata_cls = get_attention_backend(model_config.attn_backend).Metadata
@@ -186,9 +194,6 @@ class TestGemma3(unittest.TestCase):
 
         num_blocks = 1
         tokens_per_block = 128
-        head_dim = gemma3_config.head_dim
-        num_layers = gemma3_config.num_hidden_layers
-        num_kv_heads = gemma3_config.num_key_value_heads
         max_seq_len = num_blocks * tokens_per_block
         batch_size = 1
 
@@ -205,31 +210,14 @@ class TestGemma3(unittest.TestCase):
         gemma3 = Gemma3ForCausalLM(model_config).to(dtype).to(device)
         gemma3.load_weights(hf_gemma3.state_dict())
 
-        if dtype == torch.half:
-            kv_cache_dtype = tensorrt_llm.bindings.DataType.HALF
-        elif dtype == torch.bfloat16:
-            kv_cache_dtype = tensorrt_llm.bindings.DataType.BF16
-        else:
-            raise ValueError("Invalid dtype")
-
-        mapping = Mapping(world_size=1, tp_size=1, rank=0)
-        kv_cache_config = KvCacheConfig(enable_block_reuse=False,
-                                        enable_partial_reuse=False,
-                                        copy_on_partial_reuse=False,
-                                        max_tokens=num_blocks *
-                                        tokens_per_block)
-        kv_cache_manager = KVCacheManager(
-            kv_cache_config,
-            tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
-            num_layers=num_layers,
-            num_kv_heads=num_kv_heads,
-            head_dim=head_dim,
+        kv_cache_manager = self.get_kv_cache_manager(
+            dtype=dtype,
+            config=gemma3_config,
             tokens_per_block=tokens_per_block,
             max_seq_len=max_seq_len,
-            max_batch_size=batch_size,
-            mapping=mapping,
-            dtype=kv_cache_dtype,
-        )
+            batch_size=batch_size,
+            num_blocks=num_blocks)
+
         # Context phase.
         input_ids = torch.tensor([100, 200, 300, 400, 500, 600, 700, 800],
                                  dtype=torch.int32,
