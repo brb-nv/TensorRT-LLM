@@ -32,6 +32,7 @@ class SiglipVisionTransformer(nn.Module):
         self.encoder = SiglipEncoder(model_config)
         if hasattr(config, "vision_use_head"):
             assert not config.vision_use_head, "Currently, we only support vision_use_head = False"
+        self.post_layernorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
 
     def forward(
         self,
@@ -51,6 +52,12 @@ class SiglipVisionTransformer(nn.Module):
             inputs_embeds=hidden_states,
             attn_metadata=attn_metadata,
         )
+
+        print(f"[TRTLLM::SiglipVisionTransformer] encoder_outputs[-1]: {encoder_outputs[-1].shape} \n {encoder_outputs[-1]}")
+        temp_list = list(encoder_outputs)
+        temp_list[-1] = self.post_layernorm(temp_list[-1])
+        encoder_outputs = tuple(temp_list)
+        print(f"[TRTLLM::SiglipVisionTransformer] encoder_outputs[-1] after post_layernorm: {encoder_outputs[-1].shape} \n {encoder_outputs[-1]}")
 
         return encoder_outputs
 
