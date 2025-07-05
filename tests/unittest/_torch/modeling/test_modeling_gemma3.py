@@ -176,6 +176,7 @@ class TestGemma3(unittest.TestCase):
     @parameterized.expand([
         Scenario(backend="TRTLLM"),
         Scenario(backend="VANILLA"),
+        Scenario(backend="FLASHINFER"),
     ], lambda testcase_func, param_num, param:
                           f"{testcase_func.__name__}[{param.args[0]}]")
     @torch.no_grad()
