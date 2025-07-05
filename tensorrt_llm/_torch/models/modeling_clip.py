@@ -37,7 +37,8 @@ class CLIPAttention(Attention):
             bias=bias,
             pos_embd_params=pos_embd_params,
             layer_idx=layer_idx,
-            dtype=torch.bfloat16,
+            dtype=config.torch_dtype
+            if hasattr(config, 'torch_dtype') else torch.float32,
             config=model_config,
         )
 
@@ -67,24 +68,28 @@ class CLIPEncoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
     ) -> Tuple[torch.FloatTensor]:
+
+        print(f"[TRTLLM::CLIPEncoderLayer] input hidden_states: {hidden_states.shape} \n hidden_states: {hidden_states}")
         residual = hidden_states
         hidden_states = self.layer_norm1(hidden_states)
-
+        print(f"[TRTLLM::CLIPEncoderLayer] after layer_norm1 hidden_states: {hidden_states.shape} \n hidden_states: {hidden_states}")
         hidden_states = self.self_attn(
             position_ids=None,  # CLIP doesn't use explicit position_ids here
-            hidden_states=hidden_states.to(torch.bfloat16),
+            hidden_states=hidden_states,
             attn_metadata=attn_metadata,
             attention_mask=PredefinedAttentionMask.
             FULL  # Always FULL for Vision
         )
-
+        print(f"[TRTLLM::CLIPEncoderLayer] after self_attn hidden_states: {hidden_states.shape} \n hidden_states: {hidden_states}")
         hidden_states = residual + hidden_states
-
+        print(f"[TRTLLM::CLIPEncoderLayer] after first residual hidden_states: {hidden_states.shape} \n hidden_states: {hidden_states}")
         residual = hidden_states
         hidden_states = self.layer_norm2(hidden_states)
+        print(f"[TRTLLM::CLIPEncoderLayer] after layer_norm2 hidden_states: {hidden_states.shape} \n hidden_states: {hidden_states}")
         hidden_states = self.mlp(hidden_states)
+        print(f"[TRTLLM::CLIPEncoderLayer] after mlp hidden_states: {hidden_states.shape} \n hidden_states: {hidden_states}")
         hidden_states = residual + hidden_states
-
+        print(f"[TRTLLM::CLIPEncoderLayer] after second residual hidden_states: {hidden_states.shape} \n hidden_states: {hidden_states}")
         outputs = (hidden_states, )
 
         return outputs

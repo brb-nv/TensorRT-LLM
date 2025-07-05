@@ -64,6 +64,7 @@ class Gemma3InputProcessor(InputProcessor):
 
         # Use HF multi-modal projector
         self.mm_projector = hf_mm_projector
+        self.hf_vision_tower = hf_vision_tower.to(self.device)
 
     @nvtx_range("[Vision] preprocess")
     def _preprocess(self, inputs):
