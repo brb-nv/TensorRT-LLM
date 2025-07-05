@@ -51,13 +51,16 @@ class Gemma3InputProcessor(InputProcessor):
                                                   local_model_path,
                                                   strict=False)
         assert len(missing_keys) == 0, f"Missing keys: {missing_keys}"
-        hf_vision_tower = module_dict["vision_tower"].to(self.dtype).to(
-            self.device)
+        hf_vision_tower = module_dict["vision_tower"].to(self.dtype)
         hf_mm_projector = module_dict["multi_modal_projector"].to(
             self.dtype).to(self.device)
 
         # Use HF vision tower. To be replaced with TRTLLM vision tower.
-        self.vision_tower = hf_vision_tower
+        vision_model_config = ModelConfig(pretrained_config=model_config.vision_config, attn_backend="TRTLLM")
+        from .modeling_siglip import SiglipVisionModel
+        self.vision_tower = SiglipVisionModel(vision_model_config).to(
+            self.device).to(self.dtype)
+        self.vision_tower.load_weights(hf_vision_tower.state_dict())
 
         # Use HF multi-modal projector
         self.mm_projector = hf_mm_projector
@@ -86,9 +89,11 @@ class Gemma3InputProcessor(InputProcessor):
 
     @nvtx_range("[Vision] process")
     def _process(self, pixel_values):
-        image_features: Tuple[torch.Tensor] = self.vision_tower(
-            pixel_values).last_hidden_state
-        image_features = self.mm_projector(image_features)
+        assert pixel_values.dim() == 4, "pixel_values should be a 4D tensor"
+        assert pixel_values.shape[0] == 1, "pixel_values should have batch size 1"
+        attn_metadata = self.vision_tower.prepare_attn_metadata(pixel_values.shape[0])
+        image_features: Tuple[torch.Tensor] = self.vision_tower(pixel_values, attn_metadata=attn_metadata)
+        image_features = self.mm_projector(image_features[-1])
         return image_features
 
     @torch.inference_mode()

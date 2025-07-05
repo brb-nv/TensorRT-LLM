@@ -37,8 +37,7 @@ class CLIPAttention(Attention):
             bias=bias,
             pos_embd_params=pos_embd_params,
             layer_idx=layer_idx,
-            dtype=config.torch_dtype
-            if hasattr(config, 'torch_dtype') else torch.float32,
+            dtype=torch.bfloat16,
             config=model_config,
         )
 
@@ -73,7 +72,7 @@ class CLIPEncoderLayer(nn.Module):
 
         hidden_states = self.self_attn(
             position_ids=None,  # CLIP doesn't use explicit position_ids here
-            hidden_states=hidden_states,
+            hidden_states=hidden_states.to(torch.bfloat16),
             attn_metadata=attn_metadata,
             attention_mask=PredefinedAttentionMask.
             FULL  # Always FULL for Vision
