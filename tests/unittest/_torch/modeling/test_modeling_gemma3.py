@@ -44,7 +44,7 @@ GEMMA3_1B_MINI_CONFIG = {
     "rope_local_base_freq": 10000,
     "rope_scaling": None,
     "rope_theta": 1000000,
-    "sliding_window": 512,  # Modified for testing.
+    "sliding_window": 4,  # Modified for testing.
     "sliding_window_pattern": 2,  # Modified for testing.
     "torch_dtype": "bfloat16",
     "transformers_version": "4.50.0.dev0",
@@ -254,6 +254,9 @@ class TestGemma3(unittest.TestCase):
                                     position_ids=position_ids,
                                     past_key_values=hf_cache,
                                     use_cache=True)
+
+            print("[TestGemma3::test_gemma3_allclose_to_hf] max prefill diff: ", torch.max(torch.abs(logits - ref.logits[:, -1].float())).item())
+            print("[TestGemma3::test_gemma3_allclose_to_hf] mean prefill diff: ", torch.mean(torch.abs(logits - ref.logits[:, -1].float())).item())
             torch.testing.assert_close(logits,
                                        ref.logits[:, -1].float(),
                                        atol=0.05,
@@ -293,6 +296,8 @@ class TestGemma3(unittest.TestCase):
                                     cache_position=torch.IntTensor(
                                         [input_ids.size(-1)]).to(device),
                                     last_cache_position=input_ids.size(-1) + 1)
+            print("[TestGemma3::test_gemma3_allclose_to_hf] max gen diff: ", torch.max(torch.abs(logits - ref.logits[:, -1].float())).item())
+            print("[TestGemma3::test_gemma3_allclose_to_hf] mean gen diff: ", torch.mean(torch.abs(logits - ref.logits[:, -1].float())).item())
             torch.testing.assert_close(logits,
                                        ref.logits[:, -1].float(),
                                        atol=0.05,

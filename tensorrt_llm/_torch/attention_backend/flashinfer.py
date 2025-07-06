@@ -331,10 +331,13 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             print("[FlashInferAttention::plan] qo_len: \n", qo_len)
             print("[FlashInferAttention::plan] kv_len: \n", kv_len)
             for i in range(batch_size):
-                mask_i = torch.tril(
-                    torch.full((qo_len[i], kv_len[i]), True, device="cuda:0"),
-                    diagonal=(kv_len[i] - qo_len[i]),
-                )
+                # TRTLLM's sliding window attention is inclusive.
+                effective_window_size = attention_window_size + 1
+                prefill_seq_len = qo_len[i]
+                cache_position = torch.arange(prefill_seq_len, device="cuda:0")
+                attention_mask_1 = torch.arange(prefill_seq_len, device="cuda:0").unsqueeze(0) <= cache_position.unsqueeze(-1)
+                attention_mask_2 = torch.arange(prefill_seq_len, device="cuda:0").unsqueeze(0) > cache_position.unsqueeze(-1) - effective_window_size
+                mask_i = attention_mask_1 & attention_mask_2
                 print("[FlashInferAttention::plan] mask_i: \n", mask_i)
                 mask_arr.append(mask_i.flatten())
 
@@ -389,8 +392,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                 paged_kv_last_page_len_buf=self._paged_kv_last_page_len,
                 use_cuda_graph=self.is_cuda_graph)
 
-        # is_causal = plan_params.attention_mask_type == AttentionMaskType.causal
-        is_causal = False
+        is_causal = plan_params.attention_mask_type == AttentionMaskType.causal
 
         def prefill_plan():
             print("[FlashInferAttention::prefill_plan] plan_params.attention_mask_data: \n", plan_params.attention_mask_data)
