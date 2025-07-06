@@ -320,35 +320,6 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         if q_scaling is not None:
             sm_scale = 1 / (math.sqrt(head_dim) * q_scaling)
 
-        ##############################################################################
-        # HARDCODING FOR TESTING. TO BE MOVED UPSTREAM.
-        if self.num_contexts > 0:
-            batch_size = self.num_contexts + self.num_generations
-            qo_len = self.seq_lens_cuda
-            kv_len = self.seq_lens_kv_cuda
-            mask_arr = []
-            print("[FlashInferAttention::plan] batch_size: ", batch_size, "self.num_contexts: ", self.num_contexts, "self.num_generations: ", self.num_generations)
-            print("[FlashInferAttention::plan] qo_len: \n", qo_len)
-            print("[FlashInferAttention::plan] kv_len: \n", kv_len)
-            for i in range(batch_size):
-                # TRTLLM's sliding window attention is inclusive.
-                effective_window_size = attention_window_size + 1
-                prefill_seq_len = qo_len[i]
-                cache_position = torch.arange(prefill_seq_len, device="cuda:0")
-                attention_mask_1 = torch.arange(prefill_seq_len, device="cuda:0").unsqueeze(0) <= cache_position.unsqueeze(-1)
-                attention_mask_2 = torch.arange(prefill_seq_len, device="cuda:0").unsqueeze(0) > cache_position.unsqueeze(-1) - effective_window_size
-                mask_i = attention_mask_1 & attention_mask_2
-                print("[FlashInferAttention::plan] mask_i: \n", mask_i)
-                mask_arr.append(mask_i.flatten())
-
-            attention_mask_data = torch.cat(mask_arr, dim=0)
-            print("[FlashInferAttention::plan] attention_mask_data: \n", attention_mask_data)
-
-            # Reset these to make sure custom_mask is indeed being used.
-            attention_window_size = -1
-        else:
-            attention_window_size = attention_window_size
-        ##############################################################################
         plan_params = PlanParams(
             num_heads=num_heads,
             num_kv_heads=num_kv_heads,
@@ -395,7 +366,6 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         is_causal = plan_params.attention_mask_type == AttentionMaskType.causal
 
         def prefill_plan():
-            print("[FlashInferAttention::prefill_plan] plan_params.attention_mask_data: \n", plan_params.attention_mask_data)
             prefill_wrapper.plan(
                 self.qo_indptr[:self.num_contexts + 1],
                 self.paged_kv_indptr_prefill[:self.num_contexts + 1],
