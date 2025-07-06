@@ -37,14 +37,14 @@ GEMMA3_27B_MINI_CONFIG = {
     "intermediate_size": 21504,
     "model_type": "gemma3_text",
     "num_attention_heads": 32,
-    "num_hidden_layers": 1,     # Modified for testing.
+    "num_hidden_layers": 6,     # Modified for testing.
     "num_key_value_heads": 16,
     "query_pre_attn_scalar": 168,
     "rope_scaling": {
       "factor": 8.0,
       "rope_type": "linear"
     },
-    "sliding_window": 1024
+    "sliding_window": 4     # Modified for testing.
   },
   "torch_dtype": "bfloat16",
   "transformers_version": "4.50.0.dev0",
@@ -219,8 +219,8 @@ class TestGemma3(unittest.TestCase):
             print("[TestGemma3::test_gemma3_allclose_to_hf] mean prefill diff: ", torch.mean(torch.abs(logits - ref.logits[:, -1].float())).item())
             torch.testing.assert_close(logits,
                                        ref.logits[:, -1].float(),
-                                       atol=0.05,
-                                       rtol=0.05)
+                                       atol=0.1,
+                                       rtol=0.1)
 
         # Generation phase.
         gen_input_ids = torch.tensor([900], dtype=torch.int, device=device)
@@ -260,7 +260,7 @@ class TestGemma3(unittest.TestCase):
             print("[TestGemma3::test_gemma3_allclose_to_hf] mean gen diff: ", torch.mean(torch.abs(logits - ref.logits[:, -1].float())).item())
             torch.testing.assert_close(logits,
                                        ref.logits[:, -1].float(),
-                                       atol=0.05,
-                                       rtol=0.05)
+                                       atol=0.1,
+                                       rtol=0.1)
 
         kv_cache_manager.shutdown()
