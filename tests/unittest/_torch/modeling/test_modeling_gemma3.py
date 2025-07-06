@@ -255,8 +255,13 @@ class TestGemma3(unittest.TestCase):
                                     past_key_values=hf_cache,
                                     use_cache=True)
 
-            print("[TestGemma3::test_gemma3_allclose_to_hf] max prefill diff: ", torch.max(torch.abs(logits - ref.logits[:, -1].float())).item())
-            print("[TestGemma3::test_gemma3_allclose_to_hf] mean prefill diff: ", torch.mean(torch.abs(logits - ref.logits[:, -1].float())).item())
+            print(
+                "[TestGemma3::test_gemma3_allclose_to_hf] max prefill diff: ",
+                torch.max(torch.abs(logits - ref.logits[:, -1].float())).item())
+            print(
+                "[TestGemma3::test_gemma3_allclose_to_hf] mean prefill diff: ",
+                torch.mean(torch.abs(logits -
+                                     ref.logits[:, -1].float())).item())
             torch.testing.assert_close(logits,
                                        ref.logits[:, -1].float(),
                                        atol=0.05,
@@ -296,8 +301,13 @@ class TestGemma3(unittest.TestCase):
                                     cache_position=torch.IntTensor(
                                         [input_ids.size(-1)]).to(device),
                                     last_cache_position=input_ids.size(-1) + 1)
-            print("[TestGemma3::test_gemma3_allclose_to_hf] max gen diff: ", torch.max(torch.abs(logits - ref.logits[:, -1].float())).item())
-            print("[TestGemma3::test_gemma3_allclose_to_hf] mean gen diff: ", torch.mean(torch.abs(logits - ref.logits[:, -1].float())).item())
+            print(
+                "[TestGemma3::test_gemma3_allclose_to_hf] max gen diff: ",
+                torch.max(torch.abs(logits - ref.logits[:, -1].float())).item())
+            print(
+                "[TestGemma3::test_gemma3_allclose_to_hf] mean gen diff: ",
+                torch.mean(torch.abs(logits -
+                                     ref.logits[:, -1].float())).item())
             torch.testing.assert_close(logits,
                                        ref.logits[:, -1].float(),
                                        atol=0.05,
