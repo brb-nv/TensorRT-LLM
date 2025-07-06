@@ -36,7 +36,7 @@ GEMMA3_1B_MINI_CONFIG = {
     "max_position_embeddings": 32768,
     "model_type": "gemma3_text",
     "num_attention_heads": 4,
-    "num_hidden_layers": 2,  # Modified for testing.
+    "num_hidden_layers": 1,  # Modified for testing.
     "num_key_value_heads": 1,
     "pad_token_id": 0,
     "query_pre_attn_scalar": 256,
@@ -44,7 +44,7 @@ GEMMA3_1B_MINI_CONFIG = {
     "rope_local_base_freq": 10000,
     "rope_scaling": None,
     "rope_theta": 1000000,
-    "sliding_window": 4,  # Modified for testing.
+    "sliding_window": 512,  # Modified for testing.
     "sliding_window_pattern": 2,  # Modified for testing.
     "torch_dtype": "bfloat16",
     "transformers_version": "4.50.0.dev0",
