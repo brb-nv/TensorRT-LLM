@@ -10,7 +10,7 @@ from transformers.activations import ACT2FN
 from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
 from tensorrt_llm.mapping import Mapping
 
-from ..attention_backend import AttentionMetadata
+from ..attention_backend import AttentionMetadata, FlashInferAttentionMetadata
 from ..attention_backend.interface import (AttentionMask, CustomAttentionMask,
                                            PositionalEmbeddingParams,
                                            PredefinedAttentionMask, RopeParams)
@@ -113,12 +113,13 @@ class Gemma3Attention(Attention):
         # Setting attention_window_size to None for custom attention mask is important.
         # Otherwise, FlashInfer proceeds to use SWA regardless of attention_mask_data.
         if attention_mask_data is not None:
-            assert isinstance(attn_metadata, FlashInferAttentionMetadata), "Only FlashInfer backend supports custom attention mask currently."
+            assert isinstance(
+                attn_metadata, FlashInferAttentionMetadata
+            ), "Only FlashInfer backend supports custom attention mask currently."
             assert attention_mask == CustomAttentionMask.CUSTOM
             attention_window_size = None
         else:
             attention_window_size = self.attention_window_size
-        print(f"[Gemma3Attention::forward]: attention_window_size: {attention_window_size}")
         return super().forward(position_ids=position_ids,
                                hidden_states=hidden_states,
                                attn_metadata=attn_metadata,

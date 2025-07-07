@@ -14,7 +14,8 @@ from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_gemma3vl import (Gemma3Model,
-                                                          get_gemma3_causal_mask)
+                                                          get_gemma3_causal_mask
+                                                          )
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
@@ -275,48 +276,51 @@ class TestGemma3(unittest.TestCase):
         kv_cache_manager.shutdown()
 
     def test_gemma3_global_mask(self) -> None:
-      image_token_index = 262144
-      device = torch.device('cuda')
-      input_ids = torch.IntTensor([[
-          100, 200, image_token_index, image_token_index, image_token_index,
-          image_token_index, 700, 800
-      ]]).to(device=device)
-      attention_mask = get_gemma3_causal_mask(input_ids=input_ids,
-                                              image_token_index=image_token_index,
-                                              sliding_window=None)
-      print("[TestGemma3::test_gemma3_global_mask] attention_mask: \n",
-            attention_mask)
-      expected_attention_mask = torch.tensor(
-          [[[[True, False, False, False, False, False, False, False],
-              [True, True, False, False, False, False, False, False],
-              [True, True, True, True, True, True, False, False],
-              [True, True, True, True, True, True, False, False],
-              [True, True, True, True, True, True, False, False],
-              [True, True, True, True, True, True, False, False],
-              [True, True, True, True, True, True, True, False],
-              [True, True, True, True, True, True, True, True]]]],
-          device=device)
-      torch.testing.assert_close(attention_mask, expected_attention_mask)
+        image_token_index = 262144
+        device = torch.device('cuda')
+        input_ids = torch.IntTensor([
+            100, 200, image_token_index, image_token_index, image_token_index,
+            image_token_index, 700, 800
+        ]).to(device=device)
+        attention_mask = get_gemma3_causal_mask(
+            input_ids=input_ids,
+            image_token_index=image_token_index,
+            sliding_window=None)
+        print("[TestGemma3::test_gemma3_global_mask] attention_mask: \n",
+              attention_mask)
+        expected_attention_mask = torch.tensor(
+            [[True, False, False, False, False, False, False, False],
+             [True, True, False, False, False, False, False, False],
+             [True, True, True, True, True, True, False, False],
+             [True, True, True, True, True, True, False, False],
+             [True, True, True, True, True, True, False, False],
+             [True, True, True, True, True, True, False, False],
+             [True, True, True, True, True, True, True, False],
+             [True, True, True, True, True, True, True, True]],
+            device=device)
+        torch.testing.assert_close(attention_mask, expected_attention_mask)
 
     def test_gemma3_local_mask(self) -> None:
-      image_token_index = 262144
-      device = torch.device('cuda')
-      input_ids = torch.IntTensor([[
-          100, 200, image_token_index, image_token_index, image_token_index,
-          image_token_index, 700, 800
-      ]]).to(device=device)
-      attention_mask = get_gemma3_causal_mask(input_ids=input_ids,
-                                              image_token_index=image_token_index,
-                                              sliding_window=2)
-      print("[TestGemma3::test_gemma3_local_mask] attention_mask: \n", attention_mask)
-      expected_attention_mask = torch.tensor(
-          [[[[True, False, False, False, False, False, False, False],
-              [True, True, False, False, False, False, False, False],
-              [False, True, True, True, True, True, False, False],
-              [False, False, True, True, True, True, False, False],
-              [False, False, True, True, True, True, False, False],
-              [False, False, True, True, True, True, False, False],
-              [False, False, False, False, False, True, True, False],
-              [False, False, False, False, False, False, True, True]]]],
-          device=device)
-      torch.testing.assert_close(attention_mask, expected_attention_mask)
+        image_token_index = 262144
+        device = torch.device('cuda')
+        input_ids = torch.IntTensor([
+            100, 200, image_token_index, image_token_index, image_token_index,
+            image_token_index, 700, 800
+        ]).to(device=device)
+        attention_mask = get_gemma3_causal_mask(
+            input_ids=input_ids,
+            image_token_index=image_token_index,
+            sliding_window=2)
+        print("[TestGemma3::test_gemma3_local_mask] attention_mask: \n",
+              attention_mask)
+        expected_attention_mask = torch.tensor(
+            [[True, False, False, False, False, False, False, False],
+             [True, True, False, False, False, False, False, False],
+             [False, True, True, True, True, True, False, False],
+             [False, False, True, True, True, True, False, False],
+             [False, False, True, True, True, True, False, False],
+             [False, False, True, True, True, True, False, False],
+             [False, False, False, False, False, True, True, False],
+             [False, False, False, False, False, False, True, True]],
+            device=device)
+        torch.testing.assert_close(attention_mask, expected_attention_mask)
