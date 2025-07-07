@@ -14,7 +14,7 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from ..utils import get_global_attrs, get_model_extra_attrs
 from .interface import (AttentionBackend, AttentionMask, AttentionMetadata,
-                        PredefinedAttentionMask)
+                        CustomAttentionMask, PredefinedAttentionMask)
 
 try:
     check_cuda_arch()
@@ -366,6 +366,12 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         is_causal = plan_params.attention_mask_type == AttentionMaskType.causal
 
         def prefill_plan():
+            print(
+                f"[FlashInferAttentionMetadata::prefill_plan]: attention_mask_type: {plan_params.attention_mask_type}"
+            )
+            print(
+                f"[FlashInferAttentionMetadata::prefill_plan]: attention_mask_data: \n {plan_params.attention_mask_data}"
+            )
             prefill_wrapper.plan(
                 self.qo_indptr[:self.num_contexts + 1],
                 self.paged_kv_indptr_prefill[:self.num_contexts + 1],
@@ -474,8 +480,17 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
                 *,
                 attention_window_size: Optional[int] = None,
                 attention_mask: AttentionMask = PredefinedAttentionMask.CAUSAL,
+                attention_mask_data: Optional[torch.Tensor] = None,
                 **kwargs) -> torch.Tensor:
-        if attention_mask == PredefinedAttentionMask.CAUSAL:
+        if attention_mask == CustomAttentionMask.CUSTOM:
+            assert attention_mask_data is not None, "attention_mask_data is required for custom attention mask."
+            attention_mask_type = int(AttentionMaskType.custom_mask)
+            print(
+                f"[FlashInferAttention::forward]: attention_mask_data: \n {attention_mask_data}"
+            )
+            attention_mask_data = attention_mask_data if attention_mask_data.ndim == 1 else attention_mask_data.flatten(
+            )
+        elif attention_mask == PredefinedAttentionMask.CAUSAL:
             attention_mask_type = int(AttentionMaskType.causal)
             attention_mask_data = None
         elif attention_mask == PredefinedAttentionMask.FULL:

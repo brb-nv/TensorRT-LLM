@@ -310,22 +310,25 @@ class Gemma3Model(PreTrainedModel):
             mm_embeds=mm_embed,
             mm_token_ids=torch.tensor([self.image_token_index
                                        ]).to(input_ids.device))
-        if len(mm_embeds) != 0:
-            token_type_ids = torch.zeros_like(input_ids,
-                                              device=input_ids.device)
-            image_token_mask = (input_ids == self.image_token_index).to(
-                device=input_ids.device, dtype=torch.bool)
-            token_type_ids[image_token_mask] = 1
-            attention_mask = update_causal_mask(
-                attention_mask=torch.ones(input_ids.shape,
-                                          device=input_ids.device),
-                token_type_ids=token_type_ids,
-                target_length=input_ids.shape[-1],
-                cache_position=torch.arange(input_ids.shape[-1],
-                                            device=input_ids.device),
-                input_tensor=input_ids)
-        logits = self.llm.forward(attn_metadata, input_ids, position_ids,
-                                  inputs_embeds, return_context_logits)
+        # if len(mm_embeds) != 0:
+        #     token_type_ids = torch.zeros_like(input_ids,
+        #                                       device=input_ids.device)
+        #     image_token_mask = (input_ids == self.image_token_index).to(
+        #         device=input_ids.device, dtype=torch.bool)
+        #     token_type_ids[image_token_mask] = 1
+        #     attention_mask = update_causal_mask(
+        #         attention_mask=torch.ones(input_ids.shape,
+        #                                   device=input_ids.device),
+        #         token_type_ids=token_type_ids,
+        #         target_length=input_ids.shape[-1],
+        #         cache_position=torch.arange(input_ids.shape[-1],
+        #                                     device=input_ids.device),
+        #         input_tensor=input_ids)
+        logits = self.llm.forward(attn_metadata=attn_metadata,
+                                  input_ids=input_ids,
+                                  position_ids=position_ids,
+                                  inputs_embeds=inputs_embeds,
+                                  return_context_logits=return_context_logits)
         return logits
 
 

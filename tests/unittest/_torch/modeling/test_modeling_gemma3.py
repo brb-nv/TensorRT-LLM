@@ -18,85 +18,76 @@ from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 
 GEMMA3_1B_CONFIG = {
-  "architectures": [
-    "Gemma3ForCausalLM"
-  ],
-  "attention_bias": False,
-  "attention_dropout": 0.0,
-  "attn_logit_softcapping": None,
-  "bos_token_id": 2,
-  "cache_implementation": "hybrid",
-  "eos_token_id": [
-    1,
-    106
-  ],
-  "final_logit_softcapping": None,
-  "head_dim": 256,
-  "hidden_activation": "gelu_pytorch_tanh",
-  "hidden_size": 1152,
-  "initializer_range": 0.02,
-  "intermediate_size": 6912,
-  "max_position_embeddings": 32768,
-  "model_type": "gemma3_text",
-  "num_attention_heads": 4,
-  "num_hidden_layers": 26,
-  "num_key_value_heads": 1,
-  "pad_token_id": 0,
-  "query_pre_attn_scalar": 256,
-  "rms_norm_eps": 1e-06,
-  "rope_local_base_freq": 10000,
-  "rope_scaling": None,
-  "rope_theta": 1000000,
-  "sliding_window": 512,
-  "sliding_window_pattern": 6,
-  "torch_dtype": "bfloat16",
-  "transformers_version": "4.50.0.dev0",
-  "use_cache": True,
-  "vocab_size": 262144
+    "architectures": ["Gemma3ForCausalLM"],
+    "attention_bias": False,
+    "attention_dropout": 0.0,
+    "attn_logit_softcapping": None,
+    "bos_token_id": 2,
+    "cache_implementation": "hybrid",
+    "eos_token_id": [1, 106],
+    "final_logit_softcapping": None,
+    "head_dim": 256,
+    "hidden_activation": "gelu_pytorch_tanh",
+    "hidden_size": 1152,
+    "initializer_range": 0.02,
+    "intermediate_size": 6912,
+    "max_position_embeddings": 32768,
+    "model_type": "gemma3_text",
+    "num_attention_heads": 4,
+    "num_hidden_layers": 26,
+    "num_key_value_heads": 1,
+    "pad_token_id": 0,
+    "query_pre_attn_scalar": 256,
+    "rms_norm_eps": 1e-06,
+    "rope_local_base_freq": 10000,
+    "rope_scaling": None,
+    "rope_theta": 1000000,
+    "sliding_window": 512,
+    "sliding_window_pattern": 6,
+    "torch_dtype": "bfloat16",
+    "transformers_version": "4.50.0.dev0",
+    "use_cache": True,
+    "vocab_size": 262144
 }
 
 GEMMA3_27B_CONFIG = {
-  "architectures": [
-    "Gemma3ForConditionalGeneration"
-  ],
-  "boi_token_index": 255999,
-  "eoi_token_index": 256000,
-  "eos_token_id": [
-    1,
-    106
-  ],
-  "image_token_index": 262144,
-  "initializer_range": 0.02,
-  "mm_tokens_per_image": 256,
-  "model_type": "gemma3",
-  "text_config": {
-    "head_dim": 128,
-    "hidden_size": 5376,
-    "intermediate_size": 21504,
-    "model_type": "gemma3_text",
-    "num_attention_heads": 32,
-    "num_hidden_layers": 62,
-    "num_key_value_heads": 16,
-    "query_pre_attn_scalar": 168,
-    "rope_scaling": {
-      "factor": 8.0,
-      "rope_type": "linear"
+    "architectures": ["Gemma3ForConditionalGeneration"],
+    "boi_token_index": 255999,
+    "eoi_token_index": 256000,
+    "eos_token_id": [1, 106],
+    "image_token_index": 262144,
+    "initializer_range": 0.02,
+    "mm_tokens_per_image": 256,
+    "model_type": "gemma3",
+    "text_config": {
+        "head_dim": 128,
+        "hidden_size": 5376,
+        "intermediate_size": 21504,
+        "model_type": "gemma3_text",
+        "num_attention_heads": 32,
+        "num_hidden_layers": 62,
+        "num_key_value_heads": 16,
+        "query_pre_attn_scalar": 168,
+        "rope_scaling": {
+            "factor": 8.0,
+            "rope_type": "linear"
+        },
+        "sliding_window": 1024
     },
-    "sliding_window": 1024
-  },
-  "torch_dtype": "bfloat16",
-  "transformers_version": "4.50.0.dev0",
-  "vision_config": {
-    "hidden_size": 1152,
-    "image_size": 896,
-    "intermediate_size": 4304,
-    "model_type": "siglip_vision_model",
-    "num_attention_heads": 16,
-    "num_hidden_layers": 27,
-    "patch_size": 14,
-    "vision_use_head": False
-  }
+    "torch_dtype": "bfloat16",
+    "transformers_version": "4.50.0.dev0",
+    "vision_config": {
+        "hidden_size": 1152,
+        "image_size": 896,
+        "intermediate_size": 4304,
+        "model_type": "siglip_vision_model",
+        "num_attention_heads": 16,
+        "num_hidden_layers": 27,
+        "patch_size": 14,
+        "vision_use_head": False
+    }
 }
+
 
 @dataclass(repr=False)
 class Scenario:
@@ -141,7 +132,8 @@ class TestGemma3(unittest.TestCase):
 
     def test_gemma3_sanity(self):
 
-        config_dict = deepcopy(GEMMA3_1B_CONFIG)  # Using 1B config for sanity test.
+        config_dict = deepcopy(
+            GEMMA3_1B_CONFIG)  # Using 1B config for sanity test.
         gemma3_config = Gemma3Config.from_dict(config_dict)
 
         dtype = gemma3_config.torch_dtype
@@ -219,6 +211,37 @@ class TestGemma3(unittest.TestCase):
 
         kv_cache_manager.shutdown()
 
+    def generate_causal_mask(self,
+                             batch_size,
+                             target_length,
+                             sequence_length,
+                             device=None):
+        mask = torch.tril(
+            torch.ones((target_length, sequence_length),
+                       dtype=torch.bool,
+                       device=device))
+        # Expand to (batch_size, 1, target_length, sequence_length)
+        mask = mask.unsqueeze(0).unsqueeze(1).expand(batch_size, 1,
+                                                     target_length,
+                                                     sequence_length)
+        return mask
+
+    def generate_sliding_window_mask(self, batch_size: int, target_length: int,
+                                     cache_position: torch.Tensor,
+                                     device: torch.device,
+                                     attention_window_size: int):
+        # TRTLLM's sliding window attention is inclusive.
+        effective_window_size = attention_window_size + 1
+        attention_mask_1 = torch.arange(
+            target_length,
+            device=device).unsqueeze(0) <= cache_position.unsqueeze(-1)
+        attention_mask_2 = torch.arange(target_length, device=device).unsqueeze(
+            0) > cache_position.unsqueeze(-1) - effective_window_size
+        attention_mask = attention_mask_1 & attention_mask_2
+        attention_mask = attention_mask[None, None, :, :].expand(
+            batch_size, 1, -1, -1)
+        return attention_mask
+
     @parameterized.expand([
         Scenario(backend="TRTLLM", config_name="1B"),
         Scenario(backend="VANILLA", config_name="1B"),
@@ -238,7 +261,7 @@ class TestGemma3(unittest.TestCase):
         metadata_cls = get_attention_backend(backend).Metadata
 
         torch.random.manual_seed(0)
-        
+
         # Select the appropriate config based on the scenario
         if config_name == "1B":
             config_dict = deepcopy(GEMMA3_1B_CONFIG)
@@ -313,9 +336,24 @@ class TestGemma3(unittest.TestCase):
 
         with torch.inference_mode():
             attn_metadata.prepare()
+            #######################################################################
+            local_mask = self.generate_sliding_window_mask(
+                batch_size=batch_size,
+                target_length=input_ids.size(-1),
+                cache_position=torch.arange(input_ids.size(-1)).to(device),
+                device=device,
+                attention_window_size=gemma3_config.sliding_window - 1)
+            global_mask = self.generate_causal_mask(
+                batch_size=batch_size,
+                target_length=input_ids.size(-1),
+                sequence_length=input_ids.size(-1),
+                device=device)
+            #######################################################################
             logits = gemma3.forward(input_ids=input_ids,
                                     position_ids=position_ids,
-                                    attn_metadata=attn_metadata)
+                                    attn_metadata=attn_metadata,
+                                    local_attention_mask_data=local_mask,
+                                    global_attention_mask_data=global_mask)
             ref = hf_gemma3.forward(input_ids=input_ids.unsqueeze(0),
                                     position_ids=position_ids,
                                     past_key_values=hf_cache,
