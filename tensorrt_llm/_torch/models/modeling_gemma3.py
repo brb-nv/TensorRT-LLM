@@ -113,6 +113,7 @@ class Gemma3Attention(Attention):
         # Setting attention_window_size to None for custom attention mask is important.
         # Otherwise, FlashInfer proceeds to use SWA regardless of attention_mask_data.
         if attention_mask_data is not None:
+            assert isinstance(attn_metadata, FlashInferAttentionMetadata), "Only FlashInfer backend supports custom attention mask currently."
             assert attention_mask == CustomAttentionMask.CUSTOM
             attention_window_size = None
         else:
