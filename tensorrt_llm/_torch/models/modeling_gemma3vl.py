@@ -105,141 +105,36 @@ class Gemma3InputProcessor(InputProcessor):
         }
 
 
-def update_causal_mask(
-    attention_mask,
-    token_type_ids,
-    target_length,
-    cache_position,
-    input_tensor,
+def get_gemma3_causal_mask(
+    input_ids: torch.Tensor,
+    image_token_index: int,
+    sliding_window: Optional[int] = None,
 ):
-    # (Pdb) attention_mask
-    # tensor([[1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-    #         1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-    #         1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-    #         1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-    #         1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-    #         1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-    #         1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-    #         1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-    #         1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-    #         1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-    #         1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-    #         1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]])
-    # (Pdb) attention_mask.shape
-    # torch.Size([1, 281])
-    # (Pdb) token_type_ids
-    # tensor([[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-    #         1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-    #         1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-    #         1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-    #         1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-    #         1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-    #         1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-    #         1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-    #         1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-    #         1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-    #         1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-    #         1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]])
-    # (Pdb) token_type_ids.shape
-    # torch.Size([1, 281])
-    # (Pdb) cache_position
-    # tensor([  0,   1,   2,   3,   4,   5,   6,   7,   8,   9,  10,  11,  12,  13,
-    #         14,  15,  16,  17,  18,  19,  20,  21,  22,  23,  24,  25,  26,  27,
-    #         28,  29,  30,  31,  32,  33,  34,  35,  36,  37,  38,  39,  40,  41,
-    #         42,  43,  44,  45,  46,  47,  48,  49,  50,  51,  52,  53,  54,  55,
-    #         56,  57,  58,  59,  60,  61,  62,  63,  64,  65,  66,  67,  68,  69,
-    #         70,  71,  72,  73,  74,  75,  76,  77,  78,  79,  80,  81,  82,  83,
-    #         84,  85,  86,  87,  88,  89,  90,  91,  92,  93,  94,  95,  96,  97,
-    #         98,  99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111,
-    #         112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125,
-    #         126, 127, 128, 129, 130, 131, 132, 133, 134, 135, 136, 137, 138, 139,
-    #         140, 141, 142, 143, 144, 145, 146, 147, 148, 149, 150, 151, 152, 153,
-    #         154, 155, 156, 157, 158, 159, 160, 161, 162, 163, 164, 165, 166, 167,
-    #         168, 169, 170, 171, 172, 173, 174, 175, 176, 177, 178, 179, 180, 181,
-    #         182, 183, 184, 185, 186, 187, 188, 189, 190, 191, 192, 193, 194, 195,
-    #         196, 197, 198, 199, 200, 201, 202, 203, 204, 205, 206, 207, 208, 209,
-    #         210, 211, 212, 213, 214, 215, 216, 217, 218, 219, 220, 221, 222, 223,
-    #         224, 225, 226, 227, 228, 229, 230, 231, 232, 233, 234, 235, 236, 237,
-    #         238, 239, 240, 241, 242, 243, 244, 245, 246, 247, 248, 249, 250, 251,
-    #         252, 253, 254, 255, 256, 257, 258, 259, 260, 261, 262, 263, 264, 265,
-    #         266, 267, 268, 269, 270, 271, 272, 273, 274, 275, 276, 277, 278, 279,
-    #         280])
-    # (Pdb) cache_position.shape
-    # torch.Size([281])
-    # (Pdb) input_tensor
-    # tensor([[     2,    105,   2364,    107,   3048,    659,    496,  11045,  16326,
-    #         236761,    110, 255999, 262144, 262144, 262144, 262144, 262144, 262144,
-    #         262144, 262144, 262144, 262144, 262144, 262144, 262144, 262144, 262144,
-    #         262144, 262144, 262144, 262144, 262144, 262144, 262144, 262144, 262144,
-    #         262144, 262144, 262144, 262144, 262144, 262144, 262144, 262144, 262144,
-    #         262144, 262144, 262144, 262144, 262144, 262144, 262144, 262144, 262144,
-    #         262144, 262144, 262144, 262144, 262144, 262144, 262144, 262144, 262144,
-    #         262144, 262144, 262144, 262144, 262144, 262144, 262144, 262144, 262144,
-    #         262144, 262144, 262144, 262144, 262144, 262144, 262144, 262144, 262144,
-    #         262144, 262144, 262144, 262144, 262144, 262144, 262144, 262144, 262144,
-    #         262144, 262144, 262144, 262144, 262144, 262144, 262144, 262144, 262144,
-    #         262144, 262144, 262144, 262144, 262144, 262144, 262144, 262144, 262144,
-    #         262144, 262144, 262144, 262144, 262144, 262144, 262144, 262144, 262144,
-    #         262144, 262144, 262144, 262144, 262144, 262144, 262144, 262144, 262144,
-    #         262144, 262144, 262144, 262144, 262144, 262144, 262144, 262144, 262144,
-    #         262144, 262144, 262144, 262144, 262144, 262144, 262144, 262144, 262144,
-    #         262144, 262144, 262144, 262144, 262144, 262144, 262144, 262144, 262144,
-    #         262144, 262144, 262144, 262144, 262144, 262144, 262144, 262144, 262144,
-    #         262144, 262144, 262144, 262144, 262144, 262144, 262144, 262144, 262144,
-    #         262144, 262144, 262144, 262144, 262144, 262144, 262144, 262144, 262144,
-    #         262144, 262144, 262144, 262144, 262144, 262144, 262144, 262144, 262144,
-    #         262144, 262144, 262144, 262144, 262144, 262144, 262144, 262144, 262144,
-    #         262144, 262144, 262144, 262144, 262144, 262144, 262144, 262144, 262144,
-    #         262144, 262144, 262144, 262144, 262144, 262144, 262144, 262144, 262144,
-    #         262144, 262144, 262144, 262144, 262144, 262144, 262144, 262144, 262144,
-    #         262144, 262144, 262144, 262144, 262144, 262144, 262144, 262144, 262144,
-    #         262144, 262144, 262144, 262144, 262144, 262144, 262144, 262144, 262144,
-    #         262144, 262144, 262144, 262144, 262144, 262144, 262144, 262144, 262144,
-    #         262144, 262144, 262144, 262144, 262144, 262144, 262144, 262144, 262144,
-    #         262144, 262144, 262144, 262144, 262144, 262144, 262144, 256000,    108,
-    #         10936,    563,    506,   5866,   8101, 236881,    106,    107,    105,
-    #         4368,    107]])
-    # (Pdb) input_tensor.shape
-    # torch.Size([1, 281])
+    # Get token type ids. 0 corresponds to text tokens, 1 corresponds to image tokens.
+    token_type_ids = torch.zeros_like(input_ids, device=input_ids.device)
+    image_token_mask = (input_ids == image_token_index).to(device=input_ids.device, dtype=torch.bool)
+    token_type_ids[image_token_mask] = 1
 
-    sequence_length = input_tensor.shape[-1]
-    causal_mask = torch.arange(
-        target_length,
-        device=cache_position.device) <= cache_position.reshape(-1, 1)
-    causal_mask = causal_mask[None, None, :, :].expand(1, 1, -1, -1)
+    sequence_length = input_ids.shape[-1]
+    if sliding_window is None:
+        causal_mask = torch.arange(sequence_length, device=input_ids.device).unsqueeze(0) <= torch.arange(sequence_length, device=input_ids.device).unsqueeze(1)
+        causal_mask = causal_mask[None, None, :, :].expand(1, 1, -1, -1)
+    else:
+        attention_mask_1 = torch.arange(sequence_length, device=input_ids.device).unsqueeze(0) <= torch.arange(sequence_length, device=input_ids.device).unsqueeze(1)
+        attention_mask_2 = torch.arange(sequence_length, device=input_ids.device).unsqueeze(0) > torch.arange(sequence_length, device=input_ids.device).unsqueeze(1) - sliding_window
+        causal_mask = attention_mask_1 & attention_mask_2
+        causal_mask = causal_mask[None, None, :, :].expand(1, 1, -1, -1)
 
-    # Apply a bidirectional mask for image tokens of a given image. If there are image tokens from multiple images,
-    # tokens from different images will not attend to each other.
+    # Apply a bidirectional mask for image tokens.
     if token_type_ids is not None:
         token_type_mask = token_type_ids.unsqueeze(
             1) == token_type_ids.unsqueeze(2)
-        token_type_mask[token_type_ids ==
-                        0] = False  # if text token, do not change anything.
+        # If text token, do not change anything.
+        token_type_mask[token_type_ids == 0] = False
         token_type_mask = token_type_mask.unsqueeze(1).to(causal_mask.device,
                                                           dtype=torch.bool)
         causal_mask = causal_mask.clone()
-        causal_mask[:, :, :, :
-                    sequence_length] = causal_mask[:, :, :, :
-                                                   sequence_length].masked_fill(
-                                                       token_type_mask, True)
-
-    if attention_mask is not None:
-        causal_mask = causal_mask.clone(
-        )  # copy to contiguous memory for in-place edit.
-        mask_length = attention_mask.shape[-1]
-
-        # Then apply padding mask (will mask pad tokens).
-        padding_mask = causal_mask[:, :, :, :
-                                   mask_length] + attention_mask[:, None,
-                                                                 None, :].to(
-                                                                     causal_mask
-                                                                     .device)
-        padding_mask = padding_mask == 0
-        causal_mask[:, :, :, :
-                    mask_length] = causal_mask[:, :, :, :
-                                               mask_length].masked_fill(
-                                                   padding_mask, False)
-
+        causal_mask[:, :, :, :sequence_length] = causal_mask[:, :, :, :sequence_length].masked_fill(token_type_mask, True)
     return causal_mask
 
 
@@ -265,6 +160,7 @@ class Gemma3Model(PreTrainedModel):
 
         self.model_config = model_config
         self.vocab_size = config.text_config.vocab_size
+        self.sliding_window = config.text_config.sliding_window
         self.model_dtype = getattr(config.text_config, "torch_dtype",
                                    torch.float16)
         logger.info(f"[Gemma3Model::__init__]{self.dtype=} {self.model_dtype=}")
@@ -310,25 +206,24 @@ class Gemma3Model(PreTrainedModel):
             mm_embeds=mm_embed,
             mm_token_ids=torch.tensor([self.image_token_index
                                        ]).to(input_ids.device))
-        # if len(mm_embeds) != 0:
-        #     token_type_ids = torch.zeros_like(input_ids,
-        #                                       device=input_ids.device)
-        #     image_token_mask = (input_ids == self.image_token_index).to(
-        #         device=input_ids.device, dtype=torch.bool)
-        #     token_type_ids[image_token_mask] = 1
-        #     attention_mask = update_causal_mask(
-        #         attention_mask=torch.ones(input_ids.shape,
-        #                                   device=input_ids.device),
-        #         token_type_ids=token_type_ids,
-        #         target_length=input_ids.shape[-1],
-        #         cache_position=torch.arange(input_ids.shape[-1],
-        #                                     device=input_ids.device),
-        #         input_tensor=input_ids)
+        if len(mm_embed) != 0:
+            # Request has image tokens.
+            global_attention_mask = get_gemma3_causal_mask(
+                input_ids=input_ids,
+                image_token_index=self.image_token_index)
+            local_attention_mask = get_gemma3_causal_mask(
+                input_ids=input_ids,
+                image_token_index=self.image_token_index,
+                sliding_window=self.sliding_window,
+            )
         logits = self.llm.forward(attn_metadata=attn_metadata,
                                   input_ids=input_ids,
                                   position_ids=position_ids,
                                   inputs_embeds=inputs_embeds,
-                                  return_context_logits=return_context_logits)
+                                  return_context_logits=return_context_logits,
+                                  global_attention_mask_data=global_attention_mask,
+                                  local_attention_mask_data=local_attention_mask,
+                                  )
         return logits
 
 
