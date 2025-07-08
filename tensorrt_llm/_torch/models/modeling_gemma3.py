@@ -10,7 +10,7 @@ from transformers.activations import ACT2FN
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.mapping import Mapping
 
-from ..attention_backend import AttentionMetadata
+from ..attention_backend import AttentionMetadata, FlashInferAttentionMetadata
 from ..attention_backend.interface import (PositionalEmbeddingParams,
                                            PredefinedAttentionMask, RopeParams)
 from ..distributed import AllReduceParams
@@ -299,6 +299,137 @@ class Gemma3ForCausalLM(DecoderModelForCausalLM[Gemma3TextModel,
                          config=model_config,
                          hidden_size=model_config.pretrained_config.hidden_size,
                          vocab_size=model_config.pretrained_config.vocab_size)
+
+    def get_context_mask(
+        self,
+        image_token_mask: torch.BoolTensor,
+        effective_sliding_window: Optional[int] = None,
+    ):
+        """
+        Returns an attention mask such that text tokens attend to each other in causal fashion.
+        Image tokens attend in causal fashion as well as to all other image tokens.
+        Args:
+            image_token_mask: A boolean tensor of shape (sequence_length,) where True indicates an image token.
+            effective_sliding_window: The effective sliding window size for the attention mask. Default is None, which means no sliding window.
+            For Gemma3, this is the sliding window size from config (e.g. 512 for 1B model).
+        Returns:
+            A boolean attention mask of shape (sequence_length, sequence_length).
+        """
+        device = image_token_mask.device
+        sequence_length = len(image_token_mask)
+        if effective_sliding_window is None or effective_sliding_window >= sequence_length:
+            causal_mask = torch.arange(
+                sequence_length, device=device).unsqueeze(0) <= torch.arange(
+                    sequence_length, device=device).unsqueeze(1)
+        else:
+            attention_mask_1 = torch.arange(
+                sequence_length, device=device).unsqueeze(0) <= torch.arange(
+                    sequence_length, device=device).unsqueeze(1)
+            attention_mask_2 = torch.arange(
+                sequence_length, device=device).unsqueeze(0) > torch.arange(
+                    sequence_length,
+                    device=device).unsqueeze(1) - effective_sliding_window
+            causal_mask = attention_mask_1 & attention_mask_2
+
+        # Apply a bidirectional mask for image tokens.
+        token_type_ids = torch.zeros(sequence_length,
+                                     dtype=torch.int32,
+                                     device=device)
+        # 1 for image tokens, 0 for text tokens.
+        token_type_ids[image_token_mask] = 1
+        token_type_mask = token_type_ids.unsqueeze(
+            0) == token_type_ids.unsqueeze(1)
+        # If text token, do not change anything.
+        token_type_mask[token_type_ids == 0] = False
+        causal_mask = causal_mask.masked_fill(token_type_mask, True)
+        return causal_mask
+
+    def get_generation_mask(self,
+                            cached_token_len: int,
+                            device: torch.device,
+                            effective_sliding_window: Optional[int] = None):
+        """
+        Returns an attention mask for generation tokens. Generation tokens attend to KV cache in causal fashion.
+        Args:
+            cached_token_len: The number of tokens in KV cache.
+            device: The device of the attention mask.
+            effective_sliding_window: The effective sliding window size for the attention mask. Default is None, which means no sliding window.
+            For Gemma3, this is the sliding window size from config (e.g. 512 for 1B model).
+        Returns:
+            A boolean attention mask of shape (cached_token_len + 1).
+        """
+        # +1 for the query token.
+        sequence_length = cached_token_len + 1
+        generation_mask = torch.ones(sequence_length,
+                                     dtype=torch.bool,
+                                     device=device)
+        if effective_sliding_window is not None and effective_sliding_window < sequence_length:
+            generation_mask[:sequence_length - effective_sliding_window] = False
+        return generation_mask
+
+    # ASSUMPTIONS:
+    # 1) Chunked prefill is disabled to avoid chunking image tokens as they need bidirectional attention.
+    # 2) KV cache reuse is disabled to avoid partially matched image tokens (entire image must be reused to get things correct).
+    # @reviewers: Either all tokens of an image must be reused or none at all. Can we enforce this? If yes, second assumption can be relaxed.
+    def get_flashinfer_attention_mask(
+            self,
+            image_token_mask: torch.BoolTensor,
+            attn_metadata: AttentionMetadata,
+            effective_sliding_window: Optional[int] = None) -> torch.Tensor:
+        """
+        This is specifically needed for context phase requests. But, if there's a mixed batch of context and generation requests,
+        we'll apply custom mask to both for now.
+        - This function will only be called for a batch when there's at least one context request in the batch with image tokens.
+        - In context phase, each sample's input_ids may have a mix of image tokens and text tokens where tokens corresponding to an image
+        appear as a contiguous blob. Example: torch.IntTensor([2, 3, 4, 5, img_idx, img_idx, img_idx, ..., img_idx, 100])
+        - While the text tokens attend to other tokens in a causal fashion, image tokens attend to others in a causal fashion and well as
+        attend to other image tokens in a bidirectional manner. Hence, the need for custom masking.
+        Args:
+            image_token_mask: A boolean tensor of shape (len(input_ids),) where True indicates an image token. This corresponds to concatenated
+            list of tokens for all samples in the batch.
+            attn_metadata: The attention metadata for the batch.
+            effective_sliding_window: The effective sliding window size for the attention mask. Default is None, which means no sliding window.
+            For Gemma3, this is the sliding window size from config (e.g. 512 for 1B model).
+        Returns:
+            A flattened boolean mask of shape (sum(q_len[i] * k_len[i] for i in range(batch_size)).
+        """
+
+        assert isinstance(attn_metadata, FlashInferAttentionMetadata)
+        # These are the parameters passed to the flashinfer prefill plan.
+        num_contexts = attn_metadata.num_contexts
+        qo_indptr = attn_metadata.qo_indptr[:num_contexts + 1]
+        cached_token_lens_context = attn_metadata.cached_token_lens[:
+                                                                    num_contexts]
+        assert (cached_token_lens_context == 0).all(
+        ), "cached_token_lens should be 0 for context requests since chunked prefill and kv cache reuse must be disabled."
+
+        # Create masks for context requests.
+        context_mask_list = []
+        qo_len = (qo_indptr[1:] - qo_indptr[:-1]).cpu().tolist()
+        for i in range(num_contexts):
+            mask_i = self.get_context_mask(
+                image_token_mask=image_token_mask[qo_indptr[i]:qo_indptr[i +
+                                                                         1]],
+                effective_sliding_window=effective_sliding_window,
+            )
+            context_mask_list.append(mask_i.flatten())
+        context_mask = torch.cat(context_mask_list, dim=0)
+
+        # Create masks for generation requests.
+        num_generations = attn_metadata.num_generations
+        cached_token_lens_generation = attn_metadata.cached_token_lens[
+            num_contexts:num_contexts + num_generations]
+        gen_mask_list = []
+        for i in range(num_generations):
+            mask_i = self.get_generation_mask(
+                cached_token_len=cached_token_lens_generation[i],
+                device=image_token_mask.device,
+                effective_sliding_window=effective_sliding_window,
+            )
+            gen_mask_list.append(mask_i.flatten())
+        gen_mask = torch.cat(gen_mask_list, dim=0)
+
+        return torch.cat([context_mask, gen_mask], dim=0)
 
     def forward(
         self,
