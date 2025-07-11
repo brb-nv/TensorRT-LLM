@@ -1,10 +1,9 @@
-import copy
+import dataclasses
 import os
 from typing import List, Optional, Tuple
 
 import torch
-from transformers import (AutoModel, AutoProcessor, Gemma3Config,
-                          PreTrainedModel)
+from transformers import AutoModel, AutoProcessor, Gemma3Config, PreTrainedModel
 from transformers.modeling_utils import no_init_weights
 from transformers.models.gemma3.modeling_gemma3 import Gemma3MultiModalProjector
 
@@ -101,33 +100,49 @@ class Gemma3VLM(PreTrainedModel):
         config = model_config.pretrained_config
         super().__init__(config)
 
-        self.image_token_index = config.image_token_index
-
-        llm_model_config = copy.deepcopy(model_config)
-        llm_model_config.pretrained_config = model_config.pretrained_config.text_config
-
-        llm_model_config.pretrained_config.torch_dtype = torch.bfloat16
-        self.llm = Gemma3ForCausalLM(llm_model_config)
+        self._device = "cuda"
+        self._image_token_ids = torch.tensor([config.image_token_index],
+                                             dtype=torch.int32,
+                                             device=self._device)
 
         self.model_config = model_config
-        self.vocab_size = config.text_config.vocab_size
-        self.sliding_window = config.text_config.sliding_window
-        self.model_dtype = getattr(config.text_config, "torch_dtype",
-                                   torch.float16)
-        logger.info(f"[Gemma3Model::__init__]{self.dtype=} {self.model_dtype=}")
 
-        device = torch.device("cuda")
+        llm_model_config = self._get_sub_model_config(model_config,
+                                                      "text_config")
+        self.llm = Gemma3ForCausalLM(llm_model_config)
+
+        self.model_dtype = getattr(config, "torch_dtype", torch.bfloat16)
+
         # Use HF implementations. They should eventually be replaced with TRTLLM counterparts.
         # NOTE: we init the weights after transferring to the `device` since it can take a much
         # longer time to initialize them on the CPU.
         with no_init_weights():
             self.vision_tower = AutoModel.from_config(
-                config.vision_config).eval().to(device)
+                config.vision_config).eval().to(self._device)
             self.mm_projector = Gemma3MultiModalProjector(config).eval().to(
-                device)
+                self._device)
 
-        self.post_config()
+        self._post_config()
         self.is_loaded = True
+
+    @staticmethod
+    def _get_sub_model_config(
+        model_config: ModelConfig[Gemma3Config],
+        name: str,
+    ) -> ModelConfig:
+        # Extract the subconfig from the `transformers` config and include it in our own
+        # `ModelConfig` class.
+        sub_model_config: ModelConfig[Gemma3Config] = dataclasses.replace(
+            model_config,
+            pretrained_config=getattr(model_config.pretrained_config, name),
+        )
+        # Make sure some fields that are not explicitly included in the sub config, but present
+        # in the top-level config, are replicated.
+        if (hasattr(sub_model_config.pretrained_config, "torch_dtype")
+                and sub_model_config.pretrained_config.torch_dtype is None):
+            sub_model_config.pretrained_config.torch_dtype = model_config.pretrained_config.torch_dtype
+
+        return sub_model_config
 
     def load_weights(self, weights):
         llm_weights = filter_weights("language_model", weights)
@@ -148,7 +163,7 @@ class Gemma3VLM(PreTrainedModel):
                 "Missing the following keys for the multi modal projector in the checkpoint: "
                 f"[{', '.join(missing_keys)}].")
 
-    def post_config(self):
+    def _post_config(self):
         self.config = self.llm.config
         self.model_config.pretrained_config = self.llm.config
 
@@ -179,8 +194,6 @@ class Gemma3VLM(PreTrainedModel):
             pixel_values
         ) == num_context_requests, "Number of multimodal features (if provided) should be equal to number of context requests"
 
-        mm_token_ids = torch.tensor([self.image_token_index
-                                     ]).to(input_ids.device)
         mm_token_mask = None
         mm_embeds = []
         if len(pixel_values) > 0:
@@ -192,13 +205,13 @@ class Gemma3VLM(PreTrainedModel):
             mm_embeds = [image_features.reshape(B * T, embed_dim).contiguous()]
 
             # Get token type ids. 0 corresponds to text tokens, 1 corresponds to image tokens.
-            mm_token_mask = torch.isin(input_ids, mm_token_ids)
+            mm_token_mask = torch.isin(input_ids, self._image_token_ids)
 
         input_ids, inputs_embeds = fuse_input_embeds(
             embedding_layer=self.llm.model.embed_tokens,
             input_ids=input_ids,
             mm_embeds=mm_embeds,
-            mm_token_ids=mm_token_ids)
+            mm_token_ids=self._image_token_ids)
         logits = self.llm.forward(
             attn_metadata=attn_metadata,
             input_ids=input_ids,
