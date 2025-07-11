@@ -1,9 +1,10 @@
 import copy
+import os
 from typing import List, Optional, Tuple
 
 import torch
 from transformers import (AutoModel, AutoProcessor, Gemma3Config,
-                          PretrainedConfig, PreTrainedModel)
+                          PreTrainedModel)
 from transformers.modeling_utils import no_init_weights
 from transformers.models.gemma3.modeling_gemma3 import Gemma3MultiModalProjector
 
@@ -17,6 +18,13 @@ from ..model_config import ModelConfig
 from .modeling_gemma3 import Gemma3ForCausalLM
 from .modeling_multimodal_utils import fuse_input_embeds
 from .modeling_utils import ModelConfig, filter_weights, register_auto_model
+
+_MULTIMODAL_ENV_NAME = "TLLM_MULTIMODAL_DISAGGREGATED"
+
+
+# Make this a runtime lookup rather than a module-wide constant for easier unit testing.
+def _is_disagg() -> bool:
+    return os.getenv(_MULTIMODAL_ENV_NAME, "0") == "1"
 
 
 class Gemma3InputProcessor(InputProcessor):
@@ -81,15 +89,17 @@ class Gemma3InputProcessor(InputProcessor):
 
 @register_auto_model("Gemma3ForConditionalGeneration")
 @register_input_processor(Gemma3InputProcessor, model_type="gemma3")
-class Gemma3Model(PreTrainedModel):
-    config_class = Gemma3Config
+class Gemma3VLM(PreTrainedModel):
 
-    def __init__(self, model_config: ModelConfig[PretrainedConfig], *args,
-                 **kwargs) -> None:
+    def __init__(self, model_config: ModelConfig[Gemma3Config]):
+        if _is_disagg():
+            raise NotImplementedError(
+                "Gemma3VLM does not support disaggregated inference yet. Please unset "
+                f"the {_MULTIMODAL_ENV_NAME} environment variable, or set it to '0'."
+            )
+
         config = model_config.pretrained_config
         super().__init__(config)
-        if hasattr(self, "llm"):
-            return
 
         self.image_token_index = config.image_token_index
 
@@ -169,7 +179,8 @@ class Gemma3Model(PreTrainedModel):
             pixel_values
         ) == num_context_requests, "Number of multimodal features (if provided) should be equal to number of context requests"
 
-        mm_token_ids = torch.tensor([self.image_token_index]).to(input_ids.device)
+        mm_token_ids = torch.tensor([self.image_token_index
+                                     ]).to(input_ids.device)
         mm_token_mask = None
         mm_embeds = []
         if len(pixel_values) > 0:
