@@ -16,6 +16,7 @@ from ..attention_backend import AttentionMetadata
 from ..model_config import ModelConfig
 from .modeling_gemma3 import Gemma3ForCausalLM
 from .modeling_multimodal_utils import fuse_input_embeds
+from .modeling_siglip import SiglipVisionModel
 from .modeling_utils import ModelConfig, filter_weights, register_auto_model
 
 _MULTIMODAL_ENV_NAME = "TLLM_MULTIMODAL_DISAGGREGATED"
@@ -113,6 +114,13 @@ class Gemma3VLM(PreTrainedModel):
 
         self.model_dtype = getattr(config, "torch_dtype", torch.bfloat16)
 
+        #########################################################################
+        vision_model_config = self._get_sub_model_config(
+            model_config, "vision_config")
+        self._siglip_tower = SiglipVisionModel(vision_model_config,
+                                               use_post_layernorm=True)
+        #########################################################################
+
         # Use HF implementations. They should eventually be replaced with TRTLLM counterparts.
         # NOTE: we init the weights after transferring to the `device` since it can take a much
         # longer time to initialize them on the CPU.
@@ -156,6 +164,11 @@ class Gemma3VLM(PreTrainedModel):
                 "Missing the following keys for the vision tower in the checkpoint: "
                 f"[{', '.join(missing_keys)}].")
 
+        #########################################################################
+        vit_weights = filter_weights("vision_tower", weights)
+        self._siglip_tower.load_weights(vit_weights)
+        #########################################################################
+
         projector_weights = filter_weights("multi_modal_projector", weights)
         missing_keys, _ = self.mm_projector.load_state_dict(projector_weights)
         if len(missing_keys) > 0:
@@ -194,7 +207,6 @@ class Gemma3VLM(PreTrainedModel):
             pixel_values
         ) == num_context_requests, "Number of multimodal features (if provided) should be equal to number of context requests"
 
-        mm_token_mask = None
         mm_embeds = []
         if len(pixel_values) > 0:
             # The shape of `image_features` is `[B, T, embed_dim]`.
@@ -205,7 +217,7 @@ class Gemma3VLM(PreTrainedModel):
             mm_embeds = [image_features.reshape(B * T, embed_dim).contiguous()]
 
             # Get token type ids. 0 corresponds to text tokens, 1 corresponds to image tokens.
-            mm_token_mask = torch.isin(input_ids, self._image_token_ids)
+            torch.isin(input_ids, self._image_token_ids)
 
         input_ids, inputs_embeds = fuse_input_embeds(
             embedding_layer=self.llm.model.embed_tokens,
@@ -218,14 +230,24 @@ class Gemma3VLM(PreTrainedModel):
             position_ids=position_ids,
             inputs_embeds=inputs_embeds,
             return_context_logits=return_context_logits,
-            image_token_mask=mm_token_mask,
+            image_token_mask=None,
         )
         return logits
 
     @nvtx_range("[Vision] process")
     def _get_image_features(self, pixel_values):
         with torch.autocast(device_type="cuda", dtype=self.dtype):
-            image_features: Tuple[torch.Tensor] = self.vision_tower(
-                pixel_values).last_hidden_state
+            # image_features: Tuple[torch.Tensor] = self.vision_tower(
+            #     pixel_values).last_hidden_state
+            #########################################################################
+            attn_metadata = self._siglip_tower.prepare_attn_metadata(
+                pixel_values.shape[0])
+            image_features = self._siglip_tower(pixel_values,
+                                                attn_metadata=attn_metadata)[-1]
+            # print(f"[Gemma3VLM::_get_image_features]: {image_features.shape=} \n {image_features}")
+            # print(f"[Gemma3VLM::_get_image_features]: {tmp.shape=} \n {tmp}")
+            # print("max diff: ", (tmp - image_features).abs().max())
+            # print("mean diff: ", (tmp - image_features).abs().mean())
+            #########################################################################
             image_features = self.mm_projector(image_features)
         return image_features
