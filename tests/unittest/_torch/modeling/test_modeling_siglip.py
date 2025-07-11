@@ -12,22 +12,34 @@ from tensorrt_llm._torch.models.modeling_siglip import SiglipVisionModel
 
 # use the default config from HF (https://github.com/huggingface/transformers/blob/main/src/transformers/models/siglip/configuration_siglip.py#L126-L147)
 SIGLIP_CONFIG = {
-    "hidden_size": 768,
-    "intermediate_size": 3072,
-    "num_hidden_layers": 12,
-    "num_attention_heads": 12,
-    "image_size": 224,
-    "patch_size": 16,
-    "hidden_act": "gelu_pytorch_tanh",
-    "layer_norm_eps": 1e-6,
-    "hidden_dropout_prob": 0.0,
-    "attention_probs_dropout_prob": 0.0,
-    "num_channels": 3,
+    "hidden_size": 1152,
+    "intermediate_size": 4304,
+    "num_hidden_layers": 1,
+    "num_attention_heads": 16,
+    "image_size": 896,
+    "patch_size": 14,
+    # "hidden_act": "gelu_pytorch_tanh",
+    # "layer_norm_eps": 1e-6,
+    # "hidden_dropout_prob": 0.0,
+    # "attention_probs_dropout_prob": 0.0,
+    # "num_channels": 3,
     "vision_use_head": False,
 }
 
+# "vision_config": {
+#     "hidden_size": 1152,
+#     "image_size": 896,
+#     "intermediate_size": 4304,
+#     "model_type": "siglip_vision_model",
+#     "num_attention_heads": 16,
+#     "num_hidden_layers": 27,
+#     "patch_size": 14,
+#     "vision_use_head": False
+# }
+
 ACCURACY_CONFIG = {
     torch.float16: (2e-2, 5e-2),
+    torch.bfloat16: (2e-2, 5e-2),
 }
 
 
@@ -50,6 +62,7 @@ class TestSiglipVisionModel(unittest.TestCase):
     @parameterized.expand([
         Scenario(backend="VANILLA", num_images=2, dtype=torch.float16),
         Scenario(backend="TRTLLM", num_images=2, dtype=torch.float16),
+        Scenario(backend="TRTLLM", num_images=2, dtype=torch.bfloat16),
         Scenario(backend="TRTLLM", num_images=21, dtype=torch.float16),
     ], lambda testcase_func, param_num, param:
                           f"{testcase_func.__name__}[{param.args[0]}]")
@@ -107,6 +120,9 @@ class TestSiglipVisionModel(unittest.TestCase):
                 zip(hf_outputs.hidden_states, tllm_outputs)):
             self.assertEqual(hf_hs.shape, tllm_hs.shape,
                              f"Shape mismatch for hidden state {i}")
+
+            print("max diff at layer", i, " is ", (hf_hs - tllm_hs).abs().max())
+            print("mean diff at layer", i, " is ", (hf_hs - tllm_hs).abs().mean())
 
             torch.testing.assert_close(
                 hf_hs.float(),
