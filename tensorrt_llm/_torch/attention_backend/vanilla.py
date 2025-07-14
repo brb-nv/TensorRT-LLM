@@ -180,6 +180,14 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
         if self.q_scaling is not None:
             qk_scale = 1 / (math.sqrt(self.head_dim) * self.q_scaling)
 
+        print("[TRTLLM] qk_scale: ", qk_scale)
+        print(f"[TRTLLM] q: {q.shape} \n {q}")
+        print(f"[TRTLLM] key_states: {key_states.shape} \n {key_states}")
+        print(f"[TRTLLM] value_states: {value_states.shape} \n {value_states}")
+        if attn_mask is not None:
+            print(f"[TRTLLM] attn_mask: {attn_mask.shape} \n {attn_mask}")
+        print(f"[TRTLLM] is_causal: {is_causal}")
+
         attn_output = torch.nn.functional.scaled_dot_product_attention(
             q,
             key_states,

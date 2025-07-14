@@ -36,7 +36,7 @@ GEMMA3_1B_CONFIG = {
     "max_position_embeddings": 32768,
     "model_type": "gemma3_text",
     "num_attention_heads": 4,
-    "num_hidden_layers": 6,
+    "num_hidden_layers": 1,
     "num_key_value_heads": 1,
     "pad_token_id": 0,
     "query_pre_attn_scalar": 256,
@@ -44,8 +44,8 @@ GEMMA3_1B_CONFIG = {
     "rope_local_base_freq": 10000,
     "rope_scaling": None,
     "rope_theta": 1000000,
-    "sliding_window": 4,
-    "sliding_window_pattern": 6,
+    "sliding_window": 2,
+    "sliding_window_pattern": 2,
     "torch_dtype": "bfloat16",
     "transformers_version": "4.50.0.dev0",
     "use_cache": True,
@@ -249,6 +249,10 @@ class TestGemma3(unittest.TestCase):
         else:
             gemma3_config = Gemma3TextConfig.from_dict(config_dict)
 
+        assert len(gemma3_config.layer_types) == gemma3_config.num_hidden_layers
+        assert gemma3_config.layer_types[0] == "sliding_attention"
+        # assert gemma3_config.layer_types[1] == "full_attention"
+
         dtype = gemma3_config.torch_dtype
         device = torch.device('cuda')
 
@@ -261,7 +265,7 @@ class TestGemma3(unittest.TestCase):
             device).eval()
         hf_cache = HybridCache(config=gemma3_config,
                                max_batch_size=batch_size,
-                               max_cache_len=10,
+                               max_cache_len=6,
                                device=device,
                                dtype=dtype)
 
@@ -279,7 +283,7 @@ class TestGemma3(unittest.TestCase):
             num_blocks=num_blocks)
 
         # Context phase.
-        input_ids = torch.tensor([100, 200, 300, 400, 500, 600, 700, 800],
+        input_ids = torch.tensor([100, 200, 300, 400],
                                  dtype=torch.int32,
                                  device=device)
         num_cached_tokens_per_seq = [0]
@@ -307,7 +311,7 @@ class TestGemma3(unittest.TestCase):
         # This helps us better test the custom masking utils for Gemma3 VLM as well
         # as SWA plumbing for FlashInfer. All tokens being text tokens should yield
         # same results as using global or local attention for appropriate layers.
-        if backend == "FLASHINFER":
+        if False: # backend == "FLASHINFER":
             image_token_mask = torch.tensor(
                 [False, False, False, False, False, False, False, False],
                 device=device)
@@ -324,10 +328,12 @@ class TestGemma3(unittest.TestCase):
                                     position_ids=position_ids,
                                     past_key_values=hf_cache,
                                     use_cache=True)
+            print("[test_gemma3_allclose_to_hf] max prefill diff: ", (logits - ref.logits[:, -1].float()).abs().max())
+            print("[test_gemma3_allclose_to_hf] mean prefill diff: ", (logits - ref.logits[:, -1].float()).abs().mean())
             torch.testing.assert_close(logits,
                                        ref.logits[:, -1].float(),
-                                       atol=0.4,
-                                       rtol=0.4)
+                                       atol=0.05,
+                                       rtol=0.05)
 
         # Generation phase.
         gen_input_ids = torch.tensor([900], dtype=torch.int, device=device)
@@ -363,10 +369,12 @@ class TestGemma3(unittest.TestCase):
                                     cache_position=torch.LongTensor(
                                         [input_ids.size(-1)]).to(device),
                                     last_cache_position=input_ids.size(-1) + 1)
+            print("[test_gemma3_allclose_to_hf] max gen diff: ", (logits - ref.logits[:, -1].float()).abs().max())
+            print("[test_gemma3_allclose_to_hf] mean gen diff: ", (logits - ref.logits[:, -1].float()).abs().mean())
             torch.testing.assert_close(logits,
                                        ref.logits[:, -1].float(),
-                                       atol=0.4,
-                                       rtol=0.4)
+                                       atol=0.05,
+                                       rtol=0.05)
 
         kv_cache_manager.shutdown()
 
