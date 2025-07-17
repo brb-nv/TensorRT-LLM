@@ -70,9 +70,11 @@ class FlashInferAttentionMetadata(AttentionMetadata):
 
     def needs_plan(self, plan_params: PlanParams) -> bool:
         if plan_params not in self._plan_params_to_wrappers:
+            print(f"[FlashInferAttentionMetadata::needs_plan] plan_params not in {self._plan_params_to_wrappers}.")
             return True
 
         wrappers = self._plan_params_to_wrappers[plan_params]
+        print(f"[FlashInferAttentionMetadata::needs_plan] wrappers.is_planned: {wrappers.is_planned}.")
         return not wrappers.is_planned
 
     def get_prefill_wrapper(
@@ -345,7 +347,10 @@ class FlashInferAttentionMetadata(AttentionMetadata):
 
         # If there's custom attention mask, we need to plan() again.
         if attention_mask_data is None and not self.needs_plan(plan_params):
+            print(f"[FlashInferAttention::_plan_with_params] RETURNING EARLY FOR FROM_PREPARE {from_prepare}.")
             return plan_params
+        else:
+            print(f"[FlashInferAttention::_plan_with_params] GOING AHEAD WITH NEW PLAN FOR FROM_PREPARE {from_prepare}.")
 
         if self.is_cuda_graph and torch.cuda.is_current_stream_capturing():
             raise ValueError(
