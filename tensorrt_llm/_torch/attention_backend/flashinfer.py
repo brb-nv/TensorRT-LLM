@@ -39,7 +39,6 @@ class PlanParams:
     kv_dtype: torch.dtype
 
     attention_mask_type: AttentionMaskType
-    attention_mask_data: Optional[torch.Tensor] = None
     sm_scale: Optional[float] = None
     window_left: Optional[int] = None
 
@@ -302,7 +301,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         for plan_params in self._plan_params_to_wrappers:
             # Re-plan the cached wrappers for a new set of requests.
             self._plan_params_to_wrappers[plan_params].is_planned = False
-            self._plan_with_params(plan_params)
+            self._plan_with_params(plan_params, from_prepare=True)
 
         if self.cross is not None and self.cross is not self:
             self.cross.prepare()
@@ -331,17 +330,21 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             sm_scale=sm_scale,
             window_left=attention_window_size
             if attention_window_size is not None else -1,
-            attention_mask_type=AttentionMaskType(attention_mask_type),
-            attention_mask_data=attention_mask_data)
-        return self._plan_with_params(plan_params)
+            attention_mask_type=AttentionMaskType(attention_mask_type))
+        return self._plan_with_params(plan_params, attention_mask_data=attention_mask_data, from_prepare=False)
 
     def _use_tensor_cores(self, plan_params: PlanParams):
         return plan_params.kv_dtype in [
             torch.float8_e4m3fn, torch.float8_e5m2
         ] or (plan_params.num_heads // plan_params.num_kv_heads >= 4)
 
-    def _plan_with_params(self, plan_params: PlanParams) -> PlanParams:
-        if not self.needs_plan(plan_params):
+    def _plan_with_params(self, plan_params: PlanParams, attention_mask_data: Optional[torch.Tensor] = None, from_prepare: bool = False) -> PlanParams:
+        if not from_prepare:
+            if self.num_contexts > 0 and attention_mask_data is None:
+                print("ATTENTION MASK DATA IS REQUIRED FOR PREFILL.")
+
+        # If there's custom attention mask, we need to plan() again.
+        if attention_mask_data is None and not self.needs_plan(plan_params):
             return plan_params
 
         if self.is_cuda_graph and torch.cuda.is_current_stream_capturing():
@@ -365,15 +368,41 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                 paged_kv_last_page_len_buf=self._paged_kv_last_page_len,
                 use_cuda_graph=self.is_cuda_graph)
 
-        is_causal = plan_params.attention_mask_type == AttentionMaskType.causal
+        is_causal = attention_mask_data is None and plan_params.attention_mask_type == AttentionMaskType.causal
 
-        def prefill_plan():
+        def prefill_plan(attention_mask_data: Optional[torch.Tensor] = None):
             # Setting `window_left` to -1 for custom attention mask is important.
             # Else, FlashInfer proceeds to use SWA regardless of attention_mask_data.
-            if plan_params.attention_mask_data is not None:
+            if attention_mask_data is not None:
                 window_left = -1
             else:
                 window_left = plan_params.window_left
+
+            ############################################################################################################
+            print("Call to prefill_wrapper.plan()")
+            if attention_mask_data is not None:
+                print(f"[FlashInferAttention::prefill_plan] self.qo_indptr[:self.num_contexts + 1]: {self.qo_indptr[:self.num_contexts + 1]}")
+                print(f"[FlashInferAttention::prefill_plan] self.paged_kv_indptr_prefill[:self.num_contexts + 1]: {self.paged_kv_indptr_prefill[:self.num_contexts + 1]}")
+                print(f"[FlashInferAttention::prefill_plan] self._paged_kv_indices[:self.num_context_blocks]: {self._paged_kv_indices[:self.num_context_blocks]}")
+                print(f"[FlashInferAttention::prefill_plan] self._paged_kv_last_page_len[:self.num_contexts]: {self._paged_kv_last_page_len[:self.num_contexts]}")
+                print(f"[FlashInferAttention::prefill_plan] attention_mask_data: {len(attention_mask_data)}")
+            else:
+                print(f"[FlashInferAttention::prefill_plan] attention_mask_data: None")
+
+            if attention_mask_data is not None:
+                temp_qo = self.qo_indptr[:self.num_contexts + 1]
+                temp_paged_kv_indptr = self.paged_kv_indptr_prefill[:self.num_contexts + 1]
+                temp_paged_kv_last_page_len = self._paged_kv_last_page_len[:self.num_contexts]
+                expected_mask_len = 0
+                for i in range(self.num_contexts):
+                    qo_len = temp_qo[i + 1] - temp_qo[i]
+                    paged_kv_indptr_len = temp_paged_kv_indptr[i + 1] - temp_paged_kv_indptr[i]
+                    paged_kv_last_page_len = temp_paged_kv_last_page_len[i]
+                    kv_len = (paged_kv_indptr_len - 1) * self.page_size + paged_kv_last_page_len
+                    assert qo_len == kv_len, f"qo_len: {qo_len}, kv_len: {kv_len}"
+                    expected_mask_len += qo_len * kv_len
+                assert len(attention_mask_data) == expected_mask_len, f"expected_mask_len: {expected_mask_len}, actual_mask_len: {len(attention_mask_data)}"
+            ############################################################################################################
 
             prefill_wrapper.plan(
                 self.qo_indptr[:self.num_contexts + 1],
@@ -389,7 +418,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                 window_left=window_left,
                 q_data_type=plan_params.q_dtype,
                 kv_data_type=plan_params.kv_dtype,
-                custom_mask=plan_params.attention_mask_data,
+                custom_mask=attention_mask_data,
             )
 
         if plan_params in self._plan_params_to_wrappers:
@@ -433,7 +462,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         torch.cuda.current_stream().synchronize()
 
         if self.num_contexts > 0:
-            prefill_plan()
+            prefill_plan(attention_mask_data=attention_mask_data)
 
         if self.num_generations > 0:
             decode_plan()

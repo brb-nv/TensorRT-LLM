@@ -179,9 +179,7 @@ class Gemma3VLM(PreTrainedModel):
         **kwargs,
     ) -> torch.Tensor:
         num_context_requests, num_generation_requests = attn_metadata.num_contexts, attn_metadata.num_generations
-        logger.debug(
-            f"[Gemma3Model::forward]{num_context_requests=}, {num_generation_requests=}"
-        )
+        print(f"[Gemma3Model::forward] {num_context_requests=}, {num_generation_requests=}")
 
         multimodal_params = kwargs.get("multimodal_params", [])
         pixel_values = [
