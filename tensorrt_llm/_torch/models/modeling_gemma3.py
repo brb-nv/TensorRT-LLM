@@ -433,6 +433,7 @@ class Gemma3ForCausalLM(DecoderModelForCausalLM[Gemma3TextModel,
         assert (cached_token_lens == 0).all(
         ), "cached_token_lens should be 0 for context requests since chunked prefill and kv cache reuse must be disabled."
 
+        print(f"[Gemma3ForCausalLM::get_flashinfer_attention_mask] qo_indptr: {qo_indptr}")
         # Create masks for context requests.
         context_mask_list = []
         for i in range(num_contexts):
@@ -442,6 +443,7 @@ class Gemma3ForCausalLM(DecoderModelForCausalLM[Gemma3TextModel,
                 effective_sliding_window=effective_sliding_window,
             )
             context_mask_list.append(mask_i.flatten())
+        print(f"[Gemma3ForCausalLM::get_flashinfer_attention_mask] context_mask_list: {context_mask_list}")
         return torch.cat(context_mask_list, dim=0).contiguous()
 
     @torch.inference_mode()

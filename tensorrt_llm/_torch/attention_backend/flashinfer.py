@@ -192,10 +192,12 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         if extra_attrs is None:
             get_global_attrs().attention_metadata = weakref.ref(self)
         # start and end indices of each sequence in the ragged query
+        print(f"[FlashInferAttention::prepare] self.seq_lens_cuda: {self.seq_lens_cuda}")
         torch.cumsum(self.seq_lens_cuda,
                      dim=0,
                      dtype=torch.int32,
                      out=self._qo_indptr[1:self.seq_lens_cuda.size(0) + 1])
+        print(f"[FlashInferAttention::prepare] UPDATED self._qo_indptr: {self._qo_indptr}")
 
         # indices of used cache blocks for each sequence
         assert self.request_ids is not None
@@ -372,6 +374,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                 window_left = -1
             else:
                 window_left = plan_params.window_left
+
             prefill_wrapper.plan(
                 self.qo_indptr[:self.num_contexts + 1],
                 self.paged_kv_indptr_prefill[:self.num_contexts + 1],
