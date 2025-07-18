@@ -46,17 +46,19 @@ class Gemma3InputProcessor(InputProcessor):
 
         images = mm_data.get("image")
         if images and len(images) != 1:
-            raise ValueError(
-                f"Expected at most one image for processing, got {len(images)}."
+            print(
+                f"[HAIDER] Expected at most one image for processing, got {len(images)}."
             )
 
-        image = images[0] if images else None
+        # print(f"[HAIDER] prompt: {text_prompt}, len(images): {len(images)}")
+
+        # image = images[0] if images else None
         do_rescale = self.processor.image_processor.do_rescale
-        if isinstance(image, torch.Tensor):
+        if images is not None and isinstance(images[0], torch.Tensor):
             do_rescale = False
         processor_output = self.processor(
             text=text_prompt,
-            images=image,
+            images=images,
             do_rescale=do_rescale,
             return_tensors="pt",
             device=self.device).to(dtype=torch.bfloat16)
@@ -179,9 +181,7 @@ class Gemma3VLM(PreTrainedModel):
         **kwargs,
     ) -> torch.Tensor:
         num_context_requests, num_generation_requests = attn_metadata.num_contexts, attn_metadata.num_generations
-        logger.debug(
-            f"[Gemma3Model::forward]{num_context_requests=}, {num_generation_requests=}"
-        )
+        print(f"[Gemma3Model::forward]{num_context_requests=}, {num_generation_requests=}")
 
         multimodal_params = kwargs.get("multimodal_params", [])
         pixel_values = [

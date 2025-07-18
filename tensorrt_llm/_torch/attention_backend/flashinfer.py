@@ -196,6 +196,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                      dim=0,
                      dtype=torch.int32,
                      out=self._qo_indptr[1:self.seq_lens_cuda.size(0) + 1])
+        print(f"[FlashInferAttention::prepare] _qo_indptr: {self._qo_indptr}")
 
         # indices of used cache blocks for each sequence
         assert self.request_ids is not None
@@ -297,10 +298,20 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             self._positions[:positions.size(0)].copy_(positions,
                                                       non_blocking=True)
 
-        for plan_params in self._plan_params_to_wrappers:
-            # Re-plan the cached wrappers for a new set of requests.
-            self._plan_params_to_wrappers[plan_params].is_planned = False
-            self._plan_with_params(plan_params)
+        # self._plan_params_to_wrappers = {}
+        plan_params_to_remove = []
+        for i, plan_params in enumerate(self._plan_params_to_wrappers):
+            if plan_params.attention_mask_data is None:
+                # Re-plan the cached wrappers for a new set of requests.
+                print(f"[FlashInferAttention::prepare] KEEPING plan_params[{i}]: \n {plan_params}")
+                self._plan_params_to_wrappers[plan_params].is_planned = False
+                self._plan_with_params(plan_params, from_prepare=True)
+            else:
+                print(f"[FlashInferAttention::prepare] REMOVING plan_params[{i}]: \n {plan_params}")
+                plan_params_to_remove.append(plan_params)
+
+        for plan_params in plan_params_to_remove:
+            del self._plan_params_to_wrappers[plan_params]
 
         if self.cross is not None and self.cross is not self:
             self.cross.prepare()
@@ -331,17 +342,20 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             if attention_window_size is not None else -1,
             attention_mask_type=AttentionMaskType(attention_mask_type),
             attention_mask_data=attention_mask_data)
-        return self._plan_with_params(plan_params)
+        return self._plan_with_params(plan_params, from_prepare=False)
 
     def _use_tensor_cores(self, plan_params: PlanParams):
         return plan_params.kv_dtype in [
             torch.float8_e4m3fn, torch.float8_e5m2
         ] or (plan_params.num_heads // plan_params.num_kv_heads >= 4)
 
-    def _plan_with_params(self, plan_params: PlanParams) -> PlanParams:
+    def _plan_with_params(self, plan_params: PlanParams, from_prepare: bool = False) -> PlanParams:
+        print(f"[FlashInferAttention::plan_with_params] from_prepare: {from_prepare}, plan_params: \n {plan_params}")
         if not self.needs_plan(plan_params):
+            print(f"[FlashInferAttention::plan_with_params] plan_params already planned, returning early.")
             return plan_params
 
+        print(f"[FlashInferAttention::plan_with_params] plan_params not planned, planning now.")
         if self.is_cuda_graph and torch.cuda.is_current_stream_capturing():
             raise ValueError(
                 "Cannot plan() for flashinfer kernels while stream is capturing. "
@@ -349,9 +363,11 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             )
 
         if plan_params in self._plan_params_to_wrappers:
+            print(f"[FlashInferAttention::plan_with_params] plan_params already in _plan_params_to_wrappers, using existing PREFILL wrapper.")
             prefill_wrapper = self._plan_params_to_wrappers[
                 plan_params].prefill_wrapper
         else:
+            print(f"[FlashInferAttention::plan_with_params] plan_params not in _plan_params_to_wrappers, creating new PREFILL wrapper.")
             # flashinfer fa3 backend has accuracy issue in H100 PCIe
             prefill_wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
                 self.workspace_buffer,
@@ -390,9 +406,11 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             )
 
         if plan_params in self._plan_params_to_wrappers:
+            print(f"[FlashInferAttention::plan_with_params] plan_params already in _plan_params_to_wrappers, using existing DECODE wrapper.")
             decode_wrapper = self._plan_params_to_wrappers[
                 plan_params].decode_wrapper
         else:
+            print(f"[FlashInferAttention::plan_with_params] plan_params not in _plan_params_to_wrappers, creating new DECODE wrapper.")
             use_tensor_cores = self._use_tensor_cores(plan_params)
 
             decode_wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
@@ -426,7 +444,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                 kv_data_type=plan_params.kv_dtype,
             )
 
-        # Must sync after append_paged_kv_cache and before plan
+        # Must sync after append_paged_kv_cache and before plan.
         torch.cuda.current_stream().synchronize()
 
         if self.num_contexts > 0:

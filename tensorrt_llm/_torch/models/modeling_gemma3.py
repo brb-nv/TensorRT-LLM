@@ -442,6 +442,8 @@ class Gemma3ForCausalLM(DecoderModelForCausalLM[Gemma3TextModel,
                 effective_sliding_window=effective_sliding_window,
             )
             context_mask_list.append(mask_i.flatten())
+        mask_lens = [mask.numel() for mask in context_mask_list]
+        print(f"[Gemma3ForCausalLM::get_flashinfer_attention_mask] context_mask_list: {mask_lens}")
         return torch.cat(context_mask_list, dim=0).contiguous()
 
     @torch.inference_mode()
