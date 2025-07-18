@@ -438,6 +438,7 @@ def default_multimodal_input_loader(
         num_frames: int = 8,
         device: str = "cuda") -> List[dict[str, Union[str, torch.Tensor]]]:
 
+    print(f"[default_multimodal_input_loader::convert_to_conversation_message] prompts: {prompts}, media: {media}, modality: {modality}")
     def convert_to_conversation_message(prompt: str, media: Union[str,
                                                                   List[str]],
                                         modality: str) -> ConversationMessage:
@@ -479,8 +480,11 @@ def default_multimodal_input_loader(
                                                   trust_remote_code=True)
 
     inputs = []
+    idx = 0
     for prompt, media in zip(prompts, media):
+        print(f"[default_multimodal_input_loader::apply_chat_template] idx: {idx}, prompt: {prompt}, media: {media}")
         conv = convert_to_conversation_message(prompt, media, modality)
+        print(f"[default_multimodal_input_loader::apply_chat_template] conv: {conv}")
         mm_data_tracker = MultimodalDataTracker(model_type)
         for mdata in conv["media"]:
             mm_data_tracker.add_data(mdata["modality"], mdata["data"])
@@ -500,5 +504,10 @@ def default_multimodal_input_loader(
             "prompt": prompt,
             "multi_modal_data": mm_data_tracker.retrieve_all_sync()
         })
+        idx += 1
+
+    print(f"[default_multimodal_input_loader::inputs] inputs[-1]: {inputs[-1]}")
+    # for img_idx, img in enumerate(inputs[-1]["multi_modal_data"]["image"]):
+    #     print(f"[default_multimodal_input_loader::inputs] img_idx: {img_idx}, img.shape: {img.shape}")
 
     return inputs

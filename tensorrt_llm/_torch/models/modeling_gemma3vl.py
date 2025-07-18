@@ -45,24 +45,27 @@ class Gemma3InputProcessor(InputProcessor):
             raise KeyError("Expected image data in multimodal data for Gemma3.")
 
         images = mm_data.get("image")
-        if images and len(images) != 1:
-            raise ValueError(
-                f"Expected at most one image for processing, got {len(images)}."
-            )
-
-        image = images[0] if images else None
+        # if images and len(images) != 1:
+        #     print(f"RECEIVED MORE THAN ONE IMAGE FOR PROCESSING. len(images): {len(images)}.")
+        # for img_idx, img in enumerate(images):
+        #     print(f"[Gemma3InputProcessor::_preprocess] img_idx: {img_idx}, img.shape: {img.shape}")
         do_rescale = self.processor.image_processor.do_rescale
-        if isinstance(image, torch.Tensor):
+        if images is not None and isinstance(images[0], torch.Tensor):
             do_rescale = False
         processor_output = self.processor(
             text=text_prompt,
-            images=image,
+            images=images,
             do_rescale=do_rescale,
             return_tensors="pt",
             device=self.device).to(dtype=torch.bfloat16)
 
         input_ids = processor_output["input_ids"]
         pixel_values = processor_output.get("pixel_values")
+
+        # for img_idx, pixel_value in enumerate(pixel_values):
+        #     print(f"[Gemma3InputProcessor::_preprocess] pixel_idx: {img_idx}, pixel_value.shape: {pixel_value.shape}")
+
+        # print(f"[Gemma3InputProcessor::_preprocess] input_ids: {input_ids}, pixel_values: {pixel_values}")
 
         return input_ids, pixel_values
 
@@ -196,8 +199,10 @@ class Gemma3VLM(PreTrainedModel):
         mm_token_mask = None
         if len(pixel_values) > 0:
             # The shape of `image_features` is `[B, T, embed_dim]`.
+            print(f"[Gemma3VLM::forward] pixel_values concat shape: {torch.cat(pixel_values).shape}")
             image_features = self._get_image_features(
                 pixel_values=torch.cat(pixel_values))
+            print(f"[Gemma3VLM::forward] image_features shape: {image_features.shape}")
             # We need to reshape it to `[B * T, embed_dim]` before passing to `fuse_input_embeds`.
             B, T, embed_dim = image_features.shape
             mm_embeds = [image_features.reshape(B * T, embed_dim).contiguous()]
