@@ -375,9 +375,11 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             # Setting `window_left` to -1 for custom attention mask is important.
             # Else, FlashInfer proceeds to use SWA regardless of attention_mask_data.
             if plan_params.attention_mask_data is not None:
+                assert False
                 window_left = -1
             else:
                 window_left = plan_params.window_left
+            assert plan_params.attention_mask_data is None
             prefill_wrapper.plan(
                 self.qo_indptr[:self.num_contexts + 1],
                 self.paged_kv_indptr_prefill[:self.num_contexts + 1],
@@ -489,6 +491,7 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
                 attention_mask_data: Optional[torch.Tensor] = None,
                 **kwargs) -> torch.Tensor:
         if attention_mask == CustomAttentionMask.CUSTOM:
+            assert False
             assert attention_mask_data is not None, "attention_mask_data is required for custom attention mask."
             attention_mask_type = int(AttentionMaskType.custom_mask)
             attention_mask_data = attention_mask_data if attention_mask_data.ndim == 1 else attention_mask_data.flatten(

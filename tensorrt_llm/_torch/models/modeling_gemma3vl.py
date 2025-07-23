@@ -215,7 +215,7 @@ class Gemma3VLM(PreTrainedModel):
             position_ids=position_ids,
             inputs_embeds=inputs_embeds,
             return_context_logits=return_context_logits,
-            image_token_mask=mm_token_mask,
+            image_token_mask=None,      # skipping mask.
         )
         return logits
 

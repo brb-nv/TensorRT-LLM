@@ -113,6 +113,7 @@ class Gemma3Attention(Attention):
     ) -> torch.Tensor:
 
         if attention_mask_data is not None:
+            assert False
             assert isinstance(
                 attn_metadata, FlashInferAttentionMetadata
             ), "Only FlashInfer backend supports custom attention mask currently."
