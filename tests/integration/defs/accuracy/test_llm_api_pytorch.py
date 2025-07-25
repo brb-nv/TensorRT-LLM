@@ -15,6 +15,7 @@
 import os
 
 import pytest
+from defs.common import generate_dummy_loras
 from defs.conftest import get_sm_version
 
 from tensorrt_llm import LLM
@@ -23,6 +24,7 @@ from tensorrt_llm.llmapi import (CudaGraphConfig, EagleDecodingConfig,
                                  KvCacheConfig, MoeConfig, MTPDecodingConfig,
                                  NGramDecodingConfig, SamplingParams,
                                  TorchCompileConfig)
+from tensorrt_llm.lora_manager import LoraConfig
 from tensorrt_llm.quantization import QuantAlgo
 
 from ..conftest import (llm_models_root, parametrize_with_ids, skip_no_hopper,
@@ -587,6 +589,44 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
         with LLM(self.MODEL_PATH,
                  kv_cache_config=self.kv_cache_config,
                  **extra_llm_config) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    # This is a smoke test to make sure LoRA works.
+    def test_lora(self):
+        model_path = f"{llm_models_root()}/gemma/gemma-3-1b-it/"
+        lora_rank = 32
+        num_loras = 1
+        print(f"Generating {num_loras} dummy LoRAs with rank {lora_rank}...")
+        lora_output_dirs = generate_dummy_loras(
+            hf_model_dir=model_path,
+            lora_output_dir="/tmp/lora_output",
+            num_loras=num_loras,
+            lora_rank=lora_rank,
+            target_modules=["q_proj", "k_proj",
+                            "v_proj"],  # "gate_proj", "down_proj", "up_proj"],
+            zero_weights=True,
+        )
+        print("lora_output_dirs: ", lora_output_dirs)
+        lora_config = LoraConfig(
+            lora_dir=lora_output_dirs,
+            lora_ckpt_source="hf",
+            max_lora_rank=lora_rank,
+            lora_target_modules=[
+                'attn_q', 'attn_k', 'attn_v'
+            ],  # "mlp_h_to_4h", "mlp_4h_to_h", "mlp_gate"],
+            max_loras=num_loras,
+            max_cpu_loras=num_loras,
+        )
+        # Disabling kv cache reuse as a WAR to deal with gaps in kernel support for Gemma3's non-inclusive sliding window size.
+        kv_cache_config = KvCacheConfig(
+            enable_block_reuse=False,
+            enable_partial_reuse=False,
+        )
+        with LLM(model_path,
+                 lora_config=lora_config,
+                 enable_lora=True,
+                 kv_cache_config=kv_cache_config) as llm:
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
