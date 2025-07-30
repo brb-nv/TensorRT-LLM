@@ -1467,18 +1467,6 @@ class Linear(nn.Module):
         local_in_features = in_features
         local_out_features = out_features
 
-        #####################################################################
-        # Skip quantization for vision tower layers.
-        if in_features == 1152 and out_features == 4304:
-            self.quant_config = None
-        if in_features == 4304 and out_features == 1152:
-            self.quant_config = None
-        if in_features == 1152 and out_features == 1152:
-            self.quant_config = None
-        if in_features == 1152 and out_features == 3456:
-            self.quant_config = None
-        #####################################################################
-
         if self.tp_mode == TensorParallelMode.ROW:
             assert in_features % self.tp_size == 0, (
                 f'in_features {in_features} must be divisible by tp_size {self.tp_size}'
