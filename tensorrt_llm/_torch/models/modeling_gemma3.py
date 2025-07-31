@@ -1,6 +1,4 @@
 import math
-import os
-import numpy as np
 from typing import Dict, Optional, Tuple
 
 import torch
@@ -27,15 +25,6 @@ from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
                              register_auto_model)
-
-
-trtllm_debug_path = "/home/bbuddharaju/scratch/TensorRT-LLM/bf16_debug/"
-def save_tensor_to_npy(tensorname, tensor):
-    print(f"{tensorname}: \n", tensor)
-    numpy_array = tensor.detach().cpu().float().numpy()
-    filename = tensorname + ".npy"
-    filepath = os.path.join(trtllm_debug_path, filename)
-    np.save(filepath, numpy_array)
 
 
 class Gemma3TextScaledWordEmbedding(Embedding):
@@ -243,10 +232,8 @@ class Gemma3DecoderLayer(DecoderLayer):
         **kwargs,
     ) -> torch.Tensor:
 
-        print_condition = (self.layer_idx == 0)
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-        if print_condition: save_tensor_to_npy(f"attention_input_{self.layer_idx}", hidden_states)
         hidden_states = self.self_attn(
             position_ids=position_ids,
             hidden_states=hidden_states,
@@ -256,24 +243,13 @@ class Gemma3DecoderLayer(DecoderLayer):
             attention_mask_data=attention_mask_data,
             **kwargs,
         )
-        if print_condition: save_tensor_to_npy(f"attention_output_{self.layer_idx}", hidden_states)
         hidden_states = self.post_attention_layernorm(hidden_states)
-        if print_condition: save_tensor_to_npy(f"attention_output_post_layernorm_{self.layer_idx}", hidden_states)
         hidden_states = residual + hidden_states
-        if print_condition: save_tensor_to_npy(f"attention_output_with_residual_{self.layer_idx}", hidden_states)
         residual = hidden_states
         hidden_states = self.pre_feedforward_layernorm(hidden_states)
-        if print_condition: save_tensor_to_npy(f"mlp_input_{self.layer_idx}", hidden_states)
-        # if print_condition:
-        #     print(f"mlp_weight gate_proj: {self.mlp.gate_proj.weight.shape} \n {self.mlp.gate_proj.weight}")
-        #     print(f"mlp_weight up_proj: {self.mlp.up_proj.weight.shape} \n {self.mlp.up_proj.weight}")
-        #     print(f"mlp_weight down_proj: {self.mlp.down_proj.weight.shape} \n {self.mlp.down_proj.weight}")
         hidden_states = self.mlp(hidden_states)
-        if print_condition: save_tensor_to_npy(f"mlp_output_{self.layer_idx}", hidden_states)
         hidden_states = self.post_feedforward_layernorm(hidden_states)
-        if print_condition: save_tensor_to_npy(f"mlp_output_post_layernorm_{self.layer_idx}", hidden_states)
         hidden_states = residual + hidden_states
-        if print_condition: save_tensor_to_npy(f"mlp_output_with_residual_{self.layer_idx}", hidden_states)
 
         return hidden_states
 
@@ -319,10 +295,8 @@ class Gemma3TextModel(DecoderModel):
                 "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
             )
 
-        print("input_ids: ", input_ids)
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
-            save_tensor_to_npy(f"input_embeddings_scaled", inputs_embeds)
 
         hidden_states = inputs_embeds.to(self.dtype)
 
@@ -336,7 +310,6 @@ class Gemma3TextModel(DecoderModel):
                 global_attention_mask_data)
 
         hidden_states = self.norm(hidden_states)
-        save_tensor_to_npy(f"final_norm_output", hidden_states)
         return hidden_states
 
 
