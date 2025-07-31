@@ -540,26 +540,6 @@ class TestGemma3_27BInstruct(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
-    def test_fp8(self):
-        # Disabling kv cache reuse as a WAR to deal with gaps in kernel support for Gemma3's non-inclusive sliding window size.
-        kv_cache_config = KvCacheConfig(
-            enable_block_reuse=False,
-            enable_partial_reuse=False,
-        )
-        # We use FlashInfer as the attention backend for Gemma3 VLM to support custom mask for images.
-        # So, testing with it here.
-        with LLM("/home/bbuddharaju/scratch/random/hf_models/gemma-3-27b-it-fp8/",
-                 kv_cache_config=kv_cache_config,
-                 attn_backend="FLASHINFER",
-                 cuda_graph_config=None) as llm:
-            assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
-            task = CnnDailymail(self.MODEL_NAME)    # 12.54008511545332.
-            task.evaluate(llm)
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = GSM8K(self.MODEL_NAME)    # 0.0758150113722517.
-            task.evaluate(llm)
-
 
 class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
     MODEL_NAME = "google/gemma-3-1b-it"
@@ -582,14 +562,14 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
 
-    def test_fp8(self):
+    def test_fp8_prequantized(self):
         # Disabling kv cache reuse as a WAR to deal with gaps in kernel support for Gemma3's non-inclusive sliding window size.
-        kv_cache_config = KvCacheConfig(
-            enable_block_reuse=False,
-            enable_partial_reuse=False,
-            dtype="fp8"
-        )
-        with LLM("/home/bbuddharaju/scratch/random/hf_models/gemma-3-1b-it-fp8/", kv_cache_config=kv_cache_config) as llm:
+        kv_cache_config = KvCacheConfig(enable_block_reuse=False,
+                                        enable_partial_reuse=False,
+                                        dtype="fp8")
+        prequantized_model_path = "/home/bbuddharaju/scratch/random/hf_models/gemma-3-1b-it-fp8/"
+        with LLM(prequantized_model_path,
+                 kv_cache_config=kv_cache_config) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm)
@@ -605,7 +585,6 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
         with LLM(self.MODEL_PATH, kv_cache_config=self.kv_cache_config) as llm:
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
-
 
     @pytest.mark.skip(
         reason=

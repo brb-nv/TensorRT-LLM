@@ -6,6 +6,7 @@ import torch
 from transformers import AutoProcessor, Gemma3Config, PreTrainedModel
 from transformers.modeling_utils import no_init_weights
 from transformers.models.gemma3.modeling_gemma3 import Gemma3MultiModalProjector
+
 from tensorrt_llm._torch.models.checkpoints.hf.gemma3_weight_mapper import \
     Gemma3HfWeightMapper
 
