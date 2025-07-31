@@ -1507,7 +1507,6 @@ class Linear(nn.Module):
             return
 
         self.quant_method = get_quant_method(self.quant_config)
-        print("[create_weights] self.in_features: ", self.in_features, " self.out_features: ", self.out_features, " self.quant_method: ", self.quant_method)
         self.quant_method.create_weights(self, self.in_features,
                                          self.out_features, self.has_bias,
                                          self.dtype)
