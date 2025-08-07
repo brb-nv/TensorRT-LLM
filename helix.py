@@ -23,7 +23,7 @@ from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from transformers.processing_utils import Unpack
 from transformers.utils import LossKwargs, auto_docstring, can_return_tuple, logging
 from transformers import LlamaConfig
-
+from math import ceil
 
 logger = logging.get_logger(__name__)
 
@@ -200,8 +200,8 @@ class LlamaAttention(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        position_embeddings: tuple[torch.Tensor, torch.Tensor],
-        attention_mask: Optional[torch.Tensor],
+        position_embeddings: tuple[torch.Tensor, torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
         past_key_value: Optional[Cache] = None,
         cache_position: Optional[torch.LongTensor] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
@@ -213,8 +213,9 @@ class LlamaAttention(nn.Module):
         key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
         value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
-        # cos, sin = position_embeddings
-        # query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        if position_embeddings is not None:
+            cos, sin = position_embeddings
+            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
         if past_key_value is not None:
             # sin and cos are specific to RoPE models; cache_position needed for the static cache
@@ -293,15 +294,46 @@ class LlamaDecoderLayer(GradientCheckpointingLayer):
 
         return outputs
 
+class UnshardedLlamaModel():
+    def __init__(self, config: LlamaConfig):
+        self.config = config
+        self.layers = nn.ModuleList([LlamaDecoderLayer(config, i) for i in range(config.num_hidden_layers)])
+
+    def forward(self, hidden_states, attention_mask, position_ids, position_embeddings):
+        for layer in self.layers:
+            hidden_states = layer(hidden_states=hidden_states, attention_mask=attention_mask, position_ids=position_ids, position_embeddings=position_embeddings)
+        return hidden_states
+
 if __name__ == "__main__":
+    ##############################################################
+    # Params common for sharded as well as unsharded models.
+    B = 1 # Batch size.
+    S = 16 # Sequence length.
+    Hsz = 32 # Attention head size.
+    Q = 4  # Query heads.
+    K = 2  # KV heads.
+    H = Q * Hsz # Hidden dim.
+    F = 64 # Dense FFN dim.
+    ##############################################################
+
+    L = 1  # Number of layers.
     config = LlamaConfig(
-        hidden_size=4096,
-        num_attention_heads=32,
-        num_key_value_heads=32,
+        hidden_size=H,
+        num_attention_heads=Q,
+        num_key_value_heads=K,
+        num_hidden_layers=L,
+        intermediate_size=F,
     )
     layer = LlamaDecoderLayer(config, 0)
-    hidden_states = torch.randn(1, 1024, 4096)
-    attention_mask = torch.ones(1, 1, 1024, 1024)
-    position_ids = torch.arange(1024).unsqueeze(0)
-    output = layer(hidden_states, attention_mask, position_ids)
+    hidden_states = torch.randn(B, S, H)
+    attention_mask = torch.ones(B, 1, S, S)
+    position_ids = torch.arange(S).unsqueeze(0)
+    output = layer(hidden_states=hidden_states, attention_mask=attention_mask, position_ids=position_ids)
     print(output[0].shape)
+
+    N = 4 # number of gpus.
+    TPA = 2 # TP width for Attention.
+    KVP = 2 # Attention KVP width.
+    TPF = 4 # TP width for FFN.
+    KT = ceil(K/TPA) # KV heads per TPA.
+    QT = ceil(Q/TPA) # Query heads per TPA.
