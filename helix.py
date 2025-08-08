@@ -251,6 +251,7 @@ class LlamaAttention(nn.Module):
 
         attention_interface: Callable = eager_attention_forward
         if self.config._attn_implementation != "eager":
+            assert False, "Use eager attention for now."
             attention_interface = ALL_ATTENTION_FUNCTIONS[
                 self.config._attn_implementation]
 
