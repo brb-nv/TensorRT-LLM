@@ -24,6 +24,7 @@ namespace tensorrt_llm::executor::kv_cache
 
 class CommState;
 
+// @B: What is the mTag referring to?
 struct DataContext
 {
 public:

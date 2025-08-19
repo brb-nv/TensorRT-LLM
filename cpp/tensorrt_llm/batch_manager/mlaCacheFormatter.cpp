@@ -80,6 +80,7 @@ bool MLACacheFormatter::needSendCache(
         return selfTPrankINDPGroup % dupHeadFactor == destDPRank;
     }
 
+    // @B: This looks like duplicated code.
     int destTPNum = destConfig.getParallelConfig().mEnableAttentionDP
         ? destConfig.getParallelConfig().mTensorParallelism / destConfig.getParallelConfig().mDPsize
         : destConfig.getParallelConfig().mTensorParallelism;
@@ -133,6 +134,7 @@ void MLACacheFormatter::format(TransferSession& session)
     TLLM_CHECK(blockNum > 0);
     int deviceId = mCacheManager->getBlockManager().getStreamDevice();
 
+    // @B: What is zero copy?.
     if (common::getEnvTryZCopyForKVCacheTransfer()
         && destConfig.getParallelConfig().mPipelineParallelism == selfConfig.getParallelConfig().mPipelineParallelism)
     {
@@ -145,6 +147,7 @@ void MLACacheFormatter::format(TransferSession& session)
         {
             for (auto const& block : inputKvCacheBlocks)
             {
+                // @B: Does this mean no need to serialize?
                 session.send(i, block->data(), block->getSizeInBytes());
             }
         }
