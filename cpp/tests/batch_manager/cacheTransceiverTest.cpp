@@ -274,6 +274,13 @@ protected:
         }
     }
 
+    // Initialize MPI communication and split processes into sender/receiver groups.
+    // For example:
+    // Process 0: rank=0, isSender=true, mlocalRank=0
+    // Process 1: rank=1, isSender=false, mlocalRank=0
+    // Process 2: rank=2, isSender=true, mlocalRank=1
+    // Process 3: rank=3, isSender=false, mlocalRank=1
+    // @B: Where do we mention the number of processes?
     SizeType32 setUpCommunicator()
     {
         tensorrt_llm::mpi::initialize(tensorrt_llm::mpi::MpiThreadSupport::THREAD_MULTIPLE);
@@ -298,22 +305,25 @@ protected:
         mMaxNumSequences = 8;
         auto const stream = std::make_shared<tr::CudaStream>();
 
-        auto constexpr maxNumTokens = tokensPerBlock * maxBlocksPerSeq;
-        auto constexpr maxAttentionWindow = maxNumTokens;
-        auto constexpr inputLength = maxNumTokens - tokensPerBlock - 1;
-        auto constexpr numSharedBlocks = inputLength / tokensPerBlock;
+        auto constexpr maxNumTokensPerSeq = tokensPerBlock * maxBlocksPerSeq; // 80.
+        auto constexpr maxAttentionWindow = maxNumTokensPerSeq;
+        auto constexpr inputLength = maxNumTokensPerSeq - tokensPerBlock - 1; // 71.
+        // @B: What does shared block mean? Is this system prompt that's common across all sequences?
+        auto constexpr numSharedBlocks = inputLength / tokensPerBlock; // 8.
         auto constexpr numBlocksPerSeq = numSharedBlocks + (maxBlocksPerSeq - numSharedBlocks) * maxBeamWidth;
 
         auto totalNumBlocks = mMaxNumSequences * numBlocksPerSeq;
         auto constexpr blocksInSecondaryPool = 0;
 
         auto constexpr enableBlockReuse = true;
+        // @B: What does onboardBlocks mean?
         auto constexpr onboardBlocks = true;
         auto constexpr dataType = nvinfer1::DataType::kFLOAT;
 
         using BlocksPerWindow = std::map<SizeType32, std::tuple<SizeType32, SizeType32>>;
         auto const blocksPerWindow = BlocksPerWindow{{maxAttentionWindow, {totalNumBlocks, blocksInSecondaryPool}}};
 
+        // @B: Is this on the sender side or receiver side?
         mManager = std::make_unique<KVCacheManager>(numLayers, numHeads, sizePerHead, tokensPerBlock, blocksPerWindow,
             mMaxNumSequences, maxBeamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow}, std::nullopt,
             dataType, sinkTokenLength, stream, std::nullopt, enableBlockReuse, onboardBlocks, CacheType::kSELF,
@@ -321,6 +331,7 @@ protected:
         mCacheState = std::make_unique<texec::kv_cache::CacheState>(
             numLayers, numHeads, sizePerHead, tokensPerBlock, 1, 1, 1, dataType);
 
+        // @B: Only UCX and MPI seem to be supported. What about NIXL?
         if (tensorrt_llm::common::getEnvUseUCXKvCache())
         {
             std::lock_guard<std::mutex> lock(mDllMutex);

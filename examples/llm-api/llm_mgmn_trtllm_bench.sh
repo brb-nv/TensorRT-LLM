@@ -1,6 +1,6 @@
 #!/bin/bash
-#SBATCH -A <account>
-#SBATCH -p <partition>
+#SBATCH -A coreai_comparch_trtllm
+#SBATCH -p batch
 #SBATCH -t 01:00:00
 #SBATCH -N 2
 #SBATCH --ntasks-per-node=8
@@ -34,6 +34,21 @@
 #   LOCAL_MODEL: the local model directory to use, NOTE: downloading from HF is
 #      not supported in Slurm mode, you need to download the model and put it in
 #      the LOCAL_MODEL directory.
+
+# Docker container configuration
+export CONTAINER_IMAGE="urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:pytorch-25.06-py3-x86_64-ubuntu24.04-trt10.11.0.33-skip-tritondevel-202508110900-6715"
+export MOUNT_DIR="/lustre/fsw/coreai_comparch_trtllm/bbuddharaju/TensorRT-LLM"
+export MOUNT_DEST="/lustre/fsw/coreai_comparch_trtllm/bbuddharaju/TensorRT-LLM"
+export WORKDIR="/lustre/fsw/coreai_comparch_trtllm/bbuddharaju/TensorRT-LLM"
+
+# TensorRT-LLM source and model paths
+export SOURCE_ROOT="/lustre/fsw/coreai_comparch_trtllm/bbuddharaju/TensorRT-LLM"
+export LOCAL_MODEL="/lustre/fsw/coreai_comparch_trtllm/llm_data/llm-models/llama-3.3-models/Llama-3.3-70B-Instruct"
+export MODEL_NAME="Llama-3.3-70B-Instruct"
+
+# Optional variables
+export PROLOGUE="cd $WORKDIR && pip install -e . && echo 'TRTLLM installation complete!'"
+export EXTRA_ARGS=""                           # Additional arguments for trtllm-bench
 
 export prepare_dataset="$SOURCE_ROOT/benchmarks/cpp/prepare_dataset.py"
 export data_path="$WORKDIR/token-norm-dist.txt"
