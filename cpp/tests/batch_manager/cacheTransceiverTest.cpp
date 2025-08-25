@@ -1460,6 +1460,7 @@ TEST(targetTest, CacheStateNODP)
         EXPECT_EQ(expectNeedSend, MLACacheFormatter::needSendCache(contextCache, genCache, contextRank));
     };
 
+    // TP shrinks from context to generation.
     {
         tr::WorldConfig const contextWC{/*tpSize*/ 4, /*ppSize*/ 2, /*cpSize*/ 1};
         tr::WorldConfig const genWC{/*tpSize*/ 2, /*ppSize*/ 2, /*cpSize*/ 1};
@@ -1489,6 +1490,7 @@ TEST(targetTest, CacheStateNODP)
             /*expectTPDomain*/ 1, /*expectNeedSend*/ false);
     }
 
+    // TP grows from context to generation.
     {
         tr::WorldConfig const contextWC{/*tpSize*/ 2, /*ppSize*/ 2, /*cpSize*/ 1};
         tr::WorldConfig const genWC{/*tpSize*/ 4, /*ppSize*/ 2, /*cpSize*/ 1};
@@ -1506,6 +1508,7 @@ TEST(targetTest, CacheStateNODP)
             /*expectTPDomain*/ 2, /*expectNeedSend*/ true);
     }
 
+    // TP as well as PP grow from context to generation.
     {
         tr::WorldConfig const contextWC{/*tpSize*/ 2, /*ppSize*/ 1, /*cpSize*/ 1};
         tr::WorldConfig const genWC{/*tpSize*/ 4, /*ppSize*/ 2, /*cpSize*/ 1};
@@ -1518,6 +1521,33 @@ TEST(targetTest, CacheStateNODP)
             /*expectPPDomain*/ 2,
             /*expectTPDomain*/ 2, /*expectNeedSend*/ true);
     }
+
+    // CP grows from context to generation.
+    {
+        tr::WorldConfig const contextWC{/*tpSize*/ 1, /*ppSize*/ 1, /*cpSize*/ 1};
+        tr::WorldConfig const genWC{/*tpSize*/ 1, /*ppSize*/ 1, /*cpSize*/ 2};
+        verifyContext(
+            /*contextRank*/ 0, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {0, 1},
+            /*expectPPDomain*/ 1, /*expectTPDomain*/ 1, /*expectNeedSend*/ true);
+    }
+
+    // // TP shrinks while CP grows from context to generation.
+    // {
+    //     tr::WorldConfig const contextWC{/*tpSize*/ 4, /*ppSize*/ 1, /*cpSize*/ 1};
+    //     tr::WorldConfig const genWC{/*tpSize*/ 2, /*ppSize*/ 1, /*cpSize*/ 2};
+    // }
+
+    // // TP grows while CP shrinks from context to generation.
+    // {
+    //     tr::WorldConfig const contextWC{/*tpSize*/ 2, /*ppSize*/ 2, /*cpSize*/ 1};
+    //     tr::WorldConfig const genWC{/*tpSize*/ 4, /*ppSize*/ 2, /*cpSize*/ 4};
+    // }
+
+    // // TP shrinks while CP grows from context to generation.
+    // {
+    //     tr::WorldConfig const contextWC{/*tpSize*/ 4, /*ppSize*/ 1, /*cpSize*/ 1};
+    //     tr::WorldConfig const genWC{/*tpSize*/ 2, /*ppSize*/ 1, /*cpSize*/ 2};
+    // }
 }
 
 TEST(targetTest, CacheStateContextDP)
