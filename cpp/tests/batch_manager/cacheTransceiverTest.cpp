@@ -1438,69 +1438,86 @@ TEST(targetTest, CacheStateNODP)
     bool const isMLA = true;
     int const kvFactor = 2;
 
-    int contextPP = 2;
-    int contextTP = 4;
-    int contextCP = 1;
-    int genPP = 2;
-    int genTP = 2;
-    int genCP = 1;
-    bool const contextEnableDP = false;
-    bool const genEnableDP = false;
-
-    auto const verifyContext = [&](int contextRank, std::vector<int> const& expectRanks, int expectPPDomain,
-                                   int expectTPDomain, bool expectNeedSend)
+    auto const verifyContext
+        = [&](int contextRank, tr::WorldConfig const& contextWC, tr::WorldConfig const& genWC,
+              std::vector<int> const& expectRanks, int expectPPDomain, int expectTPDomain, bool expectNeedSend)
     {
         auto attentionType = isMLA ? texec::kv_cache::CacheState::AttentionType::kMLA
                                    : texec::kv_cache::CacheState::AttentionType::kDEFAULT;
-        auto const contextCache = tensorrt_llm::executor::kv_cache::CacheState{numLayers, numHeads, sizePerHead,
-            tokensPerBlock, contextTP, contextPP, contextCP, dataType, attentionType, kvFactor, contextEnableDP, 0, 0};
 
-        auto const genCache = tensorrt_llm::executor::kv_cache::CacheState{numLayers, numHeads, sizePerHead,
-            tokensPerBlock, genTP, genPP, genCP, dataType, attentionType, kvFactor, genEnableDP, 0, 0};
+        auto const sharedModelConfig
+            = texec::kv_cache::CacheState::ModelConfig{std::vector(numLayers, numHeads), sizePerHead, tokensPerBlock};
+        auto const contextCache
+            = texec::kv_cache::CacheState(sharedModelConfig, contextWC, dataType, attentionType, kvFactor);
+        auto const genCache = texec::kv_cache::CacheState(sharedModelConfig, genWC, dataType, attentionType, kvFactor);
 
-        auto const contextTragetInfo
+        auto const contextTargetInfo
             = tensorrt_llm::executor::kv_cache::TargetRanksInfoForDP(genCache, contextCache, contextRank);
 
-        EXPECT_EQ(expectRanks, contextTragetInfo.mIRanks);
-        EXPECT_EQ(expectPPDomain, contextTragetInfo.mDomainPPSize);
-        EXPECT_EQ(expectTPDomain, contextTragetInfo.mDomainTPSize);
+        EXPECT_EQ(expectRanks, contextTargetInfo.mIRanks);
+        EXPECT_EQ(expectPPDomain, contextTargetInfo.mDomainPPSize);
+        EXPECT_EQ(expectTPDomain, contextTargetInfo.mDomainTPSize);
         EXPECT_EQ(expectNeedSend, MLACacheFormatter::needSendCache(contextCache, genCache, contextRank));
     };
 
-    verifyContext(
-        /*contextRank*/ 0, /*expectRanks*/ {0}, /*expectPPDomain*/ 1, /*expectTPDomain*/ 1, /*expectNeedSend*/ true);
-    verifyContext(
-        /*contextRank*/ 1, /*expectRanks*/ {0}, /*expectPPDomain*/ 1, /*expectTPDomain*/ 1, /*expectNeedSend*/ false);
-    verifyContext(
-        /*contextRank*/ 2, /*expectRanks*/ {1}, /*expectPPDomain*/ 1, /*expectTPDomain*/ 1, /*expectNeedSend*/ true);
-    verifyContext(
-        /*contextRank*/ 3, /*expectRanks*/ {1}, /*expectPPDomain*/ 1, /*expectTPDomain*/ 1, /*expectNeedSend*/ false);
-    verifyContext(
-        /*contextRank*/ 4, /*expectRanks*/ {2}, /*expectPPDomain*/ 1, /*expectTPDomain*/ 1, /*expectNeedSend*/ true);
-    verifyContext(
-        /*contextRank*/ 5, /*expectRanks*/ {2}, /*expectPPDomain*/ 1, /*expectTPDomain*/ 1, /*expectNeedSend*/ false);
-    verifyContext(
-        /*contextRank*/ 6, /*expectRanks*/ {3}, /*expectPPDomain*/ 1, /*expectTPDomain*/ 1, /*expectNeedSend*/ true);
-    verifyContext(
-        /*contextRank*/ 7, /*expectRanks*/ {3}, /*expectPPDomain*/ 1, /*expectTPDomain*/ 1, /*expectNeedSend*/ false);
+    {
+        tr::WorldConfig const contextWC{/*tpSize*/ 4, /*ppSize*/ 2, /*cpSize*/ 1};
+        tr::WorldConfig const genWC{/*tpSize*/ 2, /*ppSize*/ 2, /*cpSize*/ 1};
+        verifyContext(
+            /*contextRank*/ 0, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {0}, /*expectPPDomain*/ 1,
+            /*expectTPDomain*/ 1, /*expectNeedSend*/ true);
+        verifyContext(
+            /*contextRank*/ 1, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {0}, /*expectPPDomain*/ 1,
+            /*expectTPDomain*/ 1, /*expectNeedSend*/ false);
+        verifyContext(
+            /*contextRank*/ 2, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {1}, /*expectPPDomain*/ 1,
+            /*expectTPDomain*/ 1, /*expectNeedSend*/ true);
+        verifyContext(
+            /*contextRank*/ 3, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {1}, /*expectPPDomain*/ 1,
+            /*expectTPDomain*/ 1, /*expectNeedSend*/ false);
+        verifyContext(
+            /*contextRank*/ 4, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {2}, /*expectPPDomain*/ 1,
+            /*expectTPDomain*/ 1, /*expectNeedSend*/ true);
+        verifyContext(
+            /*contextRank*/ 5, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {2}, /*expectPPDomain*/ 1,
+            /*expectTPDomain*/ 1, /*expectNeedSend*/ false);
+        verifyContext(
+            /*contextRank*/ 6, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {3}, /*expectPPDomain*/ 1,
+            /*expectTPDomain*/ 1, /*expectNeedSend*/ true);
+        verifyContext(
+            /*contextRank*/ 7, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {3}, /*expectPPDomain*/ 1,
+            /*expectTPDomain*/ 1, /*expectNeedSend*/ false);
+    }
 
-    contextTP = 2;
-    genTP = 4;
+    {
+        tr::WorldConfig const contextWC{/*tpSize*/ 2, /*ppSize*/ 2, /*cpSize*/ 1};
+        tr::WorldConfig const genWC{/*tpSize*/ 4, /*ppSize*/ 2, /*cpSize*/ 1};
+        verifyContext(
+            /*contextRank*/ 0, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {0, 1}, /*expectPPDomain*/ 1,
+            /*expectTPDomain*/ 2, /*expectNeedSend*/ true);
+        verifyContext(
+            /*contextRank*/ 1, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {2, 3}, /*expectPPDomain*/ 1,
+            /*expectTPDomain*/ 2, /*expectNeedSend*/ true);
+        verifyContext(
+            /*contextRank*/ 2, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {4, 5}, /*expectPPDomain*/ 1,
+            /*expectTPDomain*/ 2, /*expectNeedSend*/ true);
+        verifyContext(
+            /*contextRank*/ 3, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {6, 7}, /*expectPPDomain*/ 1,
+            /*expectTPDomain*/ 2, /*expectNeedSend*/ true);
+    }
 
-    verifyContext(
-        /*contextRank*/ 0, /*expectRanks*/ {0, 1}, /*expectPPDomain*/ 1, /*expectTPDomain*/ 2, /*expectNeedSend*/ true);
-    verifyContext(/*contextRank*/ 1, /*expectRanks*/ {2, 3}, /*expectPPDomain*/ 1, /*expectTPDomain*/ 2,
-        /*expectNeedSend*/ true);
-    verifyContext(
-        /*contextRank*/ 2, /*expectRanks*/ {4, 5}, /*expectPPDomain*/ 1, /*expectTPDomain*/ 2, /*expectNeedSend*/ true);
-    verifyContext(/*contextRank*/ 3, /*expectRanks*/ {6, 7}, /*expectPPDomain*/ 1, /*expectTPDomain*/ 2,
-        /*expectNeedSend*/ true);
-    contextPP = 1;
-    verifyContext(
-        /*contextRank*/ 0, /*expectRanks*/ {0, 4, 1, 5}, /*expectPPDomain*/ 2, /*expectTPDomain*/ 2,
-        /*expectNeedSend*/ true);
-    verifyContext(/*contextRank*/ 1, /*expectRanks*/ {2, 6, 3, 7}, /*expectPPDomain*/ 2, /*expectTPDomain*/ 2,
-        /*expectNeedSend*/ true);
+    {
+        tr::WorldConfig const contextWC{/*tpSize*/ 2, /*ppSize*/ 1, /*cpSize*/ 1};
+        tr::WorldConfig const genWC{/*tpSize*/ 4, /*ppSize*/ 2, /*cpSize*/ 1};
+        verifyContext(
+            /*contextRank*/ 0, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {0, 4, 1, 5},
+            /*expectPPDomain*/ 2,
+            /*expectTPDomain*/ 2, /*expectNeedSend*/ true);
+        verifyContext(
+            /*contextRank*/ 1, /*contextWC*/ contextWC, /*genWC*/ genWC, /*expectRanks*/ {2, 6, 3, 7},
+            /*expectPPDomain*/ 2,
+            /*expectTPDomain*/ 2, /*expectNeedSend*/ true);
+    }
 }
 
 TEST(targetTest, CacheStateContextDP)
