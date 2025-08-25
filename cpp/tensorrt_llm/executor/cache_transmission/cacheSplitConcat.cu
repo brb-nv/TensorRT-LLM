@@ -57,9 +57,12 @@ TargetRanksInfo TargetRanksInfoForDP(
     auto const selfPPNum = selfParConfig.mPipelineParallelism;
     auto const peerTPNum = peerParConfig.mTensorParallelism;
     auto const selfTPNum = selfParConfig.mTensorParallelism;
+    auto const peerCPNum = peerParConfig.mContextParallelism;
+    auto const selfCPNum = selfParConfig.mContextParallelism;
 
-    auto const selfTPRank = selfRank % selfParConfig.mTensorParallelism;
-    auto const selfPPRank = selfRank / selfParConfig.mTensorParallelism;
+    auto const selfTPRank = selfRank % selfTPNum;
+    auto const selfPPRank = selfRank / (selfTPNum * selfCPNum);
+    auto const selfCPRank = (selfRank % (selfTPNum * selfCPNum)) / selfTPNum;
 
     int peerPPRankStart = 0;
     int mDomainPPSize = 1;
