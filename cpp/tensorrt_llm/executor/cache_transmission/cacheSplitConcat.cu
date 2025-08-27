@@ -164,6 +164,10 @@ TargetRanksInfo targetIRanks(
     return TargetRanksInfoForDP(peerCacheState, selfCacheState, selfRank);
 }
 
+// Layer 0 K: [Head0[Token0[64dims], Token1[64dims], ...], Head1[...], ...]
+// Layer 0 V: [Head0[Token0[64dims], Token1[64dims], ...], Head1[...], ...]
+// Layer 1 K: [Head0[Token0[64dims], Token1[64dims], ...], Head1[...], ...]
+// Layer 1 V: [Head0[Token0[64dims], Token1[64dims], ...], Head1[...], ...]
 template <typename T>
 struct BlockInfo
 {
@@ -227,6 +231,8 @@ struct BlockInfo
 // Handling key and value copying
 // Note: k and v are not stored contiguously in memory
 
+// Performs a multi-dimensional index mapping from the output block's coordinate system (outputBlockId, headId, layerId)
+// to the input block's linear indexing system, accounting for how the data is physically laid out in memory blocks.
 __forceinline__ __device__ int getInputBlockId(int outputBlockId, int headId, int layerId, int inputBlockNumEachOutput,
     int headNumPerBlock, int layerNumPerBlock, int headNumInputModel, int layerNumInputModel)
 {
@@ -310,6 +316,7 @@ void concatKVCache(runtime::ITensor::SharedPtr* inputBlocks, int inputBlockNum, 
 
 {
     TLLM_CHECK_WITH_INFO(!inputRanks.empty(), "inputRanks should not be empty.");
+    // @B: Why?
     TLLM_CHECK_WITH_INFO(inputBlockNum == outputBlockNum * inputRanks.size(),
         "inputBlockNum must equal outputBlockNum multiplied by the size of inputRanks.");
     TLLM_CHECK(inputRanks == targetIRanks(iCacheState, oCacheState, oRank).mIRanks);
@@ -369,6 +376,7 @@ void concatKVCache(runtime::ITensor::SharedPtr* inputBlocks, int inputBlockNum, 
 
     int oPPNum = oParallelConfig.mPipelineParallelism;
     int iPPNum = iParallelConfig.mPipelineParallelism;
+    // @B: Should this be affected by CP?
     unsigned int gridDimx = oModelConfig.mNbKvHeadsPerLayer.size() / oPPNum;
     unsigned int gridDimy = outputBlockNum;
 
@@ -497,6 +505,9 @@ nvinfer1::Dims makeShapeFromCacheState(kv_cache::CacheState const& cacheState)
 
 // MLA Head 1: One thread block per [(2), tokens, dimsPerHead]
 
+// splitKVCacheForMLAKernel<T, mlaSubWarpSize, 16><<<gridDim, blockDimx, 0, bufferManager.getStream().get()>>>(
+//     inputBlockPtrsDev, outputCachePtrsDev, tokensPerBlock, numLayers, headNum, dimsPerHead,
+//     inputBlockNumSum, DomainPPSize, DomainTPSize, layerNumDomainPP, kvFactor);
 template <typename T, int subWarpSize, int vecSizeByte>
 __global__ void splitKVCacheForMLAKernel(T const** __restrict__ inputBlocks, T** __restrict__ outputCaches,
     int tokensPerBlock, int numLayers, int headNum, int dimsPerHead, int inputBlockNum, int DomainPPSize,
@@ -523,11 +534,12 @@ __global__ void splitKVCacheForMLAKernel(T const** __restrict__ inputBlocks, T**
                 T const* inputBlockPtr = inputBlocks[blockId];
                 T const* kInputPtr = inputBlockPtr + layerId * kvFactor * headNum * tokensPerBlock * dimsPerHead
                     + headId * tokensPerBlock * dimsPerHead;
-                int const outputCacheIdx = layerId / layerNumDomainPP;
+                int const outputCacheIdx = layerId / layerNumDomainPP;      // to be influenced by domainCPSize as well.
                 T* outputCachePtr = outputCaches[outputCacheIdx];
                 int const layerIdInDomainPP = layerId % layerNumDomainPP;
                 int const headIdInDomainTP = headId;
 
+                // @B: Is it fair to say input blocks may be non-contiguous but output blocks are contiguous?
                 T* kOutputPtr = outputCachePtr
                     + blockId * (layerNumDomainPP * kvFactor * headNum * tokensPerBlock * dimsPerHead)
                     + layerIdInDomainPP * kvFactor * headNum * tokensPerBlock * dimsPerHead
@@ -942,11 +954,11 @@ void splitKVCache(std::map<SizeType32, std::vector<runtime::ITensor::SharedPtr>>
     TLLM_CHECK(outputCacheNum == outputSplitBlocks.size());
     TLLM_CHECK(inputBlockNumSum > 0);
     std::vector<T*> cachePtrs;
-    std::vector<SizeType32> windowSizes;
-    std::vector<SizeType32> blockNumInwindow;
-    std::vector<SizeType32> layersInWindow;
-    size_t cacheBlockSizeSum = 0;
-    size_t inputBlockLayerNumSum = 0;
+    std::vector<SizeType32> windowSizes;    // list of window sizes.
+    std::vector<SizeType32> blockNumInwindow; // number of blocks in each window size.
+    std::vector<SizeType32> layersInWindow; // number of layers in each window size.
+    size_t cacheBlockSizeSum = 0; // sum of cache block sizes across all windows.
+    size_t inputBlockLayerNumSum = 0; // sum of number of layers across all windows.
     auto cacheDataType = kVCacheBlocksPerWindow.begin()->second.front()->getDataType();
 
     for (auto const& [window, blocks] : kVCacheBlocksPerWindow)
@@ -969,6 +981,7 @@ void splitKVCache(std::map<SizeType32, std::vector<runtime::ITensor::SharedPtr>>
         }
     }
 
+    // Why do we push outputSplitBlocks into same container as inputCacheBlocks?
     for (auto&& outputSplitBlock : outputSplitBlocks)
     {
         TLLM_CHECK(outputSplitBlock->getDataType() == cacheDataType);
@@ -978,6 +991,7 @@ void splitKVCache(std::map<SizeType32, std::vector<runtime::ITensor::SharedPtr>>
 
     bool const isWindow = windowSizes.size() > 1;
 
+    // This doesn't hold the data. It just holds pointers to the data.
     runtime::BufferManager::IBufferPtr PtrsDeviceBuffer
         = bufferManager.gpu(cachePtrs.size(), nvinfer1::DataType::kINT64);
     TLLM_CHECK(PtrsDeviceBuffer->getSizeInBytes() == cachePtrs.size() * sizeof(T*));
@@ -1001,6 +1015,7 @@ void splitKVCache(std::map<SizeType32, std::vector<runtime::ITensor::SharedPtr>>
                 layerNum % targetRankInfo.mDomainPPSize == 0, "layerNum in Window must be divisible by domainPPSize");
         }
     }
+    // How did we decide these values? Is it specific to a target SKU? Or is it generic?
     constexpr int subWarpSize = 8;
     constexpr int subWarpNumInGroup = 8;
     constexpr int blockDimx = 128;
@@ -1054,6 +1069,7 @@ void splitKVCache(std::map<SizeType32, std::vector<runtime::ITensor::SharedPtr>>
         "layersPerDomainPP: %d, headsPerDomainTP: %d",
         numLayers, headNum, DomainPPSize, DomainTPSize, layerNumDomainPP, headNumDomainTP);
 
+    // @B: Why 16 here?
     int const remainder = sizePerHead * sizeof(T) % 16;
     switch (remainder)
     {
