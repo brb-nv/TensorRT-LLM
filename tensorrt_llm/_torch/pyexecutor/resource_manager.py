@@ -12,6 +12,7 @@ import tensorrt_llm.bindings
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
 from tensorrt_llm.lora_helper import LoraConfig
 from tensorrt_llm.lora_manager import LoraManager, LoraModelConfig
+from tensorrt_llm.mapping import CpType
 from tensorrt_llm.sampling_params import SamplingParams
 
 from ..._utils import binding_to_str_dtype, get_size_in_bytes, nvtx_range
@@ -164,6 +165,10 @@ class KVCacheManager(BaseResourceManager):
         is_draft: bool = False,
         kv_connector_manager: Optional[KvCacheConnectorManager] = None,
     ) -> None:
+        # Couple of places where we assume tokens_per_block is 32: Let's assert here for now.
+        # 1) block assignment in merge_helix_requests
+        # 2) computation of cache_transceiver_config.max_tokens_in_buffer.
+        assert tokens_per_block == 32, "tokens_per_block must be 32 for helix benchmarking."
         self.mapping = mapping
         self.dtype = dtype
         self.kv_cache_type = kv_cache_type
@@ -442,6 +447,19 @@ class KVCacheManager(BaseResourceManager):
                                 req, block_ids)
 
             for req in generation_batch:
+                # Skip allocating KV cache at decode for inactive helix ranks.
+                ##################################################################
+                # TODO: This should be set elsewhere. For now, we hardcode that last rank is active.
+                # Maybe right after pyexecutor._schedule() or in sampler.update_requests() at end of
+                # executor loop for next step.
+                if self.mapping.has_cp_helix():
+                    if self.mapping.cp_rank != self.mapping.cp_size - 1:
+                        req.py_helix_is_inactive_rank = True
+                ##################################################################
+                if req.py_helix_is_inactive_rank:
+                    # print(f"[ResourceManager::prepare_resources][rank {self.mapping.rank}] Skipping KV allocation for request {req.py_request_id}.")
+                    continue
+                # print(f"[ResourceManager::prepare_resources][rank {self.mapping.rank}] Adding KV allocation for request {req.py_request_id}.")
                 self.impl.add_token(req.py_request_id)
                 for _ in range(get_draft_token_length(req)):
                     self.impl.add_token(req.py_request_id)

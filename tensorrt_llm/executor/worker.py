@@ -1,6 +1,7 @@
 import copy
 import datetime
 import enum
+import gc
 import json
 import os
 import time
@@ -514,6 +515,11 @@ class GenerationExecutorWorker(GenerationExecutor):
                     return max_tokens
             splited_prompt_len = int(len(prompt_token_ids) / cp_size)
             default_max_tokens = max_seq_len - splited_prompt_len - query_token_len
+            print(
+                f"[worker.py:_deduce_max_tokens] default_max_tokens: {default_max_tokens}, "
+                f"max_seq_len: {max_seq_len}, splited_prompt_len: {splited_prompt_len}, "
+                f"query_token_len: {query_token_len}, cp_size: {cp_size}, max_tokens: {max_tokens}"
+            )
             if default_max_tokens <= 0:
                 logger.warning(
                     f"`default_max_tokens` ({default_max_tokens}) should be greater than 0, "
@@ -867,6 +873,12 @@ def worker_main(
         if is_leader:
             worker_init_status_queue.put((e, traceback.format_exc()))
         return
+
+    # Optionally disable GC (default: not disabled)
+    if os.getenv("TRTLLM_WORKER_DISABLE_GC", "0") == "1":
+        gc.disable()
+    else:
+        assert False, "TRTLLM_WORKER_DISABLE_GC must be set to 1."
 
     with worker:
         try:

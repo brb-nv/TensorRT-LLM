@@ -1,16 +1,16 @@
 #!/bin/bash
 
-partition=<partition>
-account=<account>
-job_name=<job_name>
-container_image=<container_image>
-mounts=<mounts>  # e.g. /mnt/data:/mnt/data
-workdir=<workdir>  # Path to disaggr_torch.slurm
-model_dir=<model_dir>  # Path to the model checkpoint
-repo_dir=<repo_dir>  # Path to the repo to install TensorRT-LLM, if this is empty, the pre-installed version will be used
+partition="" # slurm partition
+account="" # slurm account
+job_name="" # slurm job name
+container_image="" # /path/to/image.sqsh
+mounts=""  # e.g. /mnt/data:/mnt/data
+workdir=""  # Path to this directory
+model_dir=""  # Path to the model checkpoint
+repo_dir=""  # Path to the repo to install TensorRT-LLM, if this is empty, the pre-installed version will be used
 
 ntasks_per_node=4 # 4 GPUs per GB200 node
-total_node_num=8
+total_node_num=2
 ntasks=$((total_node_num * ntasks_per_node))
 
 concurrency=8
@@ -19,10 +19,11 @@ osl=1024
 multi_round=10
 streaming=true
 benchmark_mode=e2e
+build_wheel=true
 
 args=(
-    1 4 1 4 4480 true "0.75"   # Context servers arguments
-    1 8 1 1024 1024 true "0.8" # Generation servers arguments
+    1 4 1 1 4 4480 false "0.75"   # Context - [num_instances, tp_size, pp_size, cp_size, batch_size, max_num_tokens, enable_attention_dp, gpu_memory_fraction]
+    1 2 1 2 1024 1024 false "0.8" # Generation - [num_instances, tp_size, pp_size, cp_size, batch_size, max_num_tokens, enable_attention_dp, gpu_memory_fraction]
     0 0                        # Other arguments
     $concurrency               # Benchmarking arguments
     $isl
@@ -35,6 +36,7 @@ args=(
     $model_dir
     $benchmark_mode
     $repo_dir
+    $build_wheel
 )
 
 # This command starts a job with 8 nodes, 32 GPUs in total.

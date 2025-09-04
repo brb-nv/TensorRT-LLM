@@ -131,6 +131,8 @@ size_t FabricMemory::getAlignedSize(size_t size)
 
 bool FabricMemory::supportFbaricMemory()
 {
+    TLLM_LOG_WARNING("Temporarily disable fabric memory.");
+    return false;
 #ifdef __aarch64__
     auto support_fun = []()
     {
@@ -181,7 +183,8 @@ bool FabricMemory::supportFbaricMemory()
         return false;
     };
     static bool support = support_fun();
-    return support;
+    TLLM_LOG_WARNING("Temporarily disable fabric memory.");
+    return false;
 
 #else
     return false;
@@ -227,7 +230,7 @@ CacheTransBufferManager::CacheTransBufferManager(
         mTransferBufferSize = FabricMemory::getAlignedSize(mTransferBufferSize);
     }
     mPreAllocBufferSize = mTransferBufferSize * (mRecvBufferCount + mSendBufferCount);
-    TLLM_LOG_INFO(
+    TLLM_LOG_WARNING(
         "CacheTransBufferManager: mMaxNumTokens:%ld, mRecvBufferCount:%ld, "
         "mSendBufferCount:%ld,mTransferBufferSize:%ld, mPreAllocBufferSize:%ld,mOnlyUseDynamicBuffer:%d "
         "mUseFabricMemory:%d mDataType:%d",
@@ -348,6 +351,7 @@ std::tuple<std::vector<runtime::ITensor::SharedPtr>, size_t, bool> CacheTransBuf
         TLLM_CHECK(static_cast<size_t>(bufferId.value()) < concurrenceResource.mBuffers.size());
         TLLM_CHECK(concurrenceResource.mBufferIndexFlag[bufferId.value()] == 1);
         size_t preBufferEleSize = 0;
+        TLLM_LOG_WARNING("[getOrAllocateBuffers]: BEGINNING TO ASSIGN bufferId:%d, mBufferEleSize:%ld, targetNum:%d.", bufferId.value(), mBufferEleSize, targetNum);
         for (int i = 0; i < targetNum; i++)
         {
             // Strict checking.
@@ -357,15 +361,17 @@ std::tuple<std::vector<runtime::ITensor::SharedPtr>, size_t, bool> CacheTransBuf
                     concurrenceResource.mBuffers[bufferId.value()], preBufferEleSize, targetBufferEleSizes[i]);
                 preBufferEleSize += targetBufferEleSizes[i];
                 bufferCoverTargetNum++;
+                TLLM_LOG_WARNING("[getOrAllocateBuffers]: ASSIGNING FROM STATIC BUFFER targetIdx:%d, bufferCoverTargetNum:%d, preBufferEleSize:%ld, targetBufferEleSizes[i]:%ld.", i, bufferCoverTargetNum, preBufferEleSize, targetBufferEleSizes[i]);
                 retSplitCaches.push_back(std::move(slice));
             }
             else
             {
+                TLLM_LOG_WARNING("[getOrAllocateBuffers]: ASSIGNING FROM DYNAMIC BUFFER targetIdx:%d, bufferCoverTargetNum:%d, preBufferEleSize:%ld, targetBufferEleSizes[i]:%ld.", i, bufferCoverTargetNum, preBufferEleSize, targetBufferEleSizes[i]);
                 retSplitCaches.push_back(bufferManagerToUse.gpu(
                     runtime::ITensor::makeShape({static_cast<int64_t>(targetBufferEleSizes[i])}), mDataType));
             }
         }
-        TLLM_LOG_DEBUG("getOrAllocateBuffers bufferCoverTargetNum:%d", bufferCoverTargetNum);
+        TLLM_LOG_WARNING("[getOrAllocateBuffers]: END OF ASSIGNMENT bufferCoverTargetNum:%d.", bufferCoverTargetNum);
         if (bufferCoverTargetNum < static_cast<size_t>(targetNum))
         {
             TLLM_LOG_WARNING(
@@ -396,6 +402,7 @@ void CacheTransBufferManager::allocateBuffer()
         return;
     }
     mBufferEleSize = mTransferBufferSize / common::getDTypeSize(mDataType);
+    TLLM_LOG_WARNING("[allocateBuffer]: mBufferEleSize:%ld mTransferBufferSize:%ld, dtype:%d.", mBufferEleSize, mTransferBufferSize);
     mConcurrenceSendResource.mBufferIndexFlag.resize(mSendBufferCount, 0);
     mConcurrenceRecvResource.mBufferIndexFlag.resize(mRecvBufferCount, 0);
     if (mUseFabricMemory)

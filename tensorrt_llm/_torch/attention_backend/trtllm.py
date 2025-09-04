@@ -189,6 +189,8 @@ class TrtllmAttentionWrapper:
         spec_decoding_generation_lengths: Optional[torch.Tensor] = None,
         attention_sinks: Optional[torch.Tensor] = None,
         chunked_prefill_buffer_batch_size: int = 1,
+        helix_position_offsets: Optional[torch.Tensor] = None,
+        helix_is_inactive_rank: Optional[torch.Tensor] = None,
         **kwargs,
     ):
         """
@@ -227,6 +229,8 @@ class TrtllmAttentionWrapper:
             softmax_stats_tensor (torch.Tensor): The tensor to store the softmax statistics (max/sum)
             attention_sinks (torch.Tensor): The attention sinks (additional value in the denominator of the softmax) with shape of (num_heads_q) on GPU.
             chunked_prefill_buffer_batch_size (int): used for malloc buffer for k and v in fp8 context mla. the max input kv length is not max_num_tokens in this case. It is chunked_prefill_buffer_batch_size * max_num_tokens.
+            helix_position_offsets (torch.Tensor): The tensor to store the helix position offsets, with shape (num_tokens) on GPU.
+            helix_is_inactive_rank (torch.Tensor): For Helix: whether the current rank is inactive, with shape (batch_size) on GPU.
         """
         self.layer_idx = layer_idx
         self.tokens_per_block = tokens_per_block
@@ -263,6 +267,11 @@ class TrtllmAttentionWrapper:
         self.block_ids_per_seq = block_ids_per_seq
         self.softmax_stats_tensor = softmax_stats_tensor
         self.attention_sinks = attention_sinks
+        self.helix_position_offsets = helix_position_offsets
+        self.helix_is_inactive_rank = helix_is_inactive_rank
+        if self.helix_is_inactive_rank is not None:
+            self.helix_is_inactive_rank = torch.tensor(
+                self.helix_is_inactive_rank, dtype=torch.bool, pin_memory=True)
 
         if max_sequence_length > self.rope_params.max_positions:
             self.rope_params.max_positions = max_sequence_length
@@ -420,6 +429,9 @@ class TrtllmAttentionWrapper:
             self.spec_decoding_generation_lengths,
             self.spec_decoding_position_offsets, self.spec_decoding_packed_mask
         ]
+        helix_tensor_params = [
+            self.helix_position_offsets, self.helix_is_inactive_rank
+        ]
 
         thop.attention(
             q,
@@ -486,6 +498,7 @@ class TrtllmAttentionWrapper:
             self.softmax_stats_tensor,
             spec_decoding_bool_params,
             spec_decoding_tensor_params,
+            helix_tensor_params,
         )
         # reset the planned states (especially tensors) to avoid memory leak
         self.plan()
@@ -561,6 +574,13 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     spec_decoding_position_offsets: Optional[torch.Tensor] = None
     spec_decoding_packed_mask: Optional[torch.Tensor] = None
     spec_decoding_generation_lengths: Optional[torch.Tensor] = None
+
+    # Whether the current rank is inactive for helix parallelism.
+    # In helix parallelism, only the active rank appends KV cache for the query token
+    # and attends to the previously cached tokens as well as the query token. Inactive
+    # ranks do not append KV cache for the query token and attend to the previously
+    # cached tokens only.
+    helix_is_inactive_rank: Optional[torch.Tensor] = None
 
     @property
     def max_seq_len(self) -> int:
@@ -795,7 +815,23 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         if self.enable_flash_mla:
             self.prepare_flash_mla()
         # number of tokens needed in the kv cache for each sequence after the next pass
-        kv_lens = cached_token_lens + self.seq_lens_kv if cached_token_lens is not None else self.seq_lens_kv
+        if self.helix_is_inactive_rank is not None and len(
+                self.helix_is_inactive_rank):
+            # If helix is inactive, attend to the previously cached tokens only.
+            # This gets further complicated with multiple requests as each request might
+            # have a different active helix rank.
+            assert cached_token_lens is not None, "cached_token_lens should be set for helix"
+            kv_lens = cached_token_lens
+            helix_is_inactive_rank_cpu = torch.tensor(
+                self.helix_is_inactive_rank,
+                dtype=torch.bool,
+                device='cpu',
+            )
+            active_rank = ~helix_is_inactive_rank_cpu
+            kv_lens[active_rank] += self.seq_lens_kv[active_rank]
+        else:
+            kv_lens = cached_token_lens + self.seq_lens_kv if cached_token_lens is not None else self.seq_lens_kv
+
         # self.kv_lens is the valid kv cache length, while the self.kv_lens_cuda is
         # the sequence length including the cached tokens and the input tokens.
         self.kv_lens[:self.num_seqs].copy_(
@@ -1215,6 +1251,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         attention_window_size: Optional[int] = None,
         softmax_stats_tensor: Optional[torch.Tensor] = None,
         enable_attn_nvfp4_output: bool = True,
+        helix_position_offsets: Optional[torch.Tensor] = None,
         output: Optional[torch.Tensor] = None,
         output_sf: Optional[torch.Tensor] = None,
         attention_sinks: Optional[torch.Tensor] = None,
@@ -1294,6 +1331,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             spec_decoding_generation_lengths,
             attention_sinks=attention_sinks,
             chunked_prefill_buffer_batch_size=chunked_prefill_buffer_batch_size,
+            helix_position_offsets=helix_position_offsets,
+            helix_is_inactive_rank=metadata.helix_is_inactive_rank,
         )
         out_dtype = None
         if out_scale is not None:

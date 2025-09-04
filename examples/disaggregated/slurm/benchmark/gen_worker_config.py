@@ -7,6 +7,7 @@ import yaml
 def gen_config_file(work_dir: str,
                     ctx_tp_size: int,
                     ctx_pp_size: int,
+                    ctx_cp_size: int,
                     ctx_batch_size: int,
                     ctx_max_num_tokens: int,
                     ctx_max_seq_len: int,
@@ -14,6 +15,8 @@ def gen_config_file(work_dir: str,
                     ctx_enable_attention_dp: bool,
                     gen_tp_size: int,
                     gen_pp_size: int,
+                    gen_cp_size: int,
+                    gen_moe_ep_size: int,
                     gen_batch_size: int,
                     gen_max_num_tokens: int,
                     gen_max_seq_len: int,
@@ -21,7 +24,8 @@ def gen_config_file(work_dir: str,
                     gen_gpu_memory_fraction: float,
                     eplb_num_slots: int,
                     mtp_size: int = 0,
-                    cache_transceiver_max_num_tokens: int = 4608) -> None:
+                    cache_transceiver_max_num_tokens: int = 4608,
+                    model_path: str = "") -> None:
     """
     Generate configuration YAML file for disaggregated inference.
 
@@ -31,6 +35,7 @@ def gen_config_file(work_dir: str,
         num_ctx_servers: Number of context servers
         ctx_tp_size: Tensor parallel size for context servers
         ctx_pp_size: Pipeline parallel size for context servers
+        ctx_cp_size: Context parallel size for context servers
         ctx_batch_size: Batch size for context servers
         ctx_max_num_tokens: Max number of tokens for context servers
         ctx_max_seq_len: Max sequence length for context servers
@@ -39,6 +44,7 @@ def gen_config_file(work_dir: str,
         num_gen_servers: Number of generation servers
         gen_tp_size: Tensor parallel size for generation servers
         gen_pp_size: Pipeline parallel size for generation servers
+        gen_cp_size: Context parallel size for generation servers
         gen_batch_size: Batch size for generation servers
         gen_max_num_tokens: Max number of tokens for generation servers
         gen_enable_attention_dp: Enable attention DP for generation servers
@@ -47,6 +53,38 @@ def gen_config_file(work_dir: str,
         worker_start_port: Start port for workers
         server_port: Server port
     """
+    # Source: docs/source/deployment-guide/quick-start-recipe-for-deepseek-r1-on-trtllm.md
+    # Support matrix for moe_backend.
+    # | device | Checkpoint | Supported moe_backend |
+    # |----------|----------|----------|
+    # | H100/H200 | FP8 | CUTLASS |
+    # | B200/GB200 EP<=8 | NVFP4 | CUTLASS, TRTLLM |
+    # | B200/GB200 EP<=8 | FP8 | DEEPGEMM |
+    # | GB200 NVL72 EP>8 | NVFP4 |  WIDEEP |
+    # | GB200 NVL72 EP>8 | FP8 | N/A (WIP) |
+
+    ctx_moe_ep_size = ctx_cp_size * ctx_tp_size
+    assert gen_enable_attention_dp is False, "Let's keep it simple for now."
+    if 'fp4' in model_path or 'FP4' in model_path:
+        if ctx_moe_ep_size <= 8:
+            ctx_moe_backend = "TRTLLM"
+        else:
+            print(
+                f"Only WideEP supports EP>8 for FP4 with ctx_moe_ep_size: {ctx_moe_ep_size}. But, that needs AttentionDP. So, keeping moe_ep_size = 8 and ctx_moe_backend = TRTLLM."
+            )
+            ctx_moe_backend = "TRTLLM"
+            ctx_moe_ep_size = 8
+    elif 'fp8' in model_path or 'FP8' in model_path:
+        if ctx_moe_ep_size <= 8:
+            ctx_moe_backend = "DEEPGEMM"
+        else:
+            raise ValueError(
+                f"No existing moe support for FP8 with ctx_moe_ep_size: {ctx_moe_ep_size}."
+            )
+    else:
+        raise ValueError(
+            f"Can't determine model dtype from model path: {model_path}")
+
     ctx_config = {
         'build_config': {
             'max_batch_size': ctx_batch_size,
@@ -56,10 +94,13 @@ def gen_config_file(work_dir: str,
         'max_batch_size': ctx_batch_size,
         'max_num_tokens': ctx_max_num_tokens,
         'max_seq_len': ctx_max_seq_len,
+        # @B: Enable CUDA graphs later (note: for context in helix, this is not important).
+        'cuda_graph_config': None,
         'tensor_parallel_size': ctx_tp_size,
-        'moe_expert_parallel_size': ctx_tp_size,
+        'moe_expert_parallel_size': ctx_moe_ep_size,
         'enable_attention_dp': True if ctx_enable_attention_dp else False,
         'pipeline_parallel_size': ctx_pp_size,
+        'context_parallel_size': ctx_cp_size,
         'print_iter_log': True,
         'disable_overlap_scheduler': True,
         'kv_cache_config': {
@@ -67,21 +108,18 @@ def gen_config_file(work_dir: str,
             'free_gpu_memory_fraction': ctx_free_gpu_memory_fraction,
             'dtype': 'fp8',
         },
+        'moe_config': {
+            'backend': ctx_moe_backend,
+        },
         'cache_transceiver_config': {
-            'max_tokens_in_buffer': cache_transceiver_max_num_tokens,
-            'backend': 'DEFAULT',
+            'max_tokens_in_buffer': 1024,   # Setting this to low value for gen-only benchmark.
+            'backend': 'UCX',
         },
     }
 
-    gen_cuda_graph_batch_sizes = [
-        1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 768, 1024, 2048, gen_batch_size
-    ]
-
-    gen_moe_backend = "CUTLASS"
-    if gen_tp_size >= 16 and gen_enable_attention_dp:
-        gen_moe_backend = "WIDEEP"
-    if not gen_enable_attention_dp:
-        gen_moe_backend = "TRTLLM"
+    # Assert that gen_batch_size is a power of 2.
+    assert gen_batch_size > 0 and (gen_batch_size & (gen_batch_size - 1)) == 0, \
+        f"gen_batch_size ({gen_batch_size}) must be a power of 2."
 
     gen_config = {
         'build_config': {
@@ -90,15 +128,16 @@ def gen_config_file(work_dir: str,
             'max_seq_len': gen_max_seq_len,
         },
         'tensor_parallel_size': gen_tp_size,
-        'moe_expert_parallel_size': gen_tp_size,
+        'moe_expert_parallel_size': gen_moe_ep_size,
         'enable_attention_dp': True if gen_enable_attention_dp else False,
         'pipeline_parallel_size': gen_pp_size,
+        'context_parallel_size': gen_cp_size,
         'max_batch_size': gen_batch_size,
         'max_num_tokens': gen_max_num_tokens,
         'max_seq_len': gen_max_seq_len,
         'cuda_graph_config': {
             'enable_padding': True,
-            'batch_sizes': gen_cuda_graph_batch_sizes,
+            'batch_sizes': [gen_batch_size],
         },
         'print_iter_log': True,
         'kv_cache_config': {
@@ -107,11 +146,11 @@ def gen_config_file(work_dir: str,
             'dtype': 'fp8',
         },
         'moe_config': {
-            'backend': gen_moe_backend,
+            'backend': 'TRTLLM',
         },
         'cache_transceiver_config': {
-            'max_tokens_in_buffer': cache_transceiver_max_num_tokens,
-            'backend': 'DEFAULT',
+            'max_tokens_in_buffer': 1024,   # Setting this to low value for gen-only benchmark.
+            'backend': 'UCX',
         },
         'stream_interval': 20,
     }
@@ -170,6 +209,10 @@ if __name__ == "__main__":
                         type=int,
                         default=1,
                         help="Pipeline parallel size for context servers")
+    parser.add_argument("--ctx_cp_size",
+                        type=int,
+                        default=1,
+                        help="Context parallel size for context servers")
     parser.add_argument("--ctx_batch_size",
                         type=int,
                         default=1,
@@ -198,6 +241,14 @@ if __name__ == "__main__":
                         type=int,
                         default=1,
                         help="Pipeline parallel size for generation servers")
+    parser.add_argument("--gen_cp_size",
+                        type=int,
+                        default=1,
+                        help="Context parallel size for generation servers")
+    parser.add_argument("--gen_moe_ep_size",
+                        type=int,
+                        default=1,
+                        help="MOE expert parallel size for generation servers")
     parser.add_argument("--gen_batch_size",
                         type=int,
                         default=256,
@@ -230,15 +281,15 @@ if __name__ == "__main__":
                         type=int,
                         default=8448,
                         help="Max number of tokens for cache transceiver")
-
+    parser.add_argument("--model_path", type=str, default="", help="Model path")
     args = parser.parse_args()
 
-    gen_config_file(args.work_dir, args.ctx_tp_size, args.ctx_pp_size,
-                    args.ctx_batch_size, args.ctx_max_num_tokens,
-                    args.ctx_max_seq_len, args.ctx_free_gpu_memory_fraction,
-                    args.ctx_enable_attention_dp, args.gen_tp_size,
-                    args.gen_pp_size, args.gen_batch_size,
-                    args.gen_max_num_tokens, args.gen_max_seq_len,
-                    args.gen_enable_attention_dp, args.gen_gpu_memory_fraction,
-                    args.eplb_num_slots, args.mtp_size,
-                    args.cache_transceiver_max_num_tokens)
+    gen_config_file(
+        args.work_dir, args.ctx_tp_size, args.ctx_pp_size, args.ctx_cp_size,
+        args.ctx_batch_size, args.ctx_max_num_tokens, args.ctx_max_seq_len,
+        args.ctx_free_gpu_memory_fraction, args.ctx_enable_attention_dp,
+        args.gen_tp_size, args.gen_pp_size, args.gen_cp_size,
+        args.gen_moe_ep_size, args.gen_batch_size, args.gen_max_num_tokens,
+        args.gen_max_seq_len, args.gen_enable_attention_dp,
+        args.gen_gpu_memory_fraction, args.eplb_num_slots, args.mtp_size,
+        args.cache_transceiver_max_num_tokens, args.model_path)

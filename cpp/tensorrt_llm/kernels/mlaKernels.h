@@ -101,6 +101,12 @@ struct MlaParams
 
     // For FP8 context qkv quantization
     float const* quant_scale_qkv = nullptr;
+
+    // for Helix parallelism: the rotary position offsets (for each token)
+    int32_t const* helix_position_offsets{nullptr};
+    // for Helix parallelism: whether the current rank is inactive, shape [b]
+    // (the current query tokens are not appended to this rank's KV cache)
+    bool const* helix_is_inactive_rank{nullptr};
 };
 
 template <typename T, typename KVCacheBuffer>
