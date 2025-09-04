@@ -37,6 +37,24 @@
 namespace tensorrt_llm::batch_manager::kv_cache_manager
 {
 
+int getBlockNumAccountingForCP(int cpRank, int cpSize, int numTotalBlocks)
+{
+    TLLM_CHECK(cpRank >= 0 && cpRank < cpSize);
+    if (cpSize == 1)
+    {
+        return numTotalBlocks;
+    }
+    // Blocks are distributed among CP ranks in a round-robin fashion as evenly as possible.
+    int numBlocksCurrRank = numTotalBlocks / cpSize;
+    // When the number of blocks is not divisible by cpSize, the remainder shall be distributed evenly
+    // among lowest-indexed CP ranks (let's call them overflow ranks).
+    if (numTotalBlocks % cpSize > cpRank)
+    {
+        numBlocksCurrRank++;
+    }
+    return numBlocksCurrRank;
+}
+
 // some context rank in connection
 std::vector<size_t> MLACacheFormatter::pickRecvConnections(
     size_t numConnections, CacheState const& selfConfig, SizeType32 selfIdx, CacheState const& destConfig) const
@@ -97,13 +115,10 @@ void MLACacheFormatter::format(TransferSession& session)
     auto& bufferManager = session.getBufferManager();
     TLLM_CHECK_WITH_INFO(llmRequest.mSamplingConfig.beamWidth == 1, "Currently only supports beam width 1.");
     TLLM_CHECK(!connections.empty());
-    // diff start
     if (!needSendCache(selfConfig, destConfig, selfIdx))
     {
         return;
     }
-
-    // diff end
 
     auto const numPools = mCacheManager->getBlockManager().getNumPools();
     auto blockRange = getBlockRangeForSending(mCacheManager, llmRequest);
@@ -148,43 +163,48 @@ void MLACacheFormatter::format(TransferSession& session)
     }
 
     auto cacheBlockSize = inputKvCacheBlocks.at(0)->getSize();
-
     auto cacheBufferId = mCacheTransBufferManager->assignBufferIndexForSend();
-    // diff start
 
     auto targetInfo = executor::kv_cache::targetIRanks(destConfig, selfConfig, selfIdx);
     auto ppRank = selfIdx
         / (selfConfig.getParallelConfig().mTensorParallelism * selfConfig.getParallelConfig().mContextParallelism);
     int selfAttentionLayerNum = selfConfig.getParallelConfig().mAttentionLayerNumPerPP.at(ppRank);
+    TLLM_CHECK_WITH_INFO(blockNum % selfAttentionLayerNum == 0, "blockNum corresponding to a ppRank must be divisible by number of layers belonging to that ppRank. blockNum: %d, selfAttentionLayerNum: %d", blockNum, selfAttentionLayerNum);
+    int selfBlockNumPerLayer = blockNum / selfAttentionLayerNum;
     size_t pPDomainSize = targetInfo.mDomainPPSize;
+    size_t cPDomainSize = targetInfo.mDomainCPSize;
+
     auto getBufferSizeForTarget = [&]()
     {
-        std::vector<size_t> bufferSizeForTarget(pPDomainSize, 0);
-        std::vector<SizeType32> LayerNumbufferTargetNum(pPDomainSize, 0);
-        size_t baseEleSize = cacheBlockSize * blockNum / selfAttentionLayerNum;
-        for (size_t i = 0; i < pPDomainSize; i++)
+        std::vector<size_t> bufferSizeForTarget(pPDomainSize * cPDomainSize, 0);
+        for (size_t ppDomainIdx = 0; ppDomainIdx < pPDomainSize; ppDomainIdx++)
         {
-            LayerNumbufferTargetNum[i] = targetInfo.getPeerPPDomainLayerNum(i);
-            bufferSizeForTarget[i] = baseEleSize * LayerNumbufferTargetNum[i];
+            auto const layerNumBufferTargetNum = targetInfo.getPeerPPDomainLayerNum(ppDomainIdx);
+            for (size_t cpDomainIdx = 0; cpDomainIdx < cPDomainSize; cpDomainIdx++)
+            {
+                auto const idx = ppDomainIdx * cPDomainSize + cpDomainIdx;
+                // Note: This should work ok for now because contextCP is always 1. So, cpDomainSize == genCPSize and cpDomainIdx == genCPRank.
+                auto const blockNumBufferTargetNum = getBlockNumAccountingForCP(cpDomainIdx, cPDomainSize, selfBlockNumPerLayer);
+                bufferSizeForTarget[idx] = cacheBlockSize * blockNumBufferTargetNum * layerNumBufferTargetNum;
+            }
         }
-        return std::make_pair(bufferSizeForTarget, LayerNumbufferTargetNum);
+        TLLM_CHECK(std::accumulate(bufferSizeForTarget.begin(), bufferSizeForTarget.end(), 0) == blockNum * cacheBlockSize);
+        return bufferSizeForTarget;
     };
-    auto [bufferEleSizes, LayerNumbufferTargetNum] = getBufferSizeForTarget();
+    auto bufferEleSizes = getBufferSizeForTarget();
     auto result = mCacheTransBufferManager->getOrAllocateSendBuffers(
-        cacheBufferId, static_cast<int>(pPDomainSize), bufferEleSizes, bufferManager);
+        cacheBufferId, static_cast<int>(pPDomainSize * cPDomainSize), bufferEleSizes, bufferManager);
     auto& outputSplitCaches = std::get<0>(result);
     auto& bufferCoverTargetNum = std::get<1>(result);
     auto& onlyUseDynamicBuffer = std::get<2>(result);
     auto* agentConnnecion = dynamic_cast<executor::kv_cache::AgentConnection const*>(connections[0]);
     if (agentConnnecion != nullptr)
     {
-        TLLM_CHECK_WITH_INFO(bufferCoverTargetNum == pPDomainSize, "Agent need all buffer pre-allocated");
+        TLLM_CHECK_WITH_INFO(bufferCoverTargetNum == pPDomainSize * cPDomainSize, "Agent need all buffer pre-allocated");
         TLLM_CHECK(onlyUseDynamicBuffer == false);
     }
-    // diff end
 
-    // The size of outputSplitCaches should be equal to pPDomainSize
-
+    // The size of outputSplitCaches should be equal to pPDomainSize * cPDomainSize.
     SizeType32 window = mCacheManager->getBlockManager().getPoolWindowSize(0);
     std::map<SizeType32, std::vector<runtime::ITensor::SharedPtr>> inputKvCacheBlocksPerWindow;
     inputKvCacheBlocksPerWindow.emplace(window, inputKvCacheBlocks);
@@ -204,7 +224,7 @@ void MLACacheFormatter::format(TransferSession& session)
 
         TLLM_CUDA_CHECK(cudaSetDevice(deviceId));
         auto startTime = std::chrono::steady_clock::now();
-        auto cacheIdx = processIdx % pPDomainSize;
+        auto cacheIdx = processIdx % (pPDomainSize * cPDomainSize);
         if (cacheIdx < bufferCoverTargetNum)
         {
             size_t size = outputSplitCaches.at(cacheIdx)->getSizeInBytes();
@@ -257,7 +277,7 @@ void MLACacheFormatter::format(TransferSession& session)
         else
         {
             // concurrency num
-            auto concurrencyNum = std::min(std::max(static_cast<size_t>(1), bufferCoverTargetNum), pPDomainSize);
+            auto concurrencyNum = std::min(std::max(static_cast<size_t>(1), bufferCoverTargetNum), pPDomainSize * cPDomainSize);
 
             auto remainSendNum = connections.size();
 
@@ -305,9 +325,7 @@ void MLACacheFormatter::unformat(TransferSession& session)
     auto& bufferManager = session.getBufferManager();
     auto arrivalTime = llmRequest.getPerfMetrics().timingMetrics.arrivalTime;
     bool recordDelay = arrivalTime != std::chrono::steady_clock::time_point();
-    // diff start
     auto pickUpConnections = pickRecvConnections(connections.size(), selfConfig, selfIdx, destConfig);
-    // diff end
     auto blockRange = getBlockRangeForReceiving(mCacheManager, llmRequest);
     std::vector<runtime::ITensor::SharedPtr> recvBufferTmps;
     std::vector<runtime::ITensor::SharedPtr> outputBuffers;
@@ -369,22 +387,23 @@ void MLACacheFormatter::unformat(TransferSession& session)
         auto ppRank = selfIdx
             / (selfConfig.getParallelConfig().mTensorParallelism * selfConfig.getParallelConfig().mContextParallelism);
         auto selfAttentionLayerNum = selfConfig.getParallelConfig().mAttentionLayerNumPerPP.at(ppRank);
+        TLLM_CHECK_WITH_INFO(blockNum % selfAttentionLayerNum == 0, "blockNum corresponding to a ppRank must be divisible by number of layers belonging to that ppRank. blockNum: %d, selfAttentionLayerNum: %d", blockNum, selfAttentionLayerNum);
+        int selfBlockNumPerLayer = blockNum / selfAttentionLayerNum;
         TLLM_CHECK_WITH_INFO(selfAttentionLayerNum != 0, "selfAttentionLayerNum should not be 0");
 
+        // @B: Maybe no updates are needed because contextCP is always 1?
         auto getBufferSizeForTarget = [&]()
         {
             std::vector<size_t> bufferEleSizes(targetNum, 0);
-            std::vector<SizeType32> LayerNumbufferTargetNum(targetNum, 0);
-            auto baseEleSize = cacheBlockSize * blockNum / selfAttentionLayerNum;
+            auto baseEleSize = cacheBlockSize * selfBlockNumPerLayer;
             for (size_t i = 0; i < targetNum; i++)
             {
-                LayerNumbufferTargetNum[i]
-                    = targetInfo.getPeerPPDomainLayerNum(static_cast<SizeType32>(pickUpConnections[i]));
-                bufferEleSizes[i] = baseEleSize * LayerNumbufferTargetNum[i];
+                auto const layerNumBufferTargetNum = targetInfo.getPeerPPDomainLayerNum(static_cast<SizeType32>(pickUpConnections[i]));
+                bufferEleSizes[i] = baseEleSize * layerNumBufferTargetNum;
             }
-            return std::make_pair(bufferEleSizes, LayerNumbufferTargetNum);
+            return bufferEleSizes;
         };
-        auto [bufferEleSizes, LayerNumbufferTargetNum] = getBufferSizeForTarget();
+        auto bufferEleSizes = getBufferSizeForTarget();
 
         auto result = mCacheTransBufferManager->getOrAllocateRecvBuffers(
             cacheBufferId, static_cast<int>(targetNum), bufferEleSizes, bufferManager);
@@ -506,7 +525,7 @@ void MLACacheFormatter::unformat(TransferSession& session)
             outputCachesPerWindow.emplace(window, outputBuffers);
             NVTX3_SCOPED_RANGE(formatInputConcatenate);
 
-            // recvSplitCaches size == ppdomainsize
+            // recvSplitCaches size == ppdomainsize * cpdomainsize.
             executor::kv_cache::concatKvCacheV2Dispatch(
                 recvSplitCaches, outputCachesPerWindow, destConfig, selfConfig, selfIdx, bufferManager);
         }
@@ -579,14 +598,6 @@ void MLACacheFormatter::unformat(TransferSession& session)
         && (selfConfig.getParallelConfig().mTensorParallelism % selfConfig.getParallelConfig().mDPsize != 0))
     {
         TLLM_LOG_WARNING("MLACacheFormatter::inquireSupport: TP size must be divisible by DP size");
-        return false;
-    }
-    if (selfConfig.getParallelConfig().mContextParallelism != 1
-        || destConfig.getParallelConfig().mContextParallelism != 1)
-    {
-        TLLM_LOG_WARNING(
-            "MLACacheFormatter::inquireSupport: context parallelism is not currently supported (selfCP=%d, destCP=%d).",
-            selfConfig.getParallelConfig().mContextParallelism, destConfig.getParallelConfig().mContextParallelism);
         return false;
     }
     if (destConfig.getParallelConfig().mEnableAttentionDP

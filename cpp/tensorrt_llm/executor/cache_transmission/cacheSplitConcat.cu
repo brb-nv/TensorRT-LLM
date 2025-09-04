@@ -573,7 +573,7 @@ __device__ __forceinline__ void getLayerIdInDomainPPandRankInDomainPP(int layerI
 template <typename T, int subWarpSize, int vecSizeByte>
 __global__ void splitKVCacheForMLAKernel(T const** __restrict__ inputBlocks, T** __restrict__ outputCaches,
     int tokensPerBlock, int numLayers, int headNum, int dimsPerHead, int inputBlockNum, int DomainPPSize,
-    int DomainTPSize, int kvFactor, uint64_t* prefixLayerNumDevPtr)
+    int DomainTPSize, int domainCPSize, int kvFactor, uint64_t* prefixLayerNumDevPtr)
 {
     int const subWarpId = threadIdx.x / subWarpSize;
     int const laneId = threadIdx.x % subWarpSize;
@@ -602,13 +602,14 @@ __global__ void splitKVCacheForMLAKernel(T const** __restrict__ inputBlocks, T**
                 T const* inputBlockPtr = inputBlocks[blockId];
                 T const* kInputPtr = inputBlockPtr + layerId * kvFactor * headNum * tokensPerBlock * dimsPerHead
                     + headId * tokensPerBlock * dimsPerHead;
-                int outputCacheIdx = rankInDomainPP;
+                int outputCacheIdx = rankInDomainPP * domainCPSize + blockId % domainCPSize;
                 T* outputCachePtr = outputCaches[outputCacheIdx];
 
                 int const headIdInDomainTP = headId;
+                int const blockIdInDomainCP = blockId / domainCPSize;
 
                 T* kOutputPtr = outputCachePtr
-                    + blockId * (layerNumInSpecPP * kvFactor * headNum * tokensPerBlock * dimsPerHead)
+                    + blockIdInDomainCP * (layerNumInSpecPP * kvFactor * headNum * tokensPerBlock * dimsPerHead)
                     + layerIdInDomainPP * kvFactor * headNum * tokensPerBlock * dimsPerHead
                     + headIdInDomainTP * tokensPerBlock * dimsPerHead;
                 int const kvOffset = headNum * tokensPerBlock * dimsPerHead;
@@ -1020,12 +1021,19 @@ void splitKVCache(std::map<SizeType32, std::vector<runtime::ITensor::SharedPtr>>
         inputBlockNumSum += blocks.size();
     }
     auto targetRankInfo = targetIRanks(destCacheState, selfCacheState, selfIdx);
+    std::cerr << "[splitKVCache] targetRankInfo.mDomainPPSize: " << targetRankInfo.mDomainPPSize << ", targetRankInfo.mDomainTPSize: " << targetRankInfo.mDomainTPSize << ", targetRankInfo.mDomainCPSize: " << targetRankInfo.mDomainCPSize << std::endl;
+    std::cerr << "[splitKVCache] targetRankInfo.mIRanks: " << std::endl;
+    for (auto rank : targetRankInfo.mIRanks)
+    {
+        std::cerr << rank << ", ";
+    }
+    std::cerr << std::endl;
     TLLM_CHECK(targetRankInfo.mIRanks.size()
-        == (static_cast<size_t>(targetRankInfo.mDomainPPSize * targetRankInfo.mDomainTPSize)));
+        == (static_cast<size_t>(targetRankInfo.mDomainPPSize * targetRankInfo.mDomainTPSize * targetRankInfo.mDomainCPSize)));
     auto outputCacheNum = targetRankInfo.mIRanks.size();
     if (selfCacheState.getAttentionConfig().mAttentionType == CacheState::AttentionType::kMLA)
     {
-        outputCacheNum = targetRankInfo.mDomainPPSize;
+        outputCacheNum = targetRankInfo.mDomainPPSize * targetRankInfo.mDomainCPSize;
     }
     else
     {
@@ -1060,12 +1068,14 @@ void splitKVCache(std::map<SizeType32, std::vector<runtime::ITensor::SharedPtr>>
             inputBlockLayerNumSum += layersNum;
         }
     }
+    std::cerr << "[splitKVCache] cachePtrs size after pushing KV cache blocks: " << cachePtrs.size() << std::endl;
 
     for (auto&& outputSplitBlock : outputSplitBlocks)
     {
         TLLM_CHECK(outputSplitBlock->getDataType() == cacheDataType);
         cachePtrs.push_back(reinterpret_cast<uint64_t>(outputSplitBlock->data()));
     }
+    std::cerr << "[splitKVCache] cachePtrs size after pushing output split blocks: " << cachePtrs.size() << std::endl;
     std::vector<uint64_t> prefixLayerNum(targetRankInfo.mDomainPPSize + 1, 0);
     prefixLayerNum[0] = 0;
     for (int i = 0; i < targetRankInfo.mDomainPPSize; i++)
@@ -1073,6 +1083,7 @@ void splitKVCache(std::map<SizeType32, std::vector<runtime::ITensor::SharedPtr>>
         prefixLayerNum[i + 1] = prefixLayerNum[i] + targetRankInfo.mPeerAttentionLayerNumInDomainPP[i];
     }
     cachePtrs.insert(cachePtrs.end(), prefixLayerNum.begin(), prefixLayerNum.end());
+    std::cerr << "[splitKVCache] cachePtrs size after pushing prefixLayerNum: " << cachePtrs.size() << std::endl;
     bool const isWindow = windowSizes.size() > 1;
 
     runtime::BufferManager::IBufferPtr PtrsDeviceBuffer
@@ -1137,13 +1148,13 @@ void splitKVCache(std::map<SizeType32, std::vector<runtime::ITensor::SharedPtr>>
         = static_cast<uint64_t*>(PtrsDeviceBuffer->data()) + inputBlockNumSum + outputSplitBlocks.size();
 
     int const tokensPerBlock = selfModelConfig.mTokensPerBlock;
-    int const numLayers
-        = selfParallelConfig.mAttentionLayerNumPerPP.at(selfIdx / selfParallelConfig.mTensorParallelism);
+    int const selfPPRank = selfIdx / (selfParallelConfig.mTensorParallelism * selfParallelConfig.mContextParallelism);
+    int const numLayers = selfParallelConfig.mAttentionLayerNumPerPP.at(selfPPRank);
     int const headNum = selfModelConfig.mNbKvHeadsPerLayer[0];
     int const dimsPerHead = selfModelConfig.mSizePerHead;
     int const DomainPPSize = targetRankInfo.mDomainPPSize;
     int const DomainTPSize = targetRankInfo.mDomainTPSize;
-    // int const layerNumDomainPP = numLayers / DomainPPSize;
+    int const domainCPSize = targetRankInfo.mDomainCPSize;
     int const headNumDomainTP = headNum / (DomainTPSize / targetRankInfo.mPeerDupHeadFactor);
     int const kvFactor = selfAttentionConfig.mKvFactor;
     bool const isMLA = selfAttentionConfig.mAttentionType == CacheState::AttentionType::kMLA;
@@ -1163,7 +1174,7 @@ void splitKVCache(std::map<SizeType32, std::vector<runtime::ITensor::SharedPtr>>
         {
             splitKVCacheForMLAKernel<T, mlaSubWarpSize, 16><<<gridDim, blockDimx, 0, bufferManager.getStream().get()>>>(
                 inputBlockPtrsDev, outputCachePtrsDev, tokensPerBlock, numLayers, headNum, dimsPerHead,
-                inputBlockNumSum, DomainPPSize, DomainTPSize, kvFactor, prefixLayerNumDevPtr);
+                inputBlockNumSum, DomainPPSize, DomainTPSize, domainCPSize, kvFactor, prefixLayerNumDevPtr);
         }
         else if (isWindow)
         {
@@ -1187,7 +1198,7 @@ void splitKVCache(std::map<SizeType32, std::vector<runtime::ITensor::SharedPtr>>
         {
             splitKVCacheForMLAKernel<T, mlaSubWarpSize, 8><<<gridDim, blockDimx, 0, bufferManager.getStream().get()>>>(
                 inputBlockPtrsDev, outputCachePtrsDev, tokensPerBlock, numLayers, headNum, dimsPerHead,
-                inputBlockNumSum, DomainPPSize, DomainTPSize, kvFactor, prefixLayerNumDevPtr);
+                inputBlockNumSum, DomainPPSize, DomainTPSize, domainCPSize, kvFactor, prefixLayerNumDevPtr);
         }
         else if (isWindow)
         {
@@ -1215,7 +1226,7 @@ void splitKVCache(std::map<SizeType32, std::vector<runtime::ITensor::SharedPtr>>
                 splitKVCacheForMLAKernel<T, mlaSubWarpSize, 4>
                     <<<gridDim, blockDimx, 0, bufferManager.getStream().get()>>>(inputBlockPtrsDev, outputCachePtrsDev,
                         tokensPerBlock, numLayers, headNum, dimsPerHead, inputBlockNumSum, DomainPPSize, DomainTPSize,
-                        kvFactor, prefixLayerNumDevPtr);
+                        domainCPSize, kvFactor, prefixLayerNumDevPtr);
             }
             else if (isWindow)
             {
@@ -1248,7 +1259,7 @@ void splitKVCache(std::map<SizeType32, std::vector<runtime::ITensor::SharedPtr>>
                 splitKVCacheForMLAKernel<T, mlaSubWarpSize, 2>
                     <<<gridDim, blockDimx, 0, bufferManager.getStream().get()>>>(inputBlockPtrsDev, outputCachePtrsDev,
                         tokensPerBlock, numLayers, headNum, dimsPerHead, inputBlockNumSum, DomainPPSize, DomainTPSize,
-                        kvFactor, prefixLayerNumDevPtr);
+                        domainCPSize, kvFactor, prefixLayerNumDevPtr);
             }
             else if (isWindow)
             {
@@ -1277,7 +1288,7 @@ void splitKVCache(std::map<SizeType32, std::vector<runtime::ITensor::SharedPtr>>
                 splitKVCacheForMLAKernel<T, mlaSubWarpSize, 1>
                     <<<gridDim, blockDimx, 0, bufferManager.getStream().get()>>>(inputBlockPtrsDev, outputCachePtrsDev,
                         tokensPerBlock, numLayers, headNum, dimsPerHead, inputBlockNumSum, DomainPPSize, DomainTPSize,
-                        kvFactor, prefixLayerNumDevPtr);
+                        domainCPSize, kvFactor, prefixLayerNumDevPtr);
             }
             else if (isWindow)
             {
@@ -1458,9 +1469,8 @@ void concatKVCache(std::vector<runtime::ITensor::SharedPtr> const& inputSplitBlo
     uint64_t* prefixLayerNumDevPtr
         = static_cast<uint64_t*>(PtrsDeviceBuffer->data()) + outputBlockNumSum + inputSplitBlocks.size();
     int const tokensPerBlock = selfModelConfig.mTokensPerBlock;
-    // int const numLayers = selfModelConfig.mNbKvHeadsPerLayer.size() / oPPNum;
-    int const numLayers
-        = selfParallelConfig.mAttentionLayerNumPerPP.at(selfIdx / selfParallelConfig.mTensorParallelism);
+    int const selfPPRank = selfIdx / (selfParallelConfig.mTensorParallelism * selfParallelConfig.mContextParallelism);
+    int const numLayers = selfParallelConfig.mAttentionLayerNumPerPP.at(selfPPRank);
     TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), "concatKVCache numLayers:%d", numLayers);
     int const headNum = selfModelConfig.mNbKvHeadsPerLayer[0];
     int const dimsPerHead = selfModelConfig.mSizePerHead;
