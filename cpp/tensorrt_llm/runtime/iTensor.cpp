@@ -194,9 +194,23 @@ void printTensor(ITensor const& tensor, std::ostream& out)
         hostData = bufferCast<T>(tensor);
     }
 
-    if (shape.nbDims > 3)
+    if (shape.nbDims > 4)
     {
-        out << "Not printing elements for more than 3 dims\n";
+        out << "Not printing elements for more than 4 dims\n";
+    }
+    else if (shape.nbDims == 4 && shape.d[3] > 1)
+    {
+        for (int i = 0; i < shape.d[0]; ++i)
+        {
+            for (int j = 0; j < shape.d[1]; ++j)
+            {
+                for (int k = 0; k < shape.d[2]; ++k)
+                {
+                    out << "i=" << i << " j=" << j << " k=" << k << ": ";
+                    tc::arr2outCasted<TOutput>(out, hostData + tc::flat_index(shape.d, i, j, k, 0), shape.d[3]) << "\n";
+                }
+            }
+        }
     }
     else if (shape.nbDims == 3 && shape.d[2] > 1)
     {

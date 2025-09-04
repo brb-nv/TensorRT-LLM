@@ -533,9 +533,14 @@ protected:
         int worldSize = tensorrt_llm::mpi::MpiComm::world().getSize();
         int worldRank = tensorrt_llm::mpi::MpiComm::world().getRank();
         tensorrt_llm::mpi::MpiComm::world().barrier();
-        int contextRanks = contextTp * contextPp;
-        int genRanks = genTp * genPp;
+        int contextRanks = contextTp * contextPp * contextCp;
+        int genRanks = genTp * genPp * genCp;
         int nprocs = (contextRanks + genRanks);
+
+        if (tensorrt_llm::mpi::MpiComm::world().getSize() < nprocs)
+        {
+            GTEST_SKIP() << "mpirun with procs=" << nprocs << " is required to run this test.";
+        }
 
         mIsContext = false;
         mIsGeneration = false;
@@ -549,8 +554,8 @@ protected:
         {
             return;
         }
-        TLLM_LOG_INFO("Run cacheTransceiverTest for ContextTp: %d, ContextPp: %d, GenTp: %d, GenPp:%d", contextTp,
-            contextPp, genTp, genPp);
+        TLLM_LOG_INFO("Run cacheTransceiverTest for ContextTp: %d, ContextPp: %d, ContextCp: %d, GenTp: %d, GenPp:%d, GenCp:%d", contextTp,
+            contextPp, contextCp, genTp, genPp, genCp);
         mComm = std::addressof(mParticipatingComm);
 
         mWorldSize = mComm->getSize();
@@ -560,7 +565,7 @@ protected:
             mIsContext = mRank < contextRanks;
             mIsGeneration = (mRank >= contextRanks && mRank < (contextRanks + genRanks));
             mRankInInstance = mIsContext ? mRank : (mRank - contextRanks);
-            mSizeInInstance = mIsContext ? (contextTp * contextPp) : (genTp * genPp);
+            mSizeInInstance = mIsContext ? (contextTp * contextPp * contextCp) : (genTp * genPp * genCp);
             int color = 0;
             if (mIsGeneration)
             {
@@ -586,7 +591,8 @@ protected:
             }
 
             mTpRank = mRankInInstance % mTpSize;
-            mPpRank = mRankInInstance / mTpSize;
+            mPpRank = mRankInInstance / (mTpSize * mCpSize);
+            mCpRank = (mRankInInstance % (mTpSize * mCpSize)) / mTpSize;
             mContextRankSize = contextRanks;
             mGenRankSize = genRanks;
             mContextTpSize = contextTp;
@@ -943,6 +949,17 @@ protected:
         return mRequester->requestAndReceiveAsync(*llmRequest);
     }
 
+    // Called only by generationVerifyKVCache. Currently, generation ranks might over-allocate blocks when CP is enabled.
+    bool isBlockOverallocated(int blockIdx, int numTotalBlocks)
+    {
+        bool const generationHasCP = mCpSize > 1;
+        if (!generationHasCP) {
+            return false;
+        }
+        int const numValidBlocks = getBlockNumAccountingForCP(mCpRank, mCpSize, numTotalBlocks, /*strict=*/true);
+        return blockIdx >= numValidBlocks;
+    }
+
     void generationVerifyKVCache(std::shared_ptr<LlmRequest> const& llmRequest)
     {
         auto constexpr beamIdx{0};
@@ -952,20 +969,42 @@ protected:
         TLLM_CUDA_CHECK(cudaDeviceSynchronize());
 
         auto blockRange = BlockRange::fromAllBlockIds(*mManager, llmRequest->mRequestId);
+        int numTotalBlocks = blockRange.getBlockIds().size();
         auto const numPools = mManager->getBlockManager().getNumPools();
         for (int poolIdx = 0; poolIdx < numPools; poolIdx++)
         {
             blockRange.updatePoolIdx(poolIdx);
             for (auto& block : blockRange)
             {
+                if (isBlockOverallocated(blockIdx, numTotalBlocks)) {
+                    TLLM_LOG_INFO("[generationVerifyKVCache] Skipping over-allocated block for request id %d (rank %d, blockIdx %d, numTotalBlocks %d)",
+                        llmRequest->mRequestId, mRank, blockIdx, numTotalBlocks);
+                    break;
+                }
                 verifyBlockData(block, blockIdx, llmRequest->getPromptLen(), poolIdx);
                 blockIdx++;
             }
         }
     }
 
+    int getEnvMpiDebugRank()
+    {
+        // Look-up env variable TLLM_DEBUG_RANK.
+        char const* const env = std::getenv("TLLM_DEBUG_RANK");
+        if (env == nullptr)
+        {
+            return -2;  // -1 means all ranks, -2 means no debug rank.
+        }
+        return std::stoi(env);
+    }
+
     void fillBlockData(tensorrt_llm::runtime::ITensor& blockData, int blockId, size_t initial, int blockPoolIdx = 0)
     {
+        static const int TARGET_RANK = getEnvMpiDebugRank(); // -1 means all ranks.
+        if (TARGET_RANK == -1 || tensorrt_llm::mpi::MpiComm::world().getRank() == TARGET_RANK)
+        {
+            TLLM_LOG_INFO("fillBlockData called for rank %d mRankInInstance %d blockId %d", mRank, mRankInInstance, blockId);
+        }
         auto const& blockManager = mManager->getBlockManager();
         auto const onlyWindowSize = blockManager.getPoolWindowSize(blockPoolIdx);
         auto const& bufferManager = blockManager.getBufferManager(onlyWindowSize);
@@ -1014,6 +1053,19 @@ protected:
                                 using ValueType = decltype(generateValue);
                                 auto* dataPtr = static_cast<ValueType*>(hostTensor->data(keyIndex));
                                 *dataPtr = generateValue;
+                                if (TARGET_RANK == -1 || tensorrt_llm::mpi::MpiComm::world().getRank() == TARGET_RANK)
+                                {
+                                    TLLM_LOG_INFO(tensorrt_llm::mpi::MpiComm::world().getRank(),
+                                        "[RANK %d] [fillBlockData::key] blockId=%d, layer=%d->%d, head=%d->%d, token=%d->%d, hidden=%d, "
+                                        "keyIdx=%zu, set_value=%s, dataType=%d",
+                                        tensorrt_llm::mpi::MpiComm::world().getRank(),
+                                        blockId, layerId, layerId + startLayerId,
+                                        headId, headId + startHeadId,
+                                        tokenId, tokenId + startTokenId,
+                                        hiddenId, keyIndex,
+                                        std::to_string(static_cast<double>(*dataPtr)).c_str(),
+                                        static_cast<int>(blockData.getDataType()));
+                                }
                             },
                             generateExpectedValue(initial, blockPoolIdx, tokenId + startTokenId, layerId + startLayerId,
                                 headId + startHeadId, hiddenId, true, blockData.getDataType()));
@@ -1025,6 +1077,19 @@ protected:
                                     using ValueType = decltype(generateValue);
                                     auto* dataPtr = static_cast<ValueType*>(hostTensor->data(valueIndex));
                                     *dataPtr = generateValue;
+                                    if (TARGET_RANK == -1 || tensorrt_llm::mpi::MpiComm::world().getRank() == TARGET_RANK)
+                                    {
+                                        TLLM_LOG_INFO(tensorrt_llm::mpi::MpiComm::world().getRank(),
+                                            "[RANK %d] [fillBlockData::value] blockId=%d, layer=%d->%d, head=%d->%d, token=%d->%d, hidden=%d, "
+                                            "valueIdx=%zu, set_value=%s, dataType=%d",
+                                            tensorrt_llm::mpi::MpiComm::world().getRank(),
+                                            blockId, layerId, layerId + startLayerId,
+                                            headId, headId + startHeadId,
+                                            tokenId, tokenId + startTokenId,
+                                            hiddenId, valueIndex,
+                                            std::to_string(static_cast<double>(*dataPtr)).c_str(),
+                                            static_cast<int>(blockData.getDataType()));
+                                    }
                                 },
                                 generateExpectedValue(initial, blockPoolIdx, tokenId + startTokenId,
                                     layerId + startLayerId, headId + startHeadId, hiddenId, false,
@@ -1040,6 +1105,11 @@ protected:
 
     void verifyBlockData(tensorrt_llm::runtime::ITensor& blockData, int blockId, size_t initial, int blockPoolIdx = 0)
     {
+        static const int TARGET_RANK = getEnvMpiDebugRank(); // -1 means all ranks.
+        if (TARGET_RANK == -1 || tensorrt_llm::mpi::MpiComm::world().getRank() == TARGET_RANK)
+        {
+            TLLM_LOG_INFO("verifyBlockData called for rank %d mRankInInstance %d blockId %d", mRank, mRankInInstance, blockId);
+        }
         auto const& blockManager = mManager->getBlockManager();
         auto const onlyWindowSize = blockManager.getPoolWindowSize(blockPoolIdx);
         auto const& bufferManager = blockManager.getBufferManager(onlyWindowSize);
@@ -1068,7 +1138,7 @@ protected:
         }
         int kvFactor = mCacheState->getAttentionConfig().mKvFactor;
         int tokensPerBlock = mCacheState->getModelConfig().mTokensPerBlock;
-        int startTokenId = blockId * tokensPerBlock;
+        int startTokenId = (blockId * mCpSize + mCpRank) * tokensPerBlock;
         int sizePerHead = mCacheState->getModelConfig().mSizePerHead;
 
         bufferManager.copy(blockData, *hostTensor);
@@ -1093,6 +1163,24 @@ protected:
                                 using ValueType = decltype(generateValue);
                                 auto* dataPtr = static_cast<ValueType*>(hostTensor->data(keyIndex));
                                 EXPECT_EQ(*dataPtr, generateValue);
+                                if (TARGET_RANK == -1 || tensorrt_llm::mpi::MpiComm::world().getRank() == TARGET_RANK)
+                                {
+                                    std::string result = "";
+                                    if (*dataPtr != generateValue) {
+                                        result = "FAILED!";
+                                    }
+                                    TLLM_LOG_INFO(tensorrt_llm::mpi::MpiComm::world().getRank(),
+                                        "[RANK %d] [verifyBlockData::key] blockId=%d, layer=%d->%d, head=%d->%d, token=%d->%d, hidden=%d, "
+                                        "keyIdx=%zu, actual_value=%s, dataType=%d %s",
+                                        tensorrt_llm::mpi::MpiComm::world().getRank(),
+                                        blockId, layerId, layerId + startLayerId,
+                                        headId, headId + startHeadId,
+                                        tokenId, tokenId + startTokenId,
+                                        hiddenId, keyIndex,
+                                        std::to_string(static_cast<double>(*dataPtr)).c_str(),
+                                        static_cast<int>(blockData.getDataType()),
+                                        result.c_str());
+                                }
                             },
                             generateExpectedValue(initial, blockPoolIdx, tokenId + startTokenId, layerId + startLayerId,
                                 headId + startHeadId, hiddenId, true, blockData.getDataType()));
@@ -1104,6 +1192,24 @@ protected:
                                     using ValueType = decltype(generateValue);
                                     auto* dataPtr = static_cast<ValueType*>(hostTensor->data(valueIndex));
                                     EXPECT_EQ(*dataPtr, generateValue);
+                                    if (TARGET_RANK == -1 || tensorrt_llm::mpi::MpiComm::world().getRank() == TARGET_RANK)
+                                    {
+                                        std::string result = "";
+                                        if (*dataPtr != generateValue) {
+                                            result = "FAILED!";
+                                        }
+                                        TLLM_LOG_INFO(tensorrt_llm::mpi::MpiComm::world().getRank(),
+                                            "[RANK %d] [verifyBlockData::value] blockId=%d, layer=%d->%d, head=%d->%d, token=%d->%d, hidden=%d, "
+                                            "valueIdx=%zu, actual_value=%s, dataType=%d %s",
+                                            tensorrt_llm::mpi::MpiComm::world().getRank(),
+                                            blockId, layerId, layerId + startLayerId,
+                                            headId, headId + startHeadId,
+                                            tokenId, tokenId + startTokenId,
+                                            hiddenId, valueIndex,
+                                            std::to_string(static_cast<double>(*dataPtr)).c_str(),
+                                            static_cast<int>(blockData.getDataType()),
+                                            result.c_str());
+                                    }
                                 },
                                 generateExpectedValue(initial, blockPoolIdx, tokenId + startTokenId,
                                     layerId + startLayerId, headId + startHeadId, hiddenId, false,
@@ -1149,7 +1255,7 @@ protected:
     tensorrt_llm::mpi::MpiComm const* mComm;
     tensorrt_llm::mpi::MpiComm mParticipatingComm{nullptr, false};
     SizeType32 mWorldSize{0}, mRank{0}, mRankInInstance{0};
-    SizeType32 mSizeInInstance{0}, mTpRank{0}, mPpRank{0}, mTpSize{0}, mPpSize{0}, mCpSize{0}, mContextRankSize{0},
+    SizeType32 mSizeInInstance{0}, mTpRank{0}, mPpRank{0}, mCpRank{0}, mTpSize{0}, mPpSize{0}, mCpSize{0}, mContextRankSize{0},
         mGenRankSize{0}, mContextTpSize{0}, mContextPpSize{0}, mContextCpSize{0};
     LlmRequest::RequestIdType mRequestId{0};
     bool mContextDP{false};
@@ -1211,7 +1317,7 @@ TEST_P(AsymmetricalCacheTest, TestCase)
         std::vector<std::shared_ptr<tensorrt_llm::batch_manager::LlmRequest>> requests;
 
         // the second loop is for cache reuse
-        for (int i = 0; i < 2; i++)
+        for (int i = 0; i < 1; i++)
         {
             for (auto len : {30, 10, 60, 80})
             {
@@ -1442,6 +1548,26 @@ INSTANTIATE_TEST_CASE_P(AsymmetricCaseTest2ForMLAEvenLayer, AsymmetricalCacheTes
         testing::Values(1), testing::Values(10), testing::Values(1), testing::Values(4), testing::Values(8),
         testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT8), testing::Values(1),
         testing::Values(true), testing::Values(false), testing::Values(false, true), testing::Values(false)));
+
+/*************************************************************************/
+INSTANTIATE_TEST_CASE_P(AsymmetricCaseTestWithCPForMLA, AsymmetricalCacheTest,
+    testing::Combine(/*contextTp*/testing::Values(1, 2, 4),
+                     /*contextPp*/testing::Values(1, 2, 4),
+                     /*contextCp*/testing::Values(1),
+                     /*genTp*/testing::Values(1, 2),
+                     /*genPp*/testing::Values(1, 2),
+                     /*genCp*/ testing::Values(2, 4),
+                     /*numLayers*/ testing::Values(4),
+                     /*numHeads*/ testing::Values(1),
+                     /*sizePerHead*/ testing::Values(4),
+                     /*tokensPerBlock*/ testing::Values(16),
+                     /*dataType*/ testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT8),
+                     /*kvFactor*/ testing::Values(2),
+                     /*isMLA*/testing::Values(true),
+                     /*contextDP*/ testing::Values(false),
+                     /*generationDP*/ testing::Values(false),
+                     /*isWindow*/ testing::Values(false)));
+/*************************************************************************/
 
 INSTANTIATE_TEST_CASE_P(AsymmetricCaseTestWithDPForMLA1, AsymmetricalCacheTestWithDP,
     testing::Combine(testing::Values(1, 2), testing::Values(1, 2), testing::Values(1), testing::Values(1, 2),

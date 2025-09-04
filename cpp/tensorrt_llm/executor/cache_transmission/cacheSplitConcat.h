@@ -42,12 +42,10 @@ struct TargetRanksInfo
     int mPeerDupHeadFactor;
     std::vector<int> mPeerAttentionLayerNumInDomainPP;
 
-    int getPeerPPDomainLayerNum(int targetRankIdx)
+    int getPeerPPDomainLayerNum(int targetRankIdx) const
     {
-        //[TP,PP]
-
         int ppDomainRankIdx = targetRankIdx % mDomainPPSize;
-        return mPeerAttentionLayerNumInDomainPP[ppDomainRankIdx];
+        return mPeerAttentionLayerNumInDomainPP.at(ppDomainRankIdx);
     }
 };
 
