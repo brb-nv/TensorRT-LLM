@@ -37,6 +37,21 @@
 namespace tensorrt_llm::batch_manager::kv_cache_manager
 {
 
+
+namespace
+{
+int getEnvMpiDebugRank()
+{
+    // Look-up env variable TLLM_DEBUG_RANK.
+    char const* const env = std::getenv("TLLM_DEBUG_RANK");
+    if (env == nullptr)
+    {
+        return -2;  // -1 means all ranks, -2 means no debug rank.
+    }
+    return std::stoi(env);
+}
+}
+
 int getBlockNumAccountingForCP(int cpRank, int cpSize, int numTotalBlocks)
 {
     TLLM_CHECK(cpRank >= 0 && cpRank < cpSize);
@@ -133,6 +148,11 @@ void MLACacheFormatter::format(TransferSession& session)
         blockRange.updatePoolIdx(poolIdx);
         for (auto it = blockRange.begin(); it != blockRange.end(); ++it)
         {
+            static const int TARGET_RANK = getEnvMpiDebugRank(); // -1 means all ranks.
+            if (TARGET_RANK == -1 || mpi::MpiComm::world().getRank() == TARGET_RANK)
+            {
+                std::cerr << "[mpiRank:" << mpi::MpiComm::world().getRank() << "]" << "[MLACacheFormatter::format] inputKvCacheBlocks[" << blockNum << "]: \n" << *it << std::endl;
+            }
             blockNum++;
             inputKvCacheBlocks.push_back(it);
         }
@@ -528,6 +548,17 @@ void MLACacheFormatter::unformat(TransferSession& session)
             // recvSplitCaches size == ppdomainsize * cpdomainsize.
             executor::kv_cache::concatKvCacheV2Dispatch(
                 recvSplitCaches, outputCachesPerWindow, destConfig, selfConfig, selfIdx, bufferManager);
+            static const int TARGET_RANK = getEnvMpiDebugRank(); // -1 means all ranks.
+            if (TARGET_RANK == -1 || mpi::MpiComm::world().getRank() == TARGET_RANK)
+            {
+                bufferManager.getStream().synchronize();
+                int blockNum = 0;
+                for (auto const& block : outputBuffers)
+                {
+                    std::cerr << "[mpiRank:" << mpi::MpiComm::world().getRank() << "]" << "[MLACacheFormatter::format] outputBuffers[" << blockNum << "]: \n" << *block << std::endl;
+                    blockNum++;
+                }
+            }
         }
         bufferManager.getStream().synchronize();
     }

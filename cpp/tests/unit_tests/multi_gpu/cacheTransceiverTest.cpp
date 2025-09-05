@@ -949,6 +949,17 @@ protected:
         return mRequester->requestAndReceiveAsync(*llmRequest);
     }
 
+    // Called only by generationVerifyKVCache. Currently, generation ranks might over-allocate blocks when CP is enabled.
+    bool isBlockOverallocated(int blockIdx, int numTotalBlocks)
+    {
+        bool const generationHasCP = mCpSize > 1;
+        if (!generationHasCP) {
+            return false;
+        }
+        int const numValidBlocks = getBlockNumAccountingForCP(mCpRank, mCpSize, numTotalBlocks);
+        return blockIdx >= numValidBlocks;
+    }
+
     void generationVerifyKVCache(std::shared_ptr<LlmRequest> const& llmRequest)
     {
         auto constexpr beamIdx{0};
@@ -958,12 +969,18 @@ protected:
         TLLM_CUDA_CHECK(cudaDeviceSynchronize());
 
         auto blockRange = BlockRange::fromAllBlockIds(*mManager, llmRequest->mRequestId);
+        int numTotalBlocks = blockRange.getBlockIds().size();
         auto const numPools = mManager->getBlockManager().getNumPools();
         for (int poolIdx = 0; poolIdx < numPools; poolIdx++)
         {
             blockRange.updatePoolIdx(poolIdx);
             for (auto& block : blockRange)
             {
+                if (isBlockOverallocated(blockIdx, numTotalBlocks)) {
+                    TLLM_LOG_INFO("[generationVerifyKVCache] Skipping over-allocated block for request id %d (rank %d, blockIdx %d, numTotalBlocks %d)",
+                        llmRequest->mRequestId, mRank, blockIdx, numTotalBlocks);
+                    break;
+                }
                 verifyBlockData(block, blockIdx, llmRequest->getPromptLen(), poolIdx);
                 blockIdx++;
             }
@@ -1145,23 +1162,24 @@ protected:
                             {
                                 using ValueType = decltype(generateValue);
                                 auto* dataPtr = static_cast<ValueType*>(hostTensor->data(keyIndex));
-                                if (*dataPtr != static_cast<ValueType>(0)) {
-                                    EXPECT_EQ(*dataPtr, generateValue);
-                                } else {
-                                    // TODO: Remove this when over-allocation is fixed.
-                                }
+                                EXPECT_EQ(*dataPtr, generateValue);
                                 if (TARGET_RANK == -1 || tensorrt_llm::mpi::MpiComm::world().getRank() == TARGET_RANK)
                                 {
+                                    std::string result = "";
+                                    if (*dataPtr != generateValue) {
+                                        result = "FAILED!";
+                                    }
                                     TLLM_LOG_INFO(tensorrt_llm::mpi::MpiComm::world().getRank(),
                                         "[RANK %d] [verifyBlockData::key] blockId=%d, layer=%d->%d, head=%d->%d, token=%d->%d, hidden=%d, "
-                                        "keyIdx=%zu, actual_value=%s, dataType=%d",
+                                        "keyIdx=%zu, actual_value=%s, dataType=%d %s",
                                         tensorrt_llm::mpi::MpiComm::world().getRank(),
                                         blockId, layerId, layerId + startLayerId,
                                         headId, headId + startHeadId,
                                         tokenId, tokenId + startTokenId,
                                         hiddenId, keyIndex,
                                         std::to_string(static_cast<double>(*dataPtr)).c_str(),
-                                        static_cast<int>(blockData.getDataType()));
+                                        static_cast<int>(blockData.getDataType()),
+                                        result.c_str());
                                 }
                             },
                             generateExpectedValue(initial, blockPoolIdx, tokenId + startTokenId, layerId + startLayerId,
@@ -1173,23 +1191,24 @@ protected:
                                 {
                                     using ValueType = decltype(generateValue);
                                     auto* dataPtr = static_cast<ValueType*>(hostTensor->data(valueIndex));
-                                    if (*dataPtr != static_cast<ValueType>(0)) {
-                                        EXPECT_EQ(*dataPtr, generateValue);
-                                    } else {
-                                        // TODO: Remove this when over-allocation is fixed.
-                                    }
+                                    EXPECT_EQ(*dataPtr, generateValue);
                                     if (TARGET_RANK == -1 || tensorrt_llm::mpi::MpiComm::world().getRank() == TARGET_RANK)
                                     {
+                                        std::string result = "";
+                                        if (*dataPtr != generateValue) {
+                                            result = "FAILED!";
+                                        }
                                         TLLM_LOG_INFO(tensorrt_llm::mpi::MpiComm::world().getRank(),
                                             "[RANK %d] [verifyBlockData::value] blockId=%d, layer=%d->%d, head=%d->%d, token=%d->%d, hidden=%d, "
-                                            "valueIdx=%zu, actual_value=%s, dataType=%d",
+                                            "valueIdx=%zu, actual_value=%s, dataType=%d %s",
                                             tensorrt_llm::mpi::MpiComm::world().getRank(),
                                             blockId, layerId, layerId + startLayerId,
                                             headId, headId + startHeadId,
                                             tokenId, tokenId + startTokenId,
                                             hiddenId, valueIndex,
                                             std::to_string(static_cast<double>(*dataPtr)).c_str(),
-                                            static_cast<int>(blockData.getDataType()));
+                                            static_cast<int>(blockData.getDataType()),
+                                            result.c_str());
                                     }
                                 },
                                 generateExpectedValue(initial, blockPoolIdx, tokenId + startTokenId,
@@ -1300,7 +1319,7 @@ TEST_P(AsymmetricalCacheTest, TestCase)
         // the second loop is for cache reuse
         for (int i = 0; i < 1; i++)
         {
-            for (auto len : {8}) //{30, 10, 60, 80}
+            for (auto len : {30, 10, 60, 80})
             {
                 requests.emplace_back(makeLlmRequest(len));
             }
@@ -1541,7 +1560,7 @@ INSTANTIATE_TEST_CASE_P(AsymmetricCaseTestWithCPForMLA, AsymmetricalCacheTest,
                      /*numLayers*/ testing::Values(1),
                      /*numHeads*/ testing::Values(1),
                      /*sizePerHead*/ testing::Values(4),
-                     /*tokensPerBlock*/ testing::Values(2),
+                     /*tokensPerBlock*/ testing::Values(16),
                      /*dataType*/ testing::Values(nvinfer1::DataType::kINT8),
                      /*kvFactor*/ testing::Values(2),
                      /*isMLA*/testing::Values(true),
