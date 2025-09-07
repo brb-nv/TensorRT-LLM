@@ -602,7 +602,15 @@ __global__ void splitKVCacheForMLAKernel(T const** __restrict__ inputBlocks, T**
                 T const* inputBlockPtr = inputBlocks[blockId];
                 T const* kInputPtr = inputBlockPtr + layerId * kvFactor * headNum * tokensPerBlock * dimsPerHead
                     + headId * tokensPerBlock * dimsPerHead;
-                int outputCacheIdx = rankInDomainPP * domainCPSize + blockId % domainCPSize;
+                // Example to understand the indexing: Say PP=2 and CP=2 for generation while PP=1 and CP=1 for context:
+                // genRank 0 is ppRank0, cpRank0
+                // genRank 1 is ppRank0, cpRank1
+                // genRank 2 is ppRank1, cpRank0
+                // genRank 3 is ppRank1, cpRank1
+                // However, the order of cache transmission (targetRankInfo.mIRanks) is {0, 2, 1, 3}. i.e. {{pp0cp0}, {pp1cp0}, {pp0cp1}, {pp1cp1}}.
+                // So, outputCaches of all ppRanks corresponding to a given cpRank are grouped together.
+                // We do blockId % domainCPSize because blocks are distributed among cpRanks in a round-robin fashion.
+                int outputCacheIdx = (blockId % domainCPSize) * DomainPPSize + rankInDomainPP;
                 T* outputCachePtr = outputCaches[outputCacheIdx];
 
                 int const headIdInDomainTP = headId;
