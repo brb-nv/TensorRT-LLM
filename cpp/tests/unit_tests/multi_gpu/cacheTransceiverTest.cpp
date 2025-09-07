@@ -526,9 +526,9 @@ protected:
 #if ENABLE_MULTI_DEVICE
         tensorrt_llm::mpi::initialize(tensorrt_llm::mpi::MpiThreadSupport::THREAD_MULTIPLE);
 
-        if (tensorrt_llm::mpi::MpiComm::world().getSize() != 4)
+        if (tensorrt_llm::mpi::MpiComm::world().getSize() != 8)
         {
-            GTEST_SKIP() << "mpirun with procs=4  is required to run this test.";
+            GTEST_SKIP() << "mpirun with procs=8  is required to run this test.";
         }
         int worldSize = tensorrt_llm::mpi::MpiComm::world().getSize();
         int worldRank = tensorrt_llm::mpi::MpiComm::world().getRank();
@@ -1551,12 +1551,12 @@ INSTANTIATE_TEST_CASE_P(AsymmetricCaseTest2ForMLAEvenLayer, AsymmetricalCacheTes
 
 /*************************************************************************/
 INSTANTIATE_TEST_CASE_P(AsymmetricCaseTestWithCPForMLA, AsymmetricalCacheTest,
-    testing::Combine(/*contextTp*/testing::Values(1, 2),
-                     /*contextPp*/testing::Values(1, 2),
+    testing::Combine(/*contextTp*/testing::Values(1, 2, 4),
+                     /*contextPp*/testing::Values(1, 2, 4),
                      /*contextCp*/testing::Values(1),
-                     /*genTp*/testing::Values(1),
+                     /*genTp*/testing::Values(1, 2),
                      /*genPp*/testing::Values(1),
-                     /*genCp*/ testing::Values(2),
+                     /*genCp*/ testing::Values(2, 4),
                      /*numLayers*/ testing::Values(4),
                      /*numHeads*/ testing::Values(1),
                      /*sizePerHead*/ testing::Values(4),
