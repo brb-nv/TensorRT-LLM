@@ -1021,13 +1021,6 @@ void splitKVCache(std::map<SizeType32, std::vector<runtime::ITensor::SharedPtr>>
         inputBlockNumSum += blocks.size();
     }
     auto targetRankInfo = targetIRanks(destCacheState, selfCacheState, selfIdx);
-    std::cerr << "[splitKVCache] targetRankInfo.mDomainPPSize: " << targetRankInfo.mDomainPPSize << ", targetRankInfo.mDomainTPSize: " << targetRankInfo.mDomainTPSize << ", targetRankInfo.mDomainCPSize: " << targetRankInfo.mDomainCPSize << std::endl;
-    std::cerr << "[splitKVCache] targetRankInfo.mIRanks: " << std::endl;
-    for (auto rank : targetRankInfo.mIRanks)
-    {
-        std::cerr << rank << ", ";
-    }
-    std::cerr << std::endl;
     TLLM_CHECK(targetRankInfo.mIRanks.size()
         == (static_cast<size_t>(targetRankInfo.mDomainPPSize * targetRankInfo.mDomainTPSize * targetRankInfo.mDomainCPSize)));
     auto outputCacheNum = targetRankInfo.mIRanks.size();
@@ -1068,14 +1061,12 @@ void splitKVCache(std::map<SizeType32, std::vector<runtime::ITensor::SharedPtr>>
             inputBlockLayerNumSum += layersNum;
         }
     }
-    std::cerr << "[splitKVCache] cachePtrs size after pushing KV cache blocks: " << cachePtrs.size() << std::endl;
 
     for (auto&& outputSplitBlock : outputSplitBlocks)
     {
         TLLM_CHECK(outputSplitBlock->getDataType() == cacheDataType);
         cachePtrs.push_back(reinterpret_cast<uint64_t>(outputSplitBlock->data()));
     }
-    std::cerr << "[splitKVCache] cachePtrs size after pushing output split blocks: " << cachePtrs.size() << std::endl;
     std::vector<uint64_t> prefixLayerNum(targetRankInfo.mDomainPPSize + 1, 0);
     prefixLayerNum[0] = 0;
     for (int i = 0; i < targetRankInfo.mDomainPPSize; i++)
@@ -1083,7 +1074,6 @@ void splitKVCache(std::map<SizeType32, std::vector<runtime::ITensor::SharedPtr>>
         prefixLayerNum[i + 1] = prefixLayerNum[i] + targetRankInfo.mPeerAttentionLayerNumInDomainPP[i];
     }
     cachePtrs.insert(cachePtrs.end(), prefixLayerNum.begin(), prefixLayerNum.end());
-    std::cerr << "[splitKVCache] cachePtrs size after pushing prefixLayerNum: " << cachePtrs.size() << std::endl;
     bool const isWindow = windowSizes.size() > 1;
 
     runtime::BufferManager::IBufferPtr PtrsDeviceBuffer

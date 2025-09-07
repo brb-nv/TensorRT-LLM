@@ -22,7 +22,7 @@
 namespace tensorrt_llm::batch_manager::kv_cache_manager
 {
 
-int getBlockNumAccountingForCP(int cpRank, int cpSize, int numTotalBlocks);
+int getBlockNumAccountingForCP(int cpRank, int cpSize, int numTotalBlocks, bool strict);
 
 // Simple cache block copy. Because it does not involve data splitting or merging, it performs best when the
 // parallel topology is completely identical, making it the preferred method.

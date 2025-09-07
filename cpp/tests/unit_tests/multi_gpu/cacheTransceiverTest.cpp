@@ -956,7 +956,7 @@ protected:
         if (!generationHasCP) {
             return false;
         }
-        int const numValidBlocks = getBlockNumAccountingForCP(mCpRank, mCpSize, numTotalBlocks);
+        int const numValidBlocks = getBlockNumAccountingForCP(mCpRank, mCpSize, numTotalBlocks, /*strict=*/true);
         return blockIdx >= numValidBlocks;
     }
 
@@ -1551,17 +1551,17 @@ INSTANTIATE_TEST_CASE_P(AsymmetricCaseTest2ForMLAEvenLayer, AsymmetricalCacheTes
 
 /*************************************************************************/
 INSTANTIATE_TEST_CASE_P(AsymmetricCaseTestWithCPForMLA, AsymmetricalCacheTest,
-    testing::Combine(/*contextTp*/testing::Values(1),
-                     /*contextPp*/testing::Values(1),
+    testing::Combine(/*contextTp*/testing::Values(1, 2),
+                     /*contextPp*/testing::Values(1, 2),
                      /*contextCp*/testing::Values(1),
                      /*genTp*/testing::Values(1),
                      /*genPp*/testing::Values(1),
                      /*genCp*/ testing::Values(2),
-                     /*numLayers*/ testing::Values(1),
+                     /*numLayers*/ testing::Values(4),
                      /*numHeads*/ testing::Values(1),
                      /*sizePerHead*/ testing::Values(4),
                      /*tokensPerBlock*/ testing::Values(16),
-                     /*dataType*/ testing::Values(nvinfer1::DataType::kINT8),
+                     /*dataType*/ testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT8),
                      /*kvFactor*/ testing::Values(2),
                      /*isMLA*/testing::Values(true),
                      /*contextDP*/ testing::Values(false),

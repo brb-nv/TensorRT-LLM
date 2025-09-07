@@ -52,12 +52,16 @@ int getEnvMpiDebugRank()
 }
 }
 
-int getBlockNumAccountingForCP(int cpRank, int cpSize, int numTotalBlocks)
+int getBlockNumAccountingForCP(int cpRank, int cpSize, int numTotalBlocks, bool strict)
 {
     TLLM_CHECK(cpRank >= 0 && cpRank < cpSize);
     if (cpSize == 1)
     {
         return numTotalBlocks;
+    }
+    if (!strict)
+    {
+        return (numTotalBlocks + cpSize - 1) / cpSize;
     }
     // Blocks are distributed among CP ranks in a round-robin fashion as evenly as possible.
     int numBlocksCurrRank = numTotalBlocks / cpSize;
@@ -182,36 +186,33 @@ void MLACacheFormatter::format(TransferSession& session)
         return;
     }
 
-    auto cacheBlockSize = inputKvCacheBlocks.at(0)->getSize();
-    auto cacheBufferId = mCacheTransBufferManager->assignBufferIndexForSend();
-
     auto targetInfo = executor::kv_cache::targetIRanks(destConfig, selfConfig, selfIdx);
-    auto ppRank = selfIdx
-        / (selfConfig.getParallelConfig().mTensorParallelism * selfConfig.getParallelConfig().mContextParallelism);
-    int selfAttentionLayerNum = selfConfig.getParallelConfig().mAttentionLayerNumPerPP.at(ppRank);
-    TLLM_CHECK_WITH_INFO(blockNum % selfAttentionLayerNum == 0, "blockNum corresponding to a ppRank must be divisible by number of layers belonging to that ppRank. blockNum: %d, selfAttentionLayerNum: %d", blockNum, selfAttentionLayerNum);
-    int selfBlockNumPerLayer = blockNum / selfAttentionLayerNum;
     size_t pPDomainSize = targetInfo.mDomainPPSize;
     size_t cPDomainSize = targetInfo.mDomainCPSize;
 
     auto getBufferSizeForTarget = [&]()
     {
+        auto const ppRank = selfIdx
+            / (selfConfig.getParallelConfig().mTensorParallelism * selfConfig.getParallelConfig().mContextParallelism);
+        auto const selfAttentionLayerNum = selfConfig.getParallelConfig().mAttentionLayerNumPerPP.at(ppRank);
+        auto const cacheBlockSize = inputKvCacheBlocks.at(0)->getSize();
+        auto const blockSizePerLayer = cacheBlockSize / selfAttentionLayerNum;
         std::vector<size_t> bufferSizeForTarget(pPDomainSize * cPDomainSize, 0);
         for (size_t ppDomainIdx = 0; ppDomainIdx < pPDomainSize; ppDomainIdx++)
         {
-            auto const layerNumBufferTargetNum = targetInfo.getPeerPPDomainLayerNum(ppDomainIdx);
+            auto const peerAttentionLayerNum = targetInfo.getPeerPPDomainLayerNum(ppDomainIdx);
             for (size_t cpDomainIdx = 0; cpDomainIdx < cPDomainSize; cpDomainIdx++)
             {
                 auto const idx = ppDomainIdx * cPDomainSize + cpDomainIdx;
                 // Note: This should work ok for now because contextCP is always 1. So, cpDomainSize == genCPSize and cpDomainIdx == genCPRank.
-                auto const blockNumBufferTargetNum = getBlockNumAccountingForCP(cpDomainIdx, cPDomainSize, selfBlockNumPerLayer);
-                bufferSizeForTarget[idx] = cacheBlockSize * blockNumBufferTargetNum * layerNumBufferTargetNum;
+                auto const peerBlockNum = getBlockNumAccountingForCP(cpDomainIdx, cPDomainSize, blockNum, /*strict=*/false);
+                bufferSizeForTarget[idx] = blockSizePerLayer * peerAttentionLayerNum * peerBlockNum;
             }
         }
-        TLLM_CHECK(std::accumulate(bufferSizeForTarget.begin(), bufferSizeForTarget.end(), 0) == blockNum * cacheBlockSize);
         return bufferSizeForTarget;
     };
     auto bufferEleSizes = getBufferSizeForTarget();
+    auto cacheBufferId = mCacheTransBufferManager->assignBufferIndexForSend();
     auto result = mCacheTransBufferManager->getOrAllocateSendBuffers(
         cacheBufferId, static_cast<int>(pPDomainSize * cPDomainSize), bufferEleSizes, bufferManager);
     auto& outputSplitCaches = std::get<0>(result);
@@ -400,26 +401,23 @@ void MLACacheFormatter::unformat(TransferSession& session)
             cacheBufferId = mCacheTransBufferManager->assignBufferIndexForRecv();
         }
 
-        auto cacheBlockSize = outputBuffers.at(0)->getSize();
-
         auto targetNum = pickUpConnections.size();
-        auto targetInfo = executor::kv_cache::targetIRanks(destConfig, selfConfig, selfIdx);
-        auto ppRank = selfIdx
-            / (selfConfig.getParallelConfig().mTensorParallelism * selfConfig.getParallelConfig().mContextParallelism);
-        auto selfAttentionLayerNum = selfConfig.getParallelConfig().mAttentionLayerNumPerPP.at(ppRank);
-        TLLM_CHECK_WITH_INFO(blockNum % selfAttentionLayerNum == 0, "blockNum corresponding to a ppRank must be divisible by number of layers belonging to that ppRank. blockNum: %d, selfAttentionLayerNum: %d", blockNum, selfAttentionLayerNum);
-        int selfBlockNumPerLayer = blockNum / selfAttentionLayerNum;
-        TLLM_CHECK_WITH_INFO(selfAttentionLayerNum != 0, "selfAttentionLayerNum should not be 0");
 
         // @B: Maybe no updates are needed because contextCP is always 1?
         auto getBufferSizeForTarget = [&]()
         {
+            auto const targetInfo = executor::kv_cache::targetIRanks(destConfig, selfConfig, selfIdx);
+            auto const cacheBlockSize = outputBuffers.at(0)->getSize();
+            auto const ppRank = selfIdx
+                / (selfConfig.getParallelConfig().mTensorParallelism * selfConfig.getParallelConfig().mContextParallelism);
+            auto const selfAttentionLayerNum = selfConfig.getParallelConfig().mAttentionLayerNumPerPP.at(ppRank);
+            TLLM_CHECK_WITH_INFO(selfAttentionLayerNum != 0, "selfAttentionLayerNum should not be 0");
             std::vector<size_t> bufferEleSizes(targetNum, 0);
-            auto baseEleSize = cacheBlockSize * selfBlockNumPerLayer;
+            auto const cacheSizePerLayer = cacheBlockSize * blockNum / selfAttentionLayerNum;
             for (size_t i = 0; i < targetNum; i++)
             {
-                auto const layerNumBufferTargetNum = targetInfo.getPeerPPDomainLayerNum(static_cast<SizeType32>(pickUpConnections[i]));
-                bufferEleSizes[i] = baseEleSize * layerNumBufferTargetNum;
+                auto const peerAttentionLayerNum = targetInfo.getPeerPPDomainLayerNum(static_cast<SizeType32>(pickUpConnections[i]));
+                bufferEleSizes[i] = cacheSizePerLayer * peerAttentionLayerNum;
             }
             return bufferEleSizes;
         };
