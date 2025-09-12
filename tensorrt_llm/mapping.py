@@ -147,8 +147,8 @@ class Mapping(object):
         if moe_cluster_size == -1:
             moe_cluster_size = 1
 
-        cp_type = CpType.ULYSSES if cp_config is None else cp_config.get(
-            "cp_type", CpType.ULYSSES)
+        cp_type = CpType.HELIX if cp_config is None else cp_config.get(
+            "cp_type", CpType.HELIX)
         moe_world_size = tp_size if cp_type == CpType.ULYSSES else tp_size * cp_size
 
         if moe_tp_size == -1 and moe_ep_size == -1:

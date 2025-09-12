@@ -183,13 +183,15 @@ class Attention(nn.Module):
         # tensor parallel
         tp_size = config.mapping.tp_size
         pp_size = config.mapping.pp_size
+        cp_size = config.mapping.cp_size
         if config.mapping.enable_attention_dp:
             tp_size = 1
 
         mapping = Mapping(
-            world_size=tp_size * pp_size,
+            world_size=tp_size * pp_size * cp_size,
             tp_size=tp_size,
             pp_size=pp_size,
+            cp_size=cp_size,
             rank=config.mapping.rank,
             gpus_per_node=config.mapping.gpus_per_node,
             enable_attention_dp=config.mapping.enable_attention_dp,
@@ -672,13 +674,15 @@ class MLA(nn.Module):
         config = config or ModelConfig()
         tp_size = config.mapping.tp_size
         pp_size = config.mapping.pp_size
+        cp_size = config.mapping.cp_size
         if config.mapping.enable_attention_dp:
             tp_size = 1
 
         mapping = Mapping(
-            world_size=tp_size * pp_size,
+            world_size=tp_size * pp_size * cp_size,
             tp_size=tp_size,
             pp_size=pp_size,
+            cp_size=cp_size,
             rank=config.mapping.rank,
             gpus_per_node=config.mapping.gpus_per_node,
             enable_attention_dp=config.mapping.enable_attention_dp,
