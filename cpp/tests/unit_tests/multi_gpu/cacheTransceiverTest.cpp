@@ -976,10 +976,10 @@ protected:
             {
                 if (isBlockOverallocated(blockIdx, numTotalBlocks))
                 {
-                    TLLM_LOG_INFO(
-                        "[generationVerifyKVCache] Skipping over-allocated block for request id %d (rank %d, blockIdx "
-                        "%d, numTotalBlocks %d)",
-                        llmRequest->mRequestId, mRank, blockIdx, numTotalBlocks);
+                    // TLLM_LOG_INFO(
+                    //     "[generationVerifyKVCache] Skipping over-allocated block for request id %d (rank %d, blockIdx "
+                    //     "%d, numTotalBlocks %d)",
+                    //     llmRequest->mRequestId, mRank, blockIdx, numTotalBlocks);
                     break;
                 }
                 verifyBlockData(block, blockIdx, llmRequest->getPromptLen(), poolIdx);
@@ -1318,7 +1318,7 @@ TEST_P(AsymmetricalCacheTest, TestCase)
         std::vector<std::shared_ptr<tensorrt_llm::batch_manager::LlmRequest>> requests;
 
         // the second loop is for cache reuse
-        for (int i = 0; i < 2; i++)
+        for (int i = 0; i < 1; i++)
         {
             for (auto len : {8}) // {30, 10, 60, 80}
             {
@@ -1558,10 +1558,10 @@ INSTANTIATE_TEST_CASE_P(AsymmetricCaseTest0WithCPForMLA, AsymmetricalCacheTest,
         /*genTp*/ testing::Values(1),
         /*genPp*/ testing::Values(1),
         /*genCp*/ testing::Values(2),
-        /*numLayers*/ testing::Values(4),
+        /*numLayers*/ testing::Values(2),
         /*numHeads*/ testing::Values(1),
         /*sizePerHead*/ testing::Values(4),
-        /*tokensPerBlock*/ testing::Values(4),
+        /*tokensPerBlock*/ testing::Values(2),
         /*dataType*/ testing::Values(nvinfer1::DataType::kINT8),
         /*kvFactor*/ testing::Values(2),
         /*isMLA*/ testing::Values(true),

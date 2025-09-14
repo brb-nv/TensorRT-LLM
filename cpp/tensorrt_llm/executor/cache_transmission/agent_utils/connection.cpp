@@ -20,6 +20,8 @@
 #include "tensorrt_llm/executor/cache_transmission/cacheSplitConcat.h"
 #include <string>
 #include <unistd.h>
+#include <iomanip>
+#include <algorithm>
 
 namespace tensorrt_llm::executor::kv_cache
 {
@@ -35,6 +37,17 @@ std::string genUniqueAgentName()
     return std::string(hostname) + "_" + std::to_string(pid) + "_" + std::to_string(counter++);
 }
 
+int getEnvMpiDebugRank()
+{
+    // Look-up env variable TLLM_DEBUG_RANK.
+    char const* const env = std::getenv("TLLM_DEBUG_RANK");
+    if (env == nullptr)
+    {
+        return -2;  // -1 means all ranks, -2 means no debug rank.
+    }
+    return std::stoi(env);
+}
+
 // NIXL connection is specific ,and different from the UCX and mpi connection, since NIXL only support one-sided
 // communication. gen send buffer metaData to context when it sending requestInfo, but don't send buffer offset, since
 // unformmatter has not called yet, it didn't know the cacheSize and offset. We assume the recv_size is the same as the
@@ -45,7 +58,7 @@ auto computeSendOffsetRatio(
     CacheState const& peerCacheState, int peerIdx, CacheState const& selfCacheState, int validConnectionIdx)
 {
     auto peerTargetInfo = targetIRanks(selfCacheState, peerCacheState, peerIdx);
-    // int ppRank = valideConnectionIdx % peerTargetInfo.mDomainPPSize;
+    
     size_t offsetLayer = 0;
     for (int i = 0; i < validConnectionIdx; i++)
     {
@@ -53,7 +66,15 @@ auto computeSendOffsetRatio(
     }
 
     size_t selfSendLayer = peerTargetInfo.getPeerPPDomainLayerNum(validConnectionIdx);
-
+    // static const int TARGET_RANK = getEnvMpiDebugRank(); // -1 means all ranks.
+    // if (TARGET_RANK == -1 || mpi::MpiComm::world().getRank() == TARGET_RANK)
+    // {
+    //     std::cerr << "[Rank " << mpi::MpiComm::world().getRank() << "][computeSendOffsetRatio] FUNCTION CALLED with validConnectionIdx: " << validConnectionIdx << std::endl;
+    //     std::cerr << "[Rank " << mpi::MpiComm::world().getRank() << "][computeSendOffsetRatio] peerCacheState: " << peerCacheState.toString() << std::endl;
+    //     std::cerr << "[Rank " << mpi::MpiComm::world().getRank() << "][computeSendOffsetRatio] selfCacheState: " << selfCacheState.toString() << std::endl;
+    //     std::cerr << "[Rank " << mpi::MpiComm::world().getRank() << "][computeSendOffsetRatio] peerIdx: " << peerIdx << std::endl;
+    //     std::cerr << "[Rank " << mpi::MpiComm::world().getRank() << "][computeSendOffsetRatio] offsetLayer: " << offsetLayer << " selfSendLayer: " << selfSendLayer << std::endl;
+    // }
     return std::make_pair(offsetLayer, selfSendLayer);
 }
 
@@ -100,13 +121,33 @@ size_t MemoryDesc::serializedSize(MemoryDesc const& memoryDesc)
 
 void AgentConnection::send(DataContext const& ctx, void const* data, size_t size) const
 {
-
+    //#####################################################################################################################
+    static const int TARGET_RANK = getEnvMpiDebugRank(); // -1 means all ranks.
+    if (TARGET_RANK == -1 || mpi::MpiComm::world().getRank() == TARGET_RANK)
+    {
+        std::cerr << "[Rank " << mpi::MpiComm::world().getRank() << "][AgentConnection::send] FUNCTION CALLED with size: " << size << ", offsetLayer: " << mSenderState.mOffsetRatio.first << ", selfSendLayer: " << mSenderState.mOffsetRatio.second << ", validSegmentIdx: " << mSenderState.validSegmentIdx << std::endl;
+        std::cerr << "[Rank " << mpi::MpiComm::world().getRank() << "][AgentConnection::send] Data pointer: " << data << ", Size: " << size << " bytes" << std::endl;
+        if (size >= sizeof(int8_t)) {
+            size_t numElements = size / sizeof(int8_t);
+            // Allocate temporary CPU buffer to copy GPU data
+            std::vector<int8_t> cpu_buffer(numElements);
+            // Copy data from GPU to CPU
+            TLLM_CUDA_CHECK(cudaMemcpy(cpu_buffer.data(), data, numElements * sizeof(int8_t), cudaMemcpyDeviceToHost));
+            std::cerr << "[Rank " << mpi::MpiComm::world().getRank() << "][AgentConnection::send] First " << numElements << " int8 values: ";
+            for (size_t i = 0; i < numElements; ++i) {
+                std::cerr << static_cast<int>(cpu_buffer[i]) << " ";
+            }
+            std::cerr << std::endl;
+        }
+    }
+    //#####################################################################################################################
     MemoryDesc srcDesc{
         reinterpret_cast<uintptr_t>(data), size, static_cast<uint32_t>(mAgentConnectionManager->getDeviceId())};
     MemoryDescs srcDescs{MemoryType::kVRAM, {srcDesc}};
     auto dstBaseDesc = mSenderState.mReceiverBufferDesc;
     auto offset = size / mSenderState.mOffsetRatio.second * mSenderState.mOffsetRatio.first;
     MemoryDesc dstDesc{dstBaseDesc.getAddr() + offset, size, dstBaseDesc.getDeviceId()};
+    std::cerr << "[Rank " << mpi::MpiComm::world().getRank() << "][AgentConnection::send] dstBaseDesc.getAddr(): " << dstBaseDesc.getAddr() << ", offset: " << offset << std::endl;
     TLLM_LOG_DEBUG(
         "send dstDesc: %p, size: %ld ,validSegmentIdx: %ld", dstDesc.getAddr(), size, mSenderState.validSegmentIdx);
     MemoryDescs dstDescs{MemoryType::kVRAM, {dstDesc}};
