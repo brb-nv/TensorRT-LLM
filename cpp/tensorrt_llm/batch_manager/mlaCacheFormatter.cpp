@@ -538,7 +538,6 @@ void MLACacheFormatter::unformat(TransferSession& session)
             // recvSplitCaches size == ppdomainsize * cpdomainsize.
             executor::kv_cache::concatKvCacheV2Dispatch(
                 recvSplitCaches, outputCachesPerWindow, destConfig, selfConfig, selfIdx, bufferManager);
-            bufferManager.getStream().synchronize();
         }
         bufferManager.getStream().synchronize();
     }
