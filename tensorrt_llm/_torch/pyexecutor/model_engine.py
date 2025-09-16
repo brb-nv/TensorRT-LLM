@@ -747,9 +747,11 @@ class PyTorchModelEngine(ModelEngine):
                         if spec_resource_manager is not None:
                             spec_resource_manager.free_resources(req)
 
+        # TODO: Update this to warmup helix attention.
         # TODO: current warmup_request is not suitable for star attention
         cp_type = self.mapping.cp_config.get('cp_type', None)
-        if cp_type == CpType.STAR:
+        if cp_type == CpType.STAR or cp_type == CpType.HELIX:
+            print("[KHUDA]: SKIP WARMUP FOR HELIX ATTENTION.")
             return
 
         if self._torch_compile_enabled:
@@ -2204,11 +2206,19 @@ class PyTorchModelEngine(ModelEngine):
             spec_metadata: Optional[SpecMetadata] = None,
             new_tensors_device: Optional[SampleStateTensors] = None,
             cache_indirection_buffer: Optional[torch.Tensor] = None):
+        print("[KHUDA]: CALL TO _prepare_inputs with cp_config: ", self.mapping.cp_config)
         if self.mapping is not None and 'cp_type' in self.mapping.cp_config:
             cp_type = self.mapping.cp_config['cp_type']
             if CpType.STAR == cp_type:
                 return self._prepare_star_attention_inputs(
                     scheduled_requests, kv_cache_manager, attn_metadata)
+            elif CpType.HELIX == cp_type:
+                # TODO: Update this to prepare helix attention inputs.
+                # return self._prepare_helix_attention_inputs(
+                #     scheduled_requests, kv_cache_manager, attn_metadata)
+                return self._prepare_tp_inputs(
+                    scheduled_requests, kv_cache_manager, attn_metadata, spec_metadata,
+                    new_tensors_device, cache_indirection_buffer)
             else:
                 assert False, f'Unsupport cp_type {cp_type}'
         else:

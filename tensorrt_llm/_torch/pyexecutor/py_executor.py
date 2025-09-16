@@ -1642,11 +1642,16 @@ class PyExecutor:
 
     @nvtx_range("_update_request_states")
     def _update_request_states(self, scheduled_requests: ScheduledRequests):
+        print("[KHUDA]: CALL TO _update_request_states with cp_config: ", self.dist.cp_config)
         cp_config = self.dist.cp_config
         if 'cp_type' in cp_config:
             cp_type = cp_config['cp_type']
             if cp_type == CpType.STAR:
                 self._update_request_states_star_attention(scheduled_requests)
+            elif cp_type == CpType.HELIX:
+                # TODO: Update this to update helix attention request states.
+                # self._update_request_states_helix_attention(scheduled_requests)
+                self._update_request_states_tp(scheduled_requests)
             else:
                 assert False, f'Unsupport cp_type {cp_type}'
         else:

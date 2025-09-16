@@ -132,7 +132,7 @@ class Mapping(object):
             gpus_per_node=8,
             *,
             cp_size=1,
-            cp_config=None,
+            cp_config={"cp_type": CpType.HELIX},
             tp_size=1,
             pp_size=1,
             moe_cluster_size=-1,  # -1 means no moe
@@ -149,6 +149,7 @@ class Mapping(object):
 
         cp_type = CpType.HELIX if cp_config is None else cp_config.get(
             "cp_type", CpType.HELIX)
+        assert cp_type == CpType.HELIX, "cp_type must be CpType.HELIX"
         moe_world_size = tp_size if cp_type == CpType.ULYSSES else tp_size * cp_size
 
         if moe_tp_size == -1 and moe_ep_size == -1:

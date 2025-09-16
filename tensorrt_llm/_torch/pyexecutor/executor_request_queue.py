@@ -599,6 +599,7 @@ class ExecutorRequestQueue:
     @nvtx_range("_merge_requests")
     def _merge_requests(
             self, new_requests: list[RequestQueueItem]) -> List[LlmRequest]:
+        print("[KHUDA]: CALL TO _merge_requests.")
         cp_config = self.dist.cp_config
         if 'cp_type' in cp_config:
             cp_type = cp_config['cp_type']
@@ -606,6 +607,18 @@ class ExecutorRequestQueue:
                 return self._merge_star_attention_requests(new_requests)
             elif cp_type == CpType.RING:
                 raise NotImplementedError("ring attention not implemented yet")
+            elif cp_type == CpType.HELIX:
+                # TODO: Update this to merge helix attention requests.
+                # return self._merge_helix_attention_requests(new_requests)
+                req_with_children = []
+                for req_item in new_requests:
+                    req = executor_request_to_llm_request(
+                        req_item.id, req_item.request, req_item.child_req_ids,
+                        self._should_exclude_last_generation_logits())
+                    req_with_children.append(req)
+                    if req.child_requests:
+                        req_with_children.extend(req.child_requests)
+                return req_with_children
             else:
                 raise NotImplementedError(f'unsupport cp type {cp_type}')
         else:

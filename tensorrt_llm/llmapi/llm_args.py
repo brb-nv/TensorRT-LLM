@@ -51,7 +51,7 @@ from ..bindings.executor import (BatchingType as _BatchingType,
 # yapf: enable
 from ..builder import BuildConfig, EngineConfig
 from ..logger import logger
-from ..mapping import Mapping
+from ..mapping import Mapping, CpType
 from ..models.automodel import AutoConfig
 from ..models.modeling_utils import (PretrainedConfig, QuantAlgo, QuantConfig,
                                      SpeculativeDecodingMode)
@@ -286,7 +286,8 @@ class _ParallelConfig:
                        tp_size=self.tp_size,
                        pp_size=self.pp_size,
                        cp_size=self.cp_size,
-                       cp_config=self.cp_config,
+                       # TODO: remove this after cp_config is supported.
+                       cp_config={"cp_type": CpType.HELIX},
                        enable_attention_dp=self.enable_attention_dp,
                        moe_cluster_size=self.moe_cluster_size,
                        moe_tp_size=self.moe_tp_size,
