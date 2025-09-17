@@ -957,7 +957,8 @@ class MLA(nn.Module):
                       k: torch.Tensor, v: torch.Tensor,
                       position_ids: torch.Tensor,
                       attn_metadata: AttentionMetadata, **kwargs):
-        if self.mapping.has_cp_helix():
+        # if self.mapping.has_cp_helix():
+        if self.mapping.cp_size > 1:
             # partial_o: [num_tokens, num_heads_tp * kv_lora_rank]
             # softmax_stats: [num_tokens, num_heads_tp, 2]
             softmax_stats = torch.empty(q.shape[0],
@@ -1144,8 +1145,9 @@ class MLA(nn.Module):
         # out_scale = getattr(self.o_proj, "inv_input_scale", None)
         out_scale = None  # Currently we use BF16 MHA for context phase
 
-        helix_position_offsets = position_ids if self.mapping.has_cp_helix(
-        ) else None
+        # helix_position_offsets = position_ids if self.mapping.has_cp_helix(
+        #     ) else None
+        helix_position_offsets = position_ids if self.mapping.cp_size > 1 else None
 
         attn_output = self.mha.forward(
             q,
@@ -1511,9 +1513,11 @@ class MLA(nn.Module):
         if self.v_b_proj.dtype == torch.bfloat16:
             # [num_heads, seq, kv_lora_rank] x [num_heads, kv_lora_rank, v_head_dim]
             # -> [num_heads, seq, v_head_dim]
-            torch.ops.trtllm.bmm_out(attn_out_latent.transpose(0, 1),
-                                     self.v_b_proj.transpose(1, 2),
-                                     attn_output.transpose(0, 1))
+            print("[WARNING][MLA::forward_generation] Skipping BMM for BFLOAT16. Update once weights are loaded properly.")
+            # print("[MLA] bmm_a.shape: ", attn_out_latent.transpose(0, 1).shape, " bmm_b.shape: ", self.v_b_proj.transpose(1, 2).shape, " bmm_out.shape: ", attn_output.transpose(0, 1).shape)
+            # torch.ops.trtllm.bmm_out(attn_out_latent.transpose(0, 1),
+            #                          self.v_b_proj.transpose(1, 2),
+            #                          attn_output.transpose(0, 1))
         elif self.v_b_proj.dtype == torch.float8_e4m3fn:
             fp8_block_scaling_bmm_out(
                 attn_out_latent,
@@ -1549,7 +1553,8 @@ class MLA(nn.Module):
                               attn_metadata,
                               output=attn_output,
                               latent_cache_gen=latent_cache_gen)
-        if self.mapping.has_cp_helix():
+        # if self.mapping.has_cp_helix():
+        if self.mapping.cp_size > 1:
             # note: for allowing testing Helix parallelism, we ensure that the output
             # is compatible with o_proj even in the context phase,
             # thus we cut it to num_heads_tp_cp * v_head_dim

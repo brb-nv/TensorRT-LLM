@@ -651,7 +651,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
             aux_stream=aux_stream_dict[AuxStreamType.Attention])
         self.enable_attention_dp = self.mapping.enable_attention_dp
 
-        self.is_p2p_supported = can_access_peer(mapping)
+        self.is_p2p_supported = can_access_peer(self.mapping)
         if self.mapping.has_cp_helix():
             # after attention, Helix CP GPUs become TP GPUs
             new_mapping = Mapping(
