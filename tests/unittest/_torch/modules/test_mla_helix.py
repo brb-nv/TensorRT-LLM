@@ -470,7 +470,7 @@ def _run_mla_distributed(rank: int, world_size: int, scenario: Scenario,
                     use_cache=True,
                     num_cached_tokens_per_seq=cached_tokens_per_seq,
                 ),
-                enable_paged_context_mla=True,
+                enable_context_mla_with_cached_kv=True,
             )
         else:
             attn_metadata.kv_cache_params = KVCacheParams(
@@ -668,7 +668,7 @@ def _full_test_multi_gpu(rank: int, world_size: int, scenario: Scenario,
                             for _ in range(scenario.batch)
                         ],
                     ),
-                    enable_paged_context_mla=True,
+                    enable_context_mla_with_cached_kv=True,
                 )
             else:
                 ref_attn_metadata.kv_cache_params = KVCacheParams(
