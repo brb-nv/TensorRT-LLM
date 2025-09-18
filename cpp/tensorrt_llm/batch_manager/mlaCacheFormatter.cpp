@@ -37,31 +37,6 @@
 namespace tensorrt_llm::batch_manager::kv_cache_manager
 {
 
-int getBlockNumAccountingForCP(int cpRank, int cpSize, int numTotalBlocks, bool strict)
-{
-    TLLM_CHECK(cpRank >= 0 && cpRank < cpSize);
-    if (cpSize == 1)
-    {
-        return numTotalBlocks;
-    }
-    // NOTE: Non-strict mode may over-allocate blocks when numTotalBlocks is not divisible by cpSize.
-    // This is a known limitation and will be addressed in a future MR.
-    if (!strict)
-    {
-        // Simple ceiling division.
-        return (numTotalBlocks + cpSize - 1) / cpSize;
-    }
-    // In strict mode, blocks are distributed among CP ranks in a round-robin fashion as evenly as possible.
-    // When the number of blocks is not divisible by cpSize, the remainder shall be distributed evenly among
-    // lowest-indexed CP ranks (let's call them overflow ranks).
-    int numBlocksCurrRank = numTotalBlocks / cpSize;
-    if (numTotalBlocks % cpSize > cpRank)
-    {
-        numBlocksCurrRank++;
-    }
-    return numBlocksCurrRank;
-}
-
 // some context rank in connection
 std::vector<size_t> MLACacheFormatter::pickRecvConnections(
     size_t numConnections, CacheState const& selfConfig, SizeType32 selfIdx, CacheState const& destConfig) const
@@ -191,7 +166,7 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
                 auto const idx = cpDomainIdx * pPDomainSize + ppDomainIdx;
                 // Note: contextCP is always 1. So, cpDomainSize == genCPSize and cpDomainIdx == genCPRank.
                 auto const peerBlockNum
-                    = getBlockNumAccountingForCP(cpDomainIdx, cPDomainSize, blockNum, /*strict=*/false);
+                    = executor::kv_cache::getBlockNumAccountingForCP(cpDomainIdx, cPDomainSize, blockNum, /*strict=*/false);
                 bufferSizeForTarget[idx] = blockSizePerLayer * peerAttentionLayerNum * peerBlockNum;
             }
         }
