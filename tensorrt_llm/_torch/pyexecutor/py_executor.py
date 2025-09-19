@@ -1029,7 +1029,7 @@ class PyExecutor:
                 if self.enable_iter_perf_stats:
                     iter_start_time = time.time()
 
-                scheduled_batch, iter_stats = self._prepare_and_schedule_batch()    # @B: Calls merge_requests().
+                scheduled_batch, iter_stats = self._prepare_and_schedule_batch()
                 if scheduled_batch is None:
                     break
 
@@ -1046,7 +1046,7 @@ class PyExecutor:
 
                         # Return the first token to the client
                         self._handle_first_token_response(scheduled_batch)
-                    self.resource_manager.prepare_resources(scheduled_batch)        # @B: Calls add_sequence().
+                    self.resource_manager.prepare_resources(scheduled_batch)
 
                     self._kv_connector_start_batch(scheduled_batch)
 
@@ -1076,14 +1076,14 @@ class PyExecutor:
                             if hasattr(self.drafter, "guided_decoder"):
                                 self.guided_decoder.rollback_draft_tokens()
 
-                    batch_outputs = self._forward_step(scheduled_batch)               # @B: Calls prepare_inputs().
+                    batch_outputs = self._forward_step(scheduled_batch)
                     if self.guided_decoder is not None:
                         self.guided_decoder.execute(batch_outputs['logits'])
 
                     sample_state = self._sample_async(scheduled_batch,
                                                       batch_outputs)
 
-                    self._update_request_states(scheduled_batch)                       # @B: Do we need to do something special for Helix?
+                    self._update_request_states(scheduled_batch)
                     self._update_requests(sample_state)
 
                     if self.kv_cache_transceiver:
@@ -1095,7 +1095,7 @@ class PyExecutor:
 
                     self._handle_canceled_requests()
                     finished_requests = self._handle_responses()
-                    self.resource_manager.update_resources(scheduled_batch)             # @B: Can we discard overallocated blocks here?
+                    self.resource_manager.update_resources(scheduled_batch)
                     if self.enable_kv_cache_events:
                         self._add_kv_cache_events()
 

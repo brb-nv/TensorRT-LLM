@@ -410,33 +410,22 @@ class KVCacheManager(BaseResourceManager):
         return need_blocks
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
-        print(f"[KVCacheManager::prepare_resources] scheduled_batch: {scheduled_batch}")
         with request_context(self.is_draft, scheduled_batch):
             context_batch = scheduled_batch.context_requests
             generation_batch = scheduled_batch.generation_requests
             # allocate KV Cache
             for req in context_batch:
-                print(f"[KVCacheManager::prepare_resources] context req: {req}")
                 req_beam_width = req.sampling_config.beam_width
-                if 'cp_type' in self.mapping.cp_config:
-                    if CpType.STAR == self.mapping.cp_config['cp_type']:
-                        if req.ctx_iters == 0:
-                            seq_len = sum(
-                                len(ctx_block) for ctx_block in req.ctx_blocks)
-                            self.impl.add_sequence(
-                                req.py_request_id,
-                                seq_len + (len(req.query_id) if self.mapping.cp_rank
-                                        == self.mapping.cp_size - 1 else 0),
-                                req_beam_width, req)
-                    elif CpType.HELIX == self.mapping.cp_config['cp_type']:
-                        # @B: Is this really needed if we already made changes to merge_requests()?
-                        # @B: Make sure this path is taken during disagg_gen_init.
-                        if req.ctx_iters == 0:
-                            seq_len = sum(
-                                len(ctx_block) for ctx_block in req.ctx_blocks)
-                            self.impl.add_sequence(req.py_request_id, seq_len, req_beam_width, req)
-                    else:
-                        assert False, f'Unsupport cp_type {self.mapping.cp_config["cp_type"]}'
+                if 'cp_type' in self.mapping.cp_config and CpType.STAR == self.mapping.cp_config[
+                        'cp_type']:
+                    if req.ctx_iters == 0:
+                        seq_len = sum(
+                            len(ctx_block) for ctx_block in req.ctx_blocks)
+                        self.impl.add_sequence(
+                            req.py_request_id,
+                            seq_len + (len(req.query_id) if self.mapping.cp_rank
+                                       == self.mapping.cp_size - 1 else 0),
+                            req_beam_width, req)
                 else:
                     if req.is_first_context_chunk and self._kv_connector_should_add_sequence(
                             req):
@@ -454,8 +443,6 @@ class KVCacheManager(BaseResourceManager):
                                 req, block_ids)
 
             for req in generation_batch:
-                # @B: Note that we're adding query token here on all KVP ranks. Need to rewind at the end of executor loop.
-                print(f"[KVCacheManager::prepare_resources] generation req: {req}")
                 self.impl.add_token(req.py_request_id)
                 for _ in range(get_draft_token_length(req)):
                     self.impl.add_token(req.py_request_id)
@@ -489,7 +476,6 @@ class KVCacheManager(BaseResourceManager):
         # occur.
         num_extra_decoding_steps: int = 0,
     ):
-        print(f"[KVCacheManager::add_dummy_requests] request_ids: {request_ids}, token_nums: {token_nums}, is_gen: {is_gen}")
         beam_width = max_beam_width
         requests = []
         for i, req_id in enumerate(request_ids):
