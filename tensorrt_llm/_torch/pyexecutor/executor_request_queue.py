@@ -596,24 +596,86 @@ class ExecutorRequestQueue:
                     self.new_active_requests_queue_latency_ms += now - self.start_times.pop(
                         child_id)
 
-    def _merge_helix_requests(self, new_requests: list[RequestQueueItem]):
-        # TODO unsure whether this is correct and even needed
-        def make_fake_data(req_item: RequestQueueItem):
-            # similar to _merge_star_attention_requests, we need fake data for scheduler
-            # we simply partition by cp_size
-            input_tokens = req_item.request.input_token_ids
-            tokens_per_rank = (len(input_tokens) + self.dist.cp_size -
-                               1) // self.dist.cp_size
-            tokens_this_rank_start = tokens_per_rank * self.dist.cp_rank
-            tokens_this_rank_end = min(tokens_this_rank_start + tokens_per_rank,
-                                       len(input_tokens))
-            return req_item.id, req_item.request, [0] * (tokens_this_rank_end -
-                                                         tokens_this_rank_start)
+    def _merge_helix_parallelism_requests(
+            self,
+            new_requests: list[RequestQueueItem],
+            num_tokens_per_block: int,
+            is_cp_dist_contiguous: bool = True) -> List[LlmRequest]:
+        result = []
+        for req_item in new_requests:
+            req_id, exe_req, query_token_ids = req_item.id, req_item.request, req_item.query
+            ctx_len0 = len(exe_req.input_token_ids)
+            # Note: All block information here is specific to this KVP rank.
+            ctx_blocks, position_blocks = self._partition_context_for_helix_parallelism(
+                exe_req.input_token_ids, num_tokens_per_block, is_cp_dist_contiguous)
 
-        return [
-            executor_request_to_llm_request(*make_fake_data(req_item))
-            for req_item in new_requests
-        ]
+            if is_cp_dist_contiguous:
+                # @B: What does it mean to have query token ids here? Will they not be always present?
+                if query_token_ids:
+                    ctx_blocks.append(query_token_ids)
+                    position_blocks.append([
+                        i for i in range(ctx_len0, ctx_len0 + len(query_token_ids))
+                    ])
+            else:
+                raise NotImplementedError("Round robin cp distribution not implemented yet.")
+
+            # @B: This may make things easier to manage in MLA kernels. Need to revisit.
+            # Insert dummy blocks on all KVP ranks such that the number of ctx iterations is the same for all ranks.
+            total_blocks = (ctx_len0 + num_tokens_per_block - 1) // num_tokens_per_block
+            # @B: Star attention has 1 extra block for query. Do we need that?
+            num_blocks_per_rank = (total_blocks + self.dist.cp_size - 1) // self.dist.cp_size
+            if len(ctx_blocks) == num_blocks_per_rank - 1:
+                # There are some overflow ranks and this KVP rank isn't one of them.
+                # Insert a dummy block at the end.
+                ctx_blocks.append([])
+                position_blocks.append([])
+            elif len(ctx_blocks) == num_blocks_per_rank:
+                # There are no overflow ranks or this KVP rank is not an overflow rank.
+                pass
+            else:
+                print(
+                    f'rank = {self.dist.cp_rank}, len(ctx_blocks)  = {len(ctx_blocks) }, num_blocks_per_rank = {num_blocks_per_rank}'
+                )
+                assert False, f'invalid context partition'
+
+            # @B: Do we need to set fake data for scheduler like star attention?
+            req = executor_request_to_llm_request(
+                request_id=req_id,
+                executor_request=exe_req,
+                child_req_ids=req_item.child_req_ids,
+                exclude_last_generation_logits=self._should_exclude_last_generation_logits())
+            # @B: Why set the following?
+            req.gen_iters = 0
+            req.ctx_iters = 0
+            req.ctx_blocks = ctx_blocks
+            req.ctx_position_blocks = position_blocks
+            req.query_id = query_token_ids
+
+            result.append(req)
+
+        return result
+
+
+    def _partition_context_for_helix_parallelism(self, ctx_ids_list, num_tokens_per_block: int, is_cp_dist_contiguous: bool = True):
+        if is_cp_dist_contiguous:
+            ctx_ids = torch.tensor(ctx_ids_list).unsqueeze(0)
+            position_ids = torch.arange(0, ctx_ids.shape[-1]).unsqueeze(0)
+
+            ctx_ids_blocks = torch.tensor_split(
+                torch.stack(ctx_ids.split(num_tokens_per_block, dim=-1)), self.dist.cp_size)
+            position_ids_blocks = torch.tensor_split(
+                torch.stack(position_ids.split(num_tokens_per_block, dim=-1)),
+                self.dist.cp_size)
+
+            ctx_blocks, position_blocks = [], []
+            for idx in range(len(ctx_ids_blocks[self.dist.cp_rank])):
+                ctx_block = ctx_ids_blocks[self.dist.cp_rank][idx]
+                position_block = position_ids_blocks[self.dist.cp_rank][idx]
+                ctx_blocks.append(ctx_block.tolist()[0])
+                position_blocks.append(position_block.tolist()[0])
+            return ctx_blocks, position_blocks
+        else:
+            raise NotImplementedError("Round robin cp distribution not implemented yet.")
 
     @nvtx_range("_merge_requests")
     def _merge_requests(
@@ -624,7 +686,7 @@ class ExecutorRequestQueue:
             if cp_type == CpType.STAR:
                 return self._merge_star_attention_requests(new_requests)
             elif cp_type == CpType.HELIX:
-                return self._merge_helix_requests(new_requests)
+                return self._merge_helix_parallelism_requests(new_requests)
             elif cp_type == CpType.RING:
                 raise NotImplementedError("ring attention not implemented yet")
             else:
@@ -649,7 +711,7 @@ class ExecutorRequestQueue:
             ctx_blocks, position_blocks, last_block_padding_num = [
                 exe_req.input_token_ids
             ], [[i for i in range(ctx_len0)]], 0
-            ctx_blocks, position_blocks, last_block_padding_num = self._partition_context(
+            ctx_blocks, position_blocks, last_block_padding_num = self._partition_context_for_star_attention(
                 exe_req.input_token_ids)
             if self.dist.cp_rank == self.dist.cp_size - 1 and last_block_padding_num > 0:
                 ctx_blocks[-1] = ctx_blocks[-1][:-last_block_padding_num]
@@ -697,7 +759,7 @@ class ExecutorRequestQueue:
 
         return result
 
-    def _partition_context(self, ctx_ids_list):
+    def _partition_context_for_star_attention(self, ctx_ids_list):
         ctx_ids = torch.tensor(ctx_ids_list).unsqueeze(0)
         ctx_len = ctx_ids.shape[-1]
         block_size = self.dist.cp_config['block_size']
