@@ -596,24 +596,48 @@ class ExecutorRequestQueue:
                     self.new_active_requests_queue_latency_ms += now - self.start_times.pop(
                         child_id)
 
-    def _merge_helix_requests(self, new_requests: list[RequestQueueItem]):
-        # TODO unsure whether this is correct and even needed
-        def make_fake_data(req_item: RequestQueueItem):
-            # similar to _merge_star_attention_requests, we need fake data for scheduler
-            # we simply partition by cp_size
-            input_tokens = req_item.request.input_token_ids
-            tokens_per_rank = (len(input_tokens) + self.dist.cp_size -
-                               1) // self.dist.cp_size
-            tokens_this_rank_start = tokens_per_rank * self.dist.cp_rank
-            tokens_this_rank_end = min(tokens_this_rank_start + tokens_per_rank,
-                                       len(input_tokens))
-            return req_item.id, req_item.request, [0] * (tokens_this_rank_end -
-                                                         tokens_this_rank_start)
+    def _merge_helix_requests(self, new_requests: list[RequestQueueItem], num_tokens_per_block: int):
+        req_with_children = []
+        num_cp_ranks = self.dist.cp_size
+        curr_cp_rank = self.dist.cp_rank
+        for req_item in new_requests:
 
-        return [
-            executor_request_to_llm_request(*make_fake_data(req_item))
-            for req_item in new_requests
-        ]
+            all_input_ids = torch.tensor(req_item.request.input_token_ids, dtype=torch.int64).unsqueeze(0)
+            input_len = all_input_ids.shape[-1]
+
+            # Pad to make sure torch.stack used with torch.tensor_split works properly.
+            if input_len < num_tokens_per_block * num_cp_ranks:
+                # There aren't enough tokens to get at least one block per CP rank.
+                padding_len = num_tokens_per_block * num_cp_ranks - input_len
+            else:
+                # Only last block on last CP rank will be padded.
+                padding_len = num_tokens_per_block - (input_len % num_tokens_per_block)
+            padding_ids = torch.zeros([1, padding_len], dtype=torch.int64)
+            all_input_ids = torch.cat((all_input_ids, padding_ids), dim=-1)
+            all_position_ids = torch.arange(0, input_len + padding_len, dtype=torch.int64).unsqueeze(0)
+
+            # TODO: Undo the padding after tensor_split based on how we want to deal with pseudo tokens.
+            input_id_blocks_per_rank = torch.tensor_split(
+                torch.stack(all_input_ids.split(num_tokens_per_block, dim=-1)), num_cp_ranks)
+            position_id_blocks_per_rank = torch.tensor_split(
+                torch.stack(all_position_ids.split(num_tokens_per_block, dim=-1)),
+                num_cp_ranks)
+
+            # Get the ctx_blocks and position_blocks for this rank.
+            input_ids_this_rank = input_id_blocks_per_rank[curr_cp_rank].flatten().tolist()
+            position_ids_this_rank = position_id_blocks_per_rank[curr_cp_rank].flatten().tolist()
+
+            # TODO: Figure how to pass down position_ids_this_rank to LLMRequest.
+            req = executor_request_to_llm_request(
+                req_id=req_item.id,
+                executor_request=req_item.request,
+                child_req_ids=req_item.child_req_ids,
+                exclude_last_generation_logits=self._should_exclude_last_generation_logits(),
+                input_token_ids=input_ids_this_rank)
+            req_with_children.append(req)
+            if req.child_requests:
+                req_with_children.extend(req.child_requests)
+            return req_with_children
 
     @nvtx_range("_merge_requests")
     def _merge_requests(
