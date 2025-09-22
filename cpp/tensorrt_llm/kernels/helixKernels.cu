@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/kernels/helixKernels.h"
 
 #include <cstdint>
@@ -36,8 +37,7 @@ static constexpr int WARP_SIZE = 32;
 
 // Utility: warp-level corrected sum
 template <int N>
-__device__ inline void warpReduceCorrectedSum(
-    float (&correctedVal)[N], float (&maxVal)[N], float (&sumVal)[N], float scale)
+__device__ inline void warpReduceCorrectedSum(float (&correctedVal)[N], float (&maxVal)[N], float (&sumVal)[N])
 {
     float warp_max = maxVal[0];
 #pragma unroll
@@ -55,7 +55,7 @@ __device__ inline void warpReduceCorrectedSum(
 #pragma unroll
     for (int nn = 0; nn < N; ++nn)
     {
-        corrected_max_exp[nn] = sumVal[nn] * expf((maxVal[nn] - warp_max) * scale);
+        corrected_max_exp[nn] = sumVal[nn] * expf(maxVal[nn] - warp_max);
         global_sum += corrected_max_exp[nn];
     }
 #pragma unroll
@@ -80,7 +80,7 @@ static constexpr int NUM_PRE_LOAD = 8;
 // which may have longer latency
 template <typename T>
 __global__ void helix_postprocess_kernel(
-    T* output, T const* gathered_o, float2 const* gathered_stats, int cp_size, int kv_lora_rank, float scale)
+    T* output, T const* gathered_o, float2 const* gathered_stats, int cp_size, int kv_lora_rank)
 {
     // Each block processes one (token, head)
     // gridDim.x: num_tokens, gridDim.y: num_heads
@@ -100,6 +100,11 @@ __global__ void helix_postprocess_kernel(
 
     int lane_idx = threadIdx.x % WARP_SIZE;
     int warp_idx = __shfl_sync(0xffffffff, threadIdx.x / WARP_SIZE, 0);
+    // here we have to wait for memory operations of the previous kernel to complete
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    cudaGridDependencySynchronize();
+#endif
+
     if (warp_idx == 0)
     {
         // the warp collectively calculates the correction values
@@ -115,7 +120,7 @@ __global__ void helix_postprocess_kernel(
             sum_values[cp_val_idx] = stats.y;
         }
         float corrected_values[MAX_CP_VAL_PER_THREAD];
-        warpReduceCorrectedSum(corrected_values, max_values, sum_values, scale);
+        warpReduceCorrectedSum(corrected_values, max_values, sum_values);
 #pragma unroll
         for (int cp_val_idx = 0; cp_val_idx < MAX_CP_VAL_PER_THREAD; ++cp_val_idx)
         {
@@ -213,10 +218,19 @@ void helixPostProcess(HelixPostProcParams<T> const& params, cudaStream_t stream)
     // Check that cp_size is not larger than the max fallback CP size
     TLLM_CHECK_WITH_INFO(params.cp_size <= MAX_CP, "cp_size > fallback max CP size");
 
-    int threads = WARP_SIZE + params.kv_lora_rank * sizeof(T) / 16;
-    dim3 grid(params.num_tokens, params.num_heads);
-    helix_postprocess_kernel<T><<<grid, threads, 0, stream>>>(
-        params.output, params.gathered_o, params.gathered_stats, params.cp_size, params.kv_lora_rank, params.scale);
+    auto* kernel_instance = &helix_postprocess_kernel<T>;
+    cudaLaunchConfig_t config;
+    config.gridDim = dim3(params.num_tokens, params.num_heads);
+    config.blockDim = WARP_SIZE + params.kv_lora_rank * sizeof(T) / 16;
+    config.dynamicSmemBytes = 0;
+    config.stream = stream;
+    cudaLaunchAttribute attrs[1];
+    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
+    config.numAttrs = 1;
+    config.attrs = attrs;
+    TLLM_CUDA_CHECK(cudaLaunchKernelEx(&config, kernel_instance, params.output, params.gathered_o,
+        params.gathered_stats, params.cp_size, params.kv_lora_rank));
 }
 
 #define INSTANTIATE_POST_PROC(T)                                                                                       \

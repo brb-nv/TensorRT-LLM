@@ -73,7 +73,7 @@ torch::Tensor helix_post_process(torch::Tensor const& gathered_o, torch::Tensor 
     tensorrt_llm::kernels::HelixPostProcParams<T> params{reinterpret_cast<T*>(output.mutable_data_ptr()),              \
         reinterpret_cast<T const*>(gathered_o.data_ptr()), reinterpret_cast<float2 const*>(gathered_stats.data_ptr()), \
         static_cast<int>(cp_size), static_cast<int>(num_tokens), static_cast<int>(num_heads),                          \
-        static_cast<int>(kv_lora_rank), static_cast<float>(scale)};                                                    \
+        static_cast<int>(kv_lora_rank)};                                                                               \
     tensorrt_llm::kernels::helixPostProcess(params, stream);
 
     if (gathered_o.scalar_type() == at::ScalarType::Half)
@@ -87,6 +87,11 @@ torch::Tensor helix_post_process(torch::Tensor const& gathered_o, torch::Tensor 
 #else
         TLLM_THROW("BFloat16 must be enabled to use helix_post_process with bf16 tensors.");
 #endif
+    }
+
+    if (scale != 1.0)
+    {
+        output *= scale;
     }
 
     return output;

@@ -37,7 +37,6 @@ struct HelixPostProcParams
     int num_tokens;
     int num_heads;
     int kv_lora_rank;
-    float scale;
 };
 
 template <typename T>

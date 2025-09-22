@@ -278,23 +278,24 @@ def _generate_random_weights(layer: DeepseekV3DecoderLayer):
 
     mla = layer.self_attn
     # Linear modules
-    for name in ["fused_a", "kv_b_proj", "o_proj", "q_b_proj"]:
-        init_linear(getattr(mla, name, None))
+    for name in ["kv_a_proj_with_mqa", "kv_b_proj", "o_proj", "q_b_proj"]:
+        init_linear(getattr(mla, name))
 
     # RMSNorm modules
     for name in ["kv_a_layernorm", "q_a_layernorm"]:
-        mod = getattr(mla, name, None)
-        if mod is not None and hasattr(mod, "weight"):
+        if name == "q_a_layernorm":
+            mod = getattr(mla, name, None)
+        else:
+            mod = getattr(mla, name)
+        if mod is not None:
             init_uniform(mod.weight, a=0.9, b=1.1)
 
     # k_b_proj_trans (created in create_weights)
-    if hasattr(mla, "k_b_proj_trans"):
-        init_uniform(mla.k_b_proj_trans, use_kaiming=True)
+    init_uniform(mla.k_b_proj_trans, use_kaiming=True)
     # k_b_proj_trans_scale (optional)
     if hasattr(mla, "k_b_proj_trans_scale"):
         init_block_scale(mla.k_b_proj_trans_scale, mla.k_b_proj_trans)
-    if hasattr(mla, "v_b_proj"):
-        init_uniform(mla.v_b_proj)
+    init_uniform(mla.v_b_proj)
     # v_b_proj_scale (optional)
     if hasattr(mla, "v_b_proj_scale"):
         init_block_scale(mla.v_b_proj_scale, mla.v_b_proj)

@@ -12,7 +12,7 @@ from tensorrt_llm.mapping import Mapping
 from ..attention_backend import (AttentionInputType, AttentionMetadata,
                                  FlashInferAttentionMetadata, TrtllmAttention,
                                  TrtllmAttentionMetadata)
-from ..attention_backend.interface import (AttentionMask, AttentionBackend,
+from ..attention_backend.interface import (AttentionBackend, AttentionMask,
                                            PositionalEmbeddingParams,
                                            PredefinedAttentionMask)
 from ..attention_backend.utils import create_attention, get_attention_backend
@@ -567,7 +567,11 @@ def mla_custom_op_inplace(
     latent_cache_gen: Optional[torch.Tensor],
 ) -> None:
     metadata, mla_layer = extract_extra_attrs(layer_idx, "mla")
-    mla_layer.forward_impl(position_ids, hidden_states, metadata, output=output, latent_cache_gen=latent_cache_gen)
+    mla_layer.forward_impl(position_ids,
+                           hidden_states,
+                           metadata,
+                           output=output,
+                           latent_cache_gen=latent_cache_gen)
 
 
 def fp8_block_scaling_bmm_out(
@@ -987,14 +991,8 @@ class MLA(nn.Module):
                 dims=[-1, 1],
                 new_dims=[0, 0],
             )
-            # TODO we need to apply the right scaling here until tllm-gen kernels
-            # are updated to output the correct softmax stats
-            max_scale = 1.0 / (
-                self.q_scaling *
-                math.sqrt(self.qk_nope_head_dim + self.qk_rope_head_dim))
             return torch.ops.trtllm.helix_post_process(gathered_o,
-                                                       gathered_stats,
-                                                       max_scale)
+                                                       gathered_stats, 1.0)
         else:
             attn_output = attn_instance.forward(q, k, v, attn_metadata,
                                                 **kwargs)
@@ -1011,7 +1009,8 @@ class MLA(nn.Module):
         return hidden_states.new_empty([num_tokens, hidden_size],
                                        dtype=hidden_states.dtype)
 
-    def forward_impl(self, position_ids: Optional[torch.Tensor],
+    def forward_impl(self,
+                     position_ids: Optional[torch.Tensor],
                      hidden_states: torch.Tensor,
                      attn_metadata: AttentionMetadata,
                      output: torch.Tensor,
@@ -1301,7 +1300,8 @@ class MLA(nn.Module):
                                                  self.qk_nope_head_dim)
             chunked_k_pe = chunked_k_pe.view(-1, 1, self.qk_rope_head_dim)
             chunked_k = torch.cat(
-                (chunked_k_nope, chunked_k_pe.expand(-1, self.num_heads_tp, -1)),
+                (chunked_k_nope, chunked_k_pe.expand(-1, self.num_heads_tp,
+                                                     -1)),
                 dim=-1)
             chunked_k = chunked_k.view(-1, self.num_heads_tp * self.qk_head_dim)
 
@@ -1421,7 +1421,8 @@ class MLA(nn.Module):
                 return self.forward_context_with_cached_kv(
                     q, latent_cache, attn_metadata, output)
         return self.forward_context_default(q, compressed_kv, k_pe,
-                                            position_ids, attn_metadata, output, latent_cache)
+                                            position_ids, attn_metadata, output,
+                                            latent_cache)
 
     def forward_generation(
         self,
@@ -1508,16 +1509,15 @@ class MLA(nn.Module):
         attn_out_latent = attn_out_latent.view(
             [-1, self.num_heads_tp_cp, self.kv_lora_rank])
 
-        attn_output = output.view([num_tokens, self.num_heads_tp_cp, self.v_head_dim])
+        attn_output = output.view(
+            [num_tokens, self.num_heads_tp_cp, self.v_head_dim])
 
         if self.v_b_proj.dtype == torch.bfloat16:
             # [num_heads, seq, kv_lora_rank] x [num_heads, kv_lora_rank, v_head_dim]
             # -> [num_heads, seq, v_head_dim]
-            print("[WARNING][MLA::forward_generation] Skipping BMM for BFLOAT16. Update once weights are loaded properly.")
-            # print("[MLA] bmm_a.shape: ", attn_out_latent.transpose(0, 1).shape, " bmm_b.shape: ", self.v_b_proj.transpose(1, 2).shape, " bmm_out.shape: ", attn_output.transpose(0, 1).shape)
-            # torch.ops.trtllm.bmm_out(attn_out_latent.transpose(0, 1),
-            #                          self.v_b_proj.transpose(1, 2),
-            #                          attn_output.transpose(0, 1))
+            torch.ops.trtllm.bmm_out(attn_out_latent.transpose(0, 1),
+                                     self.v_b_proj.transpose(1, 2),
+                                     attn_output.transpose(0, 1))
         elif self.v_b_proj.dtype == torch.float8_e4m3fn:
             fp8_block_scaling_bmm_out(
                 attn_out_latent,

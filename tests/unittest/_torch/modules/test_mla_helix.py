@@ -4,6 +4,7 @@ import time
 import traceback
 import weakref
 from dataclasses import dataclass
+from functools import partial
 from typing import List, Optional
 
 import cloudpickle
@@ -208,56 +209,92 @@ def _setup_kv_and_metadata(scenario: Scenario, mapping: Mapping,
 
 
 def _generate_random_weights(mla: MLA):
-    # Helper to init a tensor
+    # Helpers to init a tensor
+    def init_low_precision(t, op):
+        if t.dtype.itemsize <= 1:
+            t2 = torch.empty_like(t, dtype=torch.float32)
+            op(t2)
+            t.copy_(t2)
+        else:
+            op(t)
+
     def init_uniform(tensor, a=-1.0, b=1.0, use_kaiming=False):
         if tensor is not None:
             if use_kaiming:
                 tv = tensor.view(-1, tensor.shape[-2], tensor.shape[-1])
                 for t in tv:
-                    torch.nn.init.kaiming_uniform_(t)
+                    init_low_precision(t, torch.nn.init.kaiming_uniform_)
             else:
-                torch.nn.init.uniform_(tensor, a=a, b=b)
+                init_low_precision(tensor,
+                                   partial(torch.nn.init.uniform_, a=a, b=b))
 
     def init_block_scale(tensor, orig_tensor):
         if tensor is None or orig_tensor is None:
             return
-        x = orig_tensor.view(*orig_tensor.shape[:-2],
-                             orig_tensor.shape[-2] // 128, 128,
-                             orig_tensor.shape[-1] // 128, 128)
+        b1, b2 = 128, 128
+        orig_tensor = orig_tensor.contiguous().to(tensor.dtype)
+        exp1 = (orig_tensor.shape[-2] + b1 - 1) // b1
+        exp2 = (orig_tensor.shape[-1] + b2 - 1) // b2
+        if tensor.shape[-2] != exp1 or tensor.shape[-1] != exp2:
+            # for some fused weights, this can happen
+            # we simply adapt the size of the blocks and use that for the scale
+            b1 = (orig_tensor.shape[-2] + tensor.shape[-2] -
+                  1) // tensor.shape[-2]
+            b2 = (orig_tensor.shape[-1] + tensor.shape[-1] -
+                  1) // tensor.shape[-1]
+        e1 = orig_tensor.shape[-2] // b1
+        e2 = orig_tensor.shape[-1] // b2
+        x = orig_tensor[..., :e1 * b1, :e2 * b2].view(*orig_tensor.shape[:-2],
+                                                      e1, b1, e2, b2)
         scale = x.abs().amax(dim=(-3, -1)) / 448.
-        tensor.fill_(scale)
+        if e1 * b1 != orig_tensor.shape[-2]:
+            x2 = orig_tensor[...,
+                             e1 * b1:, :e2 * b2].view(*orig_tensor.shape[:-2],
+                                                      1, -1, e2, b2)
+            scale2 = x2.abs().amax(dim=(-3, -1)) / 448.
+            scale = torch.cat([scale, scale2], dim=-2)
+        if e2 * b2 != orig_tensor.shape[-1]:
+            x3 = orig_tensor[..., :e1 * b1,
+                             e2 * b2:].view(*orig_tensor.shape[:-2], e1, b1, 1,
+                                            -1)
+            scale3 = x3.abs().amax(dim=(-3, -1)) / 448.
+            if scale.shape[-2] == e1 + 1:
+                x4 = orig_tensor[..., e1 * b1:,
+                                 e2 * b2:].view(*orig_tensor.shape[:-2], 1, -1,
+                                                1, -1)
+                scale4 = x4.abs().amax(dim=(-3, -1)) / 448.
+                scale3 = torch.cat([scale3, scale4], dim=-2)
+            scale = torch.cat([scale, scale3], dim=-1)
+        tensor.copy_(scale)
+
+    def init_linear(mod):
+        if mod is None:
+            return
+        init_uniform(mod.weight, use_kaiming=True)
+        if hasattr(mod, "weight_scale"):
+            init_block_scale(mod.weight_scale, mod.weight)
+        if hasattr(mod, "bias"):
+            init_uniform(mod.bias)
 
     # Linear modules
-    for name in ["fused_a", "kv_b_proj", "o_proj"]:
-        mod = getattr(mla, name, None)
-        if mod is not None:
-            init_uniform(mod.weight, use_kaiming=True)
-            if hasattr(mod, "bias"):
-                init_uniform(mod.bias)
-
-    if hasattr(mla, "v_b_proj"):
-        init_uniform(mla.v_b_proj)
+    for name in ["kv_a_proj_with_mqa", "q_b_proj", "kv_b_proj", "o_proj"]:
+        init_linear(getattr(mla, name))
 
     # RMSNorm modules
     for name in ["kv_a_layernorm", "q_a_layernorm"]:
-        mod = getattr(mla, name, None)
+        if name == "q_a_layernorm":
+            mod = getattr(mla, name, None)
+        else:
+            mod = getattr(mla, name)
         if mod is not None and hasattr(mod, "weight"):
             init_uniform(mod.weight, a=0.9, b=1.1)
 
-    # q_b_proj and q_proj (q_proj only in lite mode, aliased as q_b_proj)
-    for name in ["q_b_proj", "q_proj"]:
-        mod = getattr(mla, name, None)
-        if mod is not None:
-            init_uniform(mod.weight, use_kaiming=True)
-            if hasattr(mod, "bias"):
-                init_uniform(mod.bias)
-
     # k_b_proj_trans (created in create_weights)
-    if hasattr(mla, "k_b_proj_trans"):
-        init_uniform(mla.k_b_proj_trans, use_kaiming=True)
+    init_uniform(mla.k_b_proj_trans, use_kaiming=True)
     # k_b_proj_trans_scale (optional)
     if hasattr(mla, "k_b_proj_trans_scale"):
         init_block_scale(mla.k_b_proj_trans_scale, mla.k_b_proj_trans)
+    init_uniform(mla.v_b_proj)
     # v_b_proj_scale (optional)
     if hasattr(mla, "v_b_proj_scale"):
         init_block_scale(mla.v_b_proj_scale, mla.v_b_proj)
