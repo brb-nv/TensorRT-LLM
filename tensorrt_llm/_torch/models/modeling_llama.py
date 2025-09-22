@@ -947,6 +947,9 @@ class LlamaModel(DecoderModel):
         lora_params=None,
         **kwargs,
     ) -> torch.Tensor:
+        print(f"[LlamaModel::forward] input_ids: \n{input_ids}")
+        print(f"[LlamaModel::forward] position_ids: \n{position_ids}")
+        print(f"[LlamaModel::forward] attn_metadata: \n{attn_metadata}")
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError(
                 "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"

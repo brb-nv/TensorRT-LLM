@@ -1496,6 +1496,7 @@ class PyExecutor:
 
         for req in scheduled_batch.generation_requests:
             if req.is_disagg_generation_transmission_complete:
+                print("[PyExecutor::_prepare_disagg_gen_transmission_complete]: TRANSMISSION COMPLETE for request ID: ", req.py_request_id)
                 req.state = LlmRequestState.GENERATION_IN_PROGRESS
                 req.context_current_position = req.prompt_len
                 req.decoding_iter = 1
@@ -1505,6 +1506,7 @@ class PyExecutor:
                 req.py_draft_tokens = [] if ctx_draft_tokens is None else ctx_draft_tokens
                 beam_width = req.sampling_config.beam_width
                 for beam in range(0, beam_width):
+                    print(f"[PyExecutor::_prepare_disagg_gen_transmission_complete]: Adding new token {first_gen_tokens[beam]} for beam {beam}.")
                     req.add_new_token(first_gen_tokens[beam], beam)
 
     @nvtx_range("_recv_disagg_gen_cache")

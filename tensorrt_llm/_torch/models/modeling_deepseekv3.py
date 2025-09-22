@@ -1238,6 +1238,9 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
         return_context_logits: bool = False,
         **kwargs,
     ) -> torch.Tensor:
+        print(f"[DeepseekV3ForCausalLM::forward] input_ids: \n{input_ids}")
+        print(f"[DeepseekV3ForCausalLM::forward] position_ids: \n{position_ids}")
+        print(f"[DeepseekV3ForCausalLM::forward] attn_metadata: \n{attn_metadata}")
         return super().forward(attn_metadata=attn_metadata,
                                input_ids=input_ids,
                                position_ids=position_ids,

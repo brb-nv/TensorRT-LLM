@@ -753,6 +753,7 @@ class PyTorchModelEngine(ModelEngine):
         # mainly, the dummy requests need to be split across KVP ranks for Helix
         cp_type = self.mapping.cp_config.get('cp_type', None)
         if cp_type is not None:
+            print("[ModelEngine::warmup] EARLY RETURN since cp_type is not None. cp_type: ", cp_type)
             return
 
         if self._torch_compile_enabled:

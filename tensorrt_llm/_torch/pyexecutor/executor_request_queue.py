@@ -639,7 +639,8 @@ class ExecutorRequestQueue:
                 executor_request=req_item.request,
                 child_req_ids=req_item.child_req_ids,
                 exclude_last_generation_logits=self._should_exclude_last_generation_logits(),
-                input_token_ids=input_ids_this_rank)
+                input_token_ids=input_ids_this_rank,
+                position_ids=position_ids_this_rank)
             req_with_children.append(req)
             if req.child_requests:
                 req_with_children.extend(req.child_requests)
