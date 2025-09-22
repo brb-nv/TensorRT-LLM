@@ -1464,9 +1464,6 @@ class PyTorchModelEngine(ModelEngine):
                     # We're treating the prompt lengths as context requests here, so
                     # the the prompt lens should not include the cached tokens.
                     prompt_lengths.append(1 + num_draft_tokens)
-                elif self.mapping.has_cp_helix():
-                    prompt_lengths.append(
-                        self._get_helix_prompt_length(request))
                 else:
                     prompt_lengths.append(request.py_prompt_len)
 
@@ -1515,9 +1512,6 @@ class PyTorchModelEngine(ModelEngine):
                 if self.enable_spec_decode and spec_config.spec_dec_mode.extend_ctx(
                         self.attn_backend):
                     prompt_lengths.append(1 + self.runtime_draft_len)
-                elif self.mapping.has_cp_helix():
-                    prompt_lengths.append(
-                        self._get_helix_prompt_length(request))
                 else:
                     prompt_lengths.append(request.py_prompt_len)
 
@@ -1546,10 +1540,7 @@ class PyTorchModelEngine(ModelEngine):
 
                 position_ids.append(past_seen_token_num)
                 num_cached_tokens_per_seq.append(past_seen_token_num)
-                if self.mapping.has_cp_helix():
-                    prompt_lengths.append(self._get_helix_prompt_length(request))
-                else:
-                    prompt_lengths.append(request.py_prompt_len)
+                prompt_lengths.append(request.py_prompt_len)
                 draft_lens.append(0)
                 sequence_lengths.append(1)
                 gather_ids.append(len(position_ids) - 1)
