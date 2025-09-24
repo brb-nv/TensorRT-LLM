@@ -604,20 +604,22 @@ class ExecutorRequestQueue:
             cp_type = cp_config['cp_type']
             if cp_type == CpType.STAR:
                 return self._merge_star_attention_requests(new_requests)
-            elif cp_type == CpType.RING:
-                raise NotImplementedError("ring attention not implemented yet")
+            elif cp_type == CpType.HELIX:
+                # Take the usual route below.
+                pass
             else:
-                raise NotImplementedError(f'unsupport cp type {cp_type}')
-        else:
-            req_with_children = []
-            for req_item in new_requests:
-                req = executor_request_to_llm_request(
-                    req_item.id, req_item.request, req_item.child_req_ids,
-                    self._should_exclude_last_generation_logits())
-                req_with_children.append(req)
-                if req.child_requests:
-                    req_with_children.extend(req.child_requests)
-            return req_with_children
+                raise NotImplementedError(
+                    f'Unsupported cp type {cp_type.name}.')
+
+        req_with_children = []
+        for req_item in new_requests:
+            req = executor_request_to_llm_request(
+                req_item.id, req_item.request, req_item.child_req_ids,
+                self._should_exclude_last_generation_logits())
+            req_with_children.append(req)
+            if req.child_requests:
+                req_with_children.extend(req.child_requests)
+        return req_with_children
 
     def _merge_star_attention_requests(
             self, new_requests: list[RequestQueueItem]) -> List[LlmRequest]:

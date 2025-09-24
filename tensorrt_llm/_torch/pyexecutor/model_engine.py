@@ -2309,13 +2309,16 @@ class PyTorchModelEngine(ModelEngine):
             if CpType.STAR == cp_type:
                 return self._prepare_star_attention_inputs(
                     scheduled_requests, kv_cache_manager, attn_metadata)
+            elif CpType.HELIX == cp_type:
+                # Take the usual route of _prepare_tp_inputs.
+                pass
             else:
-                assert False, f'Unsupport cp_type {cp_type}'
-        else:
-            return self._prepare_tp_inputs(scheduled_requests, kv_cache_manager,
-                                           attn_metadata, spec_metadata,
-                                           new_tensors_device,
-                                           cache_indirection_buffer)
+                assert False, f'Unsupported cp_type {cp_type.name}.'
+
+        return self._prepare_tp_inputs(scheduled_requests, kv_cache_manager,
+                                       attn_metadata, spec_metadata,
+                                       new_tensors_device,
+                                       cache_indirection_buffer)
 
     @torch.inference_mode()
     @with_model_extra_attrs(lambda self: self.model.extra_attrs)

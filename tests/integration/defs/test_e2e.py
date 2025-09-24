@@ -3474,3 +3474,525 @@ def test_llmapi_generation_logits(llm_venv, model_path,
     # Run the async test
     loop = asyncio.get_event_loop()
     loop.run_until_complete(async_generation_test())
+
+
+@pytest.mark.skip_less_device(2)
+@pytest.mark.skip_less_device_memory(40000)
+def test_deepseekv3_lite_mla_identity_tp_vs_cp_helix(llm_venv):
+    """
+    Test that verifies DeepseekV3ForCausalLM forward behavior across parallelism strategies.
+
+    This test:
+    1. Uses DeepseekV3 lite model with MLA attention
+    2. Mocks the entire DeepseekV3ForCausalLM.forward() method to capture inputs and return deterministic outputs
+    3. Runs generation with tp_size=2 and captures all forward call inputs
+    4. Runs generation with cp_size=2 using helix strategy and captures all forward call inputs
+    5. Verifies that inputs (input_ids, position_ids) are identical on each step between both configurations
+    6. Verifies outputs match exactly between both configurations
+
+    This validates that different parallelism strategies receive identical inputs and
+    produce identical outputs when the model forward pass is deterministic.
+    """
+    import asyncio
+    from unittest.mock import patch
+
+    import torch
+
+    from tensorrt_llm import LLM, SamplingParams
+    from tensorrt_llm.mapping import CpType
+
+    # Model configuration
+    model_path = f"{llm_models_root()}/DeepSeek-V3-Lite/bf16"
+
+    # Simple test prompt for reproducible results
+    prompt_tokens = [
+        128000,
+        128006,
+        9125,
+        128007,
+        271,  # System message start
+        3923,
+        374,
+        701,
+        836,
+        30,  # "What is your name?"
+        128009,
+        128006,
+        78191,
+        128007,
+        271  # Assistant response start
+    ]
+
+    # Deterministic sampling for exact comparison
+    sampling_config = SamplingParams(
+        max_tokens=10,
+        temperature=0.0,
+        top_p=1.0,
+        top_k=1,
+        return_context_logits=False,
+        return_generation_logits=False,
+    )
+
+    # Base LLM configuration
+    base_config = {
+        "model": model_path,
+        "tokenizer": model_path,
+        "max_seq_len": 1024,
+        "enable_chunked_prefill": False,
+        "load_format":
+        "dummy",  # Skip loading weights since we mock the forward method
+        "kv_cache_config": {
+            "enable_block_reuse": False,
+            "free_gpu_memory_fraction": 0.7,
+        },
+        "cuda_graph_config": {
+            "batch_sizes": [1, 2]
+        },
+    }
+
+    # Storage for captured inputs across both runs
+    tp_captured_calls = []
+    cp_captured_calls = []
+
+    def create_mock_forward(call_storage):
+        """Create a mock forward function that captures inputs and returns dummy logits."""
+
+        def mock_forward(self,
+                         attn_metadata,
+                         input_ids=None,
+                         position_ids=None,
+                         inputs_embeds=None,
+                         return_context_logits=False,
+                         spec_metadata=None,
+                         **kwargs):
+            """Mock DeepseekV3ForCausalLM forward that captures inputs and returns predictable logits."""
+            # Capture the call details
+            call_info = {
+                'step':
+                len(call_storage),
+                'input_ids':
+                input_ids.clone() if input_ids is not None else None,
+                'position_ids':
+                position_ids.clone() if position_ids is not None else None,
+                'inputs_embeds_shape':
+                inputs_embeds.shape if inputs_embeds is not None else None,
+                'batch_size':
+                attn_metadata.batch_size
+                if hasattr(attn_metadata, 'batch_size') else None,
+                'max_seq_len':
+                attn_metadata.max_seq_len
+                if hasattr(attn_metadata, 'max_seq_len') else None,
+            }
+            call_storage.append(call_info)
+
+            # Determine output shape - need to return logits over vocabulary
+            if input_ids is not None:
+                batch_size, seq_len = input_ids.shape
+            elif inputs_embeds is not None:
+                batch_size, seq_len = inputs_embeds.shape[:2]
+            else:
+                raise ValueError(
+                    "Either input_ids or inputs_embeds must be provided")
+
+            # Get vocab size from the model
+            vocab_size = self.lm_head.vocab_size_padded
+
+            # Return deterministic logits - just use step number to make outputs predictable
+            # All logits point to the same token to ensure deterministic generation
+            step_token_id = (len(call_storage) %
+                             1000) + 1  # Avoid special tokens (0)
+            logits = torch.full((batch_size, seq_len, vocab_size),
+                                fill_value=-1e6,
+                                dtype=torch.float32,
+                                device=input_ids.device if input_ids is not None
+                                else inputs_embeds.device)
+
+            # Set high logit for our chosen token
+            logits[:, :, step_token_id] = 10.0
+            return logits
+
+        return mock_forward
+
+    async def generate_with_config(config_overrides, call_storage):
+        """Helper function to run generation with specific configuration."""
+        config = {**base_config, **config_overrides}
+        llm = LLM(**config)
+
+        try:
+            # Apply DeepseekV3ForCausalLM forward mocking
+            mock_forward = create_mock_forward(call_storage)
+            with patch(
+                    'tensorrt_llm._torch.models.modeling_deepseekv3.DeepseekV3ForCausalLM.forward',
+                    mock_forward):
+                outputs = []
+                async for output in llm.generate_async(prompt_tokens,
+                                                       sampling_config,
+                                                       streaming=False):
+                    outputs.append(output)
+                    break  # Get final output only
+                return outputs[0] if outputs else None
+        finally:
+            llm.shutdown()
+
+    async def run_test():
+        """Main test execution."""
+        print("Starting DeepSeekV3-Lite forward mocking test: TP vs CP-Helix")
+
+        # Configuration 1: Tensor Parallelism
+        tp_config = {
+            "tensor_parallel_size": 2,
+            "pipeline_parallel_size": 1,
+            "context_parallel_size": 1,
+        }
+
+        print("Running with tensor_parallel_size=2...")
+        tp_result = await generate_with_config(tp_config, tp_captured_calls)
+
+        # Configuration 2: Context Parallelism with Helix
+        cp_config = {
+            "tensor_parallel_size": 1,
+            "pipeline_parallel_size": 1,
+            "context_parallel_size": 2,
+            "cp_config": {
+                "cp_type": CpType.HELIX
+            },
+        }
+
+        print("Running with context_parallel_size=2 (helix)...")
+        cp_result = await generate_with_config(cp_config, cp_captured_calls)
+
+        # Validation
+        assert tp_result is not None, "Tensor parallelism run failed to produce output"
+        assert cp_result is not None, "Context parallelism run failed to produce output"
+
+        # Extract results
+        tp_tokens = tp_result.outputs[0].token_ids
+        cp_tokens = cp_result.outputs[0].token_ids
+        tp_text = tp_result.outputs[0].text
+        cp_text = cp_result.outputs[0].text
+
+        # Debug output for generation results
+        print(f"TP result - Tokens: {tp_tokens}, Text: '{tp_text}'")
+        print(f"CP result - Tokens: {cp_tokens}, Text: '{cp_text}'")
+
+        # Verify we captured forward calls
+        print(f"TP captured {len(tp_captured_calls)} forward calls")
+        print(f"CP captured {len(cp_captured_calls)} forward calls")
+
+        assert len(
+            tp_captured_calls) > 0, "No forward calls captured for TP run"
+        assert len(
+            cp_captured_calls) > 0, "No forward calls captured for CP run"
+
+        # Compare captured inputs step by step
+        print("\nComparing captured inputs step by step:")
+        min_steps = min(len(tp_captured_calls), len(cp_captured_calls))
+
+        for step in range(min_steps):
+            tp_call = tp_captured_calls[step]
+            cp_call = cp_captured_calls[step]
+
+            print(f"\nStep {step}:")
+            print(
+                f"  TP input_ids shape: {tp_call['input_ids'].shape if tp_call['input_ids'] is not None else None}"
+            )
+            print(
+                f"  CP input_ids shape: {cp_call['input_ids'].shape if cp_call['input_ids'] is not None else None}"
+            )
+            print(
+                f"  TP position_ids: {tp_call['position_ids'].tolist() if tp_call['position_ids'] is not None else None}"
+            )
+            print(
+                f"  CP position_ids: {cp_call['position_ids'].tolist() if cp_call['position_ids'] is not None else None}"
+            )
+
+            # Verify input_ids match (if both exist)
+            if tp_call['input_ids'] is not None and cp_call[
+                    'input_ids'] is not None:
+                assert torch.equal(
+                    tp_call['input_ids'],
+                    cp_call['input_ids']), (f"Step {step}: input_ids differ!\n"
+                                            f"TP: {tp_call['input_ids']}\n"
+                                            f"CP: {cp_call['input_ids']}")
+
+            # Verify position_ids match (if both exist)
+            if tp_call['position_ids'] is not None and cp_call[
+                    'position_ids'] is not None:
+                assert torch.equal(tp_call['position_ids'],
+                                   cp_call['position_ids']), (
+                                       f"Step {step}: position_ids differ!\n"
+                                       f"TP: {tp_call['position_ids']}\n"
+                                       f"CP: {cp_call['position_ids']}")
+
+        # Final assertions: outputs must be identical since we use deterministic mocking
+        assert tp_tokens == cp_tokens, (f"Token sequences differ!\n"
+                                        f"TP tokens: {tp_tokens}\n"
+                                        f"CP tokens: {cp_tokens}")
+
+        assert tp_text == cp_text, (f"Generated text differs!\n"
+                                    f"TP text: '{tp_text}'\n"
+                                    f"CP text: '{cp_text}'")
+
+        print(
+            "✓ Test passed: TP and CP-Helix receive identical inputs and produce identical outputs"
+        )
+
+    # Execute test
+    asyncio.run(run_test())
+
+
+@pytest.mark.skip_less_device(2)
+@pytest.mark.skip_less_device_memory(40000)
+def test_deepseekv3_lite_cp_helix_kv_cache_blocks(llm_venv):
+    """
+    Test that verifies KV cache block allocation only happens on rank 0 with CP helix.
+
+    This test:
+    1. Uses DeepseekV3 lite model with MLA attention
+    2. Mocks the entire DeepseekV3ForCausalLM.forward() method to capture inputs and return deterministic outputs
+    3. Runs generation with cp_size=2 using helix strategy only (no TP comparison)
+    4. On each forward step, checks KV cache manager block allocations per GPU rank
+    5. Verifies that block allocation increases only on GPU at rank 0
+
+    This validates that in CP helix mode, KV cache blocks are only allocated on the first rank.
+    """
+    import asyncio
+    from unittest.mock import patch
+
+    import torch
+
+    from tensorrt_llm import LLM, SamplingParams
+    from tensorrt_llm.mapping import CpType
+
+    # Model configuration
+    model_path = f"{llm_models_root()}/DeepSeek-V3-Lite/bf16"
+
+    # Simple test prompt for reproducible results
+    prompt_tokens = [
+        128000,
+        128006,
+        9125,
+        128007,
+        271,  # System message start
+        3923,
+        374,
+        701,
+        836,
+        30,  # "What is your name?"
+        128009,
+        128006,
+        78191,
+        128007,
+        271  # Assistant response start
+    ]
+
+    # Deterministic sampling for exact comparison
+    sampling_config = SamplingParams(
+        max_tokens=10,
+        temperature=0.0,
+        top_p=1.0,
+        top_k=1,
+        return_context_logits=False,
+        return_generation_logits=False,
+    )
+
+    # Base LLM configuration
+    base_config = {
+        "model": model_path,
+        "tokenizer": model_path,
+        "max_seq_len": 1024,
+        "enable_chunked_prefill": False,
+        "load_format":
+        "dummy",  # Skip loading weights since we mock the forward method
+        "kv_cache_config": {
+            "enable_block_reuse": False,
+            "free_gpu_memory_fraction": 0.7,
+        },
+        "cuda_graph_config": {
+            "batch_sizes": [1, 2]
+        },
+    }
+
+    # Storage for captured KV cache block information
+    kv_cache_allocations = []
+
+    def create_mock_forward_with_kv_tracking(llm_instance):
+        """Create a mock forward function that tracks KV cache allocations."""
+
+        def mock_forward(self,
+                         attn_metadata,
+                         input_ids=None,
+                         position_ids=None,
+                         inputs_embeds=None,
+                         return_context_logits=False,
+                         spec_metadata=None,
+                         **kwargs):
+            """Mock DeepseekV3ForCausalLM forward that tracks KV cache block allocations."""
+            # Capture KV cache allocation info
+            try:
+                # Access the KV cache manager through the LLM's executor
+                kv_cache_manager = llm_instance._executor.resource_manager.resource_managers.get(
+                    llm_instance._executor.resource_manager.ResourceManagerType.
+                    KV_CACHE_MANAGER)
+
+                if kv_cache_manager:
+                    kv_stats = kv_cache_manager.get_kv_cache_stats()
+                    # Get distributed info
+                    rank = llm_instance._executor.dist.rank
+                    cp_rank = llm_instance._executor.dist.cp_rank
+
+                    allocation_info = {
+                        'step': len(kv_cache_allocations),
+                        'rank': rank,
+                        'cp_rank': cp_rank,
+                        'used_blocks': kv_stats.used_num_blocks,
+                        'alloc_total_blocks': kv_stats.alloc_total_blocks,
+                        'alloc_new_blocks': kv_stats.alloc_new_blocks,
+                        'max_blocks': kv_stats.max_num_blocks,
+                        'free_blocks': kv_stats.free_num_blocks,
+                    }
+                    kv_cache_allocations.append(allocation_info)
+
+                    print(
+                        f"Step {len(kv_cache_allocations)-1}: Rank {rank}/CP_Rank {cp_rank} - "
+                        f"Used: {kv_stats.used_num_blocks}, Alloc Total: {kv_stats.alloc_total_blocks}, "
+                        f"Alloc New: {kv_stats.alloc_new_blocks}")
+
+            except Exception as e:
+                print(f"Warning: Could not capture KV cache stats: {e}")
+
+            # Determine output shape - need to return logits over vocabulary
+            if input_ids is not None:
+                batch_size, seq_len = input_ids.shape
+            elif inputs_embeds is not None:
+                batch_size, seq_len = inputs_embeds.shape[:2]
+            else:
+                raise ValueError(
+                    "Either input_ids or inputs_embeds must be provided")
+
+            # Get vocab size from the model
+            vocab_size = self.lm_head.vocab_size_padded
+
+            # Return deterministic logits - just use step number to make outputs predictable
+            step_token_id = (len(kv_cache_allocations) %
+                             1000) + 1  # Avoid special tokens (0)
+            logits = torch.full((batch_size, seq_len, vocab_size),
+                                fill_value=-1e6,
+                                dtype=torch.float32,
+                                device=input_ids.device if input_ids is not None
+                                else inputs_embeds.device)
+
+            # Set high logit for our chosen token
+            logits[:, :, step_token_id] = 10.0
+            return logits
+
+        return mock_forward
+
+    async def run_test():
+        """Main test execution."""
+        print(
+            "Starting DeepSeekV3-Lite CP-Helix KV cache block allocation test..."
+        )
+
+        # Configuration: Context Parallelism with Helix
+        cp_config = {
+            "tensor_parallel_size": 1,
+            "pipeline_parallel_size": 1,
+            "context_parallel_size": 2,
+            "cp_config": {
+                "cp_type": CpType.HELIX
+            },
+        }
+
+        config = {**base_config, **cp_config}
+        llm = LLM(**config)
+
+        try:
+            # Apply DeepseekV3ForCausalLM forward mocking with KV cache tracking
+            mock_forward = create_mock_forward_with_kv_tracking(llm)
+            with patch(
+                    'tensorrt_llm._torch.models.modeling_deepseekv3.DeepseekV3ForCausalLM.forward',
+                    mock_forward):
+                outputs = []
+                async for output in llm.generate_async(prompt_tokens,
+                                                       sampling_config,
+                                                       streaming=False):
+                    outputs.append(output)
+                    break  # Get final output only
+
+                result = outputs[0] if outputs else None
+        finally:
+            llm.shutdown()
+
+        # Validation
+        assert result is not None, "Context parallelism run failed to produce output"
+
+        # Extract results
+        tokens = result.outputs[0].token_ids
+        text = result.outputs[0].text
+
+        print(f"CP result - Tokens: {tokens}, Text: '{text}'")
+        print(
+            f"Captured {len(kv_cache_allocations)} KV cache allocation snapshots"
+        )
+
+        assert len(kv_cache_allocations
+                   ) > 0, "No KV cache allocation snapshots captured"
+
+        # Analyze block allocations by rank
+        rank_allocations = {}
+        for allocation in kv_cache_allocations:
+            rank = allocation['rank']
+            if rank not in rank_allocations:
+                rank_allocations[rank] = []
+            rank_allocations[rank].append(allocation)
+
+        print(f"\nRank allocation summary:")
+        for rank in sorted(rank_allocations.keys()):
+            allocations = rank_allocations[rank]
+            print(f"  Rank {rank}: {len(allocations)} snapshots")
+            if allocations:
+                first_alloc = allocations[0]['alloc_total_blocks']
+                last_alloc = allocations[-1]['alloc_total_blocks']
+                print(
+                    f"    Total blocks: {first_alloc} -> {last_alloc} (change: {last_alloc - first_alloc})"
+                )
+
+        # Verify that block allocation only increases on rank 0
+        rank_0_allocations = rank_allocations.get(0, [])
+        other_rank_allocations = [
+            allocs for rank, allocs in rank_allocations.items() if rank != 0
+        ]
+
+        assert len(rank_0_allocations) > 0, "No allocations captured for rank 0"
+
+        # Check that rank 0 has increasing block allocations
+        if len(rank_0_allocations) > 1:
+            rank_0_first = rank_0_allocations[0]['alloc_total_blocks']
+            rank_0_last = rank_0_allocations[-1]['alloc_total_blocks']
+            assert rank_0_last > rank_0_first, (
+                f"Rank 0 total block allocation did not increase: {rank_0_first} -> {rank_0_last}"
+            )
+            print(
+                f"✓ Rank 0 block allocation increased: {rank_0_first} -> {rank_0_last}"
+            )
+
+        # Check that other ranks do not have increasing block allocations
+        for other_rank_allocs in other_rank_allocations:
+            if len(other_rank_allocs) > 1:
+                first_alloc = other_rank_allocs[0]['alloc_total_blocks']
+                last_alloc = other_rank_allocs[-1]['alloc_total_blocks']
+                # Other ranks should not allocate new blocks (or allocate much fewer)
+                assert last_alloc <= first_alloc + 1, (  # Allow for minor allocation differences
+                    f"Non-rank-0 had significant block allocation increase: {first_alloc} -> {last_alloc}"
+                )
+                print(
+                    f"✓ Rank {other_rank_allocs[0]['rank']} had minimal allocation: {first_alloc} -> {last_alloc}"
+                )
+
+        print(
+            "✓ Test passed: KV cache blocks allocated primarily on rank 0 in CP-Helix mode"
+        )
+
+    # Execute test
+    asyncio.run(run_test())

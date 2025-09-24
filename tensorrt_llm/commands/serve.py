@@ -28,6 +28,7 @@ from tensorrt_llm.llmapi.llm_utils import update_llm_args_with_extra_dict
 from tensorrt_llm.llmapi.mpi_session import find_free_port
 from tensorrt_llm.llmapi.reasoning_parser import ReasoningParserFactory
 from tensorrt_llm.logger import logger, severity_map
+from tensorrt_llm.mapping import CpType
 from tensorrt_llm.serve import OpenAIDisaggServer, OpenAIServer
 
 # Global variable to store the Popen object of the child process
@@ -80,6 +81,8 @@ def get_llm_args(model: str,
                  max_seq_len: int = BuildConfig.max_seq_len,
                  tensor_parallel_size: int = 1,
                  pipeline_parallel_size: int = 1,
+                 context_parallel_size: int = 1,
+                 cp_type: str = None,
                  moe_expert_parallel_size: Optional[int] = None,
                  gpus_per_node: Optional[int] = None,
                  free_gpu_memory_fraction: Optional[float] = None,
@@ -108,6 +111,9 @@ def get_llm_args(model: str,
         capacity_scheduler_policy=CapacitySchedulerPolicy.GUARANTEED_NO_EVICT,
         dynamic_batch_config=dynamic_batch_config,
     )
+    cp_config = None
+    if cp_type is not None:
+        cp_config = {'cp_type': CpType[cp_type.upper()]}
     llm_args = {
         "model":
         model,
@@ -119,6 +125,10 @@ def get_llm_args(model: str,
         tensor_parallel_size,
         "pipeline_parallel_size":
         pipeline_parallel_size,
+        "context_parallel_size":
+        context_parallel_size,
+        "cp_config":
+        cp_config,
         "moe_expert_parallel_size":
         moe_expert_parallel_size,
         "gpus_per_node":
@@ -270,6 +280,14 @@ class ChoiceWithAlias(click.Choice):
               type=int,
               default=1,
               help='Pipeline parallelism size.')
+@click.option("--cp_size",
+              type=int,
+              default=1,
+              help='Context parallelism size.')
+@click.option("--cp_type",
+              type=click.Choice([e.name for e in CpType]),
+              default=None,
+              help='Context parallelism type.')
 @click.option("--ep_size",
               type=int,
               default=None,
@@ -332,10 +350,11 @@ def serve(
         model: str, tokenizer: Optional[str], host: str, port: int,
         log_level: str, backend: str, max_beam_width: int, max_batch_size: int,
         max_num_tokens: int, max_seq_len: int, tp_size: int, pp_size: int,
-        ep_size: Optional[int], cluster_size: Optional[int],
-        gpus_per_node: Optional[int], kv_cache_free_gpu_memory_fraction: float,
-        num_postprocess_workers: int, trust_remote_code: bool,
-        extra_llm_api_options: Optional[str], reasoning_parser: Optional[str],
+        cp_size: int, cp_type: str, ep_size: Optional[int],
+        cluster_size: Optional[int], gpus_per_node: Optional[int],
+        kv_cache_free_gpu_memory_fraction: float, num_postprocess_workers: int,
+        trust_remote_code: bool, extra_llm_api_options: Optional[str],
+        reasoning_parser: Optional[str],
         metadata_server_config_file: Optional[str], server_role: Optional[str],
         fail_fast_on_attention_window_too_large: bool):
     """Running an OpenAI API compatible server

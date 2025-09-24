@@ -6,6 +6,7 @@ from tensorrt_llm.llmapi import (AttentionDpConfig, AutoDecodingConfig,
                                  EagleDecodingConfig, KvCacheConfig, MoeConfig,
                                  MTPDecodingConfig, NGramDecodingConfig,
                                  TorchCompileConfig)
+from tensorrt_llm.mapping import CpType
 
 example_prompts = [
     "Hello, my name is",
@@ -70,6 +71,11 @@ def add_llm_args(parser):
                         choices=["auto", "TorchSampler", "TRTLLMSampler"])
     parser.add_argument('--tp_size', type=int, default=1)
     parser.add_argument('--pp_size', type=int, default=1)
+    parser.add_argument('--cp_size', type=int, default=1)
+    parser.add_argument('--cp_type',
+                        type=str,
+                        default=None,
+                        choices=[e.name for e in CpType])
     parser.add_argument('--moe_ep_size', type=int, default=-1)
     parser.add_argument('--moe_tp_size', type=int, default=-1)
     parser.add_argument('--moe_cluster_size', type=int, default=-1)
@@ -212,6 +218,9 @@ def setup_llm(args, **kwargs):
         batching_wait_iters=args.attention_dp_batching_wait_iters,
     )
 
+    cp_config = None
+    if args.cp_type is not None:
+        cp_config = {"cp_type": CpType[args.cp_type.upper()]}
     llm = LLM(
         model=args.model_dir,
         backend='pytorch',
@@ -237,6 +246,8 @@ def setup_llm(args, **kwargs):
         attention_dp_config=attention_dp_config,
         tensor_parallel_size=args.tp_size,
         pipeline_parallel_size=args.pp_size,
+        context_parallel_size=args.cp_size,
+        cp_config=cp_config,
         moe_expert_parallel_size=args.moe_ep_size,
         moe_tensor_parallel_size=args.moe_tp_size,
         moe_cluster_parallel_size=args.moe_cluster_size,
