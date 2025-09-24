@@ -1497,6 +1497,18 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
             self.epilogue.extend(self.draft_model.mtp_layers)
             self.epilogue.append(self.spec_worker)
 
+    def process_attention_with_block_lookup(self, attn_metadata: AttentionMetadata):
+        """Complete example of accessing KV cache manager and looking up blocks"""
+
+        kv_cache_manager = attn_metadata.kv_cache_manager
+        request_ids = attn_metadata.request_ids
+        if kv_cache_manager is None or request_ids is None:
+            return
+        print("[DeepseekV3ForCausalLM::process_attention_with_block_lookup] tokens_per_block: ", kv_cache_manager.tokens_per_block)
+        block_ids_per_seq = kv_cache_manager.get_batch_cache_indices(request_ids)
+        for request_id, block_ids in zip(request_ids, block_ids_per_seq):
+            print(f"[DeepseekV3ForCausalLM::process_attention_with_block_lookup] request_id: {request_id}, block_ids: {block_ids}")
+
     def forward(
         self,
         attn_metadata: AttentionMetadata,
@@ -1507,6 +1519,10 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
         return_context_logits: bool = False,
         **kwargs,
     ) -> torch.Tensor:
+        #################################################################
+        # Process KV cache blocks
+        self.process_attention_with_block_lookup(attn_metadata)
+        #################################################################
         return super().forward(attn_metadata=attn_metadata,
                                input_ids=input_ids,
                                position_ids=position_ids,

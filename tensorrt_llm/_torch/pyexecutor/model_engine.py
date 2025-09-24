@@ -751,7 +751,9 @@ class PyTorchModelEngine(ModelEngine):
 
         # TODO: current warmup_request is not suitable for star attention
         cp_type = self.mapping.cp_config.get('cp_type', None)
-        if cp_type == CpType.STAR:
+        # @B: We can probably do better here.
+        if cp_type is not None:
+            print("[ModelEngine::warmup] Skipping warmup for cp_type: ", cp_type.name)
             return
 
         if self._torch_compile_enabled:
