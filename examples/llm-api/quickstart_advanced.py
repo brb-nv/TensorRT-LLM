@@ -221,6 +221,9 @@ def setup_llm(args, **kwargs):
     cp_config = None
     if args.cp_type is not None:
         cp_config = {"cp_type": CpType[args.cp_type.upper()]}
+        # We split blocks among CP ranks for helix parallelism.
+        if args.cp_type == "HELIX":
+            cp_config["tokens_per_block"] = kv_cache_config.tokens_per_block
     llm = LLM(
         model=args.model_dir,
         backend='pytorch',

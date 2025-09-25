@@ -596,30 +596,31 @@ class ExecutorRequestQueue:
                     self.new_active_requests_queue_latency_ms += now - self.start_times.pop(
                         child_id)
 
-    def _merge_helix_requests(self, new_requests: list[RequestQueueItem], num_tokens_per_block: int):
-        print("[ExecutorRequestQueue::_merge_helix_requests]: FUNCTION CALLED with len(new_requests): ", len(new_requests))
+    # Note: Helix parallelism is a decode-only feature run with disaggregated serving. This function gets called on gen server
+    # during initialization of a new request.
+    def _merge_helix_requests(self, new_requests: list[RequestQueueItem], tokens_per_block: int):
         req_with_children = []
         num_cp_ranks = self.dist.cp_size
         curr_cp_rank = self.dist.cp_rank
         for req_item in new_requests:
             all_input_ids = torch.tensor(req_item.request.input_token_ids, dtype=torch.int64).unsqueeze(0)
-            print("[ExecutorRequestQueue::_merge_helix_requests]: all_input_ids.shape: ", all_input_ids.shape)
             input_len = all_input_ids.shape[-1]
+            print("[ExecutorRequestQueue::_merge_helix_requests]: input_len: ", input_len, " all_input_ids:\n", all_input_ids)
 
-            num_total_blocks = (input_len + num_tokens_per_block - 1) // num_tokens_per_block
+            num_total_blocks = (input_len + tokens_per_block - 1) // tokens_per_block
             if num_total_blocks < num_cp_ranks:
                 raise ValueError(f"There aren't enough tokens to get at least one block per CP rank. num_total_blocks {num_total_blocks} < num_cp_ranks {num_cp_ranks}. Please use smaller tokens_per_block for KV cache or reduce the number of CP ranks.")
 
             # Padding to ensure torch.stack used with torch.tensor_split works properly.
-            padding_len = num_tokens_per_block - (input_len % num_tokens_per_block)
+            padding_len = tokens_per_block - (input_len % tokens_per_block)
             padding_ids = torch.zeros([1, padding_len], dtype=torch.int64)
             all_input_ids = torch.cat((all_input_ids, padding_ids), dim=-1)
             all_position_ids = torch.arange(0, input_len + padding_len, dtype=torch.int64).unsqueeze(0)
 
             input_id_blocks_per_rank = torch.tensor_split(
-                torch.stack(all_input_ids.split(num_tokens_per_block, dim=-1)), num_cp_ranks)
+                torch.stack(all_input_ids.split(tokens_per_block, dim=-1)), num_cp_ranks)
             position_id_blocks_per_rank = torch.tensor_split(
-                torch.stack(all_position_ids.split(num_tokens_per_block, dim=-1)),
+                torch.stack(all_position_ids.split(tokens_per_block, dim=-1)),
                 num_cp_ranks)
 
             # Get the ctx_blocks and position_blocks for this rank.
@@ -631,9 +632,8 @@ class ExecutorRequestQueue:
                 input_ids_this_rank = input_ids_this_rank[:-padding_len]
                 position_ids_this_rank = position_ids_this_rank[:-padding_len]
 
-            print(f"[ExecutorRequestQueue::_merge_helix_requests][{curr_cp_rank}]: input_ids_this_rank: {input_ids_this_rank}")
-            print(f"[ExecutorRequestQueue::_merge_helix_requests][{curr_cp_rank}]: position_ids_this_rank: {position_ids_this_rank}")
-            # TODO: Figure how to pass down position_ids_this_rank to LLMRequest.
+            # print(f"[ExecutorRequestQueue::_merge_helix_requests][{curr_cp_rank}]: input_ids_this_rank: {input_ids_this_rank}")
+            # print(f"[ExecutorRequestQueue::_merge_helix_requests][{curr_cp_rank}]: position_ids_this_rank: {position_ids_this_rank}")
             req = executor_request_to_llm_request(
                 req_id=req_item.id,
                 executor_request=req_item.request,
@@ -657,7 +657,7 @@ class ExecutorRequestQueue:
                 return self._merge_star_attention_requests(new_requests)
             elif cp_type == CpType.HELIX:
                 # Take the usual route below.
-                return self._merge_helix_requests(new_requests, num_tokens_per_block=64)
+                return self._merge_helix_requests(new_requests, tokens_per_block=cp_config['tokens_per_block'])
             else:
                 raise NotImplementedError(
                     f'Unsupported cp type {cp_type.name}.')

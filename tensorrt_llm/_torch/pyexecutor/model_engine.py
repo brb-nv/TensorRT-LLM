@@ -227,6 +227,14 @@ def get_rank_model_storage(model):
     return total_bytes
 
 
+def _is_active_helix_rank(cp_rank: int, cp_size: int, position_id: int, tokens_per_block: int) -> bool:
+    if cp_size == 1:
+        return True
+    global_block_id = position_id // tokens_per_block
+    # Assuming round-robin assignment of blocks to CP ranks. Math gets complicated if contiguous blocks
+    # are assigned to the same CP rank for prefill but round-robin for decode.
+    return global_block_id % cp_size == cp_rank
+
 def _filter_cuda_graph_batch_sizes(cuda_graph_batch_sizes: list[int],
                                    max_batch_size: int, max_num_tokens: int,
                                    max_draft_len: int,
@@ -1363,6 +1371,7 @@ class PyTorchModelEngine(ModelEngine):
         multimodal_params_list = []
         mrope_position_ids = []
 
+        # @B: Getting position_ids right for context requests doesn't matter for Helix.
         for request in scheduled_requests.context_requests:
             request_ids.append(request.py_request_id)
             all_prompt_tokens = request.get_tokens(0)
@@ -1449,6 +1458,7 @@ class PyTorchModelEngine(ModelEngine):
         previous_batch_indices = []
         previous_pos_indices = []
         for request in extend_requests:
+            assert False, "Not relevant to Helix."
             request_ids.append(request.py_request_id)
             # the request has no previous tensor:
             # (1) next_draft_tokens_device is None, which means overlap scheduler is disabled; or
@@ -1544,7 +1554,14 @@ class PyTorchModelEngine(ModelEngine):
                     if beam == first_beam:
                         previous_batch_indices.append(request.py_batch_idx)
                     past_seen_token_num = request.max_beam_num_tokens
-                position_ids.append(past_seen_token_num)
+                position_id = past_seen_token_num
+                if self.mapping.cp_size > 1:
+                    # Do an allgather among CP ranks to get the complete sequence length seen by all CP ranks.
+                    past_seen_token_nums = self.dist.cp_allgather(past_seen_token_num)
+                    position_id = sum(past_seen_token_nums)
+                    attn_metadata.is_active_helix_rank = _is_active_helix_rank(cp_rank=self.mapping.cp_rank, cp_size=self.mapping.cp_size, position_id=position_id, tokens_per_block=kv_cache_manager.tokens_per_block)
+                print("[prepare_tp_inputs][cp_rank ", self.mapping.cp_rank, "] Appending position_ids ", position_id, " for request ", request.py_request_id)
+                position_ids.append(position_id)
                 num_cached_tokens_per_seq.append(past_seen_token_num)
                 prompt_lengths.append(request.py_prompt_len)
                 draft_lens.append(0)
@@ -1556,6 +1573,7 @@ class PyTorchModelEngine(ModelEngine):
                     multimodal_data=request.py_multimodal_data)
                 multimodal_params.strip_for_generation()
                 if multimodal_params.has_content():
+                    assert False, "Not relevant to Helix."
                     if self.use_mrope:
                         mrope_position_deltas = multimodal_params.multimodal_data[
                             'mrope_config']['mrope_position_deltas']
@@ -1688,6 +1706,7 @@ class PyTorchModelEngine(ModelEngine):
             self.previous_kv_lens_offsets_cuda *= 0
 
         if self.use_mrope and mrope_position_ids:
+            assert False, "Not relevant to Helix."
             # NOTE: self.use_mrope is enough for differentiating whether to use mrope_position_ids but
             # `_create_dummy_context_requests` from `kv_cache_creater` makes an exception that I can not add multimodal_data to the dummy_request
             # so that we only replace position_ids with mrope_position_ids when it is not a dummy request and for models who is using mrope.
@@ -1708,6 +1727,7 @@ class PyTorchModelEngine(ModelEngine):
                                                             0)
 
         if self.enable_spec_decode:
+            assert False, "Not relevant to Helix."
             self.gather_ids_cuda[:len(gather_ids)].copy_(torch.tensor(
                 gather_ids, dtype=torch.int, pin_memory=True),
                                                          non_blocking=True)
@@ -1795,6 +1815,7 @@ class PyTorchModelEngine(ModelEngine):
             inputs['lora_params'] = lora_params
 
         if spec_metadata is not None:
+            assert False, "Not relevant to Helix."
             total_draft_lens = sum(draft_lens)
             spec_metadata.draft_tokens = self.draft_tokens_cuda[:
                                                                 total_draft_lens]
@@ -1820,6 +1841,7 @@ class PyTorchModelEngine(ModelEngine):
                 spec_metadata.all_rank_num_seqs = all_rank_num_seqs
 
         if mm_token_indices is not None:
+            assert False, "Not relevant to Helix."
             mask = torch.ones(total_num_tokens, dtype=torch.bool)
             mask[mm_token_indices] = False
             inputs['mm_token_indices'] = mm_token_indices.pin_memory().to(

@@ -138,6 +138,11 @@ class AttentionMetadata:
     cache_indirection: Optional[torch.Tensor] = None
     cuda_graph_buffers: dict[str, list[torch.Tensor]] = None
 
+    # In helix parallelism, local attention computation happens on all CP ranks but only one
+    # rank in the CP group writes to its KV cache and computes the contribution of query token
+    # in its local attention.
+    is_active_helix_rank: bool = True
+
     _saved_tensors: Dict[str, torch.Tensor] = field(init=False,
                                                     default_factory=dict)
 
