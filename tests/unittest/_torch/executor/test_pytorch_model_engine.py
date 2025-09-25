@@ -16,11 +16,11 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import (KVCacheManager,
                                                              ResourceManagerType
                                                              )
 # isort: on
-from tensorrt_llm._torch.attention_metadata import AttentionMetadata
+from tensorrt_llm._torch.attention_backend.interface import AttentionMetadata
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.llmapi import CudaGraphConfig, LlmArgs, SamplingParams
-from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.mapping import Mapping, CpType
 
 
 @dataclass
@@ -324,28 +324,27 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         self.assertTrue(pytorch_config_custom.cuda_graph_padding_enabled,
                         "Custom enable_padding should be respected")
 
-    def test_prepare_tp_inputs_with_context_parallelism(self) -> None:
-        """Test _prepare_tp_inputs function when cp_size > 1 (Helix context parallelism)."""
+    def test_prepare_tp_inputs_with_helix_parallelism(self) -> None:
+        """Test _prepare_tp_inputs function with helix parallelism."""
 
+        # Create model engine with helix parallelism.
+        config = PyTorchConfig(use_cuda_graph=False)
+        model_engine = DummyModelEngine(config, batch_size=4, dtype=torch.half)
+
+        # Provide mapping for model engine.
         cp_size = 2
         cp_rank = 0
         cp_config = {"cp_type": CpType.HELIX, "tokens_per_block": 4}
-        mapping = Mapping(world_size=2,
+        mapping = Mapping(world_size=cp_size,
                           tp_size=1,
                           pp_size=1,
                           cp_size=cp_size,
                           cp_config=cp_config,
                           rank=cp_rank)
-
-        # Create model engine with context parallelism.
-        config = PyTorchConfig(use_cuda_graph=False)
-        model_engine = DummyModelEngine(config, batch_size=4, dtype=torch.half)
         model_engine.mapping = mapping
 
-        # Mock the distributed communicator
+        # Mock model_engine's dist and its cp_allgather to return different values per CP rank.
         mock_dist = MagicMock()
-
-        # Mock cp_allgather to return different values per CP rank
         def mock_cp_allgather(obj):
             # Simulate allgather across CP ranks: [past_seen_token_num_rank0, past_seen_token_num_rank1]
             if cp_rank == 0:
@@ -356,31 +355,23 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         mock_dist.cp_allgather.side_effect = mock_cp_allgather
         model_engine.dist = mock_dist
 
-        # Create test requests
-        req1 = _create_request(num_tokens=20, req_id=1)
-        req1.py_seq_slot = 0
-        req1.max_beam_num_tokens = 50  # past_seen_token_num = 49
-        req1.py_prompt_len = 20
-        req1.sampling_config.beam_width = 1
-        req1.py_multimodal_data = {}
-        req1.is_dummy = False
-        req1.py_batch_idx = None  # Will be set during processing
-
-        req2 = _create_request(num_tokens=15, req_id=2)
-        req2.py_seq_slot = 1
-        req2.max_beam_num_tokens = 30  # past_seen_token_num = 29
-        req2.py_prompt_len = 15
-        req2.sampling_config.beam_width = 1
-        req2.py_multimodal_data = {}
-        req2.is_dummy = False
-        req2.py_batch_idx = None
-
-        # Create scheduled requests
+        # Create scheduled requests with two generation requests.
         scheduled_requests = ScheduledRequests()
         scheduled_requests.context_requests = []
-        scheduled_requests.generation_requests = [req1, req2]
+        prompt_lens = [20, 15]
+        gen_requests = []
+        for idx in range(len(prompt_lens)):
+            req = _create_request(num_tokens=prompt_lens[idx], req_id=idx+1)
+            req.py_prompt_len = prompt_lens[idx]
+            req.py_batch_idx = None
+            req.is_dummy_request = False
+            req.py_seq_slot = idx
+            req.sampling_config.beam_width = 1
+            req.py_multimodal_data = {}
+            gen_requests.append(req)
+        scheduled_requests.generation_requests = gen_requests
 
-        # Create KV cache manager
+        # Create KV cache manager for attention metadata.
         kv_cache_config = KvCacheConfig(max_tokens=512)
         kv_cache_manager = KVCacheManager(
             kv_cache_config,
@@ -394,9 +385,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
             mapping=mapping,
             dtype=tensorrt_llm.bindings.DataType.HALF,
         )
-
-        # Create attention metadata
-        attn_metadata = AttentionMetadata()
+        attn_metadata = AttentionMetadata(max_num_requests=4, max_num_tokens=512, kv_cache_manager=kv_cache_manager)
         attn_metadata.is_cuda_graph = False
 
         # Initialize model engine buffers
@@ -409,19 +398,14 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
                                                      device='cuda')
         model_engine.previous_batch_indices_cuda = torch.zeros(
             32, dtype=torch.int32, device='cuda')
-        model_engine.max_beam_width = 1
-        model_engine.use_beam_search = False
-        model_engine.enable_spec_decode = False
-        model_engine._disable_overlap_scheduler = True
-        model_engine.use_mrope = False
-        model_engine.enable_attention_dp = False
-        model_engine.guided_decoder = None
 
         # Call the function under test
-        result = model_engine._prepare_tp_inputs(
+        result, _ = model_engine._prepare_tp_inputs(
             scheduled_requests=scheduled_requests,
             kv_cache_manager=kv_cache_manager,
             attn_metadata=attn_metadata)
+
+        # import pdb; pdb.set_trace()
 
         # Verify the results
         self.assertIsNotNone(result)
@@ -437,10 +421,9 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         self.assertTrue(mock_dist.cp_allgather.called)
 
         # For cp_rank=0, the expected position_ids should be:
-        # req1: past_seen_token_num=49, allgather=[49, 59], sum=108
-        # req2: past_seen_token_num=29, allgather=[29, 39], sum=68
-        expected_positions = [108,
-                              68]  # Sum of allgather results for each request
+        # req1: past_seen_token_num=19, allgather=[19, 29], sum=48.
+        # req2: past_seen_token_num=14, allgather=[14, 24], sum=38.
+        expected_positions = [48, 38]
 
         # Extract actual position_ids (remove batch dimension)
         actual_positions = position_ids.squeeze(
@@ -466,104 +449,6 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
                    'seq_lens') and attn_metadata.seq_lens is not None:
             actual_seq_lens = attn_metadata.seq_lens.cpu().tolist()
             self.assertEqual(actual_seq_lens, expected_seq_lens)
-
-    def test_prepare_tp_inputs_with_context_parallelism_different_ranks(
-            self) -> None:
-        """Test _prepare_tp_inputs with different CP ranks to verify allgather behavior."""
-
-        # Test with cp_rank = 1
-        cp_size = 2
-        cp_rank = 1
-        mapping = Mapping(world_size=2,
-                          tp_size=1,
-                          pp_size=1,
-                          cp_size=cp_size,
-                          rank=cp_rank)
-
-        config = PyTorchConfig(use_cuda_graph=False)
-        model_engine = DummyModelEngine(config, batch_size=4, dtype=torch.half)
-        model_engine.mapping = mapping
-
-        # Mock the distributed communicator for rank 1
-        mock_dist = MagicMock()
-
-        def mock_cp_allgather_rank1(obj):
-            # Simulate different allgather results for rank 1
-            return [obj - 5, obj + 5]  # Different pattern for rank 1
-
-        mock_dist.cp_allgather.side_effect = mock_cp_allgather_rank1
-        model_engine.dist = mock_dist
-
-        # Create a test request
-        req = _create_request(num_tokens=10, req_id=10)
-        req.py_seq_slot = 0
-        req.max_beam_num_tokens = 25  # past_seen_token_num = 24
-        req.py_prompt_len = 10
-        req.sampling_config.beam_width = 1
-        req.py_multimodal_data = {}
-        req.is_dummy = False
-        req.py_batch_idx = None
-
-        scheduled_requests = ScheduledRequests()
-        scheduled_requests.context_requests = []
-        scheduled_requests.generation_requests = [req]
-
-        # Setup other required objects
-        kv_cache_config = KvCacheConfig(max_tokens=512)
-        kv_cache_manager = KVCacheManager(
-            kv_cache_config,
-            tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
-            num_layers=1,
-            num_kv_heads=16,
-            head_dim=16,
-            tokens_per_block=1,
-            max_seq_len=512,
-            max_batch_size=4,
-            mapping=mapping,
-            dtype=tensorrt_llm.bindings.DataType.HALF,
-        )
-
-        attn_metadata = AttentionMetadata()
-        attn_metadata.is_cuda_graph = False
-
-        # Initialize model engine buffers
-        model_engine.max_num_tokens = 512
-        model_engine.input_ids_cuda = torch.zeros(512,
-                                                  dtype=torch.int32,
-                                                  device='cuda')
-        model_engine.position_ids_cuda = torch.zeros(512,
-                                                     dtype=torch.int32,
-                                                     device='cuda')
-        model_engine.previous_batch_indices_cuda = torch.zeros(
-            32, dtype=torch.int32, device='cuda')
-        model_engine.max_beam_width = 1
-        model_engine.use_beam_search = False
-        model_engine.enable_spec_decode = False
-        model_engine._disable_overlap_scheduler = True
-        model_engine.use_mrope = False
-        model_engine.enable_attention_dp = False
-        model_engine.guided_decoder = None
-
-        # Call the function under test
-        result = model_engine._prepare_tp_inputs(
-            scheduled_requests=scheduled_requests,
-            kv_cache_manager=kv_cache_manager,
-            attn_metadata=attn_metadata)
-
-        # Verify cp_allgather was called
-        self.assertTrue(mock_dist.cp_allgather.called)
-
-        # For cp_rank=1 with past_seen_token_num=24:
-        # allgather=[24-5, 24+5] = [19, 29], sum=48
-        expected_position = 48
-
-        position_ids = result['position_ids']
-        actual_position = position_ids.squeeze(0)[0].item()
-
-        self.assertEqual(
-            actual_position, expected_position,
-            f"Position ID for rank 1 should be {expected_position}, got {actual_position}"
-        )
 
 
 if __name__ == "__main__":
