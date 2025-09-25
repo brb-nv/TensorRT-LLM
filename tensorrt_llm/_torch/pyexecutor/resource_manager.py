@@ -414,7 +414,6 @@ class KVCacheManager(BaseResourceManager):
             generation_batch = scheduled_batch.generation_requests
             # allocate KV Cache
             for req in context_batch:
-                # print("[ResourceManager::prepare_resources] Adding sequence for context request", req.py_request_id)
                 req_beam_width = req.sampling_config.beam_width
                 if 'cp_type' in self.mapping.cp_config and CpType.STAR == self.mapping.cp_config[
                         'cp_type']:
@@ -443,7 +442,6 @@ class KVCacheManager(BaseResourceManager):
                                 req, block_ids)
 
             for req in generation_batch:
-                # print("[ResourceManager::prepare_resources] Adding token for generation request", req.py_request_id)
                 self.impl.add_token(req.py_request_id)
                 for _ in range(get_draft_token_length(req)):
                     self.impl.add_token(req.py_request_id)

@@ -751,7 +751,6 @@ class PyTorchModelEngine(ModelEngine):
 
         # TODO: current warmup_request is not suitable for star attention
         cp_type = self.mapping.cp_config.get('cp_type', None)
-        # @B: We can probably do better here.
         if cp_type is not None:
             print("[ModelEngine::warmup] Skipping warmup for cp_type: ",
                   cp_type.name)
@@ -1364,7 +1363,6 @@ class PyTorchModelEngine(ModelEngine):
         multimodal_params_list = []
         mrope_position_ids = []
 
-        # @B: Getting position_ids right for context requests doesn't matter for Helix.
         for request in scheduled_requests.context_requests:
             request_ids.append(request.py_request_id)
             all_prompt_tokens = request.get_tokens(0)
@@ -1451,7 +1449,6 @@ class PyTorchModelEngine(ModelEngine):
         previous_batch_indices = []
         previous_pos_indices = []
         for request in extend_requests:
-            assert False, "Not relevant to Helix."
             request_ids.append(request.py_request_id)
             # the request has no previous tensor:
             # (1) next_draft_tokens_device is None, which means overlap scheduler is disabled; or
@@ -1569,7 +1566,6 @@ class PyTorchModelEngine(ModelEngine):
                     multimodal_data=request.py_multimodal_data)
                 multimodal_params.strip_for_generation()
                 if multimodal_params.has_content():
-                    assert False, "Not relevant to Helix."
                     if self.use_mrope:
                         mrope_position_deltas = multimodal_params.multimodal_data[
                             'mrope_config']['mrope_position_deltas']
@@ -1702,7 +1698,6 @@ class PyTorchModelEngine(ModelEngine):
             self.previous_kv_lens_offsets_cuda *= 0
 
         if self.use_mrope and mrope_position_ids:
-            assert False, "Not relevant to Helix."
             # NOTE: self.use_mrope is enough for differentiating whether to use mrope_position_ids but
             # `_create_dummy_context_requests` from `kv_cache_creater` makes an exception that I can not add multimodal_data to the dummy_request
             # so that we only replace position_ids with mrope_position_ids when it is not a dummy request and for models who is using mrope.
@@ -1723,7 +1718,6 @@ class PyTorchModelEngine(ModelEngine):
                                                             0)
 
         if self.enable_spec_decode:
-            assert False, "Not relevant to Helix."
             self.gather_ids_cuda[:len(gather_ids)].copy_(torch.tensor(
                 gather_ids, dtype=torch.int, pin_memory=True),
                                                          non_blocking=True)
@@ -1811,7 +1805,6 @@ class PyTorchModelEngine(ModelEngine):
             inputs['lora_params'] = lora_params
 
         if spec_metadata is not None:
-            assert False, "Not relevant to Helix."
             total_draft_lens = sum(draft_lens)
             spec_metadata.draft_tokens = self.draft_tokens_cuda[:
                                                                 total_draft_lens]
@@ -1837,7 +1830,6 @@ class PyTorchModelEngine(ModelEngine):
                 spec_metadata.all_rank_num_seqs = all_rank_num_seqs
 
         if mm_token_indices is not None:
-            assert False, "Not relevant to Helix."
             mask = torch.ones(total_num_tokens, dtype=torch.bool)
             mask[mm_token_indices] = False
             inputs['mm_token_indices'] = mm_token_indices.pin_memory().to(

@@ -607,8 +607,6 @@ class ExecutorRequestQueue:
             all_input_ids = torch.tensor(req_item.request.input_token_ids,
                                          dtype=torch.int64).unsqueeze(0)
             input_len = all_input_ids.shape[-1]
-            print("[ExecutorRequestQueue::_merge_helix_requests]: input_len: ",
-                  input_len, " all_input_ids:\n", all_input_ids)
 
             num_total_blocks = (input_len + tokens_per_block -
                                 1) // tokens_per_block
@@ -643,8 +641,6 @@ class ExecutorRequestQueue:
                 input_ids_this_rank = input_ids_this_rank[:-padding_len]
                 position_ids_this_rank = position_ids_this_rank[:-padding_len]
 
-            # print(f"[ExecutorRequestQueue::_merge_helix_requests][{curr_cp_rank}]: input_ids_this_rank: {input_ids_this_rank}")
-            # print(f"[ExecutorRequestQueue::_merge_helix_requests][{curr_cp_rank}]: position_ids_this_rank: {position_ids_this_rank}")
             req = executor_request_to_llm_request(
                 req_id=req_item.id,
                 executor_request=req_item.request,
@@ -652,7 +648,7 @@ class ExecutorRequestQueue:
                 exclude_last_generation_logits=self.
                 _should_exclude_last_generation_logits(),
                 input_token_ids=input_ids_this_rank,
-                # position_ids=position_ids_this_rank
+                position_ids=position_ids_this_rank,
             )
             req_with_children.append(req)
             if req.child_requests:

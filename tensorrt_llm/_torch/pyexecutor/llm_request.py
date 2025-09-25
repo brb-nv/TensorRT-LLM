@@ -379,10 +379,6 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
                                   exclude_last_generation_logits)
         self.child_requests = []
 
-        print(
-            f"[LlmRequest] request_id: {self.request_id}, py_prompt_len: {self.py_prompt_len}, orig_prompt_len: {self.orig_prompt_len}, decoder_iter: {self.py_decoding_iter}, max_new_tokens: {self.py_max_new_tokens}"
-        )
-
         self._py_embedding_bias_1d: Optional[torch.Tensor] = None
         if hasattr(self, 'embedding_bias') and self.embedding_bias is not None:
             # Pre-squeeze to 1D if needed (remove batch dimension)
@@ -510,7 +506,8 @@ def executor_request_to_llm_request(
         executor_request: ExecutorRequest,
         child_req_ids: List[int],
         exclude_last_generation_logits: bool,
-        input_token_ids: Optional[List] = None) -> LlmRequest:
+        input_token_ids: Optional[List] = None,
+        position_ids: Optional[List] = None) -> LlmRequest:
     executor_sampling_config = executor_request.sampling_config
     sampling_config = SamplingConfig(executor_sampling_config)
 
@@ -549,6 +546,7 @@ def executor_request_to_llm_request(
             convert_wordlist(executor_request.bad_words), dtype=torch.int32)
         if executor_request.bad_words else None,
         stop_words_list=stop_words_list,
+        position_ids=position_ids,
         prompt_embedding_table=None if executor_request.prompt_tuning_config
         is None else executor_request.prompt_tuning_config.embedding_table,
         prompt_vocab_size=None if executor_request.prompt_tuning_config is None
