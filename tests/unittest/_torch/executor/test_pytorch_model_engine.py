@@ -1,5 +1,6 @@
 import unittest
 from dataclasses import dataclass
+from unittest.mock import MagicMock
 
 import torch
 
@@ -15,6 +16,7 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import (KVCacheManager,
                                                              ResourceManagerType
                                                              )
 # isort: on
+from tensorrt_llm._torch.attention_metadata import AttentionMetadata
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.llmapi import CudaGraphConfig, LlmArgs, SamplingParams
@@ -321,6 +323,247 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
                          "Custom max_batch_size should be respected")
         self.assertTrue(pytorch_config_custom.cuda_graph_padding_enabled,
                         "Custom enable_padding should be respected")
+
+    def test_prepare_tp_inputs_with_context_parallelism(self) -> None:
+        """Test _prepare_tp_inputs function when cp_size > 1 (Helix context parallelism)."""
+
+        cp_size = 2
+        cp_rank = 0
+        cp_config = {"cp_type": CpType.HELIX, "tokens_per_block": 4}
+        mapping = Mapping(world_size=2,
+                          tp_size=1,
+                          pp_size=1,
+                          cp_size=cp_size,
+                          cp_config=cp_config,
+                          rank=cp_rank)
+
+        # Create model engine with context parallelism.
+        config = PyTorchConfig(use_cuda_graph=False)
+        model_engine = DummyModelEngine(config, batch_size=4, dtype=torch.half)
+        model_engine.mapping = mapping
+
+        # Mock the distributed communicator
+        mock_dist = MagicMock()
+
+        # Mock cp_allgather to return different values per CP rank
+        def mock_cp_allgather(obj):
+            # Simulate allgather across CP ranks: [past_seen_token_num_rank0, past_seen_token_num_rank1]
+            if cp_rank == 0:
+                return [obj, obj + 10]  # Rank 0 sees tokens [obj, obj+10]
+            else:
+                return [obj - 10, obj]  # Rank 1 sees tokens [obj-10, obj]
+
+        mock_dist.cp_allgather.side_effect = mock_cp_allgather
+        model_engine.dist = mock_dist
+
+        # Create test requests
+        req1 = _create_request(num_tokens=20, req_id=1)
+        req1.py_seq_slot = 0
+        req1.max_beam_num_tokens = 50  # past_seen_token_num = 49
+        req1.py_prompt_len = 20
+        req1.sampling_config.beam_width = 1
+        req1.py_multimodal_data = {}
+        req1.is_dummy = False
+        req1.py_batch_idx = None  # Will be set during processing
+
+        req2 = _create_request(num_tokens=15, req_id=2)
+        req2.py_seq_slot = 1
+        req2.max_beam_num_tokens = 30  # past_seen_token_num = 29
+        req2.py_prompt_len = 15
+        req2.sampling_config.beam_width = 1
+        req2.py_multimodal_data = {}
+        req2.is_dummy = False
+        req2.py_batch_idx = None
+
+        # Create scheduled requests
+        scheduled_requests = ScheduledRequests()
+        scheduled_requests.context_requests = []
+        scheduled_requests.generation_requests = [req1, req2]
+
+        # Create KV cache manager
+        kv_cache_config = KvCacheConfig(max_tokens=512)
+        kv_cache_manager = KVCacheManager(
+            kv_cache_config,
+            tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
+            num_layers=1,
+            num_kv_heads=16,
+            head_dim=16,
+            tokens_per_block=1,
+            max_seq_len=512,
+            max_batch_size=4,
+            mapping=mapping,
+            dtype=tensorrt_llm.bindings.DataType.HALF,
+        )
+
+        # Create attention metadata
+        attn_metadata = AttentionMetadata()
+        attn_metadata.is_cuda_graph = False
+
+        # Initialize model engine buffers
+        model_engine.max_num_tokens = 512
+        model_engine.input_ids_cuda = torch.zeros(512,
+                                                  dtype=torch.int32,
+                                                  device='cuda')
+        model_engine.position_ids_cuda = torch.zeros(512,
+                                                     dtype=torch.int32,
+                                                     device='cuda')
+        model_engine.previous_batch_indices_cuda = torch.zeros(
+            32, dtype=torch.int32, device='cuda')
+        model_engine.max_beam_width = 1
+        model_engine.use_beam_search = False
+        model_engine.enable_spec_decode = False
+        model_engine._disable_overlap_scheduler = True
+        model_engine.use_mrope = False
+        model_engine.enable_attention_dp = False
+        model_engine.guided_decoder = None
+
+        # Call the function under test
+        result = model_engine._prepare_tp_inputs(
+            scheduled_requests=scheduled_requests,
+            kv_cache_manager=kv_cache_manager,
+            attn_metadata=attn_metadata)
+
+        # Verify the results
+        self.assertIsNotNone(result)
+        self.assertIn('input_ids', result)
+        self.assertIn('position_ids', result)
+        self.assertIn('attn_metadata', result)
+
+        # Verify position_ids calculation with CP allgather
+        position_ids = result['position_ids']
+        self.assertIsInstance(position_ids, torch.Tensor)
+
+        # Check that cp_allgather was called for position calculation
+        self.assertTrue(mock_dist.cp_allgather.called)
+
+        # For cp_rank=0, the expected position_ids should be:
+        # req1: past_seen_token_num=49, allgather=[49, 59], sum=108
+        # req2: past_seen_token_num=29, allgather=[29, 39], sum=68
+        expected_positions = [108,
+                              68]  # Sum of allgather results for each request
+
+        # Extract actual position_ids (remove batch dimension)
+        actual_positions = position_ids.squeeze(
+            0).cpu().tolist()[:2]  # First 2 positions
+
+        self.assertEqual(
+            actual_positions, expected_positions,
+            f"Position IDs should reflect CP allgather results. Expected: {expected_positions}, Got: {actual_positions}"
+        )
+
+        # Verify attention metadata is properly configured
+        self.assertEqual(attn_metadata.request_ids, [1, 2])
+        self.assertEqual(attn_metadata.prompt_lens, [20, 15])
+        self.assertEqual(attn_metadata.num_contexts, 0)  # No context requests
+
+        # Verify KV cache parameters
+        self.assertIsNotNone(attn_metadata.kv_cache_params)
+        self.assertTrue(attn_metadata.kv_cache_params.use_cache)
+
+        # Verify sequence lengths are correct
+        expected_seq_lens = [1, 1]  # Generation requests have seq_len=1
+        if hasattr(attn_metadata,
+                   'seq_lens') and attn_metadata.seq_lens is not None:
+            actual_seq_lens = attn_metadata.seq_lens.cpu().tolist()
+            self.assertEqual(actual_seq_lens, expected_seq_lens)
+
+    def test_prepare_tp_inputs_with_context_parallelism_different_ranks(
+            self) -> None:
+        """Test _prepare_tp_inputs with different CP ranks to verify allgather behavior."""
+
+        # Test with cp_rank = 1
+        cp_size = 2
+        cp_rank = 1
+        mapping = Mapping(world_size=2,
+                          tp_size=1,
+                          pp_size=1,
+                          cp_size=cp_size,
+                          rank=cp_rank)
+
+        config = PyTorchConfig(use_cuda_graph=False)
+        model_engine = DummyModelEngine(config, batch_size=4, dtype=torch.half)
+        model_engine.mapping = mapping
+
+        # Mock the distributed communicator for rank 1
+        mock_dist = MagicMock()
+
+        def mock_cp_allgather_rank1(obj):
+            # Simulate different allgather results for rank 1
+            return [obj - 5, obj + 5]  # Different pattern for rank 1
+
+        mock_dist.cp_allgather.side_effect = mock_cp_allgather_rank1
+        model_engine.dist = mock_dist
+
+        # Create a test request
+        req = _create_request(num_tokens=10, req_id=10)
+        req.py_seq_slot = 0
+        req.max_beam_num_tokens = 25  # past_seen_token_num = 24
+        req.py_prompt_len = 10
+        req.sampling_config.beam_width = 1
+        req.py_multimodal_data = {}
+        req.is_dummy = False
+        req.py_batch_idx = None
+
+        scheduled_requests = ScheduledRequests()
+        scheduled_requests.context_requests = []
+        scheduled_requests.generation_requests = [req]
+
+        # Setup other required objects
+        kv_cache_config = KvCacheConfig(max_tokens=512)
+        kv_cache_manager = KVCacheManager(
+            kv_cache_config,
+            tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
+            num_layers=1,
+            num_kv_heads=16,
+            head_dim=16,
+            tokens_per_block=1,
+            max_seq_len=512,
+            max_batch_size=4,
+            mapping=mapping,
+            dtype=tensorrt_llm.bindings.DataType.HALF,
+        )
+
+        attn_metadata = AttentionMetadata()
+        attn_metadata.is_cuda_graph = False
+
+        # Initialize model engine buffers
+        model_engine.max_num_tokens = 512
+        model_engine.input_ids_cuda = torch.zeros(512,
+                                                  dtype=torch.int32,
+                                                  device='cuda')
+        model_engine.position_ids_cuda = torch.zeros(512,
+                                                     dtype=torch.int32,
+                                                     device='cuda')
+        model_engine.previous_batch_indices_cuda = torch.zeros(
+            32, dtype=torch.int32, device='cuda')
+        model_engine.max_beam_width = 1
+        model_engine.use_beam_search = False
+        model_engine.enable_spec_decode = False
+        model_engine._disable_overlap_scheduler = True
+        model_engine.use_mrope = False
+        model_engine.enable_attention_dp = False
+        model_engine.guided_decoder = None
+
+        # Call the function under test
+        result = model_engine._prepare_tp_inputs(
+            scheduled_requests=scheduled_requests,
+            kv_cache_manager=kv_cache_manager,
+            attn_metadata=attn_metadata)
+
+        # Verify cp_allgather was called
+        self.assertTrue(mock_dist.cp_allgather.called)
+
+        # For cp_rank=1 with past_seen_token_num=24:
+        # allgather=[24-5, 24+5] = [19, 29], sum=48
+        expected_position = 48
+
+        position_ids = result['position_ids']
+        actual_position = position_ids.squeeze(0)[0].item()
+
+        self.assertEqual(
+            actual_position, expected_position,
+            f"Position ID for rank 1 should be {expected_position}, got {actual_position}"
+        )
 
 
 if __name__ == "__main__":

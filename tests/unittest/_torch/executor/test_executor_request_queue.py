@@ -173,7 +173,7 @@ def test_merge_helix_requests_insufficient_blocks_error(mock_dist):
         request=executor_request,
     )
 
-    # Loop over ranks 0, 1, 2, 3 and verify that all ranks throw assertion
+    # Loop over ranks 0, 1, 2, 3 and verify that all ranks throw assertion.
     for rank in range(4):
         mock_dist.cp_rank = rank
 
