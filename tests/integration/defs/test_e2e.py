@@ -3476,6 +3476,32 @@ def test_llmapi_generation_logits(llm_venv, model_path,
     loop.run_until_complete(async_generation_test())
 
 
+# This is just a smoke test. Will be replaced with accuracy tests later.
+@pytest.mark.skip_less_device_memory(80000)
+@pytest.mark.skip_less_device(2)
+@pytest.mark.parametrize("model_path", [
+    pytest.param('DeepSeek-V3-Lite/bf16', marks=skip_pre_hopper),
+])
+def test_ptp_quickstart_advanced_helix_parallelism(llm_root, llm_venv,
+                                                   model_path):
+    print(f"Testing {model_path}.")
+    cp_size = 2
+    example_root = Path(os.path.join(llm_root, "examples", "llm-api"))
+    run_cmd = [
+        "trtllm-llmapi-launch",
+        "python3",
+        str(example_root / "quickstart_advanced.py"),
+        f"--model_dir={llm_models_root()}/{model_path}",
+        f"--cp_size={cp_size}",
+        f"--cp_type=HELIX",
+        f"--kv_cache_fraction={_MEM_FRACTION_50}",
+        "--max_batch_size=32",
+        "--max_num_tokens=2048",
+        "--disable_kv_cache_reuse",
+    ]
+    check_call(" ".join(run_cmd), shell=True, env=llm_venv._new_env)
+
+
 @pytest.mark.skip_less_device(2)
 @pytest.mark.skip_less_device_memory(40000)
 def test_deepseekv3_lite_cp_helix_kv_cache_blocks(llm_venv):
@@ -3495,28 +3521,14 @@ def test_deepseekv3_lite_cp_helix_kv_cache_blocks(llm_venv):
     import torch
 
     from tensorrt_llm import LLM, SamplingParams
-    from tensorrt_llm.mapping import CpType
 
     # Model configuration
     model_path = f"{llm_models_root()}/DeepSeek-V3-Lite/bf16"
 
     # Simple test prompt for reproducible results.
     prompt_tokens = [
-        128000,
-        128006,
-        9125,
-        128007,
-        271,
-        3923,
-        374,
-        701,
-        836,
-        30,
-        128009,
-        128006,
-        78191,
-        128007,
-        271
+        128000, 128006, 9125, 128007, 271, 3923, 374, 701, 836, 30, 128009,
+        128006, 78191, 128007, 271
     ]
 
     # Deterministic sampling for exact comparison
@@ -3543,12 +3555,12 @@ def test_deepseekv3_lite_cp_helix_kv_cache_blocks(llm_venv):
             "tokens_per_block": 4,
         },
         "cuda_graph_config": None,
-        "context_parallel_size": 2,
-        "cp_config": {
-            "cp_type": CpType.HELIX,
-            # Use the same as tokens_per_block in kv_cache_config.
-            "tokens_per_block": 4,
-        },
+        # "context_parallel_size": 2,
+        # "cp_config": {
+        #     "cp_type": CpType.HELIX,
+        #     # Use the same as tokens_per_block in kv_cache_config.
+        #     "tokens_per_block": 4,
+        # },
     }
 
     # Storage for captured forward call information.
@@ -3566,26 +3578,34 @@ def test_deepseekv3_lite_cp_helix_kv_cache_blocks(llm_venv):
                          spec_metadata=None,
                          **kwargs):
             """Mock DeepseekV3ForCausalLM forward that captures inputs and returns deterministic outputs."""
-            
+
             # Capture the call information
             call_info = {
-                'step': len(forward_calls),
-                'rank': getattr(self.model_config.mapping, 'rank', 0),
-                'cp_rank': getattr(self.model_config.mapping, 'cp_rank', 0),
-                'input_ids': input_ids.tolist() if input_ids is not None else None,
-                'position_ids': position_ids.tolist() if position_ids is not None else None,
-                'is_prefill': None,  # Will be determined by sequence length
-                'allocated_blocks': 0,  # Will try to capture from attn_metadata
-                'kv_stats': None,
+                'step':
+                len(forward_calls),
+                'rank':
+                getattr(self.model_config.mapping, 'rank', 0),
+                'cp_rank':
+                getattr(self.model_config.mapping, 'cp_rank', 0),
+                'input_ids':
+                input_ids.tolist() if input_ids is not None else None,
+                'position_ids':
+                position_ids.tolist() if position_ids is not None else None,
+                'is_prefill':
+                None,  # Will be determined by sequence length
+                'allocated_blocks':
+                0,  # Will try to capture from attn_metadata
+                'kv_stats':
+                None,
             }
-            
+
             # Determine if this is prefill or decode based on sequence length
             if input_ids is not None:
                 seq_len = input_ids.shape[1]
                 call_info['seq_len'] = seq_len
                 call_info['is_prefill'] = seq_len > 1
             elif inputs_embeds is not None:
-                seq_len = inputs_embeds.shape[1] 
+                seq_len = inputs_embeds.shape[1]
                 call_info['seq_len'] = seq_len
                 call_info['is_prefill'] = seq_len > 1
             else:
@@ -3594,42 +3614,56 @@ def test_deepseekv3_lite_cp_helix_kv_cache_blocks(llm_venv):
 
             # Try to capture KV cache block information from attn_metadata
             try:
-                if hasattr(attn_metadata, 'kv_cache_manager') and attn_metadata.kv_cache_manager is not None:
+                if hasattr(attn_metadata, 'kv_cache_manager'
+                           ) and attn_metadata.kv_cache_manager is not None:
                     kv_manager = attn_metadata.kv_cache_manager
-                    if hasattr(kv_manager, 'get_batch_cache_indices') and attn_metadata.request_ids is not None:
-                        block_ids_per_seq = kv_manager.get_batch_cache_indices(attn_metadata.request_ids)
+                    if hasattr(kv_manager, 'get_batch_cache_indices'
+                               ) and attn_metadata.request_ids is not None:
+                        block_ids_per_seq = kv_manager.get_batch_cache_indices(
+                            attn_metadata.request_ids)
                         if block_ids_per_seq:
                             # Count total allocated blocks across all sequences
-                            total_blocks = sum(len(block_ids) for block_ids in block_ids_per_seq)
+                            total_blocks = sum(
+                                len(block_ids)
+                                for block_ids in block_ids_per_seq)
                             call_info['allocated_blocks'] = total_blocks
-                            call_info['block_ids'] = [block_ids.tolist() if hasattr(block_ids, 'tolist') else list(block_ids) for block_ids in block_ids_per_seq]
-                        
+                            call_info['block_ids'] = [
+                                block_ids.tolist() if hasattr(
+                                    block_ids, 'tolist') else list(block_ids)
+                                for block_ids in block_ids_per_seq
+                            ]
+
                     # Also try to get general stats if available - try executor access
                     try:
                         kv_cache_manager = llm_instance._executor.resource_manager.resource_managers.get(
-                            llm_instance._executor.resource_manager.ResourceManagerType.KV_CACHE_MANAGER)
+                            llm_instance._executor.resource_manager.
+                            ResourceManagerType.KV_CACHE_MANAGER)
                         if kv_cache_manager:
                             kv_stats = kv_cache_manager.get_kv_cache_stats()
                             call_info['kv_stats'] = {
                                 'used_blocks': kv_stats.used_num_blocks,
-                                'alloc_total_blocks': kv_stats.alloc_total_blocks,
+                                'alloc_total_blocks':
+                                kv_stats.alloc_total_blocks,
                                 'alloc_new_blocks': kv_stats.alloc_new_blocks,
                                 'max_blocks': kv_stats.max_num_blocks,
                                 'free_blocks': kv_stats.free_num_blocks,
                             }
-                            call_info['allocated_blocks'] = kv_stats.alloc_total_blocks
+                            call_info[
+                                'allocated_blocks'] = kv_stats.alloc_total_blocks
                     except:
                         pass
-                        
+
             except Exception as e:
                 call_info['kv_error'] = str(e)
-            
+
             forward_calls.append(call_info)
-            
-            print(f"[MOCK FORWARD] Step {call_info['step']}, Rank {call_info['rank']}, CP Rank {call_info['cp_rank']}, "
-                  f"{'Prefill' if call_info['is_prefill'] else 'Decode'}, "
-                  f"seq_len={call_info['seq_len']}, allocated_blocks={call_info['allocated_blocks']}")
-            
+
+            print(
+                f"[MOCK FORWARD] Step {call_info['step']}, Rank {call_info['rank']}, CP Rank {call_info['cp_rank']}, "
+                f"{'Prefill' if call_info['is_prefill'] else 'Decode'}, "
+                f"seq_len={call_info['seq_len']}, allocated_blocks={call_info['allocated_blocks']}"
+            )
+
             # Determine output shape
             if input_ids is not None:
                 batch_size, seq_len = input_ids.shape
@@ -3638,19 +3672,21 @@ def test_deepseekv3_lite_cp_helix_kv_cache_blocks(llm_venv):
                 batch_size, seq_len = inputs_embeds.shape[:2]
                 device = inputs_embeds.device
             else:
-                raise ValueError("Either input_ids or inputs_embeds must be provided")
+                raise ValueError(
+                    "Either input_ids or inputs_embeds must be provided")
 
             # Get vocab size from the model
             vocab_size = self.lm_head.vocab_size_padded
 
             # Return deterministic logits - use step number to make outputs predictable
-            step_token_id = (len(forward_calls) % 1000) + 1  # Avoid special tokens (0)
+            step_token_id = (len(forward_calls) %
+                             1000) + 1  # Avoid special tokens (0)
             logits = torch.full((batch_size, seq_len, vocab_size),
                                 fill_value=-1e6,
                                 dtype=torch.float32,
                                 device=device)
 
-            # Set high logit for our chosen token  
+            # Set high logit for our chosen token
             logits[:, :, step_token_id] = 10.0
             return logits
 
@@ -3666,6 +3702,7 @@ def test_deepseekv3_lite_cp_helix_kv_cache_blocks(llm_venv):
         try:
             # Apply DeepseekV3ForCausalLM forward mocking with KV cache tracking
             mock_forward = create_mock_forward_with_kv_tracking(llm)
+            patch.dict(os.environ, {"TLLM_WORKER_USE_SINGLE_PROCESS": "1"})
             with patch(
                     'tensorrt_llm._torch.models.modeling_deepseekv3.DeepseekV3ForCausalLM.forward',
                     mock_forward):
@@ -3676,7 +3713,7 @@ def test_deepseekv3_lite_cp_helix_kv_cache_blocks(llm_venv):
                     outputs.append(output)
                     break  # Get final output only
 
-                result = outputs[0] if outputs else None
+                outputs[0] if outputs else None
         finally:
             llm.shutdown()
 
@@ -3695,7 +3732,7 @@ def test_deepseekv3_lite_cp_helix_kv_cache_blocks(llm_venv):
         # # Separate calls by phase (prefill vs decode) and rank
         # prefill_calls = [call for call in forward_calls if call['is_prefill']]
         # decode_calls = [call for call in forward_calls if not call['is_prefill']]
-        
+
         # print(f"\nForward call summary:")
         # print(f"  Prefill calls: {len(prefill_calls)}")
         # print(f"  Decode calls: {len(decode_calls)}")
@@ -3726,7 +3763,7 @@ def test_deepseekv3_lite_cp_helix_kv_cache_blocks(llm_venv):
         #         if rank not in prefill_by_rank:
         #             prefill_by_rank[rank] = []
         #         prefill_by_rank[rank].append(call)
-            
+
         #     # Check that different ranks have different block allocations during prefill
         #     block_counts_by_rank = {}
         #     for rank, calls in prefill_by_rank.items():
@@ -3734,13 +3771,13 @@ def test_deepseekv3_lite_cp_helix_kv_cache_blocks(llm_venv):
         #             # Use the first prefill call for each rank
         #             block_counts_by_rank[rank] = calls[0]['allocated_blocks']
         #             print(f"  Rank {rank} prefill allocated blocks: {calls[0]['allocated_blocks']}")
-            
+
         #     if len(block_counts_by_rank) >= 2:
         #         # For CP helix, we expect different block allocations across ranks during prefill
         #         all_block_counts = list(block_counts_by_rank.values())
         #         unique_block_counts = set(all_block_counts)
         #         print(f"  Unique block counts across ranks: {sorted(unique_block_counts)}")
-                
+
         #         # Allow for some variation - ranks might have similar but not identical allocations
         #         if len(unique_block_counts) > 1:
         #             print("✓ Block allocation varies across CP ranks during prefill")
@@ -3758,13 +3795,13 @@ def test_deepseekv3_lite_cp_helix_kv_cache_blocks(llm_venv):
         #         if rank not in decode_by_rank:
         #             decode_by_rank[rank] = []
         #         decode_by_rank[rank].append(call)
-            
+
         #     # Check linear increase in block allocation on both CP ranks
         #     for rank, calls in decode_by_rank.items():
         #         if len(calls) > 1:
         #             block_counts = [call['allocated_blocks'] for call in calls]
         #             print(f"  Rank {rank} decode block progression: {block_counts}")
-                    
+
         #             # Check if blocks increase linearly (or at least monotonically)
         #             is_increasing = all(block_counts[i] <= block_counts[i+1] for i in range(len(block_counts)-1))
         #             if is_increasing:
@@ -3773,7 +3810,7 @@ def test_deepseekv3_lite_cp_helix_kv_cache_blocks(llm_venv):
         #                 print(f"⚠ Warning: Rank {rank} block allocation does not increase linearly during decode")
         #         else:
         #             print(f"  Rank {rank}: Only {len(calls)} decode call(s), cannot verify linear increase")
-            
+
         #     # Check that same position_ids are received on both CP ranks during decode
         #     if len(decode_by_rank) >= 2:
         #         # Group decode calls by step to compare position_ids across ranks
@@ -3784,7 +3821,7 @@ def test_deepseekv3_lite_cp_helix_kv_cache_blocks(llm_venv):
         #                 if step not in decode_steps:
         #                     decode_steps[step] = {}
         #                 decode_steps[step][rank] = call['position_ids']
-                
+
         #         print(f"  Comparing position_ids across ranks for {len(decode_steps)} decode steps:")
         #         position_ids_match = True
         #         for step, rank_position_ids in decode_steps.items():
@@ -3792,13 +3829,13 @@ def test_deepseekv3_lite_cp_helix_kv_cache_blocks(llm_venv):
         #                 ranks = sorted(rank_position_ids.keys())
         #                 pos_ids_0 = rank_position_ids[ranks[0]]
         #                 pos_ids_1 = rank_position_ids[ranks[1]]
-                        
+
         #                 if pos_ids_0 == pos_ids_1:
         #                     print(f"    Step {step}: ✓ position_ids match across ranks {ranks}: {pos_ids_0}")
         #                 else:
         #                     print(f"    Step {step}: ✗ position_ids differ: rank {ranks[0]}={pos_ids_0}, rank {ranks[1]}={pos_ids_1}")
         #                     position_ids_match = False
-                
+
         #         if position_ids_match:
         #             print("✓ Same position_ids received on both CP ranks during decode")
         #         else:

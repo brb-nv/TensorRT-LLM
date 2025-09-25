@@ -18,7 +18,7 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import (KVCacheManager,
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.llmapi import CudaGraphConfig, LlmArgs, SamplingParams
-from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.mapping import CpType, Mapping
 
 
 @dataclass
@@ -50,9 +50,9 @@ class DummyModel(torch.nn.Module):
         return self.model_config.pretrained_config
 
     def forward(self, *args, **kwargs) -> torch.Tensor:
-        input_ids = kwargs["input_ids"]
+        self.recorded_input_ids = kwargs["input_ids"]
         self.recorded_position_ids = kwargs["position_ids"]
-        batch_size = input_ids.size(0)
+        batch_size = self.recorded_input_ids.size(0)
         return {"logits": torch.randn((batch_size, 10), device='cuda')}
 
 
@@ -321,6 +321,87 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
                          "Custom max_batch_size should be respected")
         self.assertTrue(pytorch_config_custom.cuda_graph_padding_enabled,
                         "Custom enable_padding should be respected")
+
+
+def create_model_engine_and_kvcache_for_helix():
+    max_num_requests = 1
+    tokens_per_block = 4
+    max_tokens = 96
+    num_layers = 1
+    batch_size = 1
+
+    config = PyTorchConfig()
+    model_engine = DummyModelEngine(config, max_num_requests, torch.half)
+
+    kv_cache_config = KvCacheConfig(max_tokens=max_tokens)
+    cp_config = {'cp_type': CpType.HELIX, 'tokens_per_block': tokens_per_block}
+    mapping = Mapping(world_size=2, cp_size=2, rank=0)
+    kv_cache_manager = KVCacheManager(
+        kv_cache_config,
+        tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
+        num_layers=num_layers,
+        num_kv_heads=model_engine.model.config.num_key_value_heads,
+        head_dim=model_engine.model.config.head_dim,
+        tokens_per_block=tokens_per_block,
+        max_seq_len=max_tokens,
+        max_batch_size=batch_size,
+        mapping=mapping,
+        dtype=tensorrt_llm.bindings.DataType.HALF,
+    )
+
+    return model_engine, kv_cache_manager
+
+
+class PyTorchModelEngineWithHelixTestCase(unittest.TestCase):
+
+    def test_position_id_preparation(self):
+        model_engine, kv_cache_manager = create_model_engine_and_kvcache_for_helix(
+        )
+        resource_manager = ResourceManager(
+            {ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager})
+
+        prompt_len = 12
+        requests = [_create_request(prompt_len, 0)]
+
+        # Prefill run
+        batch = ScheduledRequests()
+        batch.context_requests = requests
+        batch.generation_requests = []
+        kv_cache_manager.prepare_resources(batch)
+        model_engine.forward(batch, resource_manager)
+
+        expected_prefill_pos_ids = torch.arange(0,
+                                                prompt_len,
+                                                dtype=torch.int32,
+                                                device='cuda').unsqueeze(0)
+
+        print("recorded_position_ids: ",
+              model_engine.model.recorded_position_ids)
+
+        torch.testing.assert_close(model_engine.model.recorded_position_ids,
+                                   expected_prefill_pos_ids,
+                                   atol=0,
+                                   rtol=0)
+
+        # # Simulate decoding one token after prefill
+        # requests[-1].add_new_token(42, 0)
+
+        # # Generation run
+        # batch = ScheduledRequests()
+        # batch.context_requests = []
+        # batch.generation_requests = requests
+        # kv_cache_manager.prepare_resources(batch)
+
+        # model_engine.forward(batch, resource_manager)
+        # expected_gen_pos_id = torch.tensor([prompt_len],
+        #                                    dtype=torch.int32,
+        #                                    device='cuda').unsqueeze(0)
+        # torch.testing.assert_close(model_engine.model.recorded_position_ids,
+        #                            expected_gen_pos_id,
+        #                            atol=0,
+        #                            rtol=0)
+
+        # kv_cache_manager.shutdown()
 
 
 if __name__ == "__main__":

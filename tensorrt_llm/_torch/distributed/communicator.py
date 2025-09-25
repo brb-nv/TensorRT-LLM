@@ -450,8 +450,8 @@ class TorchDist(Distributed):
             return recv[0]
 
     def broadcast(self, obj, root=0):
-        assert not (self.mapping.has_cp_ulysses()
-                    and self.mapping.has_tp()), 'Unsupported mix of Ulysses CP and TP.'
+        assert not (self.mapping.has_cp_ulysses() and self.mapping.has_tp()
+                    ), 'Unsupported mix of Ulysses CP and TP.'
         if self.mapping.has_cp_ulysses():
             self.broadcast_cp(obj, root)
         elif self.mapping.has_tp():

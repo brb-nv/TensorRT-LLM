@@ -753,7 +753,8 @@ class PyTorchModelEngine(ModelEngine):
         cp_type = self.mapping.cp_config.get('cp_type', None)
         # @B: We can probably do better here.
         if cp_type is not None:
-            print("[ModelEngine::warmup] Skipping warmup for cp_type: ", cp_type.name)
+            print("[ModelEngine::warmup] Skipping warmup for cp_type: ",
+                  cp_type.name)
             return
 
         if self._torch_compile_enabled:
@@ -1549,10 +1550,13 @@ class PyTorchModelEngine(ModelEngine):
                 position_id = past_seen_token_num
                 if self.mapping.cp_size > 1:
                     # Do an allgather among CP ranks to get the complete sequence length seen by all CP ranks.
-                    past_seen_token_nums = self.dist.cp_allgather(past_seen_token_num)
+                    past_seen_token_nums = self.dist.cp_allgather(
+                        past_seen_token_num)
                     position_id = sum(past_seen_token_nums)
 
-                print("[prepare_tp_inputs][cp_rank ", self.mapping.cp_rank, "] Appending position_ids ", position_id, " for request ", request.py_request_id)
+                print("[prepare_tp_inputs][cp_rank ", self.mapping.cp_rank,
+                      "] Appending position_ids ", position_id, " for request ",
+                      request.py_request_id)
                 position_ids.append(position_id)
                 num_cached_tokens_per_seq.append(past_seen_token_num)
                 prompt_lengths.append(request.py_prompt_len)

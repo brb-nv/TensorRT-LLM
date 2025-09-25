@@ -379,7 +379,9 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
                                   exclude_last_generation_logits)
         self.child_requests = []
 
-        print(f"[LlmRequest] request_id: {self.request_id}, py_prompt_len: {self.py_prompt_len}, orig_prompt_len: {self.orig_prompt_len}, decoder_iter: {self.py_decoding_iter}, max_new_tokens: {self.py_max_new_tokens}")
+        print(
+            f"[LlmRequest] request_id: {self.request_id}, py_prompt_len: {self.py_prompt_len}, orig_prompt_len: {self.orig_prompt_len}, decoder_iter: {self.py_decoding_iter}, max_new_tokens: {self.py_max_new_tokens}"
+        )
 
         self._py_embedding_bias_1d: Optional[torch.Tensor] = None
         if hasattr(self, 'embedding_bias') and self.embedding_bias is not None:

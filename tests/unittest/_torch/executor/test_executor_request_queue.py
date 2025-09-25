@@ -4,13 +4,13 @@ import threading
 import time
 from collections import deque
 from unittest.mock import Mock, patch
-from tensorrt_llm.mapping import CpType
 
 import pytest
 
 from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
     SHUTDOWN_REQUEST_ID, ExecutorRequestQueue, RequestQueueItem)
 from tensorrt_llm.bindings import executor as trtllm
+from tensorrt_llm.mapping import CpType
 
 
 @pytest.fixture
@@ -95,18 +95,16 @@ def test_enqueue_requests(executor_queue):
 
 def test_merge_helix_requests_basic(mock_dist):
     """Test _merge_helix_requests with basic valid input."""
-    
+
     tokens_per_block = 2
 
     # Create request item with 13 tokens to get exactly 7 blocks for 4 CP ranks.
     input_tokens = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
-    executor_request = trtllm.Request(
-        input_token_ids=input_tokens,
-        max_tokens=5,
-        streaming=False,
-        sampling_config=trtllm.SamplingConfig(),
-        output_config=trtllm.OutputConfig()
-    )
+    executor_request = trtllm.Request(input_token_ids=input_tokens,
+                                      max_tokens=5,
+                                      streaming=False,
+                                      sampling_config=trtllm.SamplingConfig(),
+                                      output_config=trtllm.OutputConfig())
     request_item = RequestQueueItem(
         id=1,
         request=executor_request,
@@ -120,20 +118,21 @@ def test_merge_helix_requests_basic(mock_dist):
             'cp_type': CpType.HELIX,
             'tokens_per_block': tokens_per_block,
         }
-        executor_queue = ExecutorRequestQueue(
-            dist=mock_dist,
-            enable_attention_dp=False,
-            max_batch_size=8,
-            max_beam_width=1,
-            max_num_active_requests=16,
-            enable_iter_perf_stats=True,
-            batch_wait_timeout_ms=0.0,
-            is_disaggregated=True
-        )
+        executor_queue = ExecutorRequestQueue(dist=mock_dist,
+                                              enable_attention_dp=False,
+                                              max_batch_size=8,
+                                              max_beam_width=1,
+                                              max_num_active_requests=16,
+                                              enable_iter_perf_stats=True,
+                                              batch_wait_timeout_ms=0.0,
+                                              is_disaggregated=True)
 
         # Mock _should_exclude_last_generation_logits.
-        with patch.object(executor_queue, '_should_exclude_last_generation_logits', return_value=False):
-            result = executor_queue._merge_helix_requests([request_item], tokens_per_block)
+        with patch.object(executor_queue,
+                          '_should_exclude_last_generation_logits',
+                          return_value=False):
+            result = executor_queue._merge_helix_requests([request_item],
+                                                          tokens_per_block)
 
         # Verify the result.
         assert len(result) == 1
@@ -155,21 +154,20 @@ def test_merge_helix_requests_basic(mock_dist):
 def test_merge_helix_requests_insufficient_blocks_error(mock_dist):
     """Test _merge_helix_requests raises error when insufficient blocks."""
     mock_dist.cp_size = 4
-    
+
     tokens_per_block = 4
     mock_dist.cp_config = {
         'cp_type': CpType.HELIX,
         'tokens_per_block': tokens_per_block,
     }
-    
+
     # Create input with only 12 tokens. This creates 3 blocks which is fewer than 4 CP ranks.
     executor_request = trtllm.Request(
         input_token_ids=[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
         max_tokens=12,
         streaming=False,
         sampling_config=trtllm.SamplingConfig(),
-        output_config=trtllm.OutputConfig()
-    )
+        output_config=trtllm.OutputConfig())
     request_item = RequestQueueItem(
         id=1,
         request=executor_request,
@@ -178,20 +176,24 @@ def test_merge_helix_requests_insufficient_blocks_error(mock_dist):
     # Loop over ranks 0, 1, 2, 3 and verify that all ranks throw assertion
     for rank in range(4):
         mock_dist.cp_rank = rank
-        
-        executor_queue = ExecutorRequestQueue(
-            dist=mock_dist,
-            enable_attention_dp=False,
-            max_batch_size=8,
-            max_beam_width=1,
-            max_num_active_requests=16,
-            enable_iter_perf_stats=True,
-            batch_wait_timeout_ms=0.0,
-            is_disaggregated=True
-        )
-        
-        with pytest.raises(ValueError, match="There aren't enough tokens to get at least one block per CP rank"):
-            executor_queue._merge_helix_requests([request_item], tokens_per_block)
+
+        executor_queue = ExecutorRequestQueue(dist=mock_dist,
+                                              enable_attention_dp=False,
+                                              max_batch_size=8,
+                                              max_beam_width=1,
+                                              max_num_active_requests=16,
+                                              enable_iter_perf_stats=True,
+                                              batch_wait_timeout_ms=0.0,
+                                              is_disaggregated=True)
+
+        with pytest.raises(
+                ValueError,
+                match=
+                "There aren't enough tokens to get at least one block per CP rank"
+        ):
+            executor_queue._merge_helix_requests([request_item],
+                                                 tokens_per_block)
+
 
 def test_enqueue_request_single(executor_queue):
     """Test enqueuing a single request."""
