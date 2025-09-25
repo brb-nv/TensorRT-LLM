@@ -140,7 +140,6 @@ def test_merge_helix_requests_basic(mock_dist):
         from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
         assert isinstance(llm_request, LlmRequest)
         assert llm_request.request_id == 1
-        # 4 blocks in total, 1 block per rank.
         if rank == 0:
             assert llm_request.get_tokens(0) == [1, 2, 3, 4]
         elif rank == 1:
