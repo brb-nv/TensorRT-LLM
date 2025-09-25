@@ -81,8 +81,8 @@ public:
         torch::optional<torch::Tensor> mrope_rotary_cos_sin, torch::optional<torch::Tensor> mrope_position_deltas,
         torch::optional<torch::Tensor> softmax_stats_tensor,
         c10::ArrayRef<std::optional<torch::Tensor>> spec_decoding_tensor_params,
-        torch::optional<torch::Tensor> attention_sinks,
-        torch::optional<torch::Tensor> helix_position_offsets) const
+        torch::optional<torch::Tensor> attention_sinks, torch::optional<torch::Tensor> helix_position_offsets,
+        bool const helix_is_inactive_rank) const
         = 0;
 };
 
@@ -136,8 +136,8 @@ public:
         torch::optional<torch::Tensor> mrope_rotary_cos_sin, torch::optional<torch::Tensor> mrope_position_deltas,
         torch::optional<torch::Tensor> softmax_stats_tensor,
         c10::ArrayRef<std::optional<torch::Tensor>> spec_decoding_tensor_params,
-        torch::optional<torch::Tensor> attention_sinks,
-        torch::optional<torch::Tensor> helix_position_offsets) const override
+        torch::optional<torch::Tensor> attention_sinks, torch::optional<torch::Tensor> helix_position_offsets,
+        bool const helix_is_inactive_rank) const override
     {
         auto stream = at::cuda::getCurrentCUDAStream(qkv_or_q.get_device());
         T* attention_input = static_cast<T*>(qkv_or_q.slice(0, token_offset).data_ptr());
@@ -216,6 +216,7 @@ public:
             {
                 mla_params.helix_position_offsets = helix_position_offsets.value().data_ptr<int32_t>();
             }
+            mla_params.helix_is_inactive_rank = helix_is_inactive_rank;
         }
 
         int const* context_lengths_ptr = context_lengths.slice(0, seq_offset).data_ptr<int>();
@@ -510,7 +511,7 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     std::optional<torch::Tensor> mrope_rotary_cos_sin, std::optional<torch::Tensor> mrope_position_deltas,
     std::optional<int64_t> attention_chunk_size, std::optional<torch::Tensor> softmax_stats_tensor,
     std::vector<bool> spec_decoding_bool_params, std::vector<std::optional<torch::Tensor>> spec_decoding_tensor_params,
-    std::optional<torch::Tensor> helix_position_offsets)
+    std::optional<torch::Tensor> helix_position_offsets, bool const helix_is_inactive_rank)
 {
     TLLM_LOG_TRACE("Attention op starts at layer %d", layer_idx);
     // Use these tensors to infer if the attention is using KV cache
@@ -749,7 +750,8 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
             kv_cache_block_offsets, host_kv_cache_block_offsets, host_kv_cache_pool_pointers,
             host_kv_cache_pool_mapping, cache_indirection, kv_scale_orig_quant, kv_scale_quant_orig, out_scale,
             rotary_inv_freq, rotary_cos_sin, latent_cache, q_pe, block_ids_per_seq, mrope_rotary_cos_sin,
-            mrope_position_deltas, softmax_stats_tensor, spec_decoding_tensor_params, attention_sinks, helix_position_offsets);
+            mrope_position_deltas, softmax_stats_tensor, spec_decoding_tensor_params, attention_sinks,
+            helix_position_offsets, helix_is_inactive_rank);
     }
 
     if ((num_generations > 0) && (attn_input_type != AttentionInputType::ContextOnly))
@@ -765,7 +767,8 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
             kv_cache_block_offsets, host_kv_cache_block_offsets, host_kv_cache_pool_pointers,
             host_kv_cache_pool_mapping, cache_indirection, kv_scale_orig_quant, kv_scale_quant_orig, out_scale,
             rotary_inv_freq, rotary_cos_sin, latent_cache, q_pe, block_ids_per_seq, mrope_rotary_cos_sin,
-            mrope_position_deltas, softmax_stats_tensor, spec_decoding_tensor_params, attention_sinks, helix_position_offsets);
+            mrope_position_deltas, softmax_stats_tensor, spec_decoding_tensor_params, attention_sinks,
+            helix_position_offsets, helix_is_inactive_rank);
     }
 
     TLLM_LOG_TRACE("Attention op stops at layer %d", layer_idx);

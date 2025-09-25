@@ -55,7 +55,7 @@ void initBindings(pybind11::module_& m)
         py::arg("mrope_rotary_cos_sin") = std::nullopt, py::arg("mrope_position_deltas") = std::nullopt,
         py::arg("attention_chunk_size") = std::nullopt, py::arg("softmax_stats_tensor") = std::nullopt,
         py::arg("spec_decoding_bool_params"), py::arg("spec_decoding_tensor_params"),
-        py::arg("helix_position_offsets") = std::nullopt, "Multi-head attention operation",
-        py::call_guard<py::gil_scoped_release>());
+        py::arg("helix_position_offsets") = std::nullopt, py::arg("helix_is_inactive_rank"),
+        "Multi-head attention operation", py::call_guard<py::gil_scoped_release>());
 }
 } // namespace tensorrt_llm::pybind::thop
