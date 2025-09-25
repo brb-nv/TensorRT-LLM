@@ -227,14 +227,6 @@ def get_rank_model_storage(model):
     return total_bytes
 
 
-def _is_active_helix_rank(cp_rank: int, cp_size: int, position_id: int, tokens_per_block: int) -> bool:
-    if cp_size == 1:
-        return True
-    global_block_id = position_id // tokens_per_block
-    # Assuming round-robin assignment of blocks to CP ranks. Math gets complicated if contiguous blocks
-    # are assigned to the same CP rank for prefill but round-robin for decode.
-    return global_block_id % cp_size == cp_rank
-
 def _filter_cuda_graph_batch_sizes(cuda_graph_batch_sizes: list[int],
                                    max_batch_size: int, max_num_tokens: int,
                                    max_draft_len: int,
@@ -1559,7 +1551,7 @@ class PyTorchModelEngine(ModelEngine):
                     # Do an allgather among CP ranks to get the complete sequence length seen by all CP ranks.
                     past_seen_token_nums = self.dist.cp_allgather(past_seen_token_num)
                     position_id = sum(past_seen_token_nums)
-                    attn_metadata.is_active_helix_rank = _is_active_helix_rank(cp_rank=self.mapping.cp_rank, cp_size=self.mapping.cp_size, position_id=position_id, tokens_per_block=kv_cache_manager.tokens_per_block)
+
                 print("[prepare_tp_inputs][cp_rank ", self.mapping.cp_rank, "] Appending position_ids ", position_id, " for request ", request.py_request_id)
                 position_ids.append(position_id)
                 num_cached_tokens_per_seq.append(past_seen_token_num)
