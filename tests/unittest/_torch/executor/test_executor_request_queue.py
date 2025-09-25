@@ -93,7 +93,7 @@ def test_enqueue_requests(executor_queue):
         assert executor_queue.start_times[req_id] == 1234.5
 
 
-def test_merge_helix_requests_basic(mock_dist):
+def test_merge_helix_requests(mock_dist):
     """Test _merge_helix_requests with basic valid input."""
 
     tokens_per_block = 2

@@ -603,6 +603,10 @@ class ExecutorRequestQueue:
         req_with_children = []
         num_cp_ranks = self.dist.cp_size
         curr_cp_rank = self.dist.cp_rank
+
+        # For each request, partition the input_token_ids into blocks and then parition blocks across CP ranks.
+        # Currently, the partitioning is such that contiguous blocks are assigned to the same CP rank (as opposed
+        # to round-robin).
         for req_item in new_requests:
             all_input_ids = torch.tensor(req_item.request.input_token_ids,
                                          dtype=torch.int64).unsqueeze(0)
@@ -630,13 +634,14 @@ class ExecutorRequestQueue:
                 torch.stack(all_position_ids.split(tokens_per_block, dim=-1)),
                 num_cp_ranks)
 
-            # Get the ctx_blocks and position_blocks for this rank.
+            # Get the input_ids and position_ids for this rank.
             input_ids_this_rank = input_id_blocks_per_rank[
                 curr_cp_rank].flatten().tolist()
             position_ids_this_rank = position_id_blocks_per_rank[
                 curr_cp_rank].flatten().tolist()
 
-            # Undo the padding. Only last rank's last block will be padded right now.
+            # Undo the padding. Only last rank's last block will be padded right now
+            # given contiguous block assignment.
             if curr_cp_rank == num_cp_ranks - 1 and padding_len > 0:
                 input_ids_this_rank = input_ids_this_rank[:-padding_len]
                 position_ids_this_rank = position_ids_this_rank[:-padding_len]
