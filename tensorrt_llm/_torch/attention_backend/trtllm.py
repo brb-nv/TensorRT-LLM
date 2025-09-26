@@ -570,6 +570,15 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     spec_decoding_packed_mask: Optional[torch.Tensor] = None
     spec_decoding_generation_lengths: Optional[torch.Tensor] = None
 
+    # Whether the current rank is inactive for helix parallelism.
+    # In helix parallelism, only the active rank appends KV cache for the query token
+    # and attends to the previously cached tokens as well as the query token. Inactive
+    # ranks do not append KV cache for the query token and attend to the previously
+    # cached tokens only.
+    # TODO: Make this a list of bools for multiple requests.
+    helix_is_inactive_rank: bool = False
+
+
     @property
     def max_seq_len(self) -> int:
         """
@@ -803,7 +812,16 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         if self.enable_flash_mla:
             self.prepare_flash_mla()
         # number of tokens needed in the kv cache for each sequence after the next pass
-        kv_lens = cached_token_lens + self.seq_lens_kv if cached_token_lens is not None else self.seq_lens_kv
+        if self.helix_is_inactive_rank:
+            # If helix is inactive, attend to the previously cached tokens only.
+            # This gets further complicated with multiple requests as each request might
+            # have a different active helix rank.
+            assert cached_token_lens is not None, "cached_token_lens should be set for inactive helix"
+            kv_lens = cached_token_lens
+        else:
+            # If helix is active, attend to the previously cached tokens as well as the new input tokens.
+            assert cached_token_lens is not None, "cached_token_lens should be set for active helix"
+            kv_lens = cached_token_lens + self.seq_lens_kv if cached_token_lens is not None else self.seq_lens_kv
         # self.kv_lens is the valid kv cache length, while the self.kv_lens_cuda is
         # the sequence length including the cached tokens and the input tokens.
         self.kv_lens[:self.num_seqs].copy_(

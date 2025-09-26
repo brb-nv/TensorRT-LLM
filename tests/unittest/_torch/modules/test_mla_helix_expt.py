@@ -480,9 +480,16 @@ def _run_mla_distributed(rank: int, world_size: int, scenario: Scenario,
     start = time.time()
 
     for step in range(gen_steps):
+        # KV cache is being allocated for each rank regardless of it being active or not.
         for req_id in range(scenario.batch):
             kv_cache_manager.impl.add_token(req_id)
-        cache_add = step if rank == world_size - 1 else 0
+        # Assume last rank is active for all gen steps.
+        if rank == world_size - 1:
+            helix_is_inactive_rank = False
+            cache_add = step
+        else:
+            helix_is_inactive_rank = True
+            cache_add = 0
         cached_tokens_per_seq = [
             ctx_len_per_gpu + cache_add for _ in range(scenario.batch)
         ]
@@ -500,12 +507,14 @@ def _run_mla_distributed(rank: int, world_size: int, scenario: Scenario,
                     num_cached_tokens_per_seq=cached_tokens_per_seq,
                 ),
                 enable_context_mla_with_cached_kv=True,
+                helix_is_inactive_rank=helix_is_inactive_rank,
             )
         else:
             attn_metadata.kv_cache_params = KVCacheParams(
                 use_cache=True,
                 num_cached_tokens_per_seq=cached_tokens_per_seq,
             )
+            attn_metadata.helix_is_inactive_rank = helix_is_inactive_rank
         attn_metadata.prepare()
         extra_attrs["attention_metadata"] = weakref.ref(attn_metadata)
         if not use_cuda_graph:
