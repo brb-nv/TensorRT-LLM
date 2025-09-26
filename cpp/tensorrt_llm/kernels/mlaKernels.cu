@@ -447,7 +447,16 @@ __global__ void applyMLARopeAndAssignQKVKernelGeneration(T* qkv_output, T* q_pe,
                 if (head_idx == head_num)
                 {
                     auto const token_kv_idx = kv_cache_lengths[batch_idx] - seq_len + local_token_idx;
-
+                    printf("[applyMLARopeAndAssignQKVKernelGeneration] token_kv_idx = %d, \
+                                                                       batch_idx = %d, \
+                                                                       seq_len = %d, \
+                                                                       local_token_idx = %d, \
+                                                                       kv_cache_lengths[batch_idx] = %d\n", \
+                                                                       token_kv_idx, \
+                                                                       batch_idx, \
+                                                                       seq_len, \
+                                                                       local_token_idx, \
+                                                                       kv_cache_lengths[batch_idx]);
                     {
                         auto kDst = reinterpret_cast<T*>(kv_cache.getKBlockPtr(batch_idx, token_kv_idx));
                         auto inBlockIdx = kv_cache.getKVLocalIdx(
