@@ -337,7 +337,7 @@ __global__ void applyMLARopeAndAssignQKVKernelGeneration(T* qkv_output, T* q_pe,
     int q_pe_stride, KvCacheDataType cache_type, float* bmm1_scale, float* bmm2_scale, float const* quant_scale_o,
     float const* quant_scale_q, float const* quant_scale_kv, float const* dequant_scale_q,
     float const* dequant_scale_kv, float host_bmm1_scale, int32_t const* helix_position_offsets,
-    bool helix_is_inactive_rank)
+    bool const* helix_is_inactive_rank)
 {
 
     // Constants.
@@ -445,19 +445,16 @@ __global__ void applyMLARopeAndAssignQKVKernelGeneration(T* qkv_output, T* q_pe,
 
             if (valid_token)
             {
-                if (head_idx == head_num && !helix_is_inactive_rank)
+                if (head_idx == head_num && (helix_is_inactive_rank == nullptr || !helix_is_inactive_rank[batch_idx]))
                 {
                     auto const token_kv_idx = kv_cache_lengths[batch_idx] - seq_len + local_token_idx;
-                    printf("[applyMLARopeAndAssignQKVKernelGeneration] token_kv_idx = %d, \
+                    printf(
+                        "[applyMLARopeAndAssignQKVKernelGeneration] token_kv_idx = %d, \
                                                                        batch_idx = %d, \
                                                                        seq_len = %d, \
                                                                        local_token_idx = %d, \
-                                                                       kv_cache_lengths[batch_idx] = %d\n", \
-                                                                       token_kv_idx, \
-                                                                       batch_idx, \
-                                                                       seq_len, \
-                                                                       local_token_idx, \
-                                                                       kv_cache_lengths[batch_idx]);
+                                                                       kv_cache_lengths[batch_idx] = %d\n",
+                        token_kv_idx, batch_idx, seq_len, local_token_idx, kv_cache_lengths[batch_idx]);
                     {
                         auto kDst = reinterpret_cast<T*>(kv_cache.getKBlockPtr(batch_idx, token_kv_idx));
                         auto inBlockIdx = kv_cache.getKVLocalIdx(
@@ -488,7 +485,7 @@ __global__ void applyMLARopeAndAssignQKVKernelGeneration(T* qkv_output, T* q_pe,
             }
         }
     }
-    else if (head_idx <= head_num + 8 && !helix_is_inactive_rank)
+    else if (head_idx <= head_num + 8)
     {
         int block_dim = gridDim.y - head_num - 1;
         int block_id = head_idx - head_num - 1;
@@ -508,7 +505,7 @@ __global__ void applyMLARopeAndAssignQKVKernelGeneration(T* qkv_output, T* q_pe,
             auto local_token_idx = global_token_idx % seq_len;
             bool valid_token = global_token_idx < total_s_len;
 
-            if (valid_token)
+            if (valid_token && (helix_is_inactive_rank == nullptr || !helix_is_inactive_rank[batch_idx]))
             {
                 if (head_dim_vec_idx == 0)
                 {

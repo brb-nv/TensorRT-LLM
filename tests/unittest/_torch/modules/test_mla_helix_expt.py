@@ -109,13 +109,12 @@ all_scenarios = [
     Scenario(batch=16, ctx_len=32768),
     Scenario(batch=16, ctx_len=65536),
     # this goes OOM
-    # Scenario(batch=16, ctx_len=131072),    
+    # Scenario(batch=16, ctx_len=131072),
 ]
 
 # limit the number of test scenarios to avoid taking too long
-test_scenarios = [
-    Scenario(batch=1, ctx_len=64)
-]
+test_scenarios = [Scenario(batch=1, ctx_len=64)]
+
 
 # default values from deepseek_v3, but will be overwritten by scenario
 @dataclass(kw_only=True, frozen=True)
@@ -485,10 +484,14 @@ def _run_mla_distributed(rank: int, world_size: int, scenario: Scenario,
             kv_cache_manager.impl.add_token(req_id)
         # Assume last rank is active for all gen steps.
         if rank == world_size - 1:
-            helix_is_inactive_rank = False
+            helix_is_inactive_rank = torch.zeros(scenario.batch,
+                                                 dtype=torch.bool,
+                                                 pin_memory=True)
             cache_add = step
         else:
-            helix_is_inactive_rank = True
+            helix_is_inactive_rank = torch.ones(scenario.batch,
+                                                dtype=torch.bool,
+                                                pin_memory=True)
             cache_add = 0
         cached_tokens_per_seq = [
             ctx_len_per_gpu + cache_add for _ in range(scenario.batch)
