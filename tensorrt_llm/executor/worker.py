@@ -1,6 +1,7 @@
 import copy
 import datetime
 import enum
+import gc
 import json
 import os
 import time
@@ -872,6 +873,12 @@ def worker_main(
         if is_leader:
             worker_init_status_queue.put((e, traceback.format_exc()))
         return
+
+    # Optionally disable GC (default: not disabled)
+    if os.getenv("TRTLLM_WORKER_DISABLE_GC", "0") == "1":
+        gc.disable()
+    else:
+        assert False, "TRTLLM_WORKER_DISABLE_GC must be set to 1."
 
     with worker:
         try:
