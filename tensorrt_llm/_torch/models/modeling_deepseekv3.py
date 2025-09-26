@@ -644,29 +644,16 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         self.top_k = config.num_experts_per_tok
 
         self.mapping = model_config.mapping
+        mapping = self.mapping
 
         self.self_attn = DeepseekV3Attention(
             model_config,
             layer_idx=layer_idx,
             aux_stream=aux_stream_dict[AuxStreamType.Attention])
-        self.enable_attention_dp = self.mapping.enable_attention_dp
+        self.enable_attention_dp = mapping.enable_attention_dp
 
-        self.is_p2p_supported = can_access_peer(self.mapping)
-        if self.mapping.has_cp_helix():
-            # after attention, Helix CP GPUs become TP GPUs
-            new_mapping = Mapping(
-                world_size=self.mapping.world_size,
-                rank=self.mapping.rank,
-                gpus_per_node=self.mapping.gpus_per_node,
-                cp_size=1,
-                cp_config=None,
-                tp_size=self.mapping.tp_size * self.mapping.cp_size,
-                pp_size=self.mapping.pp_size,
-                auto_parallel=False,
-                enable_attention_dp=self.mapping.enable_attention_dp)
-            self.mapping = new_mapping
-
-        self.mlp_tp_size = self.mapping.tp_size
+        self.mlp_tp_size = mapping.tp_size
+        self.is_p2p_supported = can_access_peer(mapping)
 
         self.fusion_config = EagerFusionConfig()
         self.enable_fusion = os.environ.get(
@@ -681,8 +668,8 @@ class DeepseekV3DecoderLayer(DecoderLayer):
             quant_config.quant_algo
             is not QuantAlgo.MIXED_PRECISION), "MIXED_PRECISION is ambiguous"
 
-        has_tp = self.mapping.has_tp()
-        self.allreduce = AllReduce(mapping=self.mapping,
+        has_tp = mapping.has_tp()
+        self.allreduce = AllReduce(mapping=model_config.mapping,
                                    strategy=model_config.allreduce_strategy,
                                    dtype=config.torch_dtype)
         self.moe_allreduce = MoEAllReduce(self.mapping)
@@ -1385,6 +1372,8 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
         tp_size = self.model_config.mapping.tp_size
         cp_rank = self.model_config.mapping.cp_rank
         cp_size = self.model_config.mapping.cp_size
+
+        print("[DeepseekV3ForCausalLM::load_weights] tp_size: ", tp_size, " cp_size: ", cp_size)
 
         params_map = {'gate_up_proj': ['gate_proj', 'up_proj']}
         all_named_modules = dict(self.named_modules())
