@@ -1539,7 +1539,16 @@ class PyTorchModelEngine(ModelEngine):
                         previous_batch_indices.append(request.py_batch_idx)
                     past_seen_token_num = request.max_beam_num_tokens
 
-                position_ids.append(past_seen_token_num)
+                position_id = past_seen_token_num
+                # TODO: Need to understand how this sync works at a request level in for loop.
+                # If not, we'll need to do this at the end executor loop before next step.
+                if self.mapping.has_cp_helix():
+                    # Do an allgather among CP ranks to get the complete sequence length seen by all CP ranks.
+                    past_seen_token_nums = self.dist.cp_allgather(
+                                                past_seen_token_num)
+                    position_id = sum(past_seen_token_nums)
+
+                position_ids.append(position_id)
                 num_cached_tokens_per_seq.append(past_seen_token_num)
                 prompt_lengths.append(request.py_prompt_len)
                 draft_lens.append(0)
