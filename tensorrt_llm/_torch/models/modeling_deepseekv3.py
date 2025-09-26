@@ -234,6 +234,7 @@ class DeepseekV3Attention(MLA):
         model_config: ModelConfig[PretrainedConfig],
         layer_idx: Optional[int] = None,
         aux_stream: Optional[torch.cuda.Stream] = None,
+        mapping_with_cp: Optional[Mapping] = None,
     ):
         config = model_config.pretrained_config
         predicted_tokens_per_seq = model_config.spec_config.max_draft_len + 1 if model_config.spec_config is not None else 1
@@ -256,7 +257,10 @@ class DeepseekV3Attention(MLA):
                          layer_idx=layer_idx,
                          dtype=config.torch_dtype,
                          config=model_config,
-                         aux_stream=aux_stream)
+                         aux_stream=aux_stream,
+                         mapping_with_cp=mapping_with_cp)
+        # @B: Does this layer need to know about mapping_with_cp?
+        # Likely no because no use of mapping.
         self.kv_a_proj_with_mqa = DeepseekV3Linear(
             config.hidden_size,
             self.kv_lora_rank + self.qk_rope_head_dim +
@@ -631,7 +635,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig],
                  layer_idx: int, aux_stream_dict: Dict[AuxStreamType,
-                                                       torch.cuda.Stream]):
+                                                       torch.cuda.Stream], mapping_with_cp: Optional[Mapping] = None):
         super().__init__()
         self.model_config = model_config
         self.config = model_config.pretrained_config
@@ -649,7 +653,8 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         self.self_attn = DeepseekV3Attention(
             model_config,
             layer_idx=layer_idx,
-            aux_stream=aux_stream_dict[AuxStreamType.Attention])
+            aux_stream=aux_stream_dict[AuxStreamType.Attention],
+            mapping_with_cp=mapping_with_cp)
         self.enable_attention_dp = mapping.enable_attention_dp
 
         self.mlp_tp_size = mapping.tp_size
@@ -1103,7 +1108,7 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
 
 class DeepseekV3Model(DecoderModel):
 
-    def __init__(self, model_config: ModelConfig[PretrainedConfig]):
+    def __init__(self, model_config: ModelConfig[PretrainedConfig], mapping_with_cp: Optional[Mapping] = None):
         super().__init__(model_config)
         config = model_config.pretrained_config
         self.vocab_size = config.vocab_size
@@ -1124,7 +1129,7 @@ class DeepseekV3Model(DecoderModel):
 
         self.layers = nn.ModuleList([
             DeepseekV3DecoderLayer(model_config, layer_idx,
-                                   self.aux_stream_dict)
+                                   self.aux_stream_dict, mapping_with_cp=mapping_with_cp)
             for layer_idx in range(config.num_hidden_layers)
         ])
         self.norm = RMSNorm(hidden_size=config.hidden_size,
@@ -1168,6 +1173,26 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
                                                         PretrainedConfig]):
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig]):
+        ###############################################################################
+        self.mapping_with_cp = None
+        # Note: Currently the usage of mapping is all over the place making its usage brittle
+        # in this file. As a temporary WAR, we hold on to an original copy of mapping when CP
+        # is in action. This shall be passed on to attention which is the only layer that's
+        # affected by CP. For other layers, CP ranks are repurposed to TP. This shall be undone
+        # at the end of __init__.
+        if model_config.mapping.cp_size > 1:
+            self.mapping_with_cp = copy.deepcopy(model_config.mapping)
+
+            original_tp_size = self.mapping_with_cp.tp_size
+            original_cp_size = self.mapping_with_cp.cp_size
+
+            model_config.mapping.tp_size = original_tp_size * original_cp_size
+            model_config.mapping.attn_tp_size = original_tp_size * original_cp_size
+            model_config.mapping.cp_size = 1
+            model_config.mapping.attn_cp_size = 1
+            model_config.mapping.cp_config = {}
+        ###############################################################################
+
         # Rename some keys of quant_config_dict to support legacy checkpoints
         if model_config.quant_config_dict is not None:
             model_config = copy.deepcopy(model_config)
@@ -1181,7 +1206,7 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
             model_config.quant_config_dict = quant_config_dict
             model_config._frozen = True
 
-        super().__init__(model=DeepseekV3Model(model_config),
+        super().__init__(model=DeepseekV3Model(model_config, mapping_with_cp=self.mapping_with_cp),
                          model_config=model_config)
 
         self.model_nextn = 0
@@ -1214,6 +1239,17 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
             self.model.layers.extend(self.draft_model.mtp_layers)
             self.epilogue.extend(self.draft_model.mtp_layers)
             self.epilogue.append(self.spec_worker)
+
+        ###############################################################################
+        # Undo any manipulations done to mapping.
+        if self.mapping_with_cp is not None:
+            model_config.mapping.tp_size = self.mapping_with_cp.tp_size
+            model_config.mapping.cp_size = self.mapping_with_cp.cp_size
+            model_config.mapping.attn_tp_size = self.mapping_with_cp.attn_tp_size
+            model_config.mapping.attn_cp_size = self.mapping_with_cp.attn_cp_size
+            model_config.mapping.cp_config = self.mapping_with_cp.cp_config
+        ###############################################################################
+
 
     def forward(
         self,

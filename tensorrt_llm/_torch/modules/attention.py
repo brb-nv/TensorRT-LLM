@@ -7,7 +7,7 @@ from torch import nn
 
 from tensorrt_llm._utils import get_sm_version, is_sm_100f
 from tensorrt_llm.logger import logger
-from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.mapping import Mapping, CpType
 
 from ..attention_backend import (AttentionInputType, AttentionMetadata,
                                  FlashInferAttentionMetadata, TrtllmAttention,
@@ -620,6 +620,7 @@ class MLA(nn.Module):
         dtype: torch.dtype = None,
         dense_bias: Optional[bool] = None,
         config: Optional[ModelConfig] = None,
+        mapping_with_cp: Optional[Mapping] = None,
     ):
         """
         Initialize the MLA module.
@@ -683,7 +684,11 @@ class MLA(nn.Module):
 
         # tensor parallel
         config = config or ModelConfig()
-        self.mapping = config.mapping
+        if mapping_with_cp is not None:
+            print("[MLA::__init__] OVERRIDING MAPPING WITH CP DETECTED.")
+            self.mapping = mapping_with_cp
+        else:
+            self.mapping = config.mapping
         tp_size = self.mapping.tp_size
         pp_size = self.mapping.pp_size
         cp_size = self.mapping.cp_size
@@ -691,6 +696,8 @@ class MLA(nn.Module):
             tp_size = 1
         if self.mapping.has_cp_ulysses():
             raise NotImplementedError("MLA doesn't support CP Ulyssees yet")
+        if self.mapping.cp_size > 1:
+            assert self.mapping.cp_config['cp_type'] == CpType.HELIX
 
         mapping = Mapping(
             world_size=tp_size * pp_size * cp_size,
