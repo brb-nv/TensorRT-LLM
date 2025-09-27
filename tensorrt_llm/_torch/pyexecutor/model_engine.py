@@ -1516,6 +1516,7 @@ class PyTorchModelEngine(ModelEngine):
                 else:
                     prompt_lengths.append(request.py_prompt_len)
 
+        helix_is_inactive_rank = [] if self.mapping.cp_size > 1 else None
         for request in generation_requests:
             request_ids.append(request.py_request_id)
             beam_width = request.sampling_config.beam_width
@@ -1551,6 +1552,8 @@ class PyTorchModelEngine(ModelEngine):
                 position_ids.append(position_id)
                 num_cached_tokens_per_seq.append(past_seen_token_num)
                 prompt_lengths.append(request.py_prompt_len)
+                if self.mapping.has_cp_helix():
+                    helix_is_inactive_rank.append(request.py_helix_is_inactive_rank)
                 draft_lens.append(0)
                 sequence_lengths.append(1)
                 gather_ids.append(len(position_ids) - 1)
@@ -1704,6 +1707,7 @@ class PyTorchModelEngine(ModelEngine):
 
         attn_metadata.request_ids = request_ids
         attn_metadata.prompt_lens = prompt_lengths
+        attn_metadata.helix_is_inactive_rank = helix_is_inactive_rank
         attn_metadata.num_contexts = len(scheduled_requests.context_requests)
         # Use num_chunked_ctx_requests to record the number of extend context requests,
         # so that we can update the kv_lens_cuda correctly in _preprocess_inputs.
