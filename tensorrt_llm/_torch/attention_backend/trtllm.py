@@ -270,8 +270,7 @@ class TrtllmAttentionWrapper:
         self.helix_position_offsets = helix_position_offsets
         self.helix_is_inactive_rank = helix_is_inactive_rank
         if self.helix_is_inactive_rank is not None:
-            self.helix_is_inactive_rank = self.helix_is_inactive_rank.pin_memory(
-            ).to(torch.bool)
+            self.helix_is_inactive_rank = torch.tensor(self.helix_is_inactive_rank, dtype=torch.bool, pin_memory=True)
 
         if max_sequence_length > self.rope_params.max_positions:
             self.rope_params.max_positions = max_sequence_length
@@ -815,13 +814,18 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         if self.enable_flash_mla:
             self.prepare_flash_mla()
         # number of tokens needed in the kv cache for each sequence after the next pass
-        if self.helix_is_inactive_rank is not None:
+        if self.helix_is_inactive_rank is not None and len(self.helix_is_inactive_rank):
             # If helix is inactive, attend to the previously cached tokens only.
             # This gets further complicated with multiple requests as each request might
             # have a different active helix rank.
             assert cached_token_lens is not None, "cached_token_lens should be set for helix"
             kv_lens = cached_token_lens
-            active_rank = ~self.helix_is_inactive_rank
+            helix_is_inactive_rank_cpu = torch.tensor(
+                self.helix_is_inactive_rank,
+                dtype=torch.bool,
+                device='cpu',
+            )
+            active_rank = ~helix_is_inactive_rank_cpu
             kv_lens[active_rank] += self.seq_lens_kv[active_rank]
         else:
             kv_lens = cached_token_lens + self.seq_lens_kv if cached_token_lens is not None else self.seq_lens_kv

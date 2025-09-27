@@ -1156,14 +1156,14 @@ class DeepseekV3Model(DecoderModel):
         hidden_states = inputs_embeds
         residual = None
 
-        for decoder_layer in self.layers[:self.num_hidden_layers]:
-            hidden_states, residual = decoder_layer(
-                position_ids=position_ids,
-                hidden_states=hidden_states,
-                attn_metadata=attn_metadata,
-                residual=residual,
-                spec_metadata=spec_metadata,
-            )
+        # for decoder_layer in self.layers[:self.num_hidden_layers]:
+        #     hidden_states, residual = decoder_layer(
+        #         position_ids=position_ids,
+        #         hidden_states=hidden_states,
+        #         attn_metadata=attn_metadata,
+        #         residual=residual,
+        #         spec_metadata=spec_metadata,
+        #     )
 
         return hidden_states
 
@@ -1263,7 +1263,6 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
     ) -> torch.Tensor:
         print(f"[DeepseekV3ForCausalLM::forward] input_ids: \n{input_ids}")
         print(f"[DeepseekV3ForCausalLM::forward] position_ids: \n{position_ids}")
-        print(f"[DeepseekV3ForCausalLM::forward] attn_metadata: \n{attn_metadata}")
         return super().forward(attn_metadata=attn_metadata,
                                input_ids=input_ids,
                                position_ids=position_ids,
