@@ -949,7 +949,6 @@ template <typename T>
 int AttentionOp::mlaGeneration(
     MlaParams<T>& params, EnqueueGenerationParams<T> const& generation_params, cudaStream_t stream)
 {
-    std::cerr << "[AttentionOp::mlaGeneration] Function called." << std::endl;
     int const num_kv_heads = 1;
     int const head_size = mMLAParams.kv_lora_rank + mMLAParams.qk_rope_head_dim;
     int32_t const batch_beam = generation_params.beam_width * generation_params.num_requests;
@@ -964,8 +963,6 @@ int AttentionOp::mlaGeneration(
         generation_params.max_cyclic_attention_window_size, generation_params.sink_token_length,
         generation_params.can_use_one_more_block, generation_params.host_primary_pool_pointer,
         generation_params.host_secondary_pool_pointer, generation_params.block_offsets);
-
-    std::cerr << "[AttentionOp::mlaGeneration] batch_beam: " << batch_beam << " head_size: " << head_size << std::endl;
 
     // Currently NVFP4 KV cache is not supported for MLA. An empty placeholder is provided.
     auto kv_scale_cache_buffer = KVBlockArray();

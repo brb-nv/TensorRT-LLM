@@ -1156,14 +1156,14 @@ class DeepseekV3Model(DecoderModel):
         hidden_states = inputs_embeds
         residual = None
 
-        # for decoder_layer in self.layers[:self.num_hidden_layers]:
-        #     hidden_states, residual = decoder_layer(
-        #         position_ids=position_ids,
-        #         hidden_states=hidden_states,
-        #         attn_metadata=attn_metadata,
-        #         residual=residual,
-        #         spec_metadata=spec_metadata,
-        #     )
+        for idx, decoder_layer in enumerate(self.layers[:self.num_hidden_layers]):
+            hidden_states, residual = decoder_layer(
+                position_ids=position_ids,
+                hidden_states=hidden_states,
+                attn_metadata=attn_metadata,
+                residual=residual,
+                spec_metadata=spec_metadata,
+            )
 
         return hidden_states
 
@@ -1180,17 +1180,27 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
         # is in action. This shall be passed on to attention which is the only layer that's
         # affected by CP. For other layers, CP ranks are repurposed to TP. This shall be undone
         # at the end of __init__.
-        if model_config.mapping.cp_size > 1:
+        if model_config.mapping.cp_size > 1 and False:
+            print(f"[DeepseekV3ForCausalLM::__init__] Repurposing KVP ranks to TP while keeping other details the same.")
             self.mapping_with_cp = copy.deepcopy(model_config.mapping)
 
             original_tp_size = self.mapping_with_cp.tp_size
             original_cp_size = self.mapping_with_cp.cp_size
 
-            model_config.mapping.tp_size = original_tp_size * original_cp_size
-            model_config.mapping.attn_tp_size = original_tp_size * original_cp_size
-            model_config.mapping.cp_size = 1
-            model_config.mapping.attn_cp_size = 1
-            model_config.mapping.cp_config = {}
+            # Repurpose KVP ranks to TP while keeping other details the same.
+            model_config._frozen = False
+            model_config.mapping = Mapping(
+                world_size=model_config.mapping.world_size,
+                rank=model_config.mapping.rank,
+                gpus_per_node=model_config.mapping.gpus_per_node,
+                cp_size=1,
+                cp_config={},
+                tp_size=original_tp_size * original_cp_size,
+                pp_size=model_config.mapping.pp_size,
+                auto_parallel=model_config.mapping.auto_parallel,
+                enable_attention_dp=model_config.mapping.enable_attention_dp
+            )
+            model_config._frozen = True
         ###############################################################################
 
         # Rename some keys of quant_config_dict to support legacy checkpoints
@@ -1243,11 +1253,10 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
         ###############################################################################
         # Undo any manipulations done to mapping.
         if self.mapping_with_cp is not None:
-            model_config.mapping.tp_size = self.mapping_with_cp.tp_size
-            model_config.mapping.cp_size = self.mapping_with_cp.cp_size
-            model_config.mapping.attn_tp_size = self.mapping_with_cp.attn_tp_size
-            model_config.mapping.attn_cp_size = self.mapping_with_cp.attn_cp_size
-            model_config.mapping.cp_config = self.mapping_with_cp.cp_config
+            print(f"[DeepseekV3ForCausalLM::__init__] Restoring original mapping.")
+            model_config._frozen = False
+            model_config.mapping = self.mapping_with_cp
+            model_config._frozen = True
         ###############################################################################
 
 
