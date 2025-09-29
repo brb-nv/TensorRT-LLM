@@ -684,9 +684,10 @@ __global__ void splitKVCacheForMLAKernel(T const** __restrict__ inputBlocks, T**
                 
 
                 T* kOutputPtr = outputCachePtr
-                    + blockIdInDomainCP * (layerNumInSpecPP * kvFactor * headNum * tokensPerBlock * dimsPerHead)
-                    + layerIdInDomainPP * kvFactor * headNum * tokensPerBlock * dimsPerHead
-                    + headIdInDomainTP * tokensPerBlock * dimsPerHead;
+                    + blockIdInDomainCP
+                        * (static_cast<int64_t>(layerNumInSpecPP * kvFactor * headNum * tokensPerBlock * dimsPerHead))
+                    + static_cast<int64_t>(layerIdInDomainPP) * kvFactor * headNum * tokensPerBlock * dimsPerHead
+                    + static_cast<int64_t>(headIdInDomainTP) * tokensPerBlock * dimsPerHead;
                 int const kvOffset = headNum * tokensPerBlock * dimsPerHead;
 #pragma unroll 1
                 for (int tokenId = subWarpId; tokenId < tokensPerBlock; tokenId += subWarpNum)
@@ -764,9 +765,10 @@ __global__ void splitKVCacheKernel(T const** __restrict__ inputBlocks, T** __res
 
                 int headIdInDomainTP = headId % headNumDomainTP;
                 T* kOutputPtr = outputCachePtr
-                    + blockId * (layerNumInSpecPP * 2 * headNumDomainTP * tokensPerBlock * dimsPerHead)
-                    + layerIdInDomainPP * 2 * headNumDomainTP * tokensPerBlock * dimsPerHead
-                    + headIdInDomainTP * tokensPerBlock * dimsPerHead;
+                    + static_cast<int64_t>(blockId)
+                        * (static_cast<int64_t>(layerNumInSpecPP * 2 * headNumDomainTP * tokensPerBlock * dimsPerHead))
+                    + static_cast<int64_t>(layerIdInDomainPP) * 2 * headNumDomainTP * tokensPerBlock * dimsPerHead
+                    + static_cast<int64_t>(headIdInDomainTP) * tokensPerBlock * dimsPerHead;
 
                 T* vOutputPtr = kOutputPtr + headNumDomainTP * tokensPerBlock * dimsPerHead;
 #pragma unroll 1
@@ -938,9 +940,10 @@ __global__ void concatKVCacheForMLAKernel(T const** __restrict__ inputCaches, T*
                 int headIdInDomainTP = headId;
 
                 T const* kInputPtr = inputCachePtr
-                    + blockId * (layerNumInSpecPP * kvFactor * headNum * tokensPerBlock * dimsPerHead)
-                    + layerIdInDomainPP * kvFactor * headNum * tokensPerBlock * dimsPerHead
-                    + headIdInDomainTP * tokensPerBlock * dimsPerHead;
+                    + static_cast<int64_t>(blockId)
+                        * (static_cast<int64_t>(layerNumInSpecPP * kvFactor * headNum * tokensPerBlock * dimsPerHead))
+                    + static_cast<int64_t>(layerIdInDomainPP) * kvFactor * headNum * tokensPerBlock * dimsPerHead
+                    + static_cast<int64_t>(headIdInDomainTP) * tokensPerBlock * dimsPerHead;
                 int const kvOffset = headNum * tokensPerBlock * dimsPerHead;
 #pragma unroll 1
                 for (int tokenId = subWarpId; tokenId < tokensPerBlock; tokenId += subWarpNum)
@@ -1005,9 +1008,10 @@ __global__ void concatKVCacheKernel(T const** __restrict__ inputCaches, T** __re
 
                 int headIdInDomainTP = headId % headNumDomainTP;
                 T const* kInputPtr = inputCachePtr
-                    + blockId * (layerNumInSpecPP * 2 * headNumDomainTP * tokensPerBlock * dimsPerHead)
-                    + layerIdInDomainPP * 2 * headNumDomainTP * tokensPerBlock * dimsPerHead
-                    + headIdInDomainTP * tokensPerBlock * dimsPerHead;
+                    + static_cast<int64_t>(blockId)
+                        * (static_cast<int64_t>(layerNumInSpecPP * 2 * headNumDomainTP * tokensPerBlock * dimsPerHead))
+                    + static_cast<int64_t>(layerIdInDomainPP) * 2 * headNumDomainTP * tokensPerBlock * dimsPerHead
+                    + static_cast<int64_t>(headIdInDomainTP) * tokensPerBlock * dimsPerHead;
 
                 T const* vInputPtr = kInputPtr + headNumDomainTP * tokensPerBlock * dimsPerHead;
 #pragma unroll 1
