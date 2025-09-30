@@ -722,7 +722,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                                 bias=False,
                                 dtype=config.torch_dtype,
                                 config=model_config,
-                                overridden_tp_size=self.mlp_tp_size,
+                                # overridden_tp_size=self.mlp_tp_size,
                                 reduce_output=True)
 
         self.input_layernorm = RMSNorm(hidden_size=config.hidden_size,

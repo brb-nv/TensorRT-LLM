@@ -1544,10 +1544,8 @@ class PyTorchModelEngine(ModelEngine):
                 # TODO: Need to understand how this sync works at a request level in for loop.
                 # If not, we'll need to do this at the end executor loop before next step.
                 if self.mapping.has_cp_helix():
-                    # Do an allgather among CP ranks to get the complete sequence length seen by all CP ranks.
-                    ctx_lens_across_cp = self.dist.cp_allgather(
-                                                request.py_orig_prompt_len)
-                    position_id = sum(ctx_lens_across_cp) + request.py_decoding_iter
+                    assert request.total_input_len_cp is not None
+                    position_id = request.total_input_len_cp + request.py_decoding_iter
 
                 position_ids.append(position_id)
                 num_cached_tokens_per_seq.append(past_seen_token_num)
