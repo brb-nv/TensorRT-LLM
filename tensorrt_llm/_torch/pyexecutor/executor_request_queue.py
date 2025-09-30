@@ -641,6 +641,7 @@ class ExecutorRequestQueue:
                 exclude_last_generation_logits=self._should_exclude_last_generation_logits(),
                 input_token_ids=input_ids_this_rank,
                 position_ids=position_ids_this_rank)
+            req.total_input_len_cp = input_len
             req_with_children.append(req)
             if req.child_requests:
                 req_with_children.extend(req.child_requests)
@@ -649,7 +650,6 @@ class ExecutorRequestQueue:
     @nvtx_range("_merge_requests")
     def _merge_requests(
             self, new_requests: list[RequestQueueItem]) -> List[LlmRequest]:
-        print("[ExecutorRequestQueue::_merge_requests]: FUNCTION CALLED.")
         cp_config = self.dist.cp_config
         if 'cp_type' in cp_config:
             cp_type = cp_config['cp_type']
@@ -665,7 +665,6 @@ class ExecutorRequestQueue:
         else:
             req_with_children = []
             for req_item in new_requests:
-                print(f"[ExecutorRequestQueue::_merge_requests][{self.dist.rank}]: req_item.id: {req_item.id}, req_item.request.input_token_ids: {req_item.request.input_token_ids}")
                 req = executor_request_to_llm_request(
                     req_item.id, req_item.request, req_item.child_req_ids,
                     self._should_exclude_last_generation_logits())

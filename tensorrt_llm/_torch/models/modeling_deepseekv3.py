@@ -1180,7 +1180,7 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
         # is in action. This shall be passed on to attention which is the only layer that's
         # affected by CP. For other layers, CP ranks are repurposed to TP. This shall be undone
         # at the end of __init__.
-        if model_config.mapping.cp_size > 1 and False:
+        if model_config.mapping.cp_size > 1:
             print(f"[DeepseekV3ForCausalLM::__init__] Repurposing KVP ranks to TP while keeping other details the same.")
             self.mapping_with_cp = copy.deepcopy(model_config.mapping)
 
@@ -1270,8 +1270,8 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
         return_context_logits: bool = False,
         **kwargs,
     ) -> torch.Tensor:
-        print(f"[DeepseekV3ForCausalLM::forward] input_ids: \n{input_ids}")
-        print(f"[DeepseekV3ForCausalLM::forward] position_ids: \n{position_ids}")
+        print(f"[DeepseekV3ForCausalLM::forward][rank {self.model_config.mapping.rank}] input_ids: \n{input_ids}")
+        print(f"[DeepseekV3ForCausalLM::forward][rank {self.model_config.mapping.rank}] position_ids: \n{position_ids}")
         return super().forward(attn_metadata=attn_metadata,
                                input_ids=input_ids,
                                position_ids=position_ids,

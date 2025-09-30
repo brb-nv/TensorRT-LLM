@@ -453,7 +453,9 @@ class KVCacheManager(BaseResourceManager):
                         req.py_helix_is_inactive_rank = True
                 ##################################################################
                 if req.py_helix_is_inactive_rank:
+                    print(f"[ResourceManager::prepare_resources][rank {self.mapping.rank}] Skipping KV allocation for request {req.py_request_id}.")
                     continue
+                print(f"[ResourceManager::prepare_resources][rank {self.mapping.rank}] Adding KV allocation for request {req.py_request_id}.")
                 self.impl.add_token(req.py_request_id)
                 for _ in range(get_draft_token_length(req)):
                     self.impl.add_token(req.py_request_id)

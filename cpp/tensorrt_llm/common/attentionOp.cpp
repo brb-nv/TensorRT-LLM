@@ -1023,7 +1023,7 @@ int AttentionOp::mlaGeneration(
 
     if (mUseTllmGen)
     {
-        std::cerr << "[AttentionOp::mlaGeneration] useTllmGen is true." << std::endl;
+        // std::cerr << "[AttentionOp::mlaGeneration] useTllmGen is true." << std::endl;
         TLLM_CHECK_WITH_INFO(mTllmGenFMHARunner.get(), "mTllmGenFMHARunner not initialized.");
         TllmGenFmhaRunnerParams tllmRunnerParams;
         memset(&tllmRunnerParams, 0, sizeof(tllmRunnerParams));
@@ -1080,25 +1080,25 @@ int AttentionOp::mlaGeneration(
         // Not used in the generation kernels as contiguous_kv or paged_kv layouts are used.
         tllmRunnerParams.mSumOfSeqLensKv = int(batch_beam * tllmRunnerParams.mMaxSeqLenKv);
 
-        std::cerr << "[AttentionOp::mlaGeneration] mMaxSeqLenQ: " << tllmRunnerParams.mMaxSeqLenQ
-                  << " mMaxSeqLenKv: " << tllmRunnerParams.mMaxSeqLenKv
-                  << " mSumOfSeqLensQ: " << tllmRunnerParams.mSumOfSeqLensQ
-                  << " mSumOfSeqLensKv: " << tllmRunnerParams.mSumOfSeqLensKv
-                  << " mBatchSize: " << tllmRunnerParams.mBatchSize
-                  << " mNumHeadsQ: " << tllmRunnerParams.mNumHeadsQ
-                  << " mNumHeadsKv: " << tllmRunnerParams.mNumHeadsKv
-                  << " mNumHeadsQPerKv: " << tllmRunnerParams.mNumHeadsQPerKv
-                  << " mMaxSeqLenCacheKv: " << tllmRunnerParams.mMaxSeqLenCacheKv
-                  << std::endl;
+        // std::cerr << "[AttentionOp::mlaGeneration] mMaxSeqLenQ: " << tllmRunnerParams.mMaxSeqLenQ
+        //           << " mMaxSeqLenKv: " << tllmRunnerParams.mMaxSeqLenKv
+        //           << " mSumOfSeqLensQ: " << tllmRunnerParams.mSumOfSeqLensQ
+        //           << " mSumOfSeqLensKv: " << tllmRunnerParams.mSumOfSeqLensKv
+        //           << " mBatchSize: " << tllmRunnerParams.mBatchSize
+        //           << " mNumHeadsQ: " << tllmRunnerParams.mNumHeadsQ
+        //           << " mNumHeadsKv: " << tllmRunnerParams.mNumHeadsKv
+        //           << " mNumHeadsQPerKv: " << tllmRunnerParams.mNumHeadsQPerKv
+        //           << " mMaxSeqLenCacheKv: " << tllmRunnerParams.mMaxSeqLenCacheKv
+        //           << std::endl;
 
         // The attention window size.
         tllmRunnerParams.mAttentionWindowSize = generation_params.cyclic_attention_window_size;
         // The chunked attention size.
         tllmRunnerParams.mChunkedAttentionSize = INT_MAX;
 
-        std::cerr << "[AttentionOp::mlaGeneration] mAttentionWindowSize: " << tllmRunnerParams.mAttentionWindowSize
-                  << " mChunkedAttentionSize: " << tllmRunnerParams.mChunkedAttentionSize
-                  << std::endl;
+        // std::cerr << "[AttentionOp::mlaGeneration] mAttentionWindowSize: " << tllmRunnerParams.mAttentionWindowSize
+        //           << " mChunkedAttentionSize: " << tllmRunnerParams.mChunkedAttentionSize
+        //           << std::endl;
 
         // The scaleQ that will be applied to the BMM1 output.
         tllmRunnerParams.mScaleQ = mQScaling * sqrt((float) (mMLAParams.qk_nope_head_dim + mMLAParams.qk_rope_head_dim))
