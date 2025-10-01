@@ -1270,8 +1270,15 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
         return_context_logits: bool = False,
         **kwargs,
     ) -> torch.Tensor:
-        print(f"[DeepseekV3ForCausalLM::forward][rank {self.model_config.mapping.rank}] input_ids: \n{input_ids}")
-        print(f"[DeepseekV3ForCausalLM::forward][rank {self.model_config.mapping.rank}] position_ids: \n{position_ids}")
+        print(f"[DeepseekV3ForCausalLM::forward][rank {self.model_config.mapping.rank}] input_ids: {input_ids}")
+        print(f"[DeepseekV3ForCausalLM::forward][rank {self.model_config.mapping.rank}] position_ids: {position_ids}")
+        print(f"[DeepseekV3ForCausalLM::forward][rank {self.model_config.mapping.rank}] helix_is_inactive_rank: {attn_metadata.helix_is_inactive_rank}")
+        print(f"[DeepseekV3ForCausalLM::forward][rank {self.model_config.mapping.rank}] kv_cache_params.num_cached_tokens_per_seq: {attn_metadata.kv_cache_params.num_cached_tokens_per_seq}")
+        print(f"[DeepseekV3ForCausalLM::forward][rank {self.model_config.mapping.rank}] kv_lens_cuda: {attn_metadata.kv_lens_cuda}")
+        assert attn_metadata.kv_cache_manager.tokens_per_block == 32
+        block_ids_per_seq = attn_metadata.kv_cache_manager.get_batch_cache_indices(attn_metadata.request_ids)
+        for request_id, block_ids in zip(attn_metadata.request_ids, block_ids_per_seq):
+            print(f"[DeepseekV3ForCausalLM::forward][rank {self.model_config.mapping.rank}] request_id: {request_id}, block_ids: {block_ids}")
         return super().forward(attn_metadata=attn_metadata,
                                input_ids=input_ids,
                                position_ids=position_ids,

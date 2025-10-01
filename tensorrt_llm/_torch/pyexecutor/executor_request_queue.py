@@ -657,7 +657,7 @@ class ExecutorRequestQueue:
                 return self._merge_star_attention_requests(new_requests)
             elif cp_type == CpType.HELIX:
                 # TODO: Remove this hardcoding and obtain num_tokens_per_block from llm_args.
-                return self._merge_helix_requests(new_requests, num_tokens_per_block=64)
+                return self._merge_helix_requests(new_requests, num_tokens_per_block=32)
             elif cp_type == CpType.RING:
                 raise NotImplementedError("ring attention not implemented yet")
             else:

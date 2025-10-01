@@ -1,3 +1,3 @@
 [
-    "ReDrafter is a speculative decoding technique by Apple integrated into NVIDIA TensorRT LLM to accelerate large language model inference on GPUs. It uses recurrent neural network based drafting with tree style attention to predict multiple future tokens which are verified by the main model. This approach improves accuracy reduces overhead and enables faster low latency responses. Unlike Medusa which processes many unused paths ReDrafter accepts the best path before drafting further. Its integration into TensorRT LLM consolidates drafting and validation inside a single engine simplifying runtime and optimizing performance with quantization "
+    "Global warming is the long term rise in Earth temperature caused by greenhouse gases from human activity, burning fossil fuels, and deforestation. It leads to melting ice, rising seas, and extreme weather that threaten ecosystems, wildlife, and people. Urgent global action is "
 ]
