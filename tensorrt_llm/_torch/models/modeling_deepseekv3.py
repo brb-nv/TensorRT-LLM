@@ -1279,20 +1279,6 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
         block_ids_per_seq = attn_metadata.kv_cache_manager.get_batch_cache_indices(attn_metadata.request_ids)
         for request_id, block_ids in zip(attn_metadata.request_ids, block_ids_per_seq):
             print(f"[DeepseekV3ForCausalLM::forward][rank {self.model_config.mapping.rank}] request_id: {request_id}, block_ids: {block_ids}")
-            # On rank 0 in prefill mode (helix_is_inactive_rank is None), save the kv cache for request_id 2049.
-            if len(block_ids) == 2 and attn_metadata.helix_is_inactive_rank is None and self.model_config.mapping.rank == 0:
-                kv_buffer = attn_metadata.kv_cache_manager.get_buffers(0)
-                request_kv_data_0 = kv_buffer[block_ids[0]]
-                request_kv_data_1 = kv_buffer[block_ids[1]]
-                print(f"[DeepseekV3ForCausalLM::forward][rank {self.model_config.mapping.rank}] request_kv_data_0.shape: {request_kv_data_0.shape}, request_kv_data_1.shape: {request_kv_data_1.shape}")
-
-        result = super().forward(attn_metadata=attn_metadata,
-                                 input_ids=input_ids,
-                                 position_ids=position_ids,
-                                 inputs_embeds=inputs_embeds,
-                                 spec_metadata=spec_metadata,
-                                 return_context_logits=return_context_logits,
-                                 **kwargs)
 
         # Stream synchronization to save KV cache blocks to disk.
         torch.cuda.synchronize()
@@ -1300,7 +1286,13 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
         # Save block information to disk for specific conditions
         self._save_block_information_to_disk(attn_metadata, position_ids)
 
-        return result
+        return super().forward(attn_metadata=attn_metadata,
+                               input_ids=input_ids,
+                               position_ids=position_ids,
+                               inputs_embeds=inputs_embeds,
+                               spec_metadata=spec_metadata,
+                               return_context_logits=return_context_logits,
+                               **kwargs)
 
     def _save_block_information_to_disk(self, attn_metadata: AttentionMetadata, position_ids: torch.Tensor):
         """Save KV cache block information to disk using safetensors format."""
@@ -1309,19 +1301,24 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
         import safetensors.torch
         from pathlib import Path
 
-        # Only save on rank 0 in prefill mode.
-        if (attn_metadata.helix_is_inactive_rank is not None or
-            self.model_config.mapping.rank != 0 or len(position_ids[0]) != 52):
+        # Early return in prefill mode.
+        if (attn_metadata.helix_is_inactive_rank is None):
+            return
+
+        # Early return if this isn't the first decode step.
+        if (position_ids[0][0].item() != 52):
+            print(f"[DeepseekV3ForCausalLM::_save_block_information_to_disk][rank {self.model_config.mapping.rank}] "
+                  f"Early return in decode mode because this isn't the first decode step {position_ids[0][0].item()}")
             return
 
         # Create directory for saving block data
-        save_dir = Path("/home/bbuddharaju/scratch/TensorRT-LLM_MK/prefill_helix_ref")
+        save_dir = Path(f"/home/bbuddharaju/scratch/TensorRT-LLM_MK/decode_helix_rank_{self.model_config.mapping.rank}")
         save_dir.mkdir(exist_ok=True)
 
         block_ids_per_seq = attn_metadata.kv_cache_manager.get_batch_cache_indices(attn_metadata.request_ids)
         for request_id, block_ids in zip(attn_metadata.request_ids, block_ids_per_seq):
-            # Save blocks for requests with exactly 2 blocks.
-            if len(block_ids) == 2:
+            # Save blocks for requests with exactly 1 blocks.
+            if len(block_ids) == 1:
                 request_save_dir = save_dir / f"request_{request_id}"
                 request_save_dir.mkdir(exist_ok=True)
 
@@ -1363,7 +1360,6 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
 
                 print(f"[DeepseekV3ForCausalLM::_save_block_information_to_disk][rank {self.model_config.mapping.rank}] "
                       f"Saved block information for request {request_id} to {request_save_dir}")
-
 
     def load_weights(self, weights: Dict):
 
