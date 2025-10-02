@@ -1283,8 +1283,8 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
         # Stream synchronization to save KV cache blocks to disk.
         torch.cuda.synchronize()
 
-        # Save block information to disk for specific conditions
-        self._save_block_information_to_disk(attn_metadata, position_ids)
+        # Read block information from disk for first decode step.
+        self._read_block_information_from_disk(attn_metadata, position_ids)
 
         return super().forward(attn_metadata=attn_metadata,
                                input_ids=input_ids,
@@ -1294,8 +1294,8 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
                                return_context_logits=return_context_logits,
                                **kwargs)
 
-    def _save_block_information_to_disk(self, attn_metadata: AttentionMetadata, position_ids: torch.Tensor):
-        """Save KV cache block information to disk using safetensors format."""
+    def _read_block_information_from_disk(self, attn_metadata: AttentionMetadata, position_ids: torch.Tensor):
+        """Read KV cache block information from disk using safetensors format."""
         import os
         import json
         import safetensors.torch
@@ -1311,55 +1311,38 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
                   f"Early return in decode mode because this isn't the first decode step {position_ids[0][0].item()}")
             return
 
-        # Create directory for saving block data
-        save_dir = Path(f"/home/bbuddharaju/scratch/TensorRT-LLM_MK/decode_helix_rank_{self.model_config.mapping.rank}")
-        save_dir.mkdir(exist_ok=True)
+        if self.model_config.mapping.rank == 0:
+            # Inactive rank.
+            read_file = Path(f"/home/bbuddharaju/scratch/TensorRT-LLM_MK/prefill_helix_safekeep/request_2048/block_id_257_rank_0.safetensors")
+        else:
+            # Active rank.
+            read_file = Path(f"/home/bbuddharaju/scratch/TensorRT-LLM_MK/prefill_helix_safekeep/request_2048/block_id_258_rank_0.safetensors")
 
         block_ids_per_seq = attn_metadata.kv_cache_manager.get_batch_cache_indices(attn_metadata.request_ids)
         for request_id, block_ids in zip(attn_metadata.request_ids, block_ids_per_seq):
-            # Save blocks for requests with exactly 1 blocks.
-            if len(block_ids) == 1:
-                request_save_dir = save_dir / f"request_{request_id}"
-                request_save_dir.mkdir(exist_ok=True)
 
-                # Get KV cache buffers.
-                kv_buffer = attn_metadata.kv_cache_manager.get_buffers(0)
+            # Read blocks for requests with exactly 1 block.
+            assert len(block_ids) == 1
 
-                # Save each block separately.
-                for i, block_id in enumerate(block_ids):
-                    # Get block data from KV cache.
-                    request_kv_data = kv_buffer[block_id]
+            # Get KV cache buffers.
+            kv_buffer = attn_metadata.kv_cache_manager.get_buffers(0)
 
-                    # Create separate data dictionary for this block.
-                    block_data = {
-                        "block_data": request_kv_data.cpu()
-                    }
+            # Get block data from KV cache.
+            request_kv_data = kv_buffer[block_ids[0]]
 
-                    # Create separate metadata for this block.
-                    block_metadata = {
-                        "request_id": int(request_id),
-                        "block_id": int(block_id),
-                        "block_index": i,
-                        "block_shape": list(request_kv_data.shape),
-                        "tokens_per_block": attn_metadata.kv_cache_manager.tokens_per_block,
-                        "rank": self.model_config.mapping.rank,
-                    }
+            # Load block data from disk.
+            loaded_data = safetensors.torch.load_file(read_file)
+            block_read_data = loaded_data['block_data'].to(request_kv_data.device)
 
-                    # Save each block's data separately using safetensors.
-                    block_safetensors_path = request_save_dir / f"block_id_{block_id}_rank_{self.model_config.mapping.rank}.safetensors"
-                    safetensors.torch.save_file(block_data, str(block_safetensors_path))
+            # Copy block data to KV cache.
+            request_kv_data.copy_(block_read_data)
 
-                    # Save each block's metadata separately as JSON.
-                    block_metadata_path = request_save_dir / f"block_id_{block_id}_rank_{self.model_config.mapping.rank}_metadata.json"
-                    with open(block_metadata_path, 'w') as f:
-                        json.dump(block_metadata, f, indent=2)
+            print(f"[DeepseekV3ForCausalLM::_read_block_information_from_disk][rank {self.model_config.mapping.rank}] request_kv_data: {request_kv_data}")
 
-                    print(f"[DeepseekV3ForCausalLM::_save_block_information_to_disk][rank {self.model_config.mapping.rank}] "
-                          f"Saved block (ID: {block_id}) for request {request_id}, shape: {request_kv_data.shape} "
-                          f"to {block_safetensors_path.name}")
+            print(f"[DeepseekV3ForCausalLM::_read_block_information_from_disk][rank {self.model_config.mapping.rank}] "
+                  f"Read block data for request {request_id}, shape: {block_read_data.shape} "
+                  f"from {read_file.name}")
 
-                print(f"[DeepseekV3ForCausalLM::_save_block_information_to_disk][rank {self.model_config.mapping.rank}] "
-                      f"Saved block information for request {request_id} to {request_save_dir}")
 
     def load_weights(self, weights: Dict):
 
