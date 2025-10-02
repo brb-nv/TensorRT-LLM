@@ -1280,11 +1280,11 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
         for request_id, block_ids in zip(attn_metadata.request_ids, block_ids_per_seq):
             print(f"[DeepseekV3ForCausalLM::forward][rank {self.model_config.mapping.rank}] request_id: {request_id}, block_ids: {block_ids}")
 
-        # Stream synchronization to save KV cache blocks to disk.
-        torch.cuda.synchronize()
+        # # Stream synchronization to save KV cache blocks to disk.
+        # torch.cuda.synchronize()
 
-        # Read block information from disk for first decode step.
-        self._read_block_information_from_disk(attn_metadata, position_ids)
+        # # Read block information from disk for first decode step.
+        # self._read_block_information_from_disk(attn_metadata, position_ids)
 
         return super().forward(attn_metadata=attn_metadata,
                                input_ids=input_ids,

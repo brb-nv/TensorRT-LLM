@@ -1545,10 +1545,10 @@ class PyTorchModelEngine(ModelEngine):
                     position_id = request.total_input_len_cp + request.py_decoding_iter - 1
                     # Assuming last CP rank is the active rank.
                     if self.mapping.cp_rank == self.mapping.cp_size - 1:
-                        past_seen_token_num = request.orig_prompt_len + request.py_decoding_iter - 1
+                        past_seen_token_num = request.input_len_this_cp_rank + request.py_decoding_iter - 1
                     else:
                         # past_seen_token_num doesn't grow on inactive ranks.
-                        past_seen_token_num = request.orig_prompt_len
+                        past_seen_token_num = request.input_len_this_cp_rank
 
                 position_ids.append(position_id)
                 num_cached_tokens_per_seq.append(past_seen_token_num)
