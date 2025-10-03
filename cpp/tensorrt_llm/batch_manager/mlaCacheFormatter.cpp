@@ -105,7 +105,8 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
     }
 
     auto const numPools = mCacheManager->getBlockManager().getNumPools();
-    auto blockRange = getBlockRangeForSending(mCacheManager, llmRequest);
+    bool const recvSideHasCP = destConfig.getParallelConfig().mContextParallelism > 1;
+    auto blockRange = getBlockRangeForSending(mCacheManager, llmRequest, recvSideHasCP);
 
     auto lastTokenTime = llmRequest.getPerfMetrics().timingMetrics.lastTokenTime;
     bool recordDelay = lastTokenTime != std::chrono::steady_clock::time_point();
@@ -121,6 +122,7 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
             inputKvCacheBlocks.push_back(it);
         }
     }
+    std::cerr << "[MLACacheFormatter::format] llmRequest.mRequestId: " << llmRequest.mRequestId << ", llmRequest.getNumTokens(0): " << llmRequest.getNumTokens(0) << ", blockNum: " << blockNum << std::endl;
     TLLM_CHECK(blockNum > 0);
     int deviceId = mCacheManager->getBlockManager().getStreamDevice();
 
@@ -157,6 +159,7 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
         auto const selfAttentionLayerNum = selfConfig.getParallelConfig().mAttentionLayerNumPerPP.at(ppRank);
         auto const cacheBlockSize = inputKvCacheBlocks.at(0)->getSize();
         auto const blockSizePerLayer = cacheBlockSize / selfAttentionLayerNum;
+        TLLM_CHECK(blockSizePerLayer > 0);
         std::vector<size_t> bufferSizeForTarget(pPDomainSize * cPDomainSize, 0);
         for (size_t ppDomainIdx = 0; ppDomainIdx < pPDomainSize; ppDomainIdx++)
         {
@@ -168,14 +171,17 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
                 auto const peerBlockNum
                     = executor::kv_cache::getBlockNumAccountingForCP(cpDomainIdx, cPDomainSize, blockNum);
                 bufferSizeForTarget[idx] = blockSizePerLayer * peerAttentionLayerNum * peerBlockNum;
+                std::cerr << "[MLACacheFormatter::format] ppDomainIdx: " << ppDomainIdx << ", cpDomainIdx: " << cpDomainIdx << ", idx: " << idx << ", bufferSizeForTarget[idx]: " << bufferSizeForTarget[idx] << " cacheBlockSize: " << cacheBlockSize << " peerBlockNum: " << peerBlockNum << std::endl;
             }
         }
         return bufferSizeForTarget;
     };
     auto bufferEleSizes = getBufferSizeForTarget();
     auto cacheBufferId = mCacheTransBufferManager->assignBufferIndexForSend();
+    std::cerr << "[MLACacheFormatter::format] Before getOrAllocateSendBuffers" << std::endl;
     auto result = mCacheTransBufferManager->getOrAllocateSendBuffers(
         cacheBufferId, static_cast<int>(pPDomainSize * cPDomainSize), bufferEleSizes, bufferManager);
+    std::cerr << "[MLACacheFormatter::format] After getOrAllocateSendBuffers" << std::endl;
     auto& outputSplitCaches = std::get<0>(result);
     auto& bufferCoverTargetNum = std::get<1>(result);
     auto& onlyUseDynamicBuffer = std::get<2>(result);
@@ -191,9 +197,10 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
     SizeType32 window = mCacheManager->getBlockManager().getPoolWindowSize(0);
     std::map<SizeType32, std::vector<runtime::ITensor::SharedPtr>> inputKvCacheBlocksPerWindow;
     inputKvCacheBlocksPerWindow.emplace(window, inputKvCacheBlocks);
+    std::cerr << "[MLACacheFormatter::format] Before splitKVCacheDispatch" << std::endl;
     tensorrt_llm::executor::kv_cache::splitKVCacheDispatch(
         inputKvCacheBlocksPerWindow, outputSplitCaches, destConfig, selfConfig, selfIdx, bufferManager);
-
+    std::cerr << "[MLACacheFormatter::format] After splitKVCacheDispatch" << std::endl;
     bufferManager.getStream().synchronize();
 
     auto preAllocSendBuffer = mCacheTransBufferManager->getSendBuffer(cacheBufferId);
@@ -328,7 +335,7 @@ void MLACacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& s
             outputBuffers.push_back(it);
         }
     }
-
+    std::cerr << "[MLACacheFormatter::unformat] llmRequest.mRequestId: " << llmRequest.mRequestId << ", llmRequest.getNumTokens(0): " << llmRequest.getNumTokens(0) << ", blockNum: " << blockNum << ", pickUpConnections.size(): " << pickUpConnections.size() << std::endl;
     int deviceId = bufferManager.getStream().getDevice();
 
     std::optional<int> cacheBufferId = std::nullopt;
@@ -385,6 +392,7 @@ void MLACacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& s
                 auto const peerAttentionLayerNum
                     = targetInfo.getPeerPPDomainLayerNum(static_cast<SizeType32>(pickUpConnections[i]));
                 bufferEleSizes[i] = cacheSizePerLayer * peerAttentionLayerNum;
+                std::cerr << "[MLACacheFormatter::unformat] i: " << i << ", bufferEleSizes[i]: " << bufferEleSizes[i] << " cacheBlockSize: " << cacheBlockSize << std::endl;
             }
             return bufferEleSizes;
         };
@@ -510,9 +518,11 @@ void MLACacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& s
             outputCachesPerWindow.emplace(window, outputBuffers);
             NVTX3_SCOPED_RANGE(formatInputConcatenate);
 
+            std::cerr << "[MLACacheFormatter::unformat] Before concatKvCacheV2Dispatch" << std::endl;
             // recvSplitCaches size == ppdomainsize * cpdomainsize.
             executor::kv_cache::concatKvCacheV2Dispatch(
                 recvSplitCaches, outputCachesPerWindow, destConfig, selfConfig, selfIdx, bufferManager);
+            std::cerr << "[MLACacheFormatter::unformat] After concatKvCacheV2Dispatch" << std::endl;
         }
         bufferManager.getStream().synchronize();
     }

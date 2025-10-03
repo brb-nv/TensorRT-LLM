@@ -846,19 +846,6 @@ protected:
         return mRequester->receiveAsync(*llmRequest);
     }
 
-    // Called only by generationVerifyKVCache. Currently, generation ranks might over-allocate blocks when CP is
-    // enabled.
-    bool isBlockOverallocated(int blockIdx, int numTotalBlocks)
-    {
-        bool const generationHasCP = mCpSize > 1;
-        if (!generationHasCP)
-        {
-            return false;
-        }
-        int const numValidBlocks = tensorrt_llm::executor::kv_cache::getBlockNumAccountingForCP(mCpRank, mCpSize, numTotalBlocks);
-        return blockIdx >= numValidBlocks;
-    }
-
     int getGlobalBlockIdAccountingForCP(int localBlockIdx, int cpSize, int cpRank, int numTotalBlocks)
     {
         if (tensorrt_llm::common::getEnvUseRoundRobinBlockDistForCP()) {
@@ -882,21 +869,14 @@ protected:
         TLLM_CUDA_CHECK(cudaDeviceSynchronize());
 
         auto blockRange = BlockRange::fromAllBlockIds(*mManager, llmRequest->mRequestId);
-        int const numTotalBlocks = blockRange.getBlockIds().size();
+        int const numTokensPerBlock = mCacheState->getModelConfig().mTokensPerBlock;
+        int const numTotalBlocks = (llmRequest->getNumTokens(beamIdx) + numTokensPerBlock - 1) / numTokensPerBlock;
         auto const numPools = mManager->getBlockManager().getNumPools();
         for (int poolIdx = 0; poolIdx < numPools; poolIdx++)
         {
             blockRange.updatePoolIdx(poolIdx);
             for (auto& block : blockRange)
             {
-                if (isBlockOverallocated(blockIdx, numTotalBlocks))
-                {
-                    TLLM_LOG_INFO(
-                        "[generationVerifyKVCache] Skipping over-allocated block for request id %d (rank %d, blockIdx "
-                        "%d, numTotalBlocks %d)",
-                        llmRequest->mRequestId, mRank, blockIdx, numTotalBlocks);
-                    break;
-                }
                 verifyBlockData(block, blockIdx, llmRequest->getPromptLen(), numTotalBlocks, poolIdx);
                 blockIdx++;
             }
@@ -1079,7 +1059,7 @@ protected:
                             {
                                 using ValueType = decltype(generateValue);
                                 auto* dataPtr = static_cast<ValueType*>(hostTensor->data(keyIndex));
-                                // EXPECT_EQ(*dataPtr, generateValue);
+                                EXPECT_EQ(*dataPtr, generateValue);
                                 if (TARGET_RANK == -1 || tensorrt_llm::mpi::MpiComm::world().getRank() == TARGET_RANK)
                                 {
                                     std::string result = "";
@@ -1108,7 +1088,7 @@ protected:
                                 {
                                     using ValueType = decltype(generateValue);
                                     auto* dataPtr = static_cast<ValueType*>(hostTensor->data(valueIndex));
-                                    // EXPECT_EQ(*dataPtr, generateValue);
+                                    EXPECT_EQ(*dataPtr, generateValue);
                                     if (TARGET_RANK == -1 || tensorrt_llm::mpi::MpiComm::world().getRank() == TARGET_RANK)
                                     {
                                         std::string result = "";
@@ -1241,7 +1221,7 @@ TEST_P(AsymmetricalCacheTest, TestCase)
         // the second loop is for cache reuse
         for (int i = 0; i < 1; i++)
         {
-            for (auto len : {8})
+            for (auto len : {16})
             {
                 requests.emplace_back(makeLlmRequest(len));
             }
