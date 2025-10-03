@@ -46,19 +46,12 @@ inline bool isPowerOfTwo(int n)
 }
 } // namespace
 
-int getBlockNumAccountingForCP(int cpRank, int cpSize, int numTotalBlocks, bool strict)
+int getBlockNumAccountingForCP(int cpRank, int cpSize, int numTotalBlocks)
 {
     TLLM_CHECK(cpRank >= 0 && cpRank < cpSize);
     if (cpSize == 1)
     {
         return numTotalBlocks;
-    }
-    // NOTE: Non-strict mode may over-allocate blocks when numTotalBlocks is not divisible by cpSize.
-    // This is a known limitation and will be addressed in a future MR.
-    if (!strict)
-    {
-        // Simple ceiling division.
-        return (numTotalBlocks + cpSize - 1) / cpSize;
     }
     // In strict mode, blocks are distributed among CP ranks in a round-robin fashion as evenly as possible.
     // When the number of blocks is not divisible by cpSize, the remainder shall be distributed evenly among
@@ -1151,7 +1144,7 @@ void splitKVCache(std::map<SizeType32, std::vector<runtime::ITensor::SharedPtr>>
     prefixBlockNum[0] = 0;
     for (int i = 0; i < targetRankInfo.mDomainCPSize; i++)
     {
-        prefixBlockNum[i + 1] = prefixBlockNum[i] + getBlockNumAccountingForCP(i, targetRankInfo.mDomainCPSize, inputBlockNumSum, /*strict=*/true);
+        prefixBlockNum[i + 1] = prefixBlockNum[i] + getBlockNumAccountingForCP(i, targetRankInfo.mDomainCPSize, inputBlockNumSum);
     }
     cachePtrs.insert(cachePtrs.end(), prefixBlockNum.begin(), prefixBlockNum.end());
 

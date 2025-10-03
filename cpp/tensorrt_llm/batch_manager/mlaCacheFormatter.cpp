@@ -166,7 +166,7 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
                 auto const idx = cpDomainIdx * pPDomainSize + ppDomainIdx;
                 // Note: contextCP is always 1. So, cpDomainSize == genCPSize and cpDomainIdx == genCPRank.
                 auto const peerBlockNum
-                    = executor::kv_cache::getBlockNumAccountingForCP(cpDomainIdx, cPDomainSize, blockNum, /*strict=*/false);
+                    = executor::kv_cache::getBlockNumAccountingForCP(cpDomainIdx, cPDomainSize, blockNum);
                 bufferSizeForTarget[idx] = blockSizePerLayer * peerAttentionLayerNum * peerBlockNum;
             }
         }
