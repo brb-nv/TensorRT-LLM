@@ -60,43 +60,6 @@ namespace texec = tensorrt_llm::executor;
 using testing::Return;
 using testing::ReturnRef;
 
-// WrappedLlmRequest class that derives from LlmRequest with additional data members
-// to store information pertinent to CP.
-class WrappedLlmRequest : public LlmRequest
-{
-public:
-    int mTotalSeqLenAcrossCPRanks;
-    int mTotalNumBlocksAcrossCPRanks;
-    int mNumBlocksThisCPRank;
-    int mSeqLenOnThisCPRank;
-    std::vector<int> mGlobalBlockIds;
-
-    // Inherit constructors from base class.
-    using LlmRequest::LlmRequest;
-
-    WrappedLlmRequest(int totalSeqLen,
-            int numTokensPerBlock,
-            int cpRank,
-            int cpSize)
-    {
-        mTotalSeqLenAcrossCPRanks = totalSeqLen;
-        mTotalNumBlocksAcrossCPRanks = (totalSeqLen + numTokensPerBlock - 1) / numTokensPerBlock;
-        mNumBlocksThisCPRank = tensorrt_llm::executor::kv_cache::getBlockNumAccountingForCP(cpRank, cpSize, mTotalNumBlocksAcrossCPRanks);
-        mSeqLenOnThisCPRank = totalSeqLen;
-        int numPaddedTokensLastBlock = 0;
-        TLLM_CHECK_WITH_INFO(!tensorrt_llm::common::getEnvUseRoundRobinBlockDistForCP(), "Round-robin block distribution for CP needs further adjustments to this.");
-        // If there are any padded tokens, they will be on the last block on last CP rank for contiguous distribution of blocks.
-        if (cpRank == cpSize - 1 && totalSeqLen % numTokensPerBlock != 0) {
-            numPaddedTokensLastBlock = numTokensPerBlock - (totalSeqLen % numTokensPerBlock);
-        }
-        mSeqLenOnThisCPRank = mNumBlocksThisCPRank * numTokensPerBlock - numPaddedTokensLastBlock;
-        mGlobalBlockIds = std::vector<int>(mNumBlocksThisCPRank);
-        for (int i = 0; i < mNumBlocksThisCPRank; i++) {
-            mGlobalBlockIds[i] = tensorrt_llm::executor::kv_cache::getGlobalBlockIdAccountingForCP(i, cpSize, cpRank, mTotalNumBlocksAcrossCPRanks);
-        }
-    }
-};
-
 // ---------------------------------------
 //            RequestInfoTest
 // ---------------------------------------
@@ -448,6 +411,66 @@ using AsymmetricTestParam
 
 class AsymmetricalCacheTest : public ::testing::TestWithParam<AsymmetricTestParam>
 {
+    // WrappedLlmRequest class with additional data members to store information pertinent to CP.
+    struct WrappedLlmRequest
+    {
+    public:
+        int mTotalSeqLenAcrossCPRanks{0};
+        int mTotalNumBlocksAcrossCPRanks{0};
+        int mNumBlocksThisCPRank{0};
+        int mSeqLenOnThisCPRank{0};
+        std::vector<int> mGlobalBlockIds{};
+        std::unique_ptr<LlmRequest> mBaseRequest{nullptr};
+
+        // Inherit constructors from base class.
+        WrappedLlmRequest(int totalSeqLen,
+                int numTokensPerBlock,
+                int cpRank,
+                int cpSize)
+        {
+            mTotalSeqLenAcrossCPRanks = totalSeqLen;
+            mTotalNumBlocksAcrossCPRanks = (totalSeqLen + numTokensPerBlock - 1) / numTokensPerBlock;
+            mNumBlocksThisCPRank = tensorrt_llm::executor::kv_cache::getBlockNumAccountingForCP(cpRank, cpSize, mTotalNumBlocksAcrossCPRanks);
+            mSeqLenOnThisCPRank = totalSeqLen;
+            int numPaddedTokensLastBlock = 0;
+            TLLM_CHECK_WITH_INFO(!tensorrt_llm::common::getEnvUseRoundRobinBlockDistForCP(), "Round-robin block distribution for CP needs further adjustments.");
+            // If there are any padded tokens, they will be on the last block on last CP rank for contiguous distribution of blocks.
+            if (cpRank == cpSize - 1 && totalSeqLen % numTokensPerBlock != 0) {
+                numPaddedTokensLastBlock = numTokensPerBlock - (totalSeqLen % numTokensPerBlock);
+            }
+            mSeqLenOnThisCPRank = mNumBlocksThisCPRank * numTokensPerBlock - numPaddedTokensLastBlock;
+            mGlobalBlockIds = std::vector<int>(mNumBlocksThisCPRank);
+            for (int i = 0; i < mNumBlocksThisCPRank; i++) {
+                mGlobalBlockIds[i] = tensorrt_llm::executor::kv_cache::getGlobalBlockIdAccountingForCP(i, cpSize, cpRank, mTotalNumBlocksAcrossCPRanks);
+            }
+        }
+
+        // Move constructor.
+        WrappedLlmRequest(WrappedLlmRequest&& other) noexcept
+            : mTotalSeqLenAcrossCPRanks(other.mTotalSeqLenAcrossCPRanks)
+            , mTotalNumBlocksAcrossCPRanks(other.mTotalNumBlocksAcrossCPRanks)
+            , mNumBlocksThisCPRank(other.mNumBlocksThisCPRank)
+            , mSeqLenOnThisCPRank(other.mSeqLenOnThisCPRank)
+            , mGlobalBlockIds(std::move(other.mGlobalBlockIds))
+            , mBaseRequest(std::move(other.mBaseRequest))
+        {
+        }
+
+        // Move assignment operator.
+        WrappedLlmRequest& operator=(WrappedLlmRequest&& other) noexcept
+        {
+            if (this != &other)
+            {
+                mTotalSeqLenAcrossCPRanks = other.mTotalSeqLenAcrossCPRanks;
+                mTotalNumBlocksAcrossCPRanks = other.mTotalNumBlocksAcrossCPRanks;
+                mNumBlocksThisCPRank = other.mNumBlocksThisCPRank;
+                mSeqLenOnThisCPRank = other.mSeqLenOnThisCPRank;
+                mGlobalBlockIds = std::move(other.mGlobalBlockIds);
+                mBaseRequest = std::move(other.mBaseRequest);
+            }
+            return *this;
+        }
+    };
 
 protected:
     void SetUp() override {}
@@ -815,6 +838,13 @@ protected:
         return std::make_unique<LlmRequest>(mRequestId++, std::move(request));
     }
 
+    WrappedLlmRequest makeWrappedLlmRequest(int totalSeqLen, int numTokensPerBlock, int cpRank, int cpSize)
+    {
+        auto wrappedLlmRequest = WrappedLlmRequest(totalSeqLen, numTokensPerBlock, cpRank, cpSize);
+        wrappedLlmRequest.mBaseRequest = makeLlmRequest(wrappedLlmRequest.mSeqLenOnThisCPRank);
+        return wrappedLlmRequest;
+    }
+
     auto makeLlmRequestWithDP(SizeType32 length, LlmRequest::RequestIdType requestId, int contextDpRank)
     {
         constexpr SizeType32 maxNewTokens{1};
@@ -881,20 +911,6 @@ protected:
         mManager->addSequence(llmRequest->mRequestId, numBlocksThisRank * numTokensPerBlock, beamWidth, llmRequest);
         // mManager->addSequence(llmRequest->mRequestId, llmRequest->getNumTokens(beamIdx), beamWidth, llmRequest);
         return mRequester->receiveAsync(*llmRequest);
-    }
-
-    int getGlobalBlockIdAccountingForCP(int localBlockIdx, int cpSize, int cpRank, int numTotalBlocks)
-    {
-        if (tensorrt_llm::common::getEnvUseRoundRobinBlockDistForCP()) {
-            return localBlockIdx * cpSize + cpRank;
-        } else {
-            int const minBlocksPerCPRank = numTotalBlocks / cpSize;
-            int const minBlocksOnPrevCPRanks = minBlocksPerCPRank * cpRank;
-            int const numOverflowRanks = numTotalBlocks % cpSize;
-            // Each previous overflow rank has one more block than minBlocksPerCPRank.
-            int const overflowBlocksOnPrevCPRanks = std::min(cpRank, numOverflowRanks);
-            return minBlocksOnPrevCPRanks + overflowBlocksOnPrevCPRanks + localBlockIdx;
-        }
     }
 
     void generationVerifyKVCache(std::shared_ptr<LlmRequest> const& llmRequest)
@@ -1072,7 +1088,7 @@ protected:
         }
         int kvFactor = mCacheState->getAttentionConfig().mKvFactor;
         int tokensPerBlock = mCacheState->getModelConfig().mTokensPerBlock;
-        int startTokenId = getGlobalBlockIdAccountingForCP(blockId, mCpSize, mCpRank, numTotalBlocks) * tokensPerBlock;
+        int startTokenId = tensorrt_llm::executor::kv_cache::getGlobalBlockIdAccountingForCP(blockId, mCpSize, mCpRank, numTotalBlocks) * tokensPerBlock;
         int sizePerHead = mCacheState->getModelConfig().mSizePerHead;
 
         bufferManager.copy(blockData, *hostTensor);

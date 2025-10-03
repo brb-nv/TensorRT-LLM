@@ -64,6 +64,20 @@ int getBlockNumAccountingForCP(int cpRank, int cpSize, int numTotalBlocks)
     return numBlocksCurrRank;
 }
 
+int getGlobalBlockIdAccountingForCP(int localBlockIdx, int cpSize, int cpRank, int numTotalBlocks)
+{
+    if (tensorrt_llm::common::getEnvUseRoundRobinBlockDistForCP()) {
+        return localBlockIdx * cpSize + cpRank;
+    } else {
+        int const minBlocksPerCPRank = numTotalBlocks / cpSize;
+        int const minBlocksOnPrevCPRanks = minBlocksPerCPRank * cpRank;
+        int const numOverflowRanks = numTotalBlocks % cpSize;
+        // Each previous overflow rank has one more block than minBlocksPerCPRank.
+        int const overflowBlocksOnPrevCPRanks = std::min(cpRank, numOverflowRanks);
+        return minBlocksOnPrevCPRanks + overflowBlocksOnPrevCPRanks + localBlockIdx;
+    }
+}
+
 // inputBlockNums: [outputBlockNum, inputRanks.size]
 // [PP, TP]
 TargetRanksInfo TargetRanksInfoForDP(

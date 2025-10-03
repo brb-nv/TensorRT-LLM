@@ -74,7 +74,9 @@ TargetRanksInfo TargetRanksInfoForDP(
  *
  * @return The number of blocks allocated to the specified CP rank.
  */
- int getBlockNumAccountingForCP(int cpRank, int cpSize, int numTotalBlocks);
+int getBlockNumAccountingForCP(int cpRank, int cpSize, int numTotalBlocks);
+
+int getGlobalBlockIdAccountingForCP(int localBlockIdx, int cpSize, int cpRank, int numTotalBlocks);
 
 void concatKVCacheDispatch(runtime::ITensor::SharedPtr* inputBlocks, int inputBlockNum,
     std::vector<int> const& inputRanks, kv_cache::CacheState const& peerCacheState,
