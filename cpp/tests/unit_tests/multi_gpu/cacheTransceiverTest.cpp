@@ -60,6 +60,43 @@ namespace texec = tensorrt_llm::executor;
 using testing::Return;
 using testing::ReturnRef;
 
+// WrappedLlmRequest class that derives from LlmRequest with additional data members
+// to store information pertinent to CP.
+class WrappedLlmRequest : public LlmRequest
+{
+public:
+    int mTotalSeqLenAcrossCPRanks;
+    int mTotalNumBlocksAcrossCPRanks;
+    int mNumBlocksThisCPRank;
+    int mSeqLenOnThisCPRank;
+    std::vector<int> mGlobalBlockIds;
+
+    // Inherit constructors from base class.
+    using LlmRequest::LlmRequest;
+
+    WrappedLlmRequest(int totalSeqLen,
+            int numTokensPerBlock,
+            int cpRank,
+            int cpSize)
+    {
+        mTotalSeqLenAcrossCPRanks = totalSeqLen;
+        mTotalNumBlocksAcrossCPRanks = (totalSeqLen + numTokensPerBlock - 1) / numTokensPerBlock;
+        mNumBlocksThisCPRank = tensorrt_llm::executor::kv_cache::getBlockNumAccountingForCP(cpRank, cpSize, mTotalNumBlocksAcrossCPRanks);
+        mSeqLenOnThisCPRank = totalSeqLen;
+        int numPaddedTokensLastBlock = 0;
+        TLLM_CHECK_WITH_INFO(!tensorrt_llm::common::getEnvUseRoundRobinBlockDistForCP(), "Round-robin block distribution for CP needs further adjustments to this.");
+        // If there are any padded tokens, they will be on the last block on last CP rank for contiguous distribution of blocks.
+        if (cpRank == cpSize - 1 && totalSeqLen % numTokensPerBlock != 0) {
+            numPaddedTokensLastBlock = numTokensPerBlock - (totalSeqLen % numTokensPerBlock);
+        }
+        mSeqLenOnThisCPRank = mNumBlocksThisCPRank * numTokensPerBlock - numPaddedTokensLastBlock;
+        mGlobalBlockIds = std::vector<int>(mNumBlocksThisCPRank);
+        for (int i = 0; i < mNumBlocksThisCPRank; i++) {
+            mGlobalBlockIds[i] = tensorrt_llm::executor::kv_cache::getGlobalBlockIdAccountingForCP(i, cpSize, cpRank, mTotalNumBlocksAcrossCPRanks);
+        }
+    }
+};
+
 // ---------------------------------------
 //            RequestInfoTest
 // ---------------------------------------
