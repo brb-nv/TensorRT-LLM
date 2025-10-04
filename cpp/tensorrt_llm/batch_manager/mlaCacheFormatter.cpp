@@ -105,7 +105,8 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
     }
 
     auto const numPools = mCacheManager->getBlockManager().getNumPools();
-    auto blockRange = getBlockRangeForSending(mCacheManager, llmRequest);
+    bool const recvSideHasCP = destConfig.getParallelConfig().mContextParallelism > 1;
+    auto blockRange = getBlockRangeForSending(mCacheManager, llmRequest, recvSideHasCP);
 
     auto lastTokenTime = llmRequest.getPerfMetrics().timingMetrics.lastTokenTime;
     bool recordDelay = lastTokenTime != std::chrono::steady_clock::time_point();
@@ -157,6 +158,7 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
         auto const selfAttentionLayerNum = selfConfig.getParallelConfig().mAttentionLayerNumPerPP.at(ppRank);
         auto const cacheBlockSize = inputKvCacheBlocks.at(0)->getSize();
         auto const blockSizePerLayer = cacheBlockSize / selfAttentionLayerNum;
+        TLLM_CHECK(blockSizePerLayer > 0);
         std::vector<size_t> bufferSizeForTarget(pPDomainSize * cPDomainSize, 0);
         for (size_t ppDomainIdx = 0; ppDomainIdx < pPDomainSize; ppDomainIdx++)
         {
@@ -166,7 +168,7 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
                 auto const idx = cpDomainIdx * pPDomainSize + ppDomainIdx;
                 // Note: contextCP is always 1. So, cpDomainSize == genCPSize and cpDomainIdx == genCPRank.
                 auto const peerBlockNum
-                    = executor::kv_cache::getBlockNumAccountingForCP(cpDomainIdx, cPDomainSize, blockNum, /*strict=*/false);
+                    = executor::kv_cache::getBlockNumAccountingForCP(cpDomainIdx, cPDomainSize, blockNum);
                 bufferSizeForTarget[idx] = blockSizePerLayer * peerAttentionLayerNum * peerBlockNum;
             }
         }
@@ -193,7 +195,6 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
     inputKvCacheBlocksPerWindow.emplace(window, inputKvCacheBlocks);
     tensorrt_llm::executor::kv_cache::splitKVCacheDispatch(
         inputKvCacheBlocksPerWindow, outputSplitCaches, destConfig, selfConfig, selfIdx, bufferManager);
-
     bufferManager.getStream().synchronize();
 
     auto preAllocSendBuffer = mCacheTransBufferManager->getSendBuffer(cacheBufferId);
@@ -328,7 +329,6 @@ void MLACacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& s
             outputBuffers.push_back(it);
         }
     }
-
     int deviceId = bufferManager.getStream().getDevice();
 
     std::optional<int> cacheBufferId = std::nullopt;

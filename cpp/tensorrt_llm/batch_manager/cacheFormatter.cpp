@@ -40,13 +40,13 @@
 namespace tensorrt_llm::batch_manager::kv_cache_manager
 {
 
-BlockRange getBlockRangeForSending(BaseKVCacheManager* cacheManager, LlmRequest const& llmRequest)
+BlockRange getBlockRangeForSending(BaseKVCacheManager* cacheManager, LlmRequest const& llmRequest, bool recvSideHasCP)
 {
     size_t requestBlockNum = llmRequest.getRequestedBlockHashes().size();
     constexpr SizeType32 beam{0};
     auto blockRange = BlockRange::fromAllBlockIds(*cacheManager, llmRequest.mRequestId, beam);
     auto poolNum = cacheManager->getBlockManager().getNumPools();
-    if (poolNum > 1 || common::getEnvDisableSelectiveCacheTransfer())
+    if (poolNum > 1 || common::getEnvDisableSelectiveCacheTransfer() || recvSideHasCP)
     {
         // disable selective cache transfer for poolNum > 1
         return blockRange;

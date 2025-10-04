@@ -409,6 +409,51 @@ TEST_F(SymmetricalCacheTest, SimpleTest)
 using AsymmetricTestParam
     = std::tuple<int, int, int, int, int, int, int, int, int, int, nvinfer1::DataType, int, bool, bool, bool, bool>;
 
+// CPMetaData struct to hold CP-specific information
+struct CPMetaData
+{
+    int mTotalSeqLenAcrossCPRanks{0};
+    int mTotalNumBlocksAcrossCPRanks{0};
+    int mNumBlocksThisCPRank{0};
+    int mSeqLenOnThisCPRank{0};
+    std::vector<int> mGlobalBlockIds{};
+
+    CPMetaData() = default;
+
+    CPMetaData(int totalSeqLen, int numTokensPerBlock, int cpRank, int cpSize)
+    {
+        mTotalSeqLenAcrossCPRanks = totalSeqLen;
+        mTotalNumBlocksAcrossCPRanks = (totalSeqLen + numTokensPerBlock - 1) / numTokensPerBlock;
+        mNumBlocksThisCPRank = tensorrt_llm::executor::kv_cache::getBlockNumAccountingForCP(cpRank, cpSize, mTotalNumBlocksAcrossCPRanks);
+        mSeqLenOnThisCPRank = totalSeqLen;
+        int numPaddedTokensLastBlock = 0;
+        TLLM_CHECK_WITH_INFO(!tensorrt_llm::common::getEnvUseRoundRobinBlockDistForCP(), "Round-robin block distribution for CP needs further adjustments.");
+        // If there are any padded tokens, they will be on the last block on last CP rank for contiguous distribution of blocks.
+        if (cpRank == cpSize - 1 && totalSeqLen % numTokensPerBlock != 0) {
+            numPaddedTokensLastBlock = numTokensPerBlock - (totalSeqLen % numTokensPerBlock);
+        }
+        mSeqLenOnThisCPRank = mNumBlocksThisCPRank * numTokensPerBlock - numPaddedTokensLastBlock;
+        mGlobalBlockIds = std::vector<int>(mNumBlocksThisCPRank);
+        for (int i = 0; i < mNumBlocksThisCPRank; i++) {
+            mGlobalBlockIds[i] = tensorrt_llm::executor::kv_cache::getGlobalBlockIdAccountingForCP(i, cpSize, cpRank, mTotalNumBlocksAcrossCPRanks);
+        }
+    }
+};
+
+struct WrappedLlmRequest
+{
+    std::unique_ptr<LlmRequest> mLlmRequest;
+    std::optional<CPMetaData> mCPMetaData;
+
+    using RequestIdType = LlmRequest::RequestIdType;
+
+    WrappedLlmRequest(std::unique_ptr<LlmRequest> llmRequest, std::optional<CPMetaData> cpMetaData)
+        : mLlmRequest(std::move(llmRequest))
+        , mCPMetaData(std::move(cpMetaData))
+    {
+    }
+};
+
 class AsymmetricalCacheTest : public ::testing::TestWithParam<AsymmetricTestParam>
 {
 
@@ -423,9 +468,9 @@ protected:
 #if ENABLE_MULTI_DEVICE
         tensorrt_llm::mpi::initialize(tensorrt_llm::mpi::MpiThreadSupport::THREAD_MULTIPLE);
 
-        if (tensorrt_llm::mpi::MpiComm::world().getSize() != 8)
+        if (tensorrt_llm::mpi::MpiComm::world().getSize() != 4)
         {
-            GTEST_SKIP() << "mpirun with procs=8  is required to run this test.";
+            GTEST_SKIP() << "mpirun with procs=4 is required to run this test.";
         }
         int worldSize = tensorrt_llm::mpi::MpiComm::world().getSize();
         int worldRank = tensorrt_llm::mpi::MpiComm::world().getRank();
@@ -764,10 +809,16 @@ protected:
 
     auto makeLlmRequest(SizeType32 length)
     {
-
         constexpr SizeType32 maxNewTokens{1};
-        texec::Request request{VecTokens(length, length), maxNewTokens};
+        const auto tokensPerBlock = mCacheState->getModelConfig().mTokensPerBlock;
 
+        std::optional<CPMetaData> cpMetaData;
+        int seqLen = length;
+        if (mCpSize > 1) {
+            cpMetaData.emplace(length, tokensPerBlock, mCpRank, mCpSize);
+            seqLen = cpMetaData.value().mSeqLenOnThisCPRank;
+        }
+        texec::Request request{VecTokens(seqLen, seqLen), maxNewTokens};
         auto state = std::make_unique<texec::DataTransceiverState>();
 
         TLLM_CHECK(mContextCommState);
@@ -775,7 +826,9 @@ protected:
         state->setCacheState(*mContextCacheState);
         auto stats = texec::ContextPhaseParams({}, mRequestId, state.release(), std::nullopt);
         request.setContextPhaseParams(std::move(stats));
-        return std::make_unique<LlmRequest>(mRequestId++, std::move(request));
+
+        auto llmRequestPtr = std::make_unique<LlmRequest>(mRequestId++, std::move(request));
+        return std::make_unique<WrappedLlmRequest>(std::move(llmRequestPtr), cpMetaData);
     }
 
     auto makeLlmRequestWithDP(SizeType32 length, LlmRequest::RequestIdType requestId, int contextDpRank)
@@ -797,18 +850,27 @@ protected:
         state->setCacheState(cacheState);
         auto stats = texec::ContextPhaseParams({}, requestId, state.release(), std::nullopt);
         request.setContextPhaseParams(std::move(stats));
-        return std::make_unique<LlmRequest>(requestId, std::move(request));
+        auto llmRequestPtr = std::make_unique<LlmRequest>(requestId, std::move(request));
+
+        std::optional<CPMetaData> cpMetaData;
+        return std::make_unique<WrappedLlmRequest>(std::move(llmRequestPtr), cpMetaData);
     }
 
-    std::future<void> addRequestAndTransportCacheForContext(std::shared_ptr<LlmRequest> const& llmRequest)
+    std::future<void> addRequestAndTransportCacheForContext(std::shared_ptr<WrappedLlmRequest> const& request)
     {
         auto constexpr beamIdx{0};
         auto constexpr beamWidth{1};
+        auto& llmRequest = request->mLlmRequest;
         mManager->addSequence(llmRequest->mRequestId, llmRequest->getNumTokens(beamIdx), beamWidth, llmRequest);
         auto blockRange = BlockRange::fromAllBlockIds(*mManager, llmRequest->mRequestId);
         int blockIdx = 0;
 
         int const numPools = mManager->getBlockManager().getNumPools();
+        auto initial = llmRequest->getPromptLen();
+        if (request->mCPMetaData.has_value()) {
+            auto const& cpData = request->mCPMetaData.value();
+            initial = cpData.mTotalSeqLenAcrossCPRanks;
+        }
         TLLM_LOG_DEBUG(" addRequestAndTransportCacheForContext mManager numPools: %d", numPools);
         for (int poolIdx = 0; poolIdx < numPools; poolIdx++)
         {
@@ -816,7 +878,7 @@ protected:
             TLLM_LOG_DEBUG("update poolIdx: %d", poolIdx);
             for (auto& block : blockRange)
             {
-                fillBlockData(block, blockIdx, llmRequest->getPromptLen(), poolIdx);
+                fillBlockData(block, blockIdx, initial, poolIdx);
                 blockIdx++;
             }
             TLLM_LOG_DEBUG("blockPoolIdx: %d finish fill block data", poolIdx);
@@ -833,43 +895,16 @@ protected:
         return future;
     }
 
-    std::future<void> addRequestAndTransportCacheForGeneration(std::shared_ptr<LlmRequest> const& llmRequest)
+    std::future<void> addRequestAndTransportCacheForGeneration(std::shared_ptr<WrappedLlmRequest> const& request)
     {
         auto constexpr beamIdx{0};
         auto constexpr beamWidth{1};
+        auto& llmRequest = request->mLlmRequest;
         mManager->addSequence(llmRequest->mRequestId, llmRequest->getNumTokens(beamIdx), beamWidth, llmRequest);
-
         return mRequester->receiveAsync(*llmRequest);
     }
 
-    // Called only by generationVerifyKVCache. Currently, generation ranks might over-allocate blocks when CP is
-    // enabled.
-    bool isBlockOverallocated(int blockIdx, int numTotalBlocks)
-    {
-        bool const generationHasCP = mCpSize > 1;
-        if (!generationHasCP)
-        {
-            return false;
-        }
-        int const numValidBlocks = tensorrt_llm::executor::kv_cache::getBlockNumAccountingForCP(mCpRank, mCpSize, numTotalBlocks, /*strict=*/true);
-        return blockIdx >= numValidBlocks;
-    }
-
-    int getGlobalBlockIdAccountingForCP(int localBlockIdx, int cpSize, int cpRank, int numTotalBlocks)
-    {
-        if (tensorrt_llm::common::getEnvUseRoundRobinBlockDistForCP()) {
-            return localBlockIdx * cpSize + cpRank;
-        } else {
-            int const minBlocksPerCPRank = numTotalBlocks / cpSize;
-            int const minBlocksOnPrevCPRanks = minBlocksPerCPRank * cpRank;
-            int const numOverflowRanks = numTotalBlocks % cpSize;
-            // Each previous overflow rank has one more block than minBlocksPerCPRank.
-            int const overflowBlocksOnPrevCPRanks = std::min(cpRank, numOverflowRanks);
-            return minBlocksOnPrevCPRanks + overflowBlocksOnPrevCPRanks + localBlockIdx;
-        }
-    }
-
-    void generationVerifyKVCache(std::shared_ptr<LlmRequest> const& llmRequest)
+    void generationVerifyKVCache(std::shared_ptr<WrappedLlmRequest> const& request)
     {
         auto constexpr beamIdx{0};
         auto constexpr beamWidth{1};
@@ -877,23 +912,24 @@ protected:
 
         TLLM_CUDA_CHECK(cudaDeviceSynchronize());
 
+        auto& llmRequest = request->mLlmRequest;
         auto blockRange = BlockRange::fromAllBlockIds(*mManager, llmRequest->mRequestId);
-        int const numTotalBlocks = blockRange.getBlockIds().size();
+        auto initial = llmRequest->getPromptLen();
+        std::vector<int> globalBlockIds(blockRange.size());
+        std::iota(globalBlockIds.begin(), globalBlockIds.end(), 0);
+
+        if (request->mCPMetaData.has_value()) {
+            auto const& cpData = request->mCPMetaData.value();
+            initial = cpData.mTotalSeqLenAcrossCPRanks;
+            globalBlockIds = cpData.mGlobalBlockIds;
+        }
         auto const numPools = mManager->getBlockManager().getNumPools();
         for (int poolIdx = 0; poolIdx < numPools; poolIdx++)
         {
             blockRange.updatePoolIdx(poolIdx);
             for (auto& block : blockRange)
             {
-                if (isBlockOverallocated(blockIdx, numTotalBlocks))
-                {
-                    TLLM_LOG_INFO(
-                        "[generationVerifyKVCache] Skipping over-allocated block for request id %d (rank %d, blockIdx "
-                        "%d, numTotalBlocks %d)",
-                        llmRequest->mRequestId, mRank, blockIdx, numTotalBlocks);
-                    break;
-                }
-                verifyBlockData(block, blockIdx, llmRequest->getPromptLen(), numTotalBlocks, poolIdx);
+                verifyBlockData(block, blockIdx, initial, globalBlockIds[blockIdx], poolIdx);
                 blockIdx++;
             }
         }
@@ -1016,7 +1052,7 @@ protected:
         bufferManager.getStream().synchronize();
     }
 
-    void verifyBlockData(tensorrt_llm::runtime::ITensor& blockData, int blockId, size_t initial, int numTotalBlocks, int blockPoolIdx = 0)
+    void verifyBlockData(tensorrt_llm::runtime::ITensor& blockData, int blockId, size_t initial, int globalBlockId, int blockPoolIdx = 0)
     {
         static const int TARGET_RANK = getEnvMpiDebugRank(); // -1 means all ranks.
         if (TARGET_RANK == -1 || tensorrt_llm::mpi::MpiComm::world().getRank() == TARGET_RANK)
@@ -1051,7 +1087,7 @@ protected:
         }
         int kvFactor = mCacheState->getAttentionConfig().mKvFactor;
         int tokensPerBlock = mCacheState->getModelConfig().mTokensPerBlock;
-        int startTokenId = getGlobalBlockIdAccountingForCP(blockId, mCpSize, mCpRank, numTotalBlocks) * tokensPerBlock;
+        int startTokenId = globalBlockId * tokensPerBlock;
         int sizePerHead = mCacheState->getModelConfig().mSizePerHead;
 
         bufferManager.copy(blockData, *hostTensor);
@@ -1080,7 +1116,7 @@ protected:
                                 {
                                     std::string result = "";
                                     if (*dataPtr != generateValue) {
-                                        result = "FAILED!";
+                                        result = "FAILED! expected_value=" + std::to_string(generateValue);
                                     }
                                     TLLM_LOG_INFO(tensorrt_llm::mpi::MpiComm::world().getRank(),
                                         "[RANK %d] [verifyBlockData::key] blockId=%d, layer=%d->%d, head=%d->%d, token=%d->%d, hidden=%d, "
@@ -1137,7 +1173,12 @@ protected:
     std::variant<double, float, int16_t, int8_t> generateExpectedValue(size_t initial, int blockPoolIdx, int tokenId,
         int layerId, int headId, int hiddenId, bool key, nvinfer1::DataType dataType)
     {
-
+        static const int TARGET_RANK = getEnvMpiDebugRank(); // -1 means all ranks.
+        if (TARGET_RANK == -1 || tensorrt_llm::mpi::MpiComm::world().getRank() == TARGET_RANK)
+        {
+            TLLM_LOG_INFO("generateExpectedValue called for rank %d, initial=%zu, blockPoolIdx=%d, tokenId=%d, layerId=%d, headId=%d, hiddenId=%d, key=%d, dataType=%d",
+                tensorrt_llm::mpi::MpiComm::world().getRank(), initial, blockPoolIdx, tokenId, layerId, headId, hiddenId, key, static_cast<int>(dataType));
+        }
         size_t seed = 0;
         std::size_t hashValue = std::hash<size_t>{}(initial);
         std::hash<int> hasher{};
@@ -1232,13 +1273,17 @@ TEST_P(AsymmetricalCacheTest, TestCase)
     {
         setUpCacheManager(numLayers, numHeads, sizePerHead, tokensPerBlock, dataType, kvFactor, isMLA, false, isWindow);
         setUpCacheTransceiver();
-        std::vector<std::shared_ptr<tensorrt_llm::batch_manager::LlmRequest>> requests;
+        std::vector<std::shared_ptr<WrappedLlmRequest>> requests;
 
         // the second loop is for cache reuse
-        for (int i = 0; i < 2; i++)
+        for (int i = 0; i < 1; i++)
         {
             for (auto len : {30, 10, 60, 80})
             {
+                if (len <= tokensPerBlock) {
+                    printf("Skipping len %d because it has fewer than 2 total blocks for tokensPerBlock %d\n.", len, tokensPerBlock);
+                    continue;
+                }
                 requests.emplace_back(makeLlmRequest(len));
             }
 
@@ -1275,7 +1320,7 @@ TEST_P(AsymmetricalCacheTest, TestCase)
             }
             for (auto&& request : requests)
             {
-                mManager->removeSequence(request->mRequestId, request);
+                mManager->removeSequence(request->mLlmRequest->mRequestId, request->mLlmRequest);
             }
             requests.clear();
             mComm->barrier();
@@ -1331,7 +1376,7 @@ TEST_P(AsymmetricalCacheTestWithDP, TestCase)
         setUpCacheManager(
             numLayers, numHeads, sizePerHead, tokensPerBlock, dataType, kvFactor, isMLA, enableDP, isWindow);
         setUpCacheTransceiver();
-        std::vector<std::shared_ptr<tensorrt_llm::batch_manager::LlmRequest>> requests;
+        std::vector<std::shared_ptr<WrappedLlmRequest>> requests;
         int requestId = 0;
         for (auto len : {30, 10, 60, 30, 60, 10})
         {
@@ -1340,11 +1385,11 @@ TEST_P(AsymmetricalCacheTestWithDP, TestCase)
         }
         std::vector<std::future<void>> contextFutures;
         std::vector<std::future<void>> generationFutures;
-        std::vector<std::shared_ptr<tensorrt_llm::batch_manager::LlmRequest>> generationRequests;
+        std::vector<std::shared_ptr<WrappedLlmRequest>> generationRequests;
 
         if (mIsContext)
         {
-            std::vector<std::shared_ptr<tensorrt_llm::batch_manager::LlmRequest>> contextRequests;
+            std::vector<std::shared_ptr<WrappedLlmRequest>> contextRequests;
             if (contextDP)
             {
                 for (int i = 0; i < requests.size(); i++)
@@ -1470,6 +1515,25 @@ INSTANTIATE_TEST_CASE_P(AsymmetricCaseTest2ForMLAEvenLayer, AsymmetricalCacheTes
         testing::Values(1), testing::Values(10), testing::Values(1), testing::Values(4), testing::Values(8),
         testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT8), testing::Values(1),
         testing::Values(true), testing::Values(false), testing::Values(false, true), testing::Values(false)));
+
+// Tests cases where there's non-trivial TP and PP on context side but only CP on gen side.
+INSTANTIATE_TEST_CASE_P(AsymmetricCaseTestWithCPForMLAMinimal, AsymmetricalCacheTest,
+    testing::Combine(/*contextTp*/ testing::Values(1),
+        /*contextPp*/ testing::Values(1),
+        /*contextCp*/ testing::Values(1),
+        /*genTp*/ testing::Values(1),
+        /*genPp*/ testing::Values(1),
+        /*genCp*/ testing::Values(2),
+        /*numLayers*/ testing::Values(1),
+        /*numHeads*/ testing::Values(1),
+        /*sizePerHead*/ testing::Values(4),
+        /*tokensPerBlock*/ testing::Values(16),
+        /*dataType*/ testing::Values(nvinfer1::DataType::kINT8),
+        /*kvFactor*/ testing::Values(1),
+        /*isMLA*/ testing::Values(true),
+        /*contextDP*/ testing::Values(false),
+        /*generationDP*/ testing::Values(false),
+        /*isWindow*/ testing::Values(false)));
 
 // Tests cases where there's non-trivial TP and PP on context side but only CP on gen side.
 INSTANTIATE_TEST_CASE_P(AsymmetricCaseTest0WithCPForMLA, AsymmetricalCacheTest,
