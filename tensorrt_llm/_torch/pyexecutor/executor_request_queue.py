@@ -634,20 +634,14 @@ class ExecutorRequestQueue:
             print(f"[ExecutorRequestQueue::_merge_helix_requests][{curr_cp_rank}]: input_ids_this_rank: {input_ids_this_rank}")
             print(f"[ExecutorRequestQueue::_merge_helix_requests][{curr_cp_rank}]: position_ids_this_rank: {position_ids_this_rank}")
             # TODO: Figure how to pass down position_ids_this_rank to LLMRequest.
-            # req = executor_request_to_llm_request(
-            #     req_id=req_item.id,
-            #     executor_request=req_item.request,
-            #     child_req_ids=req_item.child_req_ids,
-            #     exclude_last_generation_logits=self._should_exclude_last_generation_logits(),
-            #     input_token_ids=input_ids_this_rank,
-            #     position_ids=position_ids_this_rank)
             req = executor_request_to_llm_request(
-                    req_id=req_item.id,
-                    executor_request=req_item.request,
-                    child_req_ids=req_item.child_req_ids,
-                    exclude_last_generation_logits=self._should_exclude_last_generation_logits())
+                req_id=req_item.id,
+                executor_request=req_item.request,
+                child_req_ids=req_item.child_req_ids,
+                exclude_last_generation_logits=self._should_exclude_last_generation_logits(),
+                input_token_ids=input_ids_this_rank,
+                position_ids=position_ids_this_rank)
             req.total_input_len_cp = input_len
-            req.input_len_this_cp_rank = len(input_ids_this_rank)
             req_with_children.append(req)
             if req.child_requests:
                 req_with_children.extend(req.child_requests)
