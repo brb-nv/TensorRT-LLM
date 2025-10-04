@@ -409,22 +409,18 @@ TEST_F(SymmetricalCacheTest, SimpleTest)
 using AsymmetricTestParam
     = std::tuple<int, int, int, int, int, int, int, int, int, int, nvinfer1::DataType, int, bool, bool, bool, bool>;
 
-// WrappedLlmRequest class with additional data members to store information pertinent to CP.
-struct WrappedLlmRequest : public LlmRequest
+// CPMetaData struct to hold CP-specific information
+struct CPMetaData
 {
-public:
     int mTotalSeqLenAcrossCPRanks{0};
     int mTotalNumBlocksAcrossCPRanks{0};
     int mNumBlocksThisCPRank{0};
     int mSeqLenOnThisCPRank{0};
     std::vector<int> mGlobalBlockIds{};
 
-    // Inherit constructors from base class.
-    WrappedLlmRequest(RequestIdType requestId, texec::Request request, int totalSeqLen,
-            int numTokensPerBlock,
-            int cpRank,
-            int cpSize)
-        : LlmRequest(requestId, std::move(request))
+    CPMetaData() = default;
+
+    CPMetaData(int totalSeqLen, int numTokensPerBlock, int cpRank, int cpSize)
     {
         mTotalSeqLenAcrossCPRanks = totalSeqLen;
         mTotalNumBlocksAcrossCPRanks = (totalSeqLen + numTokensPerBlock - 1) / numTokensPerBlock;
@@ -441,6 +437,20 @@ public:
         for (int i = 0; i < mNumBlocksThisCPRank; i++) {
             mGlobalBlockIds[i] = tensorrt_llm::executor::kv_cache::getGlobalBlockIdAccountingForCP(i, cpSize, cpRank, mTotalNumBlocksAcrossCPRanks);
         }
+    }
+};
+
+struct WrappedLlmRequest
+{
+    std::unique_ptr<LlmRequest> mLlmRequest;
+    std::optional<CPMetaData> mCPMetaData;
+
+    using RequestIdType = LlmRequest::RequestIdType;
+
+    WrappedLlmRequest(std::unique_ptr<LlmRequest> llmRequest, std::optional<CPMetaData> cpMetaData)
+        : mLlmRequest(std::move(llmRequest))
+        , mCPMetaData(std::move(cpMetaData))
+    {
     }
 };
 
@@ -801,17 +811,14 @@ protected:
     {
         constexpr SizeType32 maxNewTokens{1};
         const auto tokensPerBlock = mCacheState->getModelConfig().mTokensPerBlock;
-        // Calculate sequence length for this CP rank (same logic as in WrappedLlmRequest constructor).
-        // TODO: Remove duplication of code between here and WrappedLlmRequest constructor.
-        int totalNumBlocksAcrossCPRanks = (length + tokensPerBlock - 1) / tokensPerBlock;
-        int numBlocksThisCPRank = tensorrt_llm::executor::kv_cache::getBlockNumAccountingForCP(mCpRank, mCpSize, totalNumBlocksAcrossCPRanks);
-        int numPaddedTokensLastBlock = 0;
-        if (mCpRank == mCpSize - 1 && length % tokensPerBlock != 0) {
-            numPaddedTokensLastBlock = tokensPerBlock - (length % tokensPerBlock);
-        }
-        int seqLenThisCPRank = numBlocksThisCPRank * tokensPerBlock - numPaddedTokensLastBlock;
-        texec::Request request{VecTokens(seqLenThisCPRank, seqLenThisCPRank), maxNewTokens};
 
+        std::optional<CPMetaData> cpMetaData;
+        int seqLen = length;
+        if (mCpSize > 1) {
+            cpMetaData.emplace(length, tokensPerBlock, mCpRank, mCpSize);
+            seqLen = cpMetaData.value().mSeqLenOnThisCPRank;
+        }
+        texec::Request request{VecTokens(seqLen, seqLen), maxNewTokens};
         auto state = std::make_unique<texec::DataTransceiverState>();
 
         TLLM_CHECK(mContextCommState);
@@ -819,7 +826,9 @@ protected:
         state->setCacheState(*mContextCacheState);
         auto stats = texec::ContextPhaseParams({}, mRequestId, state.release(), std::nullopt);
         request.setContextPhaseParams(std::move(stats));
-        return std::make_unique<WrappedLlmRequest>(mRequestId++, std::move(request), length, tokensPerBlock, mCpRank, mCpSize);
+
+        auto llmRequestPtr = std::make_unique<LlmRequest>(mRequestId++, std::move(request));
+        return std::make_unique<WrappedLlmRequest>(std::move(llmRequestPtr), cpMetaData);
     }
 
     auto makeLlmRequestWithDP(SizeType32 length, LlmRequest::RequestIdType requestId, int contextDpRank)
@@ -844,15 +853,21 @@ protected:
         return std::make_unique<LlmRequest>(requestId, std::move(request));
     }
 
-    std::future<void> addRequestAndTransportCacheForContext(std::shared_ptr<LlmRequest> const& llmRequest)
+    std::future<void> addRequestAndTransportCacheForContext(std::shared_ptr<WrappedLlmRequest> const& request)
     {
         auto constexpr beamIdx{0};
         auto constexpr beamWidth{1};
+        auto& llmRequest = request->mLlmRequest;
         mManager->addSequence(llmRequest->mRequestId, llmRequest->getNumTokens(beamIdx), beamWidth, llmRequest);
         auto blockRange = BlockRange::fromAllBlockIds(*mManager, llmRequest->mRequestId);
         int blockIdx = 0;
 
         int const numPools = mManager->getBlockManager().getNumPools();
+        auto initial = llmRequest->getPromptLen();
+        if (request->mCPMetaData.has_value()) {
+            auto const& cpData = request->mCPMetaData.value();
+            initial = cpData.mTotalSeqLenAcrossCPRanks;
+        }
         TLLM_LOG_DEBUG(" addRequestAndTransportCacheForContext mManager numPools: %d", numPools);
         for (int poolIdx = 0; poolIdx < numPools; poolIdx++)
         {
@@ -860,7 +875,7 @@ protected:
             TLLM_LOG_DEBUG("update poolIdx: %d", poolIdx);
             for (auto& block : blockRange)
             {
-                fillBlockData(block, blockIdx, llmRequest->getPromptLen(), poolIdx);
+                fillBlockData(block, blockIdx, initial, poolIdx);
                 blockIdx++;
             }
             TLLM_LOG_DEBUG("blockPoolIdx: %d finish fill block data", poolIdx);
@@ -877,15 +892,16 @@ protected:
         return future;
     }
 
-    std::future<void> addRequestAndTransportCacheForGeneration(std::shared_ptr<LlmRequest> const& llmRequest)
+    std::future<void> addRequestAndTransportCacheForGeneration(std::shared_ptr<WrappedLlmRequest> const& request)
     {
         auto constexpr beamIdx{0};
         auto constexpr beamWidth{1};
+        auto& llmRequest = request->mLlmRequest;
         mManager->addSequence(llmRequest->mRequestId, llmRequest->getNumTokens(beamIdx), beamWidth, llmRequest);
         return mRequester->receiveAsync(*llmRequest);
     }
 
-    void generationVerifyKVCache(std::shared_ptr<WrappedLlmRequest> const& llmRequest)
+    void generationVerifyKVCache(std::shared_ptr<WrappedLlmRequest> const& request)
     {
         auto constexpr beamIdx{0};
         auto constexpr beamWidth{1};
@@ -893,15 +909,24 @@ protected:
 
         TLLM_CUDA_CHECK(cudaDeviceSynchronize());
 
+        auto& llmRequest = request->mLlmRequest;
         auto blockRange = BlockRange::fromAllBlockIds(*mManager, llmRequest->mRequestId);
+        auto initial = llmRequest->getPromptLen();
+        std::vector<int> globalBlockIds(blockRange.size());
+        std::iota(globalBlockIds.begin(), globalBlockIds.end(), 0);
+
+        if (request->mCPMetaData.has_value()) {
+            auto const& cpData = request->mCPMetaData.value();
+            initial = cpData.mTotalSeqLenAcrossCPRanks;
+            globalBlockIds = cpData.mGlobalBlockIds;
+        }
         auto const numPools = mManager->getBlockManager().getNumPools();
-        auto const globalBlockIds = llmRequest->mGlobalBlockIds;
         for (int poolIdx = 0; poolIdx < numPools; poolIdx++)
         {
             blockRange.updatePoolIdx(poolIdx);
             for (auto& block : blockRange)
             {
-                verifyBlockData(block, blockIdx, llmRequest->mTotalSeqLenAcrossCPRanks, globalBlockIds[blockIdx], poolIdx);
+                verifyBlockData(block, blockIdx, initial, globalBlockIds[blockIdx], poolIdx);
                 blockIdx++;
             }
         }
@@ -1292,7 +1317,7 @@ TEST_P(AsymmetricalCacheTest, TestCase)
             }
             for (auto&& request : requests)
             {
-                mManager->removeSequence(request->mRequestId, static_cast<std::shared_ptr<LlmRequest>>(request));
+                mManager->removeSequence(request->mLlmRequest->mRequestId, request->mLlmRequest);
             }
             requests.clear();
             mComm->barrier();
