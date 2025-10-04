@@ -850,7 +850,10 @@ protected:
         state->setCacheState(cacheState);
         auto stats = texec::ContextPhaseParams({}, requestId, state.release(), std::nullopt);
         request.setContextPhaseParams(std::move(stats));
-        return std::make_unique<LlmRequest>(requestId, std::move(request));
+        auto llmRequestPtr = std::make_unique<LlmRequest>(requestId, std::move(request));
+
+        std::optional<CPMetaData> cpMetaData;
+        return std::make_unique<WrappedLlmRequest>(std::move(llmRequestPtr), cpMetaData);
     }
 
     std::future<void> addRequestAndTransportCacheForContext(std::shared_ptr<WrappedLlmRequest> const& request)
@@ -1330,128 +1333,128 @@ class AsymmetricalCacheTestWithDP : public AsymmetricalCacheTest
 {
 };
 
-// TEST_P(AsymmetricalCacheTestWithDP, TestCase)
-// {
-//     if (!(tensorrt_llm::common::getEnvUseUCXKvCache()))
-//     {
-//         setenv("UCX_TLS", "^cuda_ipc", 1); // disable cuda_ipc for testing for mpi
-//     }
-//     else
-//     {
-//         setenv("UCX_TCP_CM_REUSEADDR", "y",
-//             1); // tests creates and destroies ucxCacheCommunicatoers frequently, so listener ports must be reused
-//     }
+TEST_P(AsymmetricalCacheTestWithDP, TestCase)
+{
+    if (!(tensorrt_llm::common::getEnvUseUCXKvCache()))
+    {
+        setenv("UCX_TLS", "^cuda_ipc", 1); // disable cuda_ipc for testing for mpi
+    }
+    else
+    {
+        setenv("UCX_TCP_CM_REUSEADDR", "y",
+            1); // tests creates and destroies ucxCacheCommunicatoers frequently, so listener ports must be reused
+    }
 
-//     AsymmetricTestParam param = GetParam();
-//     int contextTp = std::get<0>(param);
-//     int contextPp = std::get<1>(param);
-//     int contextCp = std::get<2>(param);
-//     int genTp = std::get<3>(param);
-//     int genPp = std::get<4>(param);
-//     int genCp = std::get<5>(param);
-//     int numLayers = std::get<6>(param);
-//     int numHeads = std::get<7>(param);
-//     int sizePerHead = std::get<8>(param);
-//     int tokensPerBlock = std::get<9>(param);
-//     nvinfer1::DataType dataType = std::get<10>(param);
+    AsymmetricTestParam param = GetParam();
+    int contextTp = std::get<0>(param);
+    int contextPp = std::get<1>(param);
+    int contextCp = std::get<2>(param);
+    int genTp = std::get<3>(param);
+    int genPp = std::get<4>(param);
+    int genCp = std::get<5>(param);
+    int numLayers = std::get<6>(param);
+    int numHeads = std::get<7>(param);
+    int sizePerHead = std::get<8>(param);
+    int tokensPerBlock = std::get<9>(param);
+    nvinfer1::DataType dataType = std::get<10>(param);
 
-//     int kvFactor = std::get<11>(param);
-//     bool isMLA = std::get<12>(param);
-//     bool contextDP = std::get<13>(param);
-//     bool generationDP = std::get<14>(param);
-//     bool isWindow = std::get<15>(param);
+    int kvFactor = std::get<11>(param);
+    bool isMLA = std::get<12>(param);
+    bool contextDP = std::get<13>(param);
+    bool generationDP = std::get<14>(param);
+    bool isWindow = std::get<15>(param);
 
-//     if (genCp > 1 && tensorrt_llm::common::getEnvUseNixlKvCache())
-//     {
-//         GTEST_SKIP() << "Temporarily skipping cache transceiver tests with NIXL backend for CP.";
-//     }
-//     setUpCommunicator(contextTp, contextPp, contextCp, genTp, genPp, genCp, isMLA, contextDP, generationDP);
+    if (genCp > 1 && tensorrt_llm::common::getEnvUseNixlKvCache())
+    {
+        GTEST_SKIP() << "Temporarily skipping cache transceiver tests with NIXL backend for CP.";
+    }
+    setUpCommunicator(contextTp, contextPp, contextCp, genTp, genPp, genCp, isMLA, contextDP, generationDP);
 
-//     if (mIsContext || mIsGeneration)
-//     {
-//         bool enableDP = mIsContext ? contextDP : generationDP;
-//         setUpCacheManager(
-//             numLayers, numHeads, sizePerHead, tokensPerBlock, dataType, kvFactor, isMLA, enableDP, isWindow);
-//         setUpCacheTransceiver();
-//         std::vector<std::shared_ptr<tensorrt_llm::batch_manager::LlmRequest>> requests;
-//         int requestId = 0;
-//         for (auto len : {30, 10, 60, 30, 60, 10})
-//         {
-//             requests.emplace_back(makeLlmRequestWithDP(len, requestId, requestId % contextTp));
-//             requestId++;
-//         }
-//         std::vector<std::future<void>> contextFutures;
-//         std::vector<std::future<void>> generationFutures;
-//         std::vector<std::shared_ptr<tensorrt_llm::batch_manager::LlmRequest>> generationRequests;
+    if (mIsContext || mIsGeneration)
+    {
+        bool enableDP = mIsContext ? contextDP : generationDP;
+        setUpCacheManager(
+            numLayers, numHeads, sizePerHead, tokensPerBlock, dataType, kvFactor, isMLA, enableDP, isWindow);
+        setUpCacheTransceiver();
+        std::vector<std::shared_ptr<WrappedLlmRequest>> requests;
+        int requestId = 0;
+        for (auto len : {30, 10, 60, 30, 60, 10})
+        {
+            requests.emplace_back(makeLlmRequestWithDP(len, requestId, requestId % contextTp));
+            requestId++;
+        }
+        std::vector<std::future<void>> contextFutures;
+        std::vector<std::future<void>> generationFutures;
+        std::vector<std::shared_ptr<WrappedLlmRequest>> generationRequests;
 
-//         if (mIsContext)
-//         {
-//             std::vector<std::shared_ptr<tensorrt_llm::batch_manager::LlmRequest>> contextRequests;
-//             if (contextDP)
-//             {
-//                 for (int i = 0; i < requests.size(); i++)
-//                 {
-//                     if ((i) % mTpSize == mTpRank)
-//                     {
-//                         // round robin
-//                         contextRequests.push_back(requests[i]);
-//                     }
-//                 }
-//             }
-//             else
-//             {
-//                 contextRequests = requests;
-//             }
-//             for (auto&& request : contextRequests)
-//             {
-//                 contextFutures.push_back(std::move(addRequestAndTransportCacheForContext(request)));
-//             }
-//             mComm->barrier();
-//         }
-//         else
-//         {
-//             if (generationDP)
-//             {
-//                 for (int i = 0; i < requests.size(); i++)
-//                 {
-//                     if ((i) % mTpSize == mTpRank)
-//                     {
-//                         generationRequests.push_back(requests[i]);
-//                     }
-//                 }
-//             }
-//             else
-//             {
-//                 generationRequests = requests;
-//             }
-//             mComm->barrier();
-//             for (auto&& request : generationRequests)
-//             {
-//                 generationFutures.push_back(std::move(addRequestAndTransportCacheForGeneration(request)));
-//             }
-//         }
-//         if (mIsContext)
-//         {
-//             for (auto&& cfuture : contextFutures)
-//             {
-//                 cfuture.get();
-//             }
-//         }
-//         else
-//         {
-//             for (auto&& gfuture : generationFutures)
-//             {
-//                 gfuture.get();
-//             }
-//             for (auto&& request : generationRequests)
-//             {
-//                 generationVerifyKVCache(request);
-//             }
-//         }
-//         mComm->barrier();
-//     }
-//     tensorrt_llm::mpi::MpiComm::world().barrier();
-// }
+        if (mIsContext)
+        {
+            std::vector<std::shared_ptr<WrappedLlmRequest>> contextRequests;
+            if (contextDP)
+            {
+                for (int i = 0; i < requests.size(); i++)
+                {
+                    if ((i) % mTpSize == mTpRank)
+                    {
+                        // round robin
+                        contextRequests.push_back(requests[i]);
+                    }
+                }
+            }
+            else
+            {
+                contextRequests = requests;
+            }
+            for (auto&& request : contextRequests)
+            {
+                contextFutures.push_back(std::move(addRequestAndTransportCacheForContext(request)));
+            }
+            mComm->barrier();
+        }
+        else
+        {
+            if (generationDP)
+            {
+                for (int i = 0; i < requests.size(); i++)
+                {
+                    if ((i) % mTpSize == mTpRank)
+                    {
+                        generationRequests.push_back(requests[i]);
+                    }
+                }
+            }
+            else
+            {
+                generationRequests = requests;
+            }
+            mComm->barrier();
+            for (auto&& request : generationRequests)
+            {
+                generationFutures.push_back(std::move(addRequestAndTransportCacheForGeneration(request)));
+            }
+        }
+        if (mIsContext)
+        {
+            for (auto&& cfuture : contextFutures)
+            {
+                cfuture.get();
+            }
+        }
+        else
+        {
+            for (auto&& gfuture : generationFutures)
+            {
+                gfuture.get();
+            }
+            for (auto&& request : generationRequests)
+            {
+                generationVerifyKVCache(request);
+            }
+        }
+        mComm->barrier();
+    }
+    tensorrt_llm::mpi::MpiComm::world().barrier();
+}
 
 INSTANTIATE_TEST_CASE_P(AsymmetricCaseTest0, AsymmetricalCacheTest,
     testing::Combine(testing::Values(1, 2), testing::Values(1, 2), testing::Values(1), testing::Values(1, 2),
