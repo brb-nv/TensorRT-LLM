@@ -468,9 +468,9 @@ protected:
 #if ENABLE_MULTI_DEVICE
         tensorrt_llm::mpi::initialize(tensorrt_llm::mpi::MpiThreadSupport::THREAD_MULTIPLE);
 
-        if (tensorrt_llm::mpi::MpiComm::world().getSize() != 4)
+        if (tensorrt_llm::mpi::MpiComm::world().getSize() != 8)
         {
-            GTEST_SKIP() << "mpirun with procs=4 is required to run this test.";
+            GTEST_SKIP() << "mpirun with procs=8 is required to run this test.";
         }
         int worldSize = tensorrt_llm::mpi::MpiComm::world().getSize();
         int worldRank = tensorrt_llm::mpi::MpiComm::world().getRank();
@@ -1266,6 +1266,19 @@ TEST_P(AsymmetricalCacheTest, TestCase)
     {
         GTEST_SKIP() << "Temporarily skipping cache transceiver tests with NIXL backend for CP.";
     }
+    std::vector<int> lenList = {30, 10, 60, 80};
+    if (genCp > 1) {
+        std::vector<int> updatedLenList;
+        for (auto len : lenList) {
+            if (len > tokensPerBlock * (genCp - 1)) {
+                updatedLenList.push_back(len);
+            }
+        }
+        if (updatedLenList.empty()) {
+            GTEST_SKIP() << "Skipping test because not even one request has one block per genCP rank. tokensPerBlock=" << tokensPerBlock << ", genCp=" << genCp;
+        }
+        lenList = updatedLenList;
+    }
 
     setUpCommunicator(contextTp, contextPp, contextCp, genTp, genPp, genCp, isMLA, contextDP, generationDP);
 
@@ -1278,12 +1291,8 @@ TEST_P(AsymmetricalCacheTest, TestCase)
         // the second loop is for cache reuse
         for (int i = 0; i < 1; i++)
         {
-            for (auto len : {30, 10, 60, 80})
+            for (auto len : lenList)
             {
-                if (len <= tokensPerBlock) {
-                    printf("Skipping len %d because it has fewer than 2 total blocks for tokensPerBlock %d\n.", len, tokensPerBlock);
-                    continue;
-                }
                 requests.emplace_back(makeLlmRequest(len));
             }
 
