@@ -60,7 +60,9 @@ def get_test_config(test_desc, example_dir, test_root):
         "gen_only_bs1":
         (4, f"{test_configs_root}/disagg_config_gen_only_bs1.yaml"),
         "gen_only_helix":
-        (2, f"{test_configs_root}/disagg_config_gen_only_deepseekv3_lite_bf16_helix.yaml"),
+        (2,
+         f"{test_configs_root}/disagg_config_gen_only_deepseekv3_lite_bf16_helix.yaml"
+         ),
         "4_ranks": (4, f"{test_configs_root}/disagg_config_ctxtp2_gentp1.yaml"),
         "4_ranks_trt_backend":
         (4,
@@ -168,6 +170,10 @@ def get_test_config(test_desc, example_dir, test_root):
         "deepseek_v3_fp8_tllm_gen_helix":
         (8,
          f"{test_configs_root}/disagg_config_ctxtp4_gencp4_deepseek_v3_fp8_tllm_gen_helix.yaml"
+         ),
+        "deepseek_r1_fp4_tllm_gen_helix":
+        (8,
+         f"{test_configs_root}/disagg_config_ctxtp4_gentp2cp2_deepseek_r1_fp4_tllm_gen_helix.yaml"
          ),
         "deepseek_v3_lite_bf16_tllm_gen_helix":
         (4,
@@ -277,7 +283,6 @@ def run_disaggregated_test(example_dir,
                     extra_endpoints_test(server_url)
 
                 # Verify outputs
-                not_expected_strings = ["Berlin Berlin"]
 
                 output_files = ['output.json']  #, 'output_streaming.json']
                 if test_desc == "overlap" or test_desc == "trtllm_sampler":
@@ -1511,6 +1516,27 @@ def test_disaggregated_deepseek_v3_fp8_tllm_gen_helix(
                            cwd=llm_venv.get_working_directory())
 
 
+@pytest.mark.skip_less_device(8)
+@pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-R1-FP4'],
+                         indirect=True)
+def test_disaggregated_deepseek_r1_fp4_tllm_gen_helix(
+        disaggregated_test_root, disaggregated_example_root, llm_venv,
+        deepseek_v3_model_root):
+    src_dst_dict = {
+        deepseek_v3_model_root:
+        f"{llm_venv.get_working_directory()}/DeepSeek-R1-FP4",
+    }
+    for src, dst in src_dst_dict.items():
+        if not os.path.islink(dst):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.symlink(src, dst, target_is_directory=True)
+
+    run_disaggregated_test(disaggregated_example_root,
+                           "deepseek_r1_fp4_tllm_gen_helix",
+                           env=llm_venv._new_env,
+                           cwd=llm_venv.get_working_directory())
+
+
 @pytest.mark.skip_less_device(4)
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-bf16'],
                          indirect=True)
@@ -1556,8 +1582,9 @@ def test_disaggregated_deepseek_v3_lite_bf16_tllm_gen_helix_ref(
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-bf16'],
                          indirect=True)
 def test_disaggregated_benchmark_gen_only_helix(disaggregated_test_root,
-                                          disaggregated_example_root, llm_venv,
-                                          deepseek_v3_model_root):
+                                                disaggregated_example_root,
+                                                llm_venv,
+                                                deepseek_v3_model_root):
     src_dst_dict = {
         deepseek_v3_model_root:
         f"{llm_venv.get_working_directory()}/DeepSeek-V3-Lite/bf16",
