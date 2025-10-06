@@ -167,6 +167,10 @@ def get_test_config(test_desc, example_dir, test_root):
         (4,
          f"{test_configs_root}/disagg_config_ctxtp2_gentp1cp2_deepseek_v3_lite_fp8_tllm_gen.yaml"
          ),
+        "deepseek_v3_lite_fp8_tllm_gen_helix_120k":
+        (8,
+         f"{test_configs_root}/disagg_config_ctxtp2_gentp1cp2_deepseek_v3_lite_fp8_tllm_gen_128k.yaml"
+         ),
         "deepseek_v3_fp8_tllm_gen_helix":
         (8,
          f"{test_configs_root}/disagg_config_ctxtp4_gencp4_deepseek_v3_fp8_tllm_gen_helix.yaml"
@@ -244,7 +248,7 @@ def run_disaggregated_test(example_dir,
                     '--server-start-timeout',
                     str(server_start_timeout)
                 ]
-                if prompt_file == "long_prompts.json":
+                if prompt_file in ["long_prompts.json", "prompt_120k.json"]:
                     # Use max_tokens 4 for long prompts to reduce test time
                     client_cmd.extend(['--max-tokens', '4'])
                 check_call(client_cmd,
@@ -276,7 +280,7 @@ def run_disaggregated_test(example_dir,
                                poll_procs=[workers_proc, server_proc])
 
                 # Skip output verification for long prompts test
-                if prompt_file == "long_prompts.json":
+                if prompt_file in ["long_prompts.json", "prompt_120k.json"]:
                     continue
 
                 if extra_endpoints_test is not None:
@@ -1535,6 +1539,50 @@ def test_disaggregated_deepseek_r1_fp4_tllm_gen_helix(
                            "deepseek_r1_fp4_tllm_gen_helix",
                            env=llm_venv._new_env,
                            cwd=llm_venv.get_working_directory())
+
+
+@pytest.mark.skip_less_device(8)
+@pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-R1-FP4'],
+                         indirect=True)
+def test_disaggregated_deepseek_r1_fp4_tllm_gen_helix_120k(
+        disaggregated_test_root, disaggregated_example_root, llm_venv,
+        deepseek_v3_model_root):
+    src_dst_dict = {
+        deepseek_v3_model_root:
+        f"{llm_venv.get_working_directory()}/DeepSeek-R1-FP4",
+    }
+    for src, dst in src_dst_dict.items():
+        if not os.path.islink(dst):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.symlink(src, dst, target_is_directory=True)
+
+    run_disaggregated_test(disaggregated_example_root,
+                           "deepseek_r1_fp4_tllm_gen_helix",
+                           env=llm_venv._new_env,
+                           cwd=llm_venv.get_working_directory(),
+                           prompt_file="prompt_120k.json")
+
+
+@pytest.mark.skip_less_device(8)
+@pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
+                         indirect=True)
+def test_disaggregated_deepseek_v3_lite_fp8_tllm_gen_helix_120k(
+        disaggregated_test_root, disaggregated_example_root, llm_venv,
+        deepseek_v3_model_root):
+    src_dst_dict = {
+        deepseek_v3_model_root:
+        f"{llm_venv.get_working_directory()}/DeepSeek-V3-Lite/fp8",
+    }
+    for src, dst in src_dst_dict.items():
+        if not os.path.islink(dst):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.symlink(src, dst, target_is_directory=True)
+
+    run_disaggregated_test(disaggregated_example_root,
+                           "deepseek_v3_lite_fp8_tllm_gen_helix_120k",
+                           env=llm_venv._new_env,
+                           cwd=llm_venv.get_working_directory(),
+                           prompt_file="prompt_120k.json")
 
 
 @pytest.mark.skip_less_device(4)
