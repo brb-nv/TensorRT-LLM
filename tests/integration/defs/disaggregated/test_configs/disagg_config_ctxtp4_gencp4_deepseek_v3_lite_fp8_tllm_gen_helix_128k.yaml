@@ -9,7 +9,11 @@ context_servers:
   num_instances: 1
   enable_chunked_prefill: False
   max_batch_size: 1
+  max_seq_len: 128000
   max_num_tokens: 128000
+  moe_config:
+    backend: DEEPGEMM
+    # max_num_tokens: 128000
   kv_cache_config:
     enable_block_reuse: False
     enable_partial_reuse: False
@@ -27,7 +31,11 @@ generation_servers:
   cp_config:
     cp_type: helix
   max_batch_size: 1
-  max_num_tokens: 64000
+  max_seq_len: 32000
+  max_num_tokens: 32000
+  moe_config:
+    backend: DEEPGEMM
+    # max_num_tokens: 32000
   enable_chunked_prefill: False
   kv_cache_config:
     enable_block_reuse: False

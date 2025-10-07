@@ -1100,10 +1100,14 @@ class PyTorchModelEngine(ModelEngine):
             # NOTE: py_executor_creator makes sure that the executor uses this
             # smaller value as its max_seq_len too.
             logger.warning(
+                f"*******************************************************\n"
                 f"Specified {self.max_seq_len=} is larger than what the model can support "
-                f"({inferred_max_seq_len}). Setting max_seq_len to {inferred_max_seq_len}. "
+                f"({inferred_max_seq_len}). NOT Setting max_seq_len to {inferred_max_seq_len}. "
+                f"ARE YOU SURE ABOUT THIS?"
+                f"*******************************************************\n"
             )
-            self.max_seq_len = inferred_max_seq_len
+            # self.max_seq_len = inferred_max_seq_len
+            pass
 
     def _infer_max_seq_len_from_config(self) -> int:
 
