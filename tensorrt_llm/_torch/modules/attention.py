@@ -933,7 +933,7 @@ class MLA(nn.Module):
                 assert self.dtype == torch.bfloat16
                 self.k_b_proj_trans_dequant = nn.Parameter(
                     torch.empty(
-                        (self.num_heads, self.kv_lora_rank,
+                        (self.num_heads_tp, self.kv_lora_rank,
                          self.qk_nope_head_dim),
                         dtype=self.dtype,
                     ),
@@ -941,7 +941,7 @@ class MLA(nn.Module):
                 )
                 self.v_b_proj_dequant = nn.Parameter(
                     torch.empty(
-                        (self.num_heads, self.v_head_dim, self.kv_lora_rank),
+                        (self.num_heads_tp_cp, self.v_head_dim, self.kv_lora_rank),
                         dtype=self.dtype,
                     ),
                     requires_grad=False,
