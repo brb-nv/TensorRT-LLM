@@ -40,7 +40,7 @@ from ..modules.linear import Linear, TensorParallelMode
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
 from ..speculative import SpecMetadata
-from ..utils import Fp4QuantizedTensor
+from ..utils import Fp4QuantizedTensor, use_torch_printoptions
 from .modeling_multimodal_utils import fuse_input_embeds
 from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
@@ -317,11 +317,12 @@ class Llama4MoE(nn.Module):
     def compute_routed_output(self, hidden_states, all_tp_rank_num_tokens,
                               cutlass_min_latency_mode):
         router_logits = self.router(hidden_states)
-        routed_output = self.experts(hidden_states,
-                                     router_logits,
-                                     do_finalize=not cutlass_min_latency_mode,
-                                     all_tp_rank_num_tokens=all_tp_rank_num_tokens,
-                                     use_dp_padding=False)
+        routed_output = self.experts(
+            hidden_states,
+            router_logits,
+            do_finalize=not cutlass_min_latency_mode,
+            all_tp_rank_num_tokens=all_tp_rank_num_tokens,
+            use_dp_padding=False)
         return routed_output
 
     def forward(
@@ -947,9 +948,13 @@ class LlamaModel(DecoderModel):
         lora_params=None,
         **kwargs,
     ) -> torch.Tensor:
-        print(f"[LlamaModel::forward] input_ids: \n{input_ids}")
-        print(f"[LlamaModel::forward] position_ids: \n{position_ids}")
-        print(f"[LlamaModel::forward] attn_metadata: \n{attn_metadata}")
+        with use_torch_printoptions(sci_mode=False,
+                                    threshold=16,
+                                    edgeitems=2,
+                                    linewidth=120):
+            print(f"[LlamaModel::forward] input_ids: \n{input_ids}")
+            print(f"[LlamaModel::forward] position_ids: \n{position_ids}")
+            print(f"[LlamaModel::forward] attn_metadata: \n{attn_metadata}")
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError(
                 "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"

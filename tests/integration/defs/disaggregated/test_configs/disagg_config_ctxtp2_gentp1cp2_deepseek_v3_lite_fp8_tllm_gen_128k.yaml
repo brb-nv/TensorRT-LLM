@@ -31,8 +31,8 @@ generation_servers:
   cp_config:
     cp_type: helix
   max_batch_size: 1
-  max_seq_len: 32000
-  max_num_tokens: 32000
+  max_seq_len: 64000
+  max_num_tokens: 64000
   moe_config:
     backend: DEEPGEMM
     # max_num_tokens: 32000

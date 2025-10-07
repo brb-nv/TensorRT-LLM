@@ -284,3 +284,31 @@ def set_per_request_piecewise_cuda_graph_flag(enable: bool):
 
 def get_per_request_piecewise_cuda_graph_flag() -> bool:
     return getattr(_global_attrs, 'per_request_piecewise_cuda_graph_flag', True)
+
+
+@contextlib.contextmanager
+def use_torch_printoptions(**kwargs):
+    try:
+        import __builtin__
+    except ImportError:
+        # Python 3
+        import builtins as __builtin__
+
+    try:
+        _print = __builtin__.print
+
+        def print_using_torch(*args, **kwargs):
+            new_args = list(args)
+            for i, arg in enumerate(args):
+                if isinstance(arg, (list, tuple)):
+                    new_args[i] = torch.tensor(arg)
+            _print(*new_args, **kwargs)
+
+        __builtin__.print = print_using_torch
+
+        options = torch._tensor_str.get_printoptions()
+        torch.set_printoptions(**kwargs)
+        yield
+    finally:
+        torch.set_printoptions(**options)
+        __builtin__.print = _print
