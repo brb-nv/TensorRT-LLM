@@ -168,8 +168,8 @@ def get_test_config(test_desc, example_dir, test_root):
          f"{test_configs_root}/disagg_config_ctxtp2_gentp1cp2_deepseek_v3_lite_fp8_tllm_gen.yaml"
          ),
         "deepseek_v3_lite_fp8_tllm_gen_helix_120k":
-        (8,
-         f"{test_configs_root}/disagg_config_ctxtp4_gencp4_deepseek_v3_lite_fp8_tllm_gen_helix_128k.yaml"
+        (4,
+         f"{test_configs_root}/disagg_config_ctxtp2_gentp1cp2_deepseek_v3_lite_fp8_tllm_gen_128k.yaml"
          ),
         "deepseek_v3_fp8_tllm_gen_helix":
         (8,
@@ -1563,7 +1563,7 @@ def test_disaggregated_deepseek_r1_fp4_tllm_gen_helix_120k(
                            prompt_file="prompt_120k.json")
 
 
-@pytest.mark.skip_less_device(8)
+@pytest.mark.skip_less_device(4)
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
                          indirect=True)
 def test_disaggregated_deepseek_v3_lite_fp8_tllm_gen_helix_120k(
