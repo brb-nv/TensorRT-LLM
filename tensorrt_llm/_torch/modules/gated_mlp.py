@@ -138,13 +138,13 @@ class GatedMLP(nn.Module):
     def forward(
         self,
         x: Union[torch.Tensor, Fp4QuantizedTensor],
-        all_tp_rank_num_tokens=None,
+        all_rank_num_tokens=None,
         final_all_reduce_params: Optional[AllReduceParams] = None,
         lora_params: Optional[dict] = None,
         **kwargs,
     ) -> torch.Tensor:
         if bool(lora_params):
-            return self.forward_lora(x, all_tp_rank_num_tokens,
+            return self.forward_lora(x, all_rank_num_tokens,
                                      final_all_reduce_params, lora_params)
 
         h1 = self.gate_up_proj(x)
@@ -157,7 +157,7 @@ class GatedMLP(nn.Module):
     def forward_lora(
         self,
         x: Union[torch.Tensor, Fp4QuantizedTensor],
-        all_tp_rank_num_tokens=None,
+        all_rank_num_tokens=None,
         final_all_reduce_params: Optional[AllReduceParams] = None,
         lora_params: Optional[dict] = None,
     ) -> torch.Tensor:

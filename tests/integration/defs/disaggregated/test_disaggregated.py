@@ -169,7 +169,7 @@ def get_test_config(test_desc, example_dir, test_root):
          ),
         "deepseek_v3_lite_fp8_tllm_gen_helix_120k":
         (8,
-         f"{test_configs_root}/disagg_config_ctxtp2_gentp1cp2_deepseek_v3_lite_fp8_tllm_gen_128k.yaml"
+         f"{test_configs_root}/disagg_config_ctxtp4_gencp4_deepseek_v3_lite_fp8_tllm_gen_helix_128k.yaml"
          ),
         "deepseek_v3_fp8_tllm_gen_helix":
         (8,
