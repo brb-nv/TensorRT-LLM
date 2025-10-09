@@ -27,8 +27,8 @@ fi
 
 config_file=${log_path}/server_config.yaml
 
-# check if the config file exists every 10 seconds timeout 1800 seconds
-timeout=1800
+# check if the config file exists every 10 seconds timeout 600 seconds
+timeout=600
 start_time=$(date +%s)
 while [ ! -f ${config_file} ]; do
     current_time=$(date +%s)
@@ -56,11 +56,12 @@ echo "Hostname: ${hostname}, Port: ${port}"
 shared_gpt_path=/tmp/ShareGPT_V3_unfiltered_cleaned_split.json
 if [ ! -f ${shared_gpt_path} ]; then
     echo "Downloading sharedgpt..."
-    wget https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered/resolve/main/ShareGPT_V3_unfiltered_cleaned_split.json -O ${shared_gpt_path}
+    wget --retry-connrefused --waitretry=10 --read-timeout=20 --timeout=15 -t 5 -O ${shared_gpt_path} \
+        https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered/resolve/main/ShareGPT_V3_unfiltered_cleaned_split.json
 fi
 
-# check server is health by curl every 10 seconds timeout 1800 seconds
-timeout=1800
+# check server is health by curl every 10 seconds timeout 300 seconds
+timeout=300
 start_time=$(date +%s)
 while ! curl -s -o /dev/null -w "%{http_code}" http://${hostname}:${port}/health; do
     current_time=$(date +%s)
