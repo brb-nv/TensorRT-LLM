@@ -622,10 +622,11 @@ class ExecutorRequestQueue:
                 )
 
             # Padding to ensure torch.stack used with torch.tensor_split works properly.
-            padding_len = num_tokens_per_block - (input_len %
-                                                  num_tokens_per_block)
-            padding_ids = torch.zeros([1, padding_len], dtype=torch.int64)
-            all_input_ids = torch.cat((all_input_ids, padding_ids), dim=-1)
+            padding_len = 0
+            if input_len % num_tokens_per_block != 0:
+                padding_len = num_tokens_per_block - (input_len % num_tokens_per_block)
+                padding_ids = torch.zeros([1, padding_len], dtype=torch.int64)
+                all_input_ids = torch.cat((all_input_ids, padding_ids), dim=-1)
             all_position_ids = torch.arange(0,
                                             input_len + padding_len,
                                             dtype=torch.int64).unsqueeze(0)
@@ -634,16 +635,17 @@ class ExecutorRequestQueue:
                 torch.stack(all_input_ids.split(num_tokens_per_block, dim=-1)),
                 num_cp_ranks)
             position_id_blocks_per_rank = torch.tensor_split(
-                torch.stack(all_position_ids.split(num_tokens_per_block,
-                                                   dim=-1)), num_cp_ranks)
+                torch.stack(all_position_ids.split(num_tokens_per_block, dim=-1)),
+                num_cp_ranks)
 
-            # Get the ctx_blocks and position_blocks for this rank.
+            # Get the input_ids and position_ids for this rank.
             input_ids_this_rank = input_id_blocks_per_rank[
                 curr_cp_rank].flatten().tolist()
             position_ids_this_rank = position_id_blocks_per_rank[
                 curr_cp_rank].flatten().tolist()
 
-            # Undo the padding. Only last rank's last block will be padded right now.
+            # Undo the padding. Only last rank's last block will be padded right now
+            # given contiguous block assignment.
             if curr_cp_rank == num_cp_ranks - 1 and padding_len > 0:
                 input_ids_this_rank = input_ids_this_rank[:-padding_len]
                 position_ids_this_rank = position_ids_this_rank[:-padding_len]
