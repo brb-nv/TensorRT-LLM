@@ -60,6 +60,8 @@ def gen_config_file(work_dir: str,
         'max_batch_size': ctx_batch_size,
         'max_num_tokens': ctx_max_num_tokens,
         'max_seq_len': ctx_max_seq_len,
+        # @B: Enable CUDA graphs later (note: for context in helix, this is not important).
+        'cuda_graph_config': None,
         'tensor_parallel_size': ctx_tp_size,
         'moe_expert_parallel_size': ctx_tp_size,
         'enable_attention_dp': True if ctx_enable_attention_dp else False,
@@ -73,7 +75,7 @@ def gen_config_file(work_dir: str,
             'dtype': 'fp8',
         },
         'moe_config': {
-            # @B: Ideally, we should update this in below logic.
+            # @B: Ideally, we should update this in below logic (note: for context in helix, this is not important).
             'backend': 'DEEPGEMM',
         },
         'cache_transceiver_config': {
@@ -89,8 +91,10 @@ def gen_config_file(work_dir: str,
     gen_moe_backend = "CUTLASS"
     if gen_tp_size >= 16 and gen_enable_attention_dp:
         gen_moe_backend = "WIDEEP"
-    if not gen_enable_attention_dp:
+    if gen_tp_size >= 8 and not gen_enable_attention_dp:
         gen_moe_backend = "TRTLLM"
+    else:
+        gen_moe_backend = "DEEPGEMM"
 
     gen_config = {
         'build_config': {
@@ -115,8 +119,7 @@ def gen_config_file(work_dir: str,
             'dtype': 'fp8',
         },
         'moe_config': {
-            # @B: Ideally, we should update this in above logic.
-            'backend': 'DEEPGEMM',
+            'backend': gen_moe_backend,
         },
         'cache_transceiver_config': {
             'max_tokens_in_buffer': cache_transceiver_max_num_tokens,
@@ -250,9 +253,10 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    gen_config_file(args.work_dir, args.ctx_tp_size, args.ctx_pp_size, args.ctx_cp_size,
-                    args.ctx_batch_size, args.ctx_max_num_tokens,
-                    args.ctx_max_seq_len, args.ctx_free_gpu_memory_fraction,
+    gen_config_file(args.work_dir, args.ctx_tp_size, args.ctx_pp_size,
+                    args.ctx_cp_size, args.ctx_batch_size,
+                    args.ctx_max_num_tokens, args.ctx_max_seq_len,
+                    args.ctx_free_gpu_memory_fraction,
                     args.ctx_enable_attention_dp, args.gen_tp_size,
                     args.gen_pp_size, args.gen_cp_size, args.gen_batch_size,
                     args.gen_max_num_tokens, args.gen_max_seq_len,

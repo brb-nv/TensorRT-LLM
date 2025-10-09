@@ -56,7 +56,9 @@ workdir=${26}
 model_dir=${27}
 benchmark_mode=${28}
 trtllm_repo=${29:-""}
-build_wheel=${30}
+build_wheel=${30:-"true"}
+cuda_architectures=${31:-"100a-real"}
+data_dir=${32:-"/tmp"}
 
 # Get GPUs per node dynamically from SLURM
 ntasks_per_node=${SLURM_NTASKS_PER_NODE:-4}  # Default to 4 for GB200
@@ -93,6 +95,8 @@ echo "benchmark_mode: ${benchmark_mode}"
 echo "trtllm_repo: ${trtllm_repo}"
 echo "ntasks_per_node: ${ntasks_per_node}"
 echo "build_wheel: ${build_wheel}"
+echo "cuda_architectures: ${cuda_architectures}"
+echo "data_dir: ${data_dir}"
 echo "==========================================="
 
 
@@ -151,7 +155,7 @@ if [ -d "${trtllm_repo}" ]; then
 
     if [ "${build_wheel}" = "true" ]; then
         echo "Building TensorRT-LLM wheel on one node..."
-        build_command="python3 ${trtllm_repo}/scripts/build_wheel.py --trt_root /usr/local/tensorrt --benchmarks --use_ccache --clean"
+        build_command="python3 ${trtllm_repo}/scripts/build_wheel.py --trt_root /usr/local/tensorrt --benchmarks --use_ccache --cuda_architectures \"${cuda_architectures}\""
         if ! srun --container-name=${container_name} \
             --container-mounts=${mounts} \
             --mpi=pmix --overlap -N 1 --ntasks-per-node=1 \
@@ -262,7 +266,7 @@ srun -l --container-name=${container_name} \
 srun -l --container-name=${container_name} \
     --container-mounts=${mounts} \
     --mpi=pmix --overlap -N 1 -n 1 \
-    bash ${workdir}/run_benchmark.sh ${isl} ${osl} ${multi_round} ${model_dir} "${concurrency}" ${streaming} ${full_logdir} \
+    bash ${workdir}/run_benchmark.sh ${isl} ${osl} ${multi_round} ${model_dir} "${concurrency}" ${streaming} ${full_logdir} ${data_dir} \
         &> ${full_logdir}/benchmark.log 2>&1
 
 scancel ${SLURM_JOB_ID}
