@@ -60,8 +60,8 @@ if [ ! -f ${shared_gpt_path} ]; then
         https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered/resolve/main/ShareGPT_V3_unfiltered_cleaned_split.json
 fi
 
-# check server is health by curl every 10 seconds timeout 300 seconds
-timeout=300
+# check server is health by curl every 10 seconds timeout 600 seconds
+timeout=600
 start_time=$(date +%s)
 while ! curl -s -o /dev/null -w "%{http_code}" http://${hostname}:${port}/health; do
     current_time=$(date +%s)

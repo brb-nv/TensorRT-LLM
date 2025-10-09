@@ -91,8 +91,10 @@ def gen_config_file(work_dir: str,
     gen_moe_backend = "CUTLASS"
     if gen_tp_size >= 16 and gen_enable_attention_dp:
         gen_moe_backend = "WIDEEP"
-    if not gen_enable_attention_dp:
+    if gen_tp_size >= 8 and not gen_enable_attention_dp:
         gen_moe_backend = "TRTLLM"
+    else:
+        gen_moe_backend = "DEEPGEMM"
 
     gen_config = {
         'build_config': {
