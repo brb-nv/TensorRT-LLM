@@ -9,7 +9,7 @@ gen_cp_size=2
 partition=batch
 account=coreai_horizon_dilations
 job_name=coreai_horizon_dilations-helix_benchmark_test_ctxtp${ctx_tp_size}cp${ctx_cp_size}$(if [ "${ctx_chunked_prefill}" = "true" ]; then echo "chunked"; fi)_gentp${gen_tp_size}cp${gen_cp_size}
-container_image=urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:pytorch-25.08-py3-aarch64-ubuntu24.04-trt10.13.2.6-skip-tritondevel-202509112230-7568
+container_image=/lustre/fsw/portfolios/coreai/projects/coreai_horizon_dilations/users/mjoux/containers/tllm_pyt2508_py3_aarch64_trt10.13.2.6_202509112230_7568.sqsh
 # e.g. /mnt/data:/mnt/data
 mounts=/lustre/fsw/portfolios/coreai/projects/coreai_horizon_dilations:/lustre/fsw/portfolios/coreai/projects/coreai_horizon_dilations
 # Path to disaggr_torch.slurm
@@ -18,6 +18,8 @@ workdir=/lustre/fsw/portfolios/coreai/projects/coreai_horizon_dilations/users/mj
 model_dir=/lustre/fsw/portfolios/coreai/projects/coreai_horizon_dilations/users/mjoux/data/models/DeepSeek-V3-Lite/fp8
 # Path to the repo to install TensorRT-LLM, if this is empty, the pre-installed version will be used
 repo_dir=/lustre/fsw/portfolios/coreai/projects/coreai_horizon_dilations/users/mjoux/TensorRT-LLM
+# Path to the data directory
+data_dir=/lustre/fsw/portfolios/coreai/projects/coreai_horizon_dilations/users/mjoux/data
 
 ntasks_per_node=4 # 4 GPUs per GB200 node
 total_node_num=2
@@ -57,6 +59,7 @@ args=(
     $repo_dir
     $build_wheel
     $cuda_architectures
+    $data_dir
 )
 
 # This command starts a job with 8 nodes, 32 GPUs in total.

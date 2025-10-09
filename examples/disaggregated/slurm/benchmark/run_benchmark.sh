@@ -18,6 +18,7 @@ model_name=$4
 concurrency_list=$5
 streaming=$6
 log_path=$7
+data_dir=$8
 
 # check process id is not 0
 if [[ ${SLURM_PROCID} != "0" ]]; then
@@ -53,7 +54,7 @@ fi
 echo "Hostname: ${hostname}, Port: ${port}"
 
 # download sharedgpt for benchmarking
-shared_gpt_path=/tmp/ShareGPT_V3_unfiltered_cleaned_split.json
+shared_gpt_path=${data_dir}/ShareGPT_V3_unfiltered_cleaned_split.json
 if [ ! -f ${shared_gpt_path} ]; then
     echo "Downloading sharedgpt..."
     wget --retry-connrefused --waitretry=10 --read-timeout=20 --timeout=15 -t 5 -O ${shared_gpt_path} \

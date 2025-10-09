@@ -58,6 +58,7 @@ benchmark_mode=${28}
 trtllm_repo=${29:-""}
 build_wheel=${30:-"true"}
 cuda_architectures=${31:-"100a-real"}
+data_dir=${32:-"/tmp"}
 
 # Get GPUs per node dynamically from SLURM
 ntasks_per_node=${SLURM_NTASKS_PER_NODE:-4}  # Default to 4 for GB200
@@ -95,6 +96,7 @@ echo "trtllm_repo: ${trtllm_repo}"
 echo "ntasks_per_node: ${ntasks_per_node}"
 echo "build_wheel: ${build_wheel}"
 echo "cuda_architectures: ${cuda_architectures}"
+echo "data_dir: ${data_dir}"
 echo "==========================================="
 
 
@@ -264,7 +266,7 @@ srun -l --container-name=${container_name} \
 srun -l --container-name=${container_name} \
     --container-mounts=${mounts} \
     --mpi=pmix --overlap -N 1 -n 1 \
-    bash ${workdir}/run_benchmark.sh ${isl} ${osl} ${multi_round} ${model_dir} "${concurrency}" ${streaming} ${full_logdir} \
+    bash ${workdir}/run_benchmark.sh ${isl} ${osl} ${multi_round} ${model_dir} "${concurrency}" ${streaming} ${full_logdir} ${data_dir} \
         &> ${full_logdir}/benchmark.log 2>&1
 
 scancel ${SLURM_JOB_ID}
