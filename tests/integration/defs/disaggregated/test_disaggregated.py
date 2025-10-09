@@ -17,6 +17,7 @@ import os
 import re
 import subprocess
 import tempfile
+import json
 from typing import Callable
 
 import pytest
@@ -206,11 +207,34 @@ def run_disaggregated_test(example_dir,
                            env=None,
                            cwd=None,
                            prompt_file="prompts.json",
+                           prompt_len=None,
                            extra_endpoints_test: Callable[[str], None] = None):
+    print(f"[run_disaggregated_test] called with prompt_file: {prompt_file}, prompt_len: {prompt_len}")
     """Run disaggregated test with given configuration."""
     cleanup_output_files()
     run_env = env.copy()
     run_env["UCX_TLS"] = "^ib"
+
+    # Handle prompt_len parameter by generating a temporary prompt file
+    temp_prompt_file = None
+    if prompt_len is not None:
+        if prompt_file is not None:
+            raise ValueError("Cannot specify both prompt_file and prompt_len.")
+
+        # Generate a prompt by repeating the word "test" prompt_len times
+        repeated_prompt = " ".join(["test"] * prompt_len)
+        prompt_data = [repeated_prompt]
+
+        # Create temporary prompt file in the clients directory
+        client_dir = f"{example_dir}/clients"
+        temp_fd, temp_prompt_file = tempfile.mkstemp(suffix='.json', prefix='temp_prompt_', dir=client_dir)
+        try:
+            with os.fdopen(temp_fd, 'w') as f:
+                json.dump(prompt_data, f)
+            prompt_file = os.path.basename(temp_prompt_file)
+        except:
+            os.close(temp_fd)
+            raise
 
     num_ranks, config_file = get_test_config(test_desc, example_dir,
                                              os.path.dirname(__file__))
@@ -252,7 +276,7 @@ def run_disaggregated_test(example_dir,
                     '--server-start-timeout',
                     str(server_start_timeout)
                 ]
-                if prompt_file in ["long_prompts.json", "prompt_120k.json"]:
+                if prompt_file in ["long_prompts.json", "prompt_120k.json"] or prompt_len is not None:
                     # Use max_tokens 4 for long prompts to reduce test time
                     client_cmd.extend(['--max-tokens', '4'])
                 check_call(client_cmd,
@@ -284,7 +308,7 @@ def run_disaggregated_test(example_dir,
                                poll_procs=[workers_proc, server_proc])
 
                 # Skip output verification for long prompts test
-                if prompt_file in ["long_prompts.json", "prompt_120k.json"]:
+                if prompt_file in ["long_prompts.json", "prompt_120k.json"] or prompt_len is not None:
                     continue
 
                 if extra_endpoints_test is not None:
@@ -340,6 +364,10 @@ def run_disaggregated_test(example_dir,
         workers_proc.terminate()
         server_proc.wait()
         workers_proc.wait()
+
+        # Clean up temporary prompt file if created
+        if temp_prompt_file and os.path.exists(temp_prompt_file):
+            os.remove(temp_prompt_file)
 
 
 @pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
@@ -584,7 +612,6 @@ def test_disaggregated_perf_metrics(disaggregated_test_root, llm_venv,
             os.symlink(src, dst, target_is_directory=True)
 
     def extra_endpoints_test(server_url: str):
-        import json
         import urllib.request
 
         with urllib.request.urlopen(f"{server_url}/perf_metrics",
@@ -1604,11 +1631,14 @@ def test_disaggregated_deepseek_v3_lite_fp8_tllm_gen_helix_120k(
             os.makedirs(os.path.dirname(dst), exist_ok=True)
             os.symlink(src, dst, target_is_directory=True)
 
+    dummy_prompt_len = 64
+    print(f"USING DUMMY PROMPT LEN: {dummy_prompt_len}")
     run_disaggregated_test(disaggregated_example_root,
                            "deepseek_v3_lite_fp8_tllm_gen_helix_120k",
                            env=llm_venv._new_env,
                            cwd=llm_venv.get_working_directory(),
-                           prompt_file="prompt_120k.json")
+                           prompt_file="prompt_120k.json" if dummy_prompt_len is None else None,
+                           prompt_len=dummy_prompt_len)
 
 
 @pytest.mark.skip_less_device(4)
