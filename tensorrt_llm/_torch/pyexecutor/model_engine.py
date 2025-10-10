@@ -1544,7 +1544,9 @@ class PyTorchModelEngine(ModelEngine):
 
                 position_id = past_seen_token_num
                 if self.mapping.has_cp_helix():
-                    position_id = request.total_input_len_cp + request.py_decoding_iter - 1
+                    # Warmup doesn't have `total_input_len_cp` set because merge_helix_requests is not called.
+                    if not self.is_warmup:
+                        position_id = request.total_input_len_cp + request.py_decoding_iter - 1
                     # Assuming last CP rank is the active rank.
                     if self.mapping.cp_rank == self.mapping.cp_size - 1:
                         past_seen_token_num = request.orig_prompt_len + request.py_decoding_iter - 1
