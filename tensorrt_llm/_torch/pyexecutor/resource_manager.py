@@ -165,6 +165,10 @@ class KVCacheManager(BaseResourceManager):
         is_draft: bool = False,
         kv_connector_manager: Optional[KvCacheConnectorManager] = None,
     ) -> None:
+        # Couple of places where we assume tokens_per_block is 32: Let's assert here for now.
+        # 1) block assignment in merge_helix_requests
+        # 2) computation of cache_transceiver_config.max_tokens_in_buffer.
+        assert tokens_per_block == 32, "tokens_per_block must be 32 for helix benchmarking."
         self.mapping = mapping
         self.dtype = dtype
         self.kv_cache_type = kv_cache_type

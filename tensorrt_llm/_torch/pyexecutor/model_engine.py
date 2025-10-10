@@ -11,7 +11,6 @@ import weakref
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from typing import Any, Callable, Dict, List, Optional, Tuple
-from .llm_request import LlmRequest
 
 import torch
 import torch._dynamo.config
@@ -62,7 +61,7 @@ from .config_utils import is_mla
 from .cuda_graph_runner import CUDAGraphRunner
 from .guided_decoder import CapturableGuidedDecoder
 from .layerwise_nvtx_marker import LayerwiseNvtxMarker
-from .llm_request import get_draft_token_length
+from .llm_request import LlmRequest, get_draft_token_length
 from .resource_manager import (BaseResourceManager, KVCacheManager,
                                ResourceManager, ResourceManagerType)
 from .sampler import SampleStateTensors
@@ -749,12 +748,13 @@ class PyTorchModelEngine(ModelEngine):
                             spec_resource_manager.free_resources(req)
 
         # TODO: current warmup_request is not suitable for context parallelism
-        # TODO: check whether this is actually the case for Helix parallelism:
-        # mainly, the dummy requests need to be split across KVP ranks for Helix
         cp_type = self.mapping.cp_config.get('cp_type', None)
         if cp_type is not None:
-            print("[ModelEngine::warmup] EARLY RETURN since cp_type is not None. cp_type: ", cp_type)
-            return
+            if cp_type in [CpType.ULYSSES, CpType.STAR]:
+                assert False, "cp_type must be HELIX for helix benchmarking."
+                print("[ModelEngine::warmup] EARLY RETURN since cp_type ",
+                      cp_type)
+                return
 
         if self._torch_compile_enabled:
 
@@ -1104,10 +1104,8 @@ class PyTorchModelEngine(ModelEngine):
                 f"Specified {self.max_seq_len=} is larger than what the model can support "
                 f"({inferred_max_seq_len}). NOT Setting max_seq_len to {inferred_max_seq_len}. "
                 f"ARE YOU SURE ABOUT THIS?"
-                f"*******************************************************\n"
-            )
+                f"*******************************************************\n")
             # self.max_seq_len = inferred_max_seq_len
-            pass
 
     def _infer_max_seq_len_from_config(self) -> int:
 
@@ -1558,7 +1556,8 @@ class PyTorchModelEngine(ModelEngine):
                 num_cached_tokens_per_seq.append(past_seen_token_num)
                 prompt_lengths.append(request.py_prompt_len)
                 if self.mapping.has_cp_helix():
-                    helix_is_inactive_rank.append(request.py_helix_is_inactive_rank)
+                    helix_is_inactive_rank.append(
+                        request.py_helix_is_inactive_rank)
                 draft_lens.append(0)
                 sequence_lengths.append(1)
                 gather_ids.append(len(position_ids) - 1)
@@ -1794,7 +1793,9 @@ class PyTorchModelEngine(ModelEngine):
                 spec_all_tp_rank_num_tokens = [
                     item[0] for item in all_tp_rank_num_tokens
                 ]
-                all_tp_rank_num_seqs = [item[1] for item in all_tp_rank_num_tokens]
+                all_tp_rank_num_seqs = [
+                    item[1] for item in all_tp_rank_num_tokens
+                ]
                 spec_metadata.all_tp_rank_num_tokens = spec_all_tp_rank_num_tokens
                 spec_metadata.all_tp_rank_num_seqs = all_tp_rank_num_seqs
 
@@ -2289,16 +2290,19 @@ class PyTorchModelEngine(ModelEngine):
             spec_metadata: Optional[SpecMetadata] = None,
             new_tensors_device: Optional[SampleStateTensors] = None,
             cache_indirection_buffer: Optional[torch.Tensor] = None):
-        cp_type = None if self.mapping is None else self.mapping.cp_config.get("cp_type", None)
+        cp_type = None if self.mapping is None else self.mapping.cp_config.get(
+            "cp_type", None)
         if cp_type == CpType.HELIX:
             return self._prepare_tp_inputs(scheduled_requests, kv_cache_manager,
                                            attn_metadata, spec_metadata,
-                                           new_tensors_device, cache_indirection_buffer)
+                                           new_tensors_device,
+                                           cache_indirection_buffer)
         elif cp_type == CpType.STAR:
-            return self._prepare_star_attention_inputs(
-                scheduled_requests, kv_cache_manager, attn_metadata)
+            return self._prepare_star_attention_inputs(scheduled_requests,
+                                                       kv_cache_manager,
+                                                       attn_metadata)
         elif cp_type is not None:
-                assert False, f'Unsupport cp_type {cp_type}'
+            assert False, f'Unsupport cp_type {cp_type}'
         else:
             return self._prepare_tp_inputs(scheduled_requests, kv_cache_manager,
                                            attn_metadata, spec_metadata,
