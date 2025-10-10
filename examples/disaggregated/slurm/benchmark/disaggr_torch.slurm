@@ -59,6 +59,7 @@ trtllm_repo=${29:-""}
 build_wheel=${30:-"true"}
 cuda_architectures=${31:-"100a-real"}
 data_dir=${32:-"/tmp"}
+cache_transceiver_max_num_tokens=${33:-8448}
 
 # Get GPUs per node dynamically from SLURM
 ntasks_per_node=${SLURM_NTASKS_PER_NODE:-4}  # Default to 4 for GB200
@@ -97,6 +98,7 @@ echo "ntasks_per_node: ${ntasks_per_node}"
 echo "build_wheel: ${build_wheel}"
 echo "cuda_architectures: ${cuda_architectures}"
 echo "data_dir: ${data_dir}"
+echo "cache_transceiver_max_num_tokens: ${cache_transceiver_max_num_tokens}"
 echo "==========================================="
 
 
@@ -104,8 +106,6 @@ numa_bind=true # Only allocate memory from nodes, this only works on GB200
 ctx_max_seq_len=$((isl + 10))
 gen_max_seq_len=$((isl + osl + 10))
 ctx_gpu_frac=${ctx_gpu_memory_fraction}
-# @B: NEED TO UPDATE THIS TO OUR USECASE.
-cache_transceiver_max_num_tokens=8448
 
 container_name=disaggregated_serving
 logdir=${workdir}/slurm-${SLURM_JOB_ID}/benchmark-${isl}-${osl}

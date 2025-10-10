@@ -36,6 +36,11 @@ build_wheel=true
 cuda_architectures="100a-real"
 ctx_max_tokens=$((batch * (isl + 10)))
 gen_max_tokens=$((batch * (isl + osl + 10)))
+# note: this also works for 32 tokens/block
+tokens_per_block=64
+transceiver_factor=2
+transceiver_blocks=$(((ctx_max_tokens * transceiver_factor + tokens_per_block - 1) / tokens_per_block))
+cache_transceiver_max_num_tokens=$((tokens_per_block * transceiver_blocks))
 
 args=(
     # Context - [num_instances, tp_size, pp_size, cp_size, batch_size, max_num_tokens, enable_attention_dp, gpu_memory_fraction]
@@ -60,6 +65,7 @@ args=(
     $build_wheel
     $cuda_architectures
     $data_dir
+    $cache_transceiver_max_num_tokens
 )
 
 # This command starts a job with 8 nodes, 32 GPUs in total.
