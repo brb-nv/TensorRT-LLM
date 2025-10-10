@@ -76,7 +76,7 @@ def gen_config_file(work_dir: str,
         },
         'moe_config': {
             # @B: Ideally, we should update this in below logic (note: for context in helix, this is not important).
-            'backend': 'DEEPGEMM',
+            'backend': 'DEEPGEMM' if ctx_tp_size < 8 else 'TRTLLM',
         },
         'cache_transceiver_config': {
             'max_tokens_in_buffer': cache_transceiver_max_num_tokens,
