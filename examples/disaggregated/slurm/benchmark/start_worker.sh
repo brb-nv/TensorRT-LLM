@@ -18,7 +18,7 @@ unset UCX_TLS
 echo "concurrency: ${concurrency}, enable_pdl: ${enable_pdl}, work_dir: ${work_dir}"
 echo "SLURM_PROCID: ${SLURM_PROCID}, hostname: $(hostname), instance_id: ${instance_id}"
 
-export TLLM_LOG_LEVEL=INFO
+export TLLM_LOG_LEVEL=WARNING
 
 if [ "${enable_pdl}" = "true" ]; then
     export TRTLLM_ENABLE_PDL=1

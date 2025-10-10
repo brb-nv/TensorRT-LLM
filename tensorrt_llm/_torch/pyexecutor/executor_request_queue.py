@@ -600,9 +600,9 @@ class ExecutorRequestQueue:
 
     def _merge_helix_requests(self, new_requests: list[RequestQueueItem],
                               num_tokens_per_block: int):
-        print(
-            "[ExecutorRequestQueue::_merge_helix_requests]: FUNCTION CALLED with len(new_requests): ",
-            len(new_requests))
+        # print(
+        #     "[ExecutorRequestQueue::_merge_helix_requests]: FUNCTION CALLED with len(new_requests): ",
+        #     len(new_requests))
         req_with_children = []
         num_cp_ranks = self.dist.cp_size
         curr_cp_rank = self.dist.cp_rank
@@ -624,7 +624,8 @@ class ExecutorRequestQueue:
             # Padding to ensure torch.stack used with torch.tensor_split works properly.
             padding_len = 0
             if input_len % num_tokens_per_block != 0:
-                padding_len = num_tokens_per_block - (input_len % num_tokens_per_block)
+                padding_len = num_tokens_per_block - (input_len %
+                                                      num_tokens_per_block)
                 padding_ids = torch.zeros([1, padding_len], dtype=torch.int64)
                 all_input_ids = torch.cat((all_input_ids, padding_ids), dim=-1)
             all_position_ids = torch.arange(0,
@@ -635,8 +636,8 @@ class ExecutorRequestQueue:
                 torch.stack(all_input_ids.split(num_tokens_per_block, dim=-1)),
                 num_cp_ranks)
             position_id_blocks_per_rank = torch.tensor_split(
-                torch.stack(all_position_ids.split(num_tokens_per_block, dim=-1)),
-                num_cp_ranks)
+                torch.stack(all_position_ids.split(num_tokens_per_block,
+                                                   dim=-1)), num_cp_ranks)
 
             # Get the input_ids and position_ids for this rank.
             input_ids_this_rank = input_id_blocks_per_rank[
