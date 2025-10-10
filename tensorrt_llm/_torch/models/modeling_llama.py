@@ -40,11 +40,13 @@ from ..modules.linear import Linear, TensorParallelMode
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
 from ..speculative import SpecMetadata
-from ..utils import Fp4QuantizedTensor, use_torch_printoptions
+from ..utils import Fp4QuantizedTensor
 from .modeling_multimodal_utils import fuse_input_embeds
 from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
                              EagerFusionConfig, register_auto_model)
+
+# from ..utils import use_torch_printoptions
 
 DISAGG = os.getenv('TLLM_MULTIMODAL_DISAGGREGATED', '0') == '1'
 
@@ -948,13 +950,13 @@ class LlamaModel(DecoderModel):
         lora_params=None,
         **kwargs,
     ) -> torch.Tensor:
-        with use_torch_printoptions(sci_mode=False,
-                                    threshold=16,
-                                    edgeitems=2,
-                                    linewidth=120):
-            print(f"[LlamaModel::forward] input_ids: \n{input_ids}")
-            print(f"[LlamaModel::forward] position_ids: \n{position_ids}")
-            print(f"[LlamaModel::forward] attn_metadata: \n{attn_metadata}")
+        # with use_torch_printoptions(sci_mode=False,
+        #                             threshold=16,
+        #                             edgeitems=2,
+        #                             linewidth=120):
+        #     print(f"[LlamaModel::forward] input_ids: \n{input_ids}")
+        #     print(f"[LlamaModel::forward] position_ids: \n{position_ids}")
+        #     print(f"[LlamaModel::forward] attn_metadata: \n{attn_metadata}")
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError(
                 "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
