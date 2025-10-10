@@ -14,4 +14,4 @@ python3 ${script_dir}/gen_server_config.py \
     --work_dir ${work_dir}
 echo "server config generated to ${work_dir}/server_config.yaml"
 
-trtllm-serve disaggregated -c ${work_dir}/server_config.yaml -t 900 -r 900
+trtllm-serve disaggregated -c ${work_dir}/server_config.yaml -t 1800 -r 1200
