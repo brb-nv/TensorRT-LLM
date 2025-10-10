@@ -749,12 +749,12 @@ class PyTorchModelEngine(ModelEngine):
                             spec_resource_manager.free_resources(req)
 
         # TODO: current warmup_request is not suitable for context parallelism
-        # TODO: check whether this is actually the case for Helix parallelism:
-        # mainly, the dummy requests need to be split across KVP ranks for Helix
         cp_type = self.mapping.cp_config.get('cp_type', None)
         if cp_type is not None:
-            print("[ModelEngine::warmup] EARLY RETURN since cp_type is not None. cp_type: ", cp_type)
-            return
+            if cp_type in [CpType.ULYSSES, CpType.STAR]:
+                assert False, "cp_type must be HELIX for helix benchmarking."
+                print("[ModelEngine::warmup] EARLY RETURN since cp_type ", cp_type)
+                return
 
         if self._torch_compile_enabled:
 

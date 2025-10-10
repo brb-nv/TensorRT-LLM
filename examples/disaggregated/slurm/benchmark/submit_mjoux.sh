@@ -15,13 +15,13 @@ container_image=/lustre/fsw/portfolios/coreai/projects/coreai_horizon_dilations/
 # e.g. /mnt/data:/mnt/data
 mounts=/lustre/fsw/portfolios/coreai/projects/coreai_horizon_dilations:/lustre/fsw/portfolios/coreai/projects/coreai_horizon_dilations
 # Path to disaggr_torch.slurm
-workdir=/lustre/fsw/portfolios/coreai/projects/coreai_horizon_dilations/users/mjoux/TensorRT-LLM/examples/disaggregated/slurm/benchmark/
+workdir=/lustre/fsw/portfolios/coreai/projects/coreai_horizon_dilations/users/$USER/TensorRT-LLM/examples/disaggregated/slurm/benchmark/
 # Path to the model checkpoint
 model_dir=/lustre/fsw/portfolios/coreai/projects/coreai_horizon_dilations/users/mjoux/data/models/DeepSeek-R1/DeepSeek-R1-FP4
 # Path to the repo to install TensorRT-LLM, if this is empty, the pre-installed version will be used
-repo_dir=/lustre/fsw/portfolios/coreai/projects/coreai_horizon_dilations/users/mjoux/TensorRT-LLM
+repo_dir=/lustre/fsw/portfolios/coreai/projects/coreai_horizon_dilations/users/$USER/TensorRT-LLM
 # Path to the data directory
-data_dir=/lustre/fsw/portfolios/coreai/projects/coreai_horizon_dilations/users/mjoux/data
+data_dir=/lustre/fsw/portfolios/coreai/projects/coreai_horizon_dilations/users/$USER/data
 
 ntasks_per_node=4 # 4 GPUs per GB200 node
 
@@ -35,12 +35,10 @@ benchmark_mode=e2e
 build_wheel=true
 cuda_architectures="100a-real"
 ctx_max_tokens=$((batch * (isl + 10)))
-gen_max_tokens=$((batch * (isl + osl + 10)))
-# note: this also works for 32 tokens/block
-tokens_per_block=64
-transceiver_factor=2
-transceiver_blocks=$(((ctx_max_tokens * transceiver_factor + tokens_per_block - 1) / tokens_per_block))
-cache_transceiver_max_num_tokens=$((tokens_per_block * transceiver_blocks))
+gen_max_tokens=$((batch * (1 + 10)))
+tokens_per_block=32
+transceiver_blocks=$(((ctx_max_tokens + tokens_per_block - 1) / tokens_per_block))
+cache_transceiver_max_num_tokens=$((tokens_per_block * transceiver_blocks + 512))
 
 ctx_nodes_num=$(((ctx_tp_size * ctx_pp_size * ctx_cp_size + ntasks_per_node - 1) / ntasks_per_node))
 gen_nodes_num=$(((gen_tp_size * gen_pp_size * gen_cp_size + ntasks_per_node - 1) / ntasks_per_node))
