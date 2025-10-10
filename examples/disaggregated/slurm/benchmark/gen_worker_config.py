@@ -84,9 +84,16 @@ def gen_config_file(work_dir: str,
         },
     }
 
-    gen_cuda_graph_batch_sizes = [
-        1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 768, 1024, 2048, gen_batch_size
-    ]
+    # Assert that gen_batch_size is a power of 2.
+    assert gen_batch_size > 0 and (gen_batch_size & (gen_batch_size - 1)) == 0, \
+        f"gen_batch_size ({gen_batch_size}) must be a power of 2."
+
+    # Generate list of powers of 2 up to gen_batch_size.
+    gen_cuda_graph_batch_sizes = []
+    power = 1
+    while power <= gen_batch_size:
+        gen_cuda_graph_batch_sizes.append(power)
+        power *= 2
 
     gen_moe_backend = "CUTLASS"
     if gen_tp_size >= 16 and gen_enable_attention_dp:
@@ -110,8 +117,11 @@ def gen_config_file(work_dir: str,
         'max_batch_size': gen_batch_size,
         'max_num_tokens': gen_max_num_tokens,
         'max_seq_len': gen_max_seq_len,
-        # @B: Enable CUDA graphs later.
-        'cuda_graph_config': None,
+        'cuda_graph_config': {
+            'enable_padding': True,
+            'batch_sizes': gen_cuda_graph_batch_sizes,
+            'max_batch_size': gen_batch_size,
+        },
         'print_iter_log': True,
         'kv_cache_config': {
             'enable_block_reuse': False,

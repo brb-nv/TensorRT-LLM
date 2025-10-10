@@ -170,8 +170,10 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
                 auto const peerBlockNum
                     = executor::kv_cache::getBlockNumAccountingForCP(cpDomainIdx, cPDomainSize, blockNum);
                 bufferSizeForTarget[idx] = blockSizePerLayer * peerAttentionLayerNum * peerBlockNum;
+                TLLM_LOG_WARNING("[format::getBufferSizeForTarget]: cpDomainIdx:%d, cpDomainSize:%d, blockNum:%d, peerBlockNum:%d, cacheBlockSize:%ld, peerAttentionLayerNum:%d, bufferSizeForTarget[idx]:%ld.", cpDomainIdx, cPDomainSize, blockNum, peerBlockNum, cacheBlockSize, peerAttentionLayerNum, bufferSizeForTarget[idx]);
             }
         }
+        TLLM_LOG_WARNING("[format::getBufferSizeForTarget]: END OF ASSIGNMENT bufferSizeForTarget:%ld.", bufferSizeForTarget.size());
         return bufferSizeForTarget;
     };
     auto bufferEleSizes = getBufferSizeForTarget();
@@ -385,7 +387,9 @@ void MLACacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& s
                 auto const peerAttentionLayerNum
                     = targetInfo.getPeerPPDomainLayerNum(static_cast<SizeType32>(pickUpConnections[i]));
                 bufferEleSizes[i] = cacheSizePerLayer * peerAttentionLayerNum;
+                TLLM_LOG_WARNING("[unformat::getBufferSizeForTarget]: i:%d, peerAttentionLayerNum:%d, bufferEleSizes[i]:%ld.", i, peerAttentionLayerNum, bufferEleSizes[i]);
             }
+            TLLM_LOG_WARNING("[unformat::getBufferSizeForTarget]: END OF ASSIGNMENT bufferEleSizes:%ld.", bufferEleSizes.size());
             return bufferEleSizes;
         };
         auto bufferEleSizes = getBufferSizeForTarget();
