@@ -131,6 +131,8 @@ size_t FabricMemory::getAlignedSize(size_t size)
 
 bool FabricMemory::supportFbaricMemory()
 {
+    TLLM_LOG_WARNING("Temporarily disable fabric memory.");
+    return false;
 #ifdef __aarch64__
     auto support_fun = []()
     {
@@ -181,7 +183,8 @@ bool FabricMemory::supportFbaricMemory()
         return false;
     };
     static bool support = support_fun();
-    return support;
+    TLLM_LOG_WARNING("Temporarily disable fabric memory.");
+    return false;
 
 #else
     return false;
