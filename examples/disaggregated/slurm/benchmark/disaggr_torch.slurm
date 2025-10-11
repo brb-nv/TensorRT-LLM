@@ -203,6 +203,7 @@ srun -l -N 1 -n 1 \
                 --eplb_num_slots ${eplb_num_slots} \
                 --mtp_size ${mtp_size} \
                 --cache_transceiver_max_num_tokens ${cache_transceiver_max_num_tokens} \
+                --model_path ${model_dir} \
                 $(if [ "${ctx_enable_attention_dp}" = "true" ]; then echo "--ctx_enable_attention_dp"; fi) \
                 $(if [ "${gen_enable_attention_dp}" = "true" ]; then echo "--gen_enable_attention_dp"; fi) \
                 2>&1 | tee ${full_logdir}/gen_worker_config.log

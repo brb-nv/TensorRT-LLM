@@ -23,7 +23,8 @@ def gen_config_file(work_dir: str,
                     gen_gpu_memory_fraction: float,
                     eplb_num_slots: int,
                     mtp_size: int = 0,
-                    cache_transceiver_max_num_tokens: int = 4608) -> None:
+                    cache_transceiver_max_num_tokens: int = 4608,
+                    model_path: str = "") -> None:
     """
     Generate configuration YAML file for disaggregated inference.
 
@@ -95,13 +96,26 @@ def gen_config_file(work_dir: str,
         gen_cuda_graph_batch_sizes.append(power)
         power *= 2
 
-    gen_moe_backend = "CUTLASS"
-    if gen_tp_size >= 16 and gen_enable_attention_dp:
-        gen_moe_backend = "WIDEEP"
-    if gen_tp_size >= 8 and not gen_enable_attention_dp:
-        gen_moe_backend = "TRTLLM"
+    # Source: docs/source/deployment-guide/quick-start-recipe-for-deepseek-r1-on-trtllm.md
+    # Support matrix for moe_backend.
+    # | device | Checkpoint | Supported moe_backend |
+    # |----------|----------|----------|
+    # | H100/H200 | FP8 | CUTLASS |
+    # | B200/GB200 EP<=8 | NVFP4 | CUTLASS, TRTLLM |
+    # | B200/GB200 EP<=8 | FP8 | DEEPGEMM |
+    # | GB200 NVL72 EP>8 | NVFP4 |  WIDEEP |
+    # | GB200 NVL72 EP>8 | FP8 | N/A (WIP) |
+
+    assert gen_enable_attention_dp is False, "Let's keep it simple for now."
+    if 'fp4' in model_path or 'FP4' in model_path:
+        gen_moe_backend = "TRTLLM" if gen_tp_size <= 8 else "WIDEEP"
+    elif 'fp8' in model_path or 'FP8' in model_path:
+        if gen_tp_size <= 8:
+            gen_moe_backend = "DEEPGEMM"
+        else:
+            raise ValueError(f"No existing moe support for {model_dtype} with gen_tp_size: {gen_tp_size}.")
     else:
-        gen_moe_backend = "DEEPGEMM"
+        raise ValueError(f"Unsupported model dtype: {model_dtype}")
 
     gen_config = {
         'build_config': {
@@ -260,6 +274,10 @@ if __name__ == "__main__":
                         type=int,
                         default=8448,
                         help="Max number of tokens for cache transceiver")
+    parser.add_argument("--model_path",
+                        type=str,
+                        default="",
+                        help="Model path")
 
     args = parser.parse_args()
 
@@ -272,4 +290,4 @@ if __name__ == "__main__":
                     args.gen_max_num_tokens, args.gen_max_seq_len,
                     args.gen_enable_attention_dp, args.gen_gpu_memory_fraction,
                     args.eplb_num_slots, args.mtp_size,
-                    args.cache_transceiver_max_num_tokens)
+                    args.cache_transceiver_max_num_tokens, args.model_path)
