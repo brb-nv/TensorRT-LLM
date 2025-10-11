@@ -104,7 +104,9 @@ echo "==========================================="
 
 numa_bind=true # Only allocate memory from nodes, this only works on GB200
 ctx_max_seq_len=$((isl + 10))
-gen_max_seq_len=$((isl + osl + 10))
+# isl is split among CP ranks. As we keep a single active rank now, all osl will land on
+# single rank. Additional tokens_per_blocks (32) as we split blocks among CP ranks.
+gen_max_seq_len=$((isl / gen_cp_size + 32 + osl + 10))
 ctx_gpu_frac=${ctx_gpu_memory_fraction}
 
 container_name=disaggregated_serving

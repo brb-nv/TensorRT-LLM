@@ -6,7 +6,7 @@ ctx_cp_size=1
 ctx_chunked_prefill=false
 gen_tp_size=8
 gen_pp_size=1
-gen_cp_size=2
+gen_cp_size=4
 
 partition=batch
 account=coreai_horizon_dilations
@@ -26,7 +26,7 @@ data_dir=/lustre/fsw/portfolios/coreai/projects/coreai_horizon_dilations/users/$
 ntasks_per_node=4 # 4 GPUs per GB200 node
 
 batch=1
-isl=524288
+isl=1048576
 osl=1024
 concurrency=8
 multi_round=1
@@ -49,9 +49,9 @@ export TRTLLM_DISAGG_BENCHMARK_GEN_ONLY=1
 
 args=(
     # Context - [num_instances, tp_size, pp_size, cp_size, batch_size, max_num_tokens, enable_attention_dp, gpu_memory_fraction]
-    1 $ctx_tp_size $ctx_pp_size $ctx_cp_size $batch $ctx_max_tokens false "0.25"
+    1 $ctx_tp_size $ctx_pp_size $ctx_cp_size $batch $ctx_max_tokens false "0.1"
     # Generation - [num_instances, tp_size, pp_size, cp_size, batch_size, max_num_tokens, enable_attention_dp, gpu_memory_fraction]
-    1 $gen_tp_size $gen_pp_size $gen_cp_size $batch $gen_max_tokens false "0.25"
+    1 $gen_tp_size $gen_pp_size $gen_cp_size $batch $gen_max_tokens false "0.1"
     # Other arguments - [eplb_num_slots, mtp_size]
     0 0
     # Benchmarking arguments
