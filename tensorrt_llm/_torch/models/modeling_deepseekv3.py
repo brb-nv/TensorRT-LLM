@@ -1161,6 +1161,10 @@ class DeepseekV3Model(DecoderModel):
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
 
+        if os.getenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY") == "1" and self.model_config.mapping.cp_size == 1:
+            print("[DeepseekV3Model::forward] SKIPPING PREFILL FORWARD IN GEN ONLY MODE.")
+            return inputs_embeds
+
         hidden_states = inputs_embeds
         residual = None
 

@@ -26,7 +26,7 @@ data_dir=/lustre/fsw/portfolios/coreai/projects/coreai_horizon_dilations/users/$
 ntasks_per_node=4 # 4 GPUs per GB200 node
 
 batch=1
-isl=262144
+isl=524288
 osl=1024
 concurrency=8
 multi_round=1
@@ -44,6 +44,8 @@ ctx_nodes_num=$(((ctx_tp_size * ctx_pp_size * ctx_cp_size + ntasks_per_node - 1)
 gen_nodes_num=$(((gen_tp_size * gen_pp_size * gen_cp_size + ntasks_per_node - 1) / ntasks_per_node))
 total_node_num=$((ctx_nodes_num + gen_nodes_num))
 ntasks=$((total_node_num * ntasks_per_node))
+
+export TRTLLM_DISAGG_BENCHMARK_GEN_ONLY=1
 
 args=(
     # Context - [num_instances, tp_size, pp_size, cp_size, batch_size, max_num_tokens, enable_attention_dp, gpu_memory_fraction]
