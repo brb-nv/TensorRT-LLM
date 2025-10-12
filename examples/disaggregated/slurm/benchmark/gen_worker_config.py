@@ -106,14 +106,15 @@ def gen_config_file(work_dir: str,
     # | GB200 NVL72 EP>8 | NVFP4 |  WIDEEP |
     # | GB200 NVL72 EP>8 | FP8 | N/A (WIP) |
 
+    gen_moe_ep_size = gen_cp_size * gen_tp_size
     assert gen_enable_attention_dp is False, "Let's keep it simple for now."
     if 'fp4' in model_path or 'FP4' in model_path:
-        gen_moe_backend = "TRTLLM" if gen_tp_size <= 8 else "WIDEEP"
+        gen_moe_backend = "TRTLLM" if gen_moe_ep_size <= 8 else "WIDEEP"
     elif 'fp8' in model_path or 'FP8' in model_path:
-        if gen_tp_size <= 8:
+        if gen_moe_ep_size <= 8:
             gen_moe_backend = "DEEPGEMM"
         else:
-            raise ValueError(f"No existing moe support for {model_dtype} with gen_tp_size: {gen_tp_size}.")
+            raise ValueError(f"No existing moe support for {model_dtype} with gen_moe_ep_size: {gen_moe_ep_size}.")
     else:
         raise ValueError(f"Unsupported model dtype: {model_dtype}")
 
@@ -124,7 +125,7 @@ def gen_config_file(work_dir: str,
             'max_seq_len': gen_max_seq_len,
         },
         'tensor_parallel_size': gen_tp_size,
-        'moe_expert_parallel_size': gen_tp_size,
+        'moe_expert_parallel_size': gen_moe_ep_size,
         'enable_attention_dp': True if gen_enable_attention_dp else False,
         'pipeline_parallel_size': gen_pp_size,
         'context_parallel_size': gen_cp_size,
