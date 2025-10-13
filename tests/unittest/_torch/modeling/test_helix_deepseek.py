@@ -3,13 +3,15 @@
 import json
 import os
 import pickle
+import shutil
 import sys
 import tempfile
 import time
 import traceback
 import weakref
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from functools import partial
+from pathlib import Path
 from typing import Optional
 
 import cloudpickle
@@ -21,6 +23,8 @@ from transformers import PretrainedConfig
 import tensorrt_llm
 from tensorrt_llm._torch.attention_backend.interface import KVCacheParams
 from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
+from tensorrt_llm._torch.auto_deploy.utils.quantization_utils import \
+    fp4_global_scale
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_deepseekv3 import \
     DeepseekV3DecoderLayer
@@ -42,14 +46,36 @@ MPI.pickle.__init__(
     pickle.HIGHEST_PROTOCOL,
 )
 
+
+def llm_models_root(check=False) -> Optional[Path]:
+    root = Path("/home/scratch.trt_llm_data/llm-models/")
+
+    if "LLM_MODELS_ROOT" in os.environ:
+        root = Path(os.environ.get("LLM_MODELS_ROOT"))
+
+    if not root.exists():
+        root = Path("/scratch.trt_llm_data/llm-models/")
+
+    if check:
+        assert root.exists(), \
+        "You shall set LLM_MODELS_ROOT env or be able to access /home/scratch.trt_llm_data to run this test"
+
+    return root if root.exists() else None
+
+
 # set this to ensure we get DS Fp8
-# TODO: debug this once we get access to machines
-QUANTIZATION_CONFIG = {
+QUANTIZATION_CONFIG_FP8 = {
     "activation_scheme": "dynamic",
     "fmt": "e4m3",
     "quant_method": "fp8",
     "weight_block_size": [128, 128]
 }
+# set this to None / "nvfp4" / "dsfp8"
+QUANTIZATION_TYPE = "nvfp4"
+FP4_QUANT_CONFIG_PATH = llm_models_root(
+) / "DeepSeek-R1" / "DeepSeek-R1-FP4" / "hf_quant_config.json"
+
+NUM_HIDDEN_LAYERS = 61
 
 
 # values for deepseek_v3_lite
@@ -92,8 +118,6 @@ class Scenario:
     vocab_size: int = 129280
     bias: bool = False
     num_hidden_layers: int = 1
-    quantization_config: dict = field(
-        default_factory=lambda: QUANTIZATION_CONFIG)
     # test setup parameters
     kv_cache_tokens_per_block: int = 64
     # TODO only 1 is supported for now here
@@ -209,26 +233,41 @@ def _setup_kv(scenario: Scenario, mapping: Mapping, gen_steps: int):
 
 
 def _generate_random_weights(layer: DeepseekV3DecoderLayer):
+    quant_dict = dict()
+
     # Helpers to init a tensor
-    def init_low_precision(t, op):
-        if t.dtype.itemsize <= 1:
+    def init_low_precision(t, op, t_hash, no_fp4):
+        if QUANTIZATION_TYPE == "nvfp4" and not no_fp4:
+            t2 = torch.empty(t.shape[:-1] + (t.shape[-1] * 2, ),
+                             dtype=torch.float32,
+                             device=t.device)
+            op(t2)
+            t3 = t2.to(dtype=torch.float16)
+            t4, x_scale = torch.ops.trtllm.fp4_quantize(t3,
+                                                        fp4_global_scale(t2),
+                                                        16, False)
+            quant_dict[t_hash] = x_scale
+            t.copy_(t4)
+        elif t.dtype.itemsize <= 1:
             t2 = torch.empty_like(t, dtype=torch.float32)
             op(t2)
             t.copy_(t2)
         else:
             op(t)
 
-    def init_uniform(tensor, a=-1.0, b=1.0, use_kaiming=False):
+    def init_uniform(tensor, a=-1.0, b=1.0, use_kaiming=False, no_fp4=False):
         if tensor is not None:
             if use_kaiming:
                 tv = tensor.view(-1, tensor.shape[-2], tensor.shape[-1])
                 for t in tv:
-                    init_low_precision(t, torch.nn.init.kaiming_uniform_)
+                    init_low_precision(t, torch.nn.init.kaiming_uniform_,
+                                       hash(tensor), no_fp4)
             else:
                 init_low_precision(tensor,
-                                   partial(torch.nn.init.uniform_, a=a, b=b))
+                                   partial(torch.nn.init.uniform_, a=a, b=b),
+                                   hash(tensor), no_fp4)
 
-    def init_block_scale(tensor, orig_tensor):
+    def init_block_scale_fp8(tensor, orig_tensor, _no_fp4):
         if tensor is None or orig_tensor is None:
             return
         b1, b2 = 128, 128
@@ -267,14 +306,33 @@ def _generate_random_weights(layer: DeepseekV3DecoderLayer):
             scale = torch.cat([scale, scale3], dim=-1)
         tensor.copy_(scale)
 
-    def init_linear(mod):
+    def init_block_scale_fp4(tensor, orig_tensor, no_fp4):
+        if no_fp4:
+            init_block_scale_fp8(tensor, orig_tensor, None)
+            return
+        if tensor is None or orig_tensor is None:
+            return
+        if hash(orig_tensor) in quant_dict:
+            tensor.copy_(quant_dict[hash(orig_tensor)])
+            return
+        print_dict = {k: (v.shape, v.dtype) for k, v in quant_dict.items()}
+        raise ValueError(
+            "init_block_scale_fp4 must be called after init_uniform "
+            f"for original tensor, {hash(orig_tensor)} not in {print_dict}")
+
+    if QUANTIZATION_TYPE == "nvfp4":
+        init_block_scale = init_block_scale_fp4
+    elif QUANTIZATION_TYPE == "dsfp8":
+        init_block_scale = init_block_scale_fp8
+
+    def init_linear(mod, no_fp4=False):
         if mod is None:
             return
-        init_uniform(mod.weight, use_kaiming=True)
+        init_uniform(mod.weight, use_kaiming=True, no_fp4=no_fp4)
         if hasattr(mod, "weight_scale"):
-            init_block_scale(mod.weight_scale, mod.weight)
+            init_block_scale(mod.weight_scale, mod.weight, no_fp4=no_fp4)
         if hasattr(mod, "bias"):
-            init_uniform(mod.bias)
+            init_uniform(mod.bias, no_fp4=True)
 
     mla = layer.self_attn
     # Linear modules
@@ -288,24 +346,26 @@ def _generate_random_weights(layer: DeepseekV3DecoderLayer):
         else:
             mod = getattr(mla, name)
         if mod is not None:
-            init_uniform(mod.weight, a=0.9, b=1.1)
+            init_uniform(mod.weight, a=0.9, b=1.1, no_fp4=True)
 
     # k_b_proj_trans (created in create_weights)
-    init_uniform(mla.k_b_proj_trans, use_kaiming=True)
+    init_uniform(mla.k_b_proj_trans, use_kaiming=True, no_fp4=True)
     # k_b_proj_trans_scale (optional)
     if hasattr(mla, "k_b_proj_trans_scale"):
-        init_block_scale(mla.k_b_proj_trans_scale, mla.k_b_proj_trans)
-    init_uniform(mla.v_b_proj)
+        init_block_scale(mla.k_b_proj_trans_scale,
+                         mla.k_b_proj_trans,
+                         no_fp4=True)
+    init_uniform(mla.v_b_proj, no_fp4=True)
     # v_b_proj_scale (optional)
     if hasattr(mla, "v_b_proj_scale"):
-        init_block_scale(mla.v_b_proj_scale, mla.v_b_proj)
+        init_block_scale(mla.v_b_proj_scale, mla.v_b_proj, no_fp4=True)
 
     # Initialize the MoE weights / all remaining parameters from decoder layer
     # Initialize input and post-attention layer norms
     for name in ["input_layernorm", "post_attention_layernorm"]:
         mod = getattr(layer, name, None)
         if mod is not None and hasattr(mod, "weight"):
-            init_uniform(mod.weight, a=0.9, b=1.1)
+            init_uniform(mod.weight, a=0.9, b=1.1, no_fp4=True)
 
     # Initialize MLP weights
     if hasattr(layer, "mlp"):
@@ -318,9 +378,12 @@ def _generate_random_weights(layer: DeepseekV3DecoderLayer):
         elif hasattr(mlp, "gate"):
             # Deepseekv3MoE case
             # Initialize gate weights
-            init_uniform(mlp.gate.weight, use_kaiming=True)
+            init_uniform(mlp.gate.weight, use_kaiming=True, no_fp4=True)
             if hasattr(mlp.gate, "e_score_correction_bias"):
-                init_uniform(mlp.gate.e_score_correction_bias, a=1.5, b=2.5)
+                init_uniform(mlp.gate.e_score_correction_bias,
+                             a=1.5,
+                             b=2.5,
+                             no_fp4=True)
 
             # Initialize experts weights
             if hasattr(mlp, "experts"):
@@ -360,7 +423,7 @@ def _generate_random_weights(layer: DeepseekV3DecoderLayer):
                             init_block_scale(getattr(experts, name),
                                              experts.w2_weight)
                         else:
-                            init_uniform(getattr(experts, name))
+                            init_uniform(getattr(experts, name), no_fp4=True)
 
             # Initialize shared experts weights
             if hasattr(mlp, "shared_experts"):
@@ -431,7 +494,6 @@ def _run_ds_layer_distributed(rank: int, world_size: int, scenario: Scenario,
         num_hidden_layers=scenario.num_hidden_layers,
         torch_dtype=scenario.dtype,
         model_type=scenario.model_type,
-        quantization_config=scenario.quantization_config,
         use_bfloat16=scenario.dtype == torch.bfloat16,
     )
     # the mapping used for helix
@@ -440,9 +502,19 @@ def _run_ds_layer_distributed(rank: int, world_size: int, scenario: Scenario,
                       moe_ep_size=(world_size + 3) // 4,
                       tp_size=scenario.tp_size,
                       cp_size=world_size // scenario.tp_size,
-                      cp_config={'cp_type': CpType.HELIX})
+                      cp_config={'cp_type': CpType.HELIX},
+                      gpus_per_node=tensorrt_llm.local_mpi_size())
     with tempfile.TemporaryDirectory() as tmpdir:
         config_dict = pretrained_config.to_dict()
+        if QUANTIZATION_TYPE == "nvfp4":
+            if not FP4_QUANT_CONFIG_PATH.exists():
+                raise FileNotFoundError(
+                    f"FP4 quantization config file not found at {FP4_QUANT_CONFIG_PATH}"
+                )
+            shutil.copy(FP4_QUANT_CONFIG_PATH,
+                        os.path.join(tmpdir, "hf_quant_config.json"))
+        elif QUANTIZATION_TYPE == "dsfp8":
+            config_dict["quantization_config"] = QUANTIZATION_CONFIG_FP8
         config_dict["model_type"] = scenario.model_type
         with open(os.path.join(tmpdir, "config.json"), "w") as f:
             json.dump(config_dict, f)
@@ -510,7 +582,6 @@ def _run_ds_layer_distributed(rank: int, world_size: int, scenario: Scenario,
                     use_cache=True,
                     num_cached_tokens_per_seq=cached_tokens_per_seq,
                 ),
-                enable_paged_context_mla=True,
             )
         else:
             attn_metadata.kv_cache_params = KVCacheParams(
@@ -559,12 +630,13 @@ def _run_ds_layer_distributed(rank: int, world_size: int, scenario: Scenario,
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
                 with model_extra_attrs(extra_attrs):
-                    graph_output, _ = layer(
-                        position_ids=position_ids_gen,
-                        hidden_states=input_gen,
-                        attn_metadata=attn_metadata,
-                        residual=input_gen_residual,
-                    )
+                    for _ in range(NUM_HIDDEN_LAYERS):
+                        graph_output, _ = layer(
+                            position_ids=position_ids_gen,
+                            hidden_states=input_gen,
+                            attn_metadata=attn_metadata,
+                            residual=input_gen_residual,
+                        )
             result = graph_output
         elif step == scenario.ref_steps:
             start = time.time()
@@ -588,9 +660,12 @@ def _run_ds_layer_distributed(rank: int, world_size: int, scenario: Scenario,
     else:
         avg_gen_time = (end - start) / (gen_steps - scenario.ref_steps)
     throughput = scenario.batch / avg_gen_time
-    print(f"Rank {rank} {world_size}-GPU: time taken for "
-          f"{gen_steps - scenario.ref_steps} steps: "
-          f"{end - start} s, throughput: {throughput} DS decoder layer/s")
+    print(
+        f"Rank {rank} {world_size}-GPU: time taken for "
+        f"{gen_steps - scenario.ref_steps} steps, ctx_len/ctx_len_per_gpu/tp/kvp: "
+        f"{scenario.ctx_len}/{ctx_len_per_gpu}/{scenario.tp_size}/{mapping.cp_size}: "
+        f"{end - start} s, expected TPOT: {avg_gen_time * 1000.} ms, "
+        f"throughput: {throughput} DS decoder layer/s")
     output = torch.stack(outputs, dim=0)
     kv_cache_manager.shutdown()
 
@@ -602,7 +677,8 @@ def _run_ds_layer_distributed(rank: int, world_size: int, scenario: Scenario,
 def _run_single_rank(func, *args, **kwargs):
     rank = tensorrt_llm.mpi_rank()
     print(f"rank {rank} starting")
-    torch.cuda.set_device(rank)
+    torch.cuda.set_device(tensorrt_llm.local_mpi_rank())
+    print(f"rank {rank} set device to {tensorrt_llm.local_mpi_rank()}")
     try:
         ret = func(rank, *args, **kwargs)
         print(f"rank {rank} done")
@@ -627,8 +703,22 @@ def test_mla_helix_distributed(scenario: Scenario,
 
 
 if __name__ == "__main__":
-    for scenario in all_scenarios[:11]:
-        timing_steps = 256
-        gen_steps = scenario.ref_steps + timing_steps
-        print(f"Running scenario: {scenario} and timing {timing_steps} steps")
-        test_mla_helix_distributed(scenario, gen_steps=gen_steps)
+    test_scenarios = all_scenarios[3:10]
+    timing_steps = 10
+    if MPI.COMM_WORLD is not None and MPI.COMM_WORLD.Get_size() > 1:
+        # we already have a session setup by mpirun/srun, just call _run_single_rank
+        world_sizes = [scenario.world_size for scenario in test_scenarios]
+        assert len(set(
+            world_sizes)) == 1, "all scenarios must have the same world size"
+        world_size = world_sizes[0]
+        assert world_size == MPI.COMM_WORLD.Get_size(), "world size must match"
+        for scenario in test_scenarios:
+            gen_steps = scenario.ref_steps + timing_steps
+            _run_single_rank(_run_ds_layer_distributed, world_size, scenario,
+                             gen_steps)
+    else:
+        for scenario in test_scenarios:
+            gen_steps = scenario.ref_steps + timing_steps
+            print(
+                f"Running scenario: {scenario} and timing {timing_steps} steps")
+            test_mla_helix_distributed(scenario, gen_steps=gen_steps)
