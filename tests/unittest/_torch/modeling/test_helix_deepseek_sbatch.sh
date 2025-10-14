@@ -2,6 +2,11 @@
 TP=${1:-8}
 KVP=${2:-1}
 EP=${3:-2}
+DENSE=${4:-0}
+dense_arg=""
+if (( DENSE == 1 )); then
+  dense_arg="--dense"
+fi
 world_size=$((TP * KVP))
 if (( world_size % EP != 0 )); then
   echo "World size $world_size must be a multiple of EP $EP"
@@ -82,6 +87,6 @@ srun --mpi pmix -N ${NODES} --ntasks-per-node ${gpus_per_node} \
   --container-env=MASTER_ADDR,MASTER_PORT \
   --container-name=\${CONTAINER_NAME} \
   --container-mounts=\${CONTAINER_MOUNT} \
-  python3 \${trtllm_repo}/tests/unittest/_torch/modeling/test_helix_deepseek.py --type v3 --tp ${TP} --kvp ${KVP} --ep ${EP} \
+  python3 \${trtllm_repo}/tests/unittest/_torch/modeling/test_helix_deepseek.py --type v3 --tp ${TP} --kvp ${KVP} --ep ${EP} ${dense_arg} \
     &> \${full_logdir}/benchmark.log 2>&1
 EOF
