@@ -11,10 +11,13 @@ context_servers:
   kv_cache_config:
     enable_block_reuse: False
     enable_partial_reuse: False
+  moe_config:
+    backend: DEEPGEMM
   tensor_parallel_size: 2
   pipeline_parallel_size: 1
   cache_transceiver_config:
     backend: "UCX"
+    max_tokens_in_buffer: 4096
   urls:
       - "localhost:8001"
 generation_servers:
@@ -30,5 +33,8 @@ generation_servers:
     enable_partial_reuse: False
   cache_transceiver_config:
     backend: "UCX"
+    max_tokens_in_buffer: 4096
+  moe_config:
+    backend: DEEPGEMM
   urls:
       - "localhost:8002"

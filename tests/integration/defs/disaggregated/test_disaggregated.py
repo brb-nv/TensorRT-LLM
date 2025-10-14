@@ -273,8 +273,7 @@ def run_disaggregated_test(example_dir,
                     str(server_start_timeout)
                 ]
                 if prompt_file in ["long_prompts.json", "prompt_120k.json"] or prompt_len is not None:
-                    # Use max_tokens 4 for long prompts to reduce test time
-                    client_cmd.extend(['--max-tokens', '4'])
+                    client_cmd.extend(['--max-tokens', '256'])
                 check_call(client_cmd,
                            env=env,
                            poll_procs=[workers_proc, server_proc])
@@ -1565,7 +1564,8 @@ def test_disaggregated_deepseek_r1_fp4_tllm_gen_helix(
     run_disaggregated_test(disaggregated_example_root,
                            "deepseek_r1_fp4_tllm_gen_helix",
                            env=llm_venv._new_env,
-                           cwd=llm_venv.get_working_directory())
+                           cwd=llm_venv.get_working_directory(),
+                           prompt_file="prompt_120k.json")
 
 
 @pytest.mark.skip_less_device(8)
