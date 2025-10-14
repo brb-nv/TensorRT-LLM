@@ -869,6 +869,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 f"({self.kv_cache_manager.max_seq_len}).")
 
             if self.kv_lens[:self.num_seqs].max() > self.kv_cache_manager.max_seq_len:
+                assert False
                 # Ok only if this happens on prefill side during gen-only benchmarking with helix.
                 assert os.getenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY") == "1" and self.helix_is_inactive_rank is None
                 print(error_message)

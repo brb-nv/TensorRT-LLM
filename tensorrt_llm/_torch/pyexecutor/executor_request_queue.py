@@ -600,9 +600,9 @@ class ExecutorRequestQueue:
 
     def _merge_helix_requests(self, new_requests: list[RequestQueueItem],
                               num_tokens_per_block: int):
-        # print(
-        #     "[ExecutorRequestQueue::_merge_helix_requests]: FUNCTION CALLED with len(new_requests): ",
-        #     len(new_requests))
+        print(
+            "[ExecutorRequestQueue::_merge_helix_requests]: FUNCTION CALLED with len(new_requests): ",
+            len(new_requests))
         req_with_children = []
         num_cp_ranks = self.dist.cp_size
         curr_cp_rank = self.dist.cp_rank

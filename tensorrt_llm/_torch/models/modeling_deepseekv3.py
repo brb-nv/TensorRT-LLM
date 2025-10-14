@@ -71,7 +71,7 @@ from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import (DecoderModel, EagerFusionConfig, filter_weights,
                              register_auto_model)
 
-# from ..utils import use_torch_printoptions
+from ..utils import use_torch_printoptions
 
 
 @triton.jit
@@ -1163,6 +1163,7 @@ class DeepseekV3Model(DecoderModel):
 
         if os.getenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY") == "1" and self.model_config.mapping.cp_size == 1:
             print("[DeepseekV3Model::forward] SKIPPING PREFILL FORWARD IN GEN ONLY MODE.")
+            assert False
             return inputs_embeds
 
         hidden_states = inputs_embeds
@@ -1287,33 +1288,33 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
         return_context_logits: bool = False,
         **kwargs,
     ) -> torch.Tensor:
-        # with use_torch_printoptions(sci_mode=False,
-        #                             threshold=16,
-        #                             edgeitems=2,
-        #                             linewidth=120):
-        #     print(
-        #         f"[DeepseekV3ForCausalLM::forward][rank {self.model_config.mapping.rank}] input_ids: {input_ids}"
-        #     )
-        #     print(
-        #         f"[DeepseekV3ForCausalLM::forward][rank {self.model_config.mapping.rank}] position_ids: {position_ids}"
-        #     )
-        #     print(
-        #         f"[DeepseekV3ForCausalLM::forward][rank {self.model_config.mapping.rank}] helix_is_inactive_rank: {attn_metadata.helix_is_inactive_rank}"
-        #     )
-        #     print(
-        #         f"[DeepseekV3ForCausalLM::forward][rank {self.model_config.mapping.rank}] kv_cache_params.num_cached_tokens_per_seq: {attn_metadata.kv_cache_params.num_cached_tokens_per_seq}"
-        #     )
-        #     print(
-        #         f"[DeepseekV3ForCausalLM::forward][rank {self.model_config.mapping.rank}] kv_lens_cuda: {attn_metadata.kv_lens_cuda}"
-        #     )
-        #     assert attn_metadata.kv_cache_manager.tokens_per_block == 32
-        #     block_ids_per_seq = attn_metadata.kv_cache_manager.get_batch_cache_indices(
-        #         attn_metadata.request_ids)
-        #     for request_id, block_ids in zip(attn_metadata.request_ids,
-        #                                      block_ids_per_seq):
-        #         print(
-        #             f"[DeepseekV3ForCausalLM::forward][rank {self.model_config.mapping.rank}] request_id: {request_id}, block_ids: {torch.tensor(block_ids)}"
-        #         )
+        with use_torch_printoptions(sci_mode=False,
+                                    threshold=16,
+                                    edgeitems=2,
+                                    linewidth=120):
+            print(
+                f"[DeepseekV3ForCausalLM::forward][rank {self.model_config.mapping.rank}] input_ids: {input_ids}"
+            )
+            print(
+                f"[DeepseekV3ForCausalLM::forward][rank {self.model_config.mapping.rank}] position_ids: {position_ids}"
+            )
+            print(
+                f"[DeepseekV3ForCausalLM::forward][rank {self.model_config.mapping.rank}] helix_is_inactive_rank: {attn_metadata.helix_is_inactive_rank}"
+            )
+            print(
+                f"[DeepseekV3ForCausalLM::forward][rank {self.model_config.mapping.rank}] kv_cache_params.num_cached_tokens_per_seq: {attn_metadata.kv_cache_params.num_cached_tokens_per_seq}"
+            )
+            print(
+                f"[DeepseekV3ForCausalLM::forward][rank {self.model_config.mapping.rank}] kv_lens_cuda: {attn_metadata.kv_lens_cuda}"
+            )
+            assert attn_metadata.kv_cache_manager.tokens_per_block == 32
+            block_ids_per_seq = attn_metadata.kv_cache_manager.get_batch_cache_indices(
+                attn_metadata.request_ids)
+            for request_id, block_ids in zip(attn_metadata.request_ids,
+                                             block_ids_per_seq):
+                print(
+                    f"[DeepseekV3ForCausalLM::forward][rank {self.model_config.mapping.rank}] request_id: {request_id}, block_ids: {torch.tensor(block_ids)}"
+                )
         return super().forward(attn_metadata=attn_metadata,
                                input_ids=input_ids,
                                position_ids=position_ids,
