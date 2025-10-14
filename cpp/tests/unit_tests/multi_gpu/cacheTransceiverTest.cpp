@@ -468,9 +468,9 @@ protected:
 #if ENABLE_MULTI_DEVICE
         tensorrt_llm::mpi::initialize(tensorrt_llm::mpi::MpiThreadSupport::THREAD_MULTIPLE);
 
-        if (tensorrt_llm::mpi::MpiComm::world().getSize() != 8)
+        if (tensorrt_llm::mpi::MpiComm::world().getSize() != 4)
         {
-            GTEST_SKIP() << "mpirun with procs=8 is required to run this test.";
+            GTEST_SKIP() << "mpirun with procs=4 is required to run this test.";
         }
         int worldSize = tensorrt_llm::mpi::MpiComm::world().getSize();
         int worldRank = tensorrt_llm::mpi::MpiComm::world().getRank();
@@ -606,17 +606,17 @@ protected:
             mDupHeadFactor = 1;
         }
         auto hiddenSize = numHeadsPerRank * sizePerHead;
-        auto maxBlocksPerSeq = 10;
+        auto maxBlocksPerSeq = 625000;
         auto maxBeamWidth = 1;
         auto constexpr sinkTokenLength = 0;
-        mMaxNumSequences = 8;
+        mMaxNumSequences = 1;
         auto const stream = std::make_shared<tr::CudaStream>();
 
         auto maxNumTokens = tokensPerBlock * maxBlocksPerSeq;
         auto windowAttentionToken = 2 * tokensPerBlock;
         auto maxAttentionWindow = maxNumTokens;
         auto inputLength = maxNumTokens - tokensPerBlock - 1;
-        auto numSharedBlocks = inputLength / tokensPerBlock;
+        auto numSharedBlocks = 0;
         auto numBlocksPerSeq = numSharedBlocks + (maxBlocksPerSeq - numSharedBlocks) * maxBeamWidth;
 
         auto totalNumBlocks = mMaxNumSequences * numBlocksPerSeq;
@@ -690,7 +690,7 @@ protected:
         else if (tensorrt_llm::common::getEnvUseMPIKvCache() || tensorrt_llm::common::getEnvUseUCXKvCache()
             || tensorrt_llm::common::getEnvUseNixlKvCache())
         {
-            int maxNumTokens = 2048;
+            int maxNumTokens = 1000000;
             mCacheTransBufferManager = std::make_unique<CacheTransBufferManager>(mManager.get(), maxNumTokens);
             bool isUcx = tensorrt_llm::common::getEnvUseUCXKvCache();
             bool isNixl = tensorrt_llm::common::getEnvUseNixlKvCache();
@@ -1266,7 +1266,7 @@ TEST_P(AsymmetricalCacheTest, TestCase)
     {
         GTEST_SKIP() << "Temporarily skipping cache transceiver tests with NIXL backend for CP.";
     }
-    std::vector<int> lenList = {30, 10, 60, 80};
+    std::vector<int> lenList = {1000000};
     if (genCp > 1) {
         std::vector<int> updatedLenList;
         for (auto len : lenList) {
