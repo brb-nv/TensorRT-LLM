@@ -35,7 +35,7 @@ benchmark_mode=e2e
 build_wheel=true
 cuda_architectures="100a-real"
 ctx_max_tokens=$((batch * (isl + 10)))
-gen_max_tokens=$((batch * (isl + osl + 10)))
+gen_max_tokens=$((batch * 1))
 # note: this also works for 32 tokens/block
 tokens_per_block=64
 transceiver_factor=2
