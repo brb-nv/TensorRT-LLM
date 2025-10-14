@@ -6,7 +6,7 @@ ctx_cp_size=1
 ctx_chunked_prefill=false
 gen_tp_size=1
 gen_pp_size=1
-gen_cp_size=8
+gen_cp_size=16
 
 partition=batch
 account=coreai_horizon_dilations
@@ -26,7 +26,7 @@ data_dir=/lustre/fsw/portfolios/coreai/projects/coreai_horizon_dilations/users/$
 ntasks_per_node=4 # 4 GPUs per GB200 node
 
 batch=1
-isl=2097152
+isl=4194304
 osl=1024
 concurrency=8
 multi_round=1

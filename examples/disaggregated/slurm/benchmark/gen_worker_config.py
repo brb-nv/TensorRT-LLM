@@ -52,6 +52,33 @@ def gen_config_file(work_dir: str,
         worker_start_port: Start port for workers
         server_port: Server port
     """
+    # Source: docs/source/deployment-guide/quick-start-recipe-for-deepseek-r1-on-trtllm.md
+    # Support matrix for moe_backend.
+    # | device | Checkpoint | Supported moe_backend |
+    # |----------|----------|----------|
+    # | H100/H200 | FP8 | CUTLASS |
+    # | B200/GB200 EP<=8 | NVFP4 | CUTLASS, TRTLLM |
+    # | B200/GB200 EP<=8 | FP8 | DEEPGEMM |
+    # | GB200 NVL72 EP>8 | NVFP4 |  WIDEEP |
+    # | GB200 NVL72 EP>8 | FP8 | N/A (WIP) |
+
+    ctx_moe_ep_size = ctx_cp_size * ctx_tp_size
+    assert gen_enable_attention_dp is False, "Let's keep it simple for now."
+    if 'fp4' in model_path or 'FP4' in model_path:
+        if ctx_moe_ep_size <= 8:
+            ctx_moe_backend = "TRTLLM"
+        else:
+            print(f"Only WideEP supports EP>8 for FP4 with ctx_moe_ep_size: {ctx_moe_ep_size}. But, that needs AttentionDP. So, keeping moe_ep_size = 8 and ctx_moe_backend = TRTLLM.")
+            ctx_moe_backend = "TRTLLM"
+            ctx_moe_ep_size = 8
+    elif 'fp8' in model_path or 'FP8' in model_path:
+        if ctx_moe_ep_size <= 8:
+            ctx_moe_backend = "DEEPGEMM"
+        else:
+            raise ValueError(f"No existing moe support for FP8 with ctx_moe_ep_size: {ctx_moe_ep_size}.")
+    else:
+        raise ValueError(f"Can't determine model dtype from model path: {model_path}")
+
     ctx_config = {
         'build_config': {
             'max_batch_size': ctx_batch_size,
@@ -64,7 +91,7 @@ def gen_config_file(work_dir: str,
         # @B: Enable CUDA graphs later (note: for context in helix, this is not important).
         'cuda_graph_config': None,
         'tensor_parallel_size': ctx_tp_size,
-        'moe_expert_parallel_size': ctx_tp_size,
+        'moe_expert_parallel_size': ctx_moe_ep_size,
         'enable_attention_dp': True if ctx_enable_attention_dp else False,
         'pipeline_parallel_size': ctx_pp_size,
         'context_parallel_size': ctx_cp_size,
@@ -76,8 +103,7 @@ def gen_config_file(work_dir: str,
             'dtype': 'fp8',
         },
         'moe_config': {
-            # @B: Ideally, we should update this in below logic (note: for context in helix, this is not important).
-            'backend': 'DEEPGEMM' if ctx_tp_size < 8 else 'TRTLLM',
+            'backend': ctx_moe_backend,
         },
         'cache_transceiver_config': {
             'max_tokens_in_buffer': cache_transceiver_max_num_tokens,
@@ -96,27 +122,22 @@ def gen_config_file(work_dir: str,
         gen_cuda_graph_batch_sizes.append(power)
         power *= 2
 
-    # Source: docs/source/deployment-guide/quick-start-recipe-for-deepseek-r1-on-trtllm.md
-    # Support matrix for moe_backend.
-    # | device | Checkpoint | Supported moe_backend |
-    # |----------|----------|----------|
-    # | H100/H200 | FP8 | CUTLASS |
-    # | B200/GB200 EP<=8 | NVFP4 | CUTLASS, TRTLLM |
-    # | B200/GB200 EP<=8 | FP8 | DEEPGEMM |
-    # | GB200 NVL72 EP>8 | NVFP4 |  WIDEEP |
-    # | GB200 NVL72 EP>8 | FP8 | N/A (WIP) |
-
     gen_moe_ep_size = gen_cp_size * gen_tp_size
     assert gen_enable_attention_dp is False, "Let's keep it simple for now."
     if 'fp4' in model_path or 'FP4' in model_path:
-        gen_moe_backend = "TRTLLM" if gen_moe_ep_size <= 8 else "WIDEEP"
+        if gen_moe_ep_size <= 8:
+            gen_moe_backend = "TRTLLM"
+        else:
+            print(f"Only WideEP supports EP>8 for FP4 with gen_moe_ep_size: {gen_moe_ep_size}. But, that needs AttentionDP. So, keeping moe_ep_size = 8 and gen_moe_backend = TRTLLM.")
+            gen_moe_backend = "TRTLLM"
+            gen_moe_ep_size = 8
     elif 'fp8' in model_path or 'FP8' in model_path:
         if gen_moe_ep_size <= 8:
             gen_moe_backend = "DEEPGEMM"
         else:
-            raise ValueError(f"No existing moe support for {model_dtype} with gen_moe_ep_size: {gen_moe_ep_size}.")
+            raise ValueError(f"No existing moe support for FP8 with gen_moe_ep_size: {gen_moe_ep_size}.")
     else:
-        raise ValueError(f"Unsupported model dtype: {model_dtype}")
+        raise ValueError(f"Can't determine model dtype from model path: {model_path}")
 
     gen_config = {
         'build_config': {
