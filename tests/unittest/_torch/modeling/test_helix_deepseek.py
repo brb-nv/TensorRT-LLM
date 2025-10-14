@@ -1,12 +1,12 @@
 # for now, this is only used as a benchmark and not a correctness test
 
+import argparse
 import json
 import os
 import pickle
 import shutil
 import sys
 import tempfile
-import time
 import traceback
 import weakref
 from dataclasses import dataclass
@@ -202,36 +202,58 @@ class ScenarioV3(Scenario):
     rms_norm_eps: float = 1e-6
 
 
-all_scenarios = [
-    ScenarioV3(batch=1, ctx_len=8192),
-    ScenarioV3(batch=1, ctx_len=16384),
-    ScenarioV3(batch=1, ctx_len=32768),
-    ScenarioV3(batch=1, ctx_len=65536),
-    ScenarioV3(batch=1, ctx_len=131072),
-    ScenarioV3(batch=1, ctx_len=262144),
-    ScenarioV3(batch=1, ctx_len=524288),
-    ScenarioV3(batch=1, ctx_len=1048576),
-    ScenarioV3(batch=1, ctx_len=2097152),
-    ScenarioV3(batch=1, ctx_len=4194304),
-    ScenarioV3(batch=1, ctx_len=8388608),
-    Scenario(batch=8, ctx_len=1024),
-    Scenario(batch=8, ctx_len=2048),
-    Scenario(batch=8, ctx_len=4096),
-    Scenario(batch=8, ctx_len=8192),
-    Scenario(batch=8, ctx_len=16384),
-    Scenario(batch=8, ctx_len=32768),
-    Scenario(batch=8, ctx_len=65536),
-    Scenario(batch=8, ctx_len=131072),
-    Scenario(batch=16, ctx_len=1024),
-    Scenario(batch=16, ctx_len=2048),
-    Scenario(batch=16, ctx_len=4096),
-    Scenario(batch=16, ctx_len=8192),
-    Scenario(batch=16, ctx_len=16384),
-    Scenario(batch=16, ctx_len=32768),
-    Scenario(batch=16, ctx_len=65536),
-    # this goes OOM
-    # Scenario(batch=16, ctx_len=131072),
-]
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description='Run DeepSeek V3 Helix distributed benchmarks')
+    parser.add_argument('--type',
+                        type=str,
+                        default='v3',
+                        choices=['v3', 'lite'],
+                        help='Model type: v3 or lite (default: v3)')
+    parser.add_argument('--ctx_len_start',
+                        type=int,
+                        default=2**16,
+                        help='Starting context length (default: 65536)')
+    parser.add_argument('--ctx_len_end',
+                        type=int,
+                        default=2**22,
+                        help='Ending context length (default: 4194304)')
+    parser.add_argument('--batch',
+                        type=int,
+                        default=1,
+                        help='Batch size (default: 1)')
+    parser.add_argument('--tp',
+                        type=int,
+                        default=8,
+                        help='Tensor parallelism size (default: 8)')
+    parser.add_argument('--kvp',
+                        type=int,
+                        default=1,
+                        help='KV parallelism size (default: 1)')
+    parser.add_argument('--ep',
+                        type=int,
+                        default=2,
+                        help='Expert parallelism size (default: 2)')
+    return parser.parse_args()
+
+
+def generate_scenarios(args):
+    """Generate scenarios based on command line arguments."""
+    scenarios = []
+    scenario_class = ScenarioV3 if args.type == 'v3' else Scenario
+
+    # Generate scenarios by doubling ctx_len from start to end
+    ctx_len = args.ctx_len_start
+    while ctx_len <= args.ctx_len_end:
+        scenarios.append(
+            scenario_class(batch=args.batch,
+                           ctx_len=ctx_len,
+                           tp_size=args.tp,
+                           kvp_size=args.kvp,
+                           ep_size=args.ep))
+        ctx_len *= 2
+
+    return scenarios
 
 
 def _setup_kv(scenario: Scenario, mapping: Mapping, gen_steps: int):
@@ -620,13 +642,13 @@ def _run_ds_layer_distributed(rank: int, world_size: int, scenario: Scenario,
     ctx_len_per_gpu = scenario.ctx_len // mapping_with_cp.cp_size
 
     outputs = []
-    start = time.time()
 
     # CUDA graph setup for timing
     use_cuda_graph = gen_steps > scenario.ref_steps
     graph = None
     graph_output = None
-    start = time.time()
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
 
     for step in range(gen_steps):
         for req_id in range(scenario.batch):
@@ -706,7 +728,7 @@ def _run_ds_layer_distributed(rank: int, world_size: int, scenario: Scenario,
                             )
             result = graph_output
         elif step == scenario.ref_steps:
-            start = time.time()
+            start_event.record()
 
         graph.replay()
         result = graph_output
@@ -719,19 +741,22 @@ def _run_ds_layer_distributed(rank: int, world_size: int, scenario: Scenario,
             outputs.append(result)
 
     # synchronize to ensure all graphs are done
+    end_event.record()
     torch.cuda.synchronize()
 
-    end = time.time()
     if gen_steps == scenario.ref_steps:
+        time_ms = 0.
         avg_gen_time = float('inf')
     else:
-        avg_gen_time = (end - start) / (gen_steps - scenario.ref_steps)
-    throughput = scenario.batch / avg_gen_time
+        time_ms = end_event.elapsed_time(start_event)
+        avg_gen_time = time_ms / (gen_steps - scenario.ref_steps)
+    throughput = 1000. * scenario.batch / avg_gen_time
+    layer_str = "dense" if scenario.first_k_dense_replace > 0 else "moe"
     print(
         f"Rank {rank} {world_size}-GPU: time taken for "
-        f"{gen_steps - scenario.ref_steps} steps, ctx_len/ctx_len_per_gpu/tp/kvp: "
-        f"{scenario.ctx_len}/{ctx_len_per_gpu}/{scenario.tp_size}/{mapping_with_cp.cp_size}: "
-        f"{end - start} s, expected TPOT: {avg_gen_time * 1000.} ms, "
+        f"{gen_steps - scenario.ref_steps} steps of {layer_str}, ctx_len/ctx_len_per_gpu/tp/kvp/ep: "
+        f"{scenario.ctx_len}/{ctx_len_per_gpu}/{scenario.tp_size}/{mapping_with_cp.cp_size}/{scenario.ep_size}: "
+        f"{time_ms} ms, expected TPOT: {avg_gen_time} ms, "
         f"throughput: {throughput} DS decoder layer/s")
     output = torch.stack(outputs, dim=0)
     kv_cache_manager.shutdown()
@@ -770,7 +795,8 @@ def test_mla_helix_distributed(scenario: Scenario,
 
 
 if __name__ == "__main__":
-    test_scenarios = all_scenarios[3:10]
+    args = parse_args()
+    test_scenarios = generate_scenarios(args)
     timing_steps = 10
     world_sizes = [scenario.world_size for scenario in test_scenarios]
     assert len(

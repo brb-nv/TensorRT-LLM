@@ -1,6 +1,14 @@
 #!/bin/bash
-NODES=${1:-4}
+TP=${1:-8}
+KVP=${2:-1}
+EP=${3:-2}
+world_size=$((TP * KVP))
+if (( world_size % EP != 0 )); then
+  echo "World size $world_size must be a multiple of EP $EP"
+  exit 1
+fi
 gpus_per_node=4
+NODES=$(((world_size + gpus_per_node - 1) / gpus_per_node))
 gpus=$((NODES * gpus_per_node))
 sbatch <<EOF
 #!/bin/bash
@@ -43,15 +51,15 @@ if [ -d "\${trtllm_repo}" ]; then
     TRT_LLM_GIT_COMMIT=\$(git -C \${trtllm_repo} rev-parse --short HEAD 2>/dev/null || echo "unknown")
     echo "TRT_LLM_GIT_COMMIT: \${TRT_LLM_GIT_COMMIT}"
 
-    echo "Building TensorRT-LLM wheel on one node..."
-    build_command="python3 \${trtllm_repo}/scripts/build_wheel.py --trt_root /usr/local/tensorrt --benchmarks --use_ccache --cuda_architectures \"\${cuda_architectures}\""
-    if ! srun --container-name=\${CONTAINER_NAME} \
-        --container-mounts=\${CONTAINER_MOUNT} \
-        --mpi=pmix --overlap -N 1 --ntasks-per-node=1 \
-        bash -c "cd \${trtllm_repo} && \${build_command}" \
-        &> \${full_logdir}/build.log; then
-        cleanup_on_failure "TensorRT-LLM build failed. Check \${full_logdir}/build.log for details"
-    fi
+    #echo "Building TensorRT-LLM wheel on one node..."
+    #build_command="python3 \${trtllm_repo}/scripts/build_wheel.py --trt_root /usr/local/tensorrt --benchmarks --use_ccache --cuda_architectures \"\${cuda_architectures}\""
+    #if ! srun --container-name=\${CONTAINER_NAME} \
+    #    --container-mounts=\${CONTAINER_MOUNT} \
+    #    --mpi=pmix --overlap -N 1 --ntasks-per-node=1 \
+    #    bash -c "cd \${trtllm_repo} && \${build_command}" \
+    #    &> \${full_logdir}/build.log; then
+    #    cleanup_on_failure "TensorRT-LLM build failed. Check \${full_logdir}/build.log for details"
+    #fi
 
     echo "Installing TensorRT-LLM..."
     if ! srun --container-name=\${CONTAINER_NAME} \
@@ -74,6 +82,6 @@ srun --mpi pmix -N ${NODES} --ntasks-per-node ${gpus_per_node} \
   --container-env=MASTER_ADDR,MASTER_PORT \
   --container-name=\${CONTAINER_NAME} \
   --container-mounts=\${CONTAINER_MOUNT} \
-  python3 \${trtllm_repo}/tests/unittest/_torch/modeling/test_helix_deepseek.py \
+  python3 \${trtllm_repo}/tests/unittest/_torch/modeling/test_helix_deepseek.py --type v3 --tp ${TP} --kvp ${KVP} --ep ${EP} \
     &> \${full_logdir}/benchmark.log 2>&1
 EOF
