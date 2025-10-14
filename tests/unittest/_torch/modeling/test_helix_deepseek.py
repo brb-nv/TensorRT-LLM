@@ -234,6 +234,9 @@ def parse_args():
                         type=int,
                         default=2,
                         help='Expert parallelism size (default: 2)')
+    parser.add_argument('--dense',
+                        action='store_true',
+                        help='Use dense layer instead of MoE layer')
     return parser.parse_args()
 
 
@@ -241,6 +244,7 @@ def generate_scenarios(args):
     """Generate scenarios based on command line arguments."""
     scenarios = []
     scenario_class = ScenarioV3 if args.type == 'v3' else Scenario
+    first_k_dense_replace = 1 if args.dense else 0
 
     # Generate scenarios by doubling ctx_len from start to end
     ctx_len = args.ctx_len_start
@@ -250,7 +254,8 @@ def generate_scenarios(args):
                            ctx_len=ctx_len,
                            tp_size=args.tp,
                            kvp_size=args.kvp,
-                           ep_size=args.ep))
+                           ep_size=args.ep,
+                           first_k_dense_replace=first_k_dense_replace))
         ctx_len *= 2
 
     return scenarios
