@@ -270,7 +270,8 @@ class TrtllmAttentionWrapper:
         self.helix_position_offsets = helix_position_offsets
         self.helix_is_inactive_rank = helix_is_inactive_rank
         if self.helix_is_inactive_rank is not None:
-            self.helix_is_inactive_rank = torch.tensor(self.helix_is_inactive_rank, dtype=torch.bool, pin_memory=True)
+            self.helix_is_inactive_rank = torch.tensor(
+                self.helix_is_inactive_rank, dtype=torch.bool, pin_memory=True)
 
         if max_sequence_length > self.rope_params.max_positions:
             self.rope_params.max_positions = max_sequence_length
@@ -814,7 +815,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         if self.enable_flash_mla:
             self.prepare_flash_mla()
         # number of tokens needed in the kv cache for each sequence after the next pass
-        if self.helix_is_inactive_rank is not None and len(self.helix_is_inactive_rank):
+        if self.helix_is_inactive_rank is not None and len(
+                self.helix_is_inactive_rank):
             # If helix is inactive, attend to the previously cached tokens only.
             # This gets further complicated with multiple requests as each request might
             # have a different active helix rank.
@@ -868,10 +870,12 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 f"exceeds the KV cache manager's maximum supported length "
                 f"({self.kv_cache_manager.max_seq_len}).")
 
-            if self.kv_lens[:self.num_seqs].max() > self.kv_cache_manager.max_seq_len:
-                # Ok only if this happens on prefill side during gen-only benchmarking with helix.
-                assert os.getenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY") == "1" and self.helix_is_inactive_rank is None
-                print(error_message)
+            assert self.kv_lens[:self.num_seqs].max(
+            ) <= self.kv_cache_manager.max_seq_len, error_message
+            # if self.kv_lens[:self.num_seqs].max() > self.kv_cache_manager.max_seq_len:
+            #     # Ok only if this happens on prefill side during gen-only benchmarking with helix.
+            #     assert os.getenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY") == "1" and self.helix_is_inactive_rank is None
+            #     print(error_message)
 
         self.kv_lens_cuda_runtime = self.kv_lens_cuda[:self.num_seqs]
         self.kv_lens_runtime = self.kv_lens[:self.num_seqs]

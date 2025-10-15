@@ -25,6 +25,8 @@ sbatch <<EOF
 #SBATCH --comment=fact_off
 #SBATCH --gres=gpu:${gpus_per_node}
 #SBATCH --segment=${NODES}
+#SBATCH --ntasks=${gpus}
+#SBATCH --ntasks-per-node=${gpus_per_node}
 
 cleanup_on_failure() {
     echo "Error: \$1"

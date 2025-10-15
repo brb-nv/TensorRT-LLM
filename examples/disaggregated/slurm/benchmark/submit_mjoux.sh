@@ -88,5 +88,5 @@ sbatch --nodes=${total_node_num} \
     --account=${account} \
     --job-name=${job_name} \
     --gres=gpu:${ntasks_per_node} \
-    --segment=${total_node_num} \
+    --segment=${gen_nodes_num} \
     ${workdir}/disaggr_torch.slurm "${args[@]}"
