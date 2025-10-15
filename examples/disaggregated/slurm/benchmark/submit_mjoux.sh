@@ -4,13 +4,14 @@ ctx_tp_size=8
 ctx_pp_size=1
 ctx_cp_size=1
 ctx_chunked_prefill=false
-gen_tp_size=1
+gen_tp_size=8
 gen_pp_size=1
-gen_cp_size=16
+gen_cp_size=1
+gen_ep_size=2
 
 partition=batch
 account=coreai_horizon_dilations
-job_name=coreai_horizon_dilations-helix_benchmark_test_ctxtp${ctx_tp_size}cp${ctx_cp_size}$(if [ "${ctx_chunked_prefill}" = "true" ]; then echo "chunked"; fi)_gentp${gen_tp_size}cp${gen_cp_size}
+job_name=coreai_horizon_dilations-helix_benchmark_test_ctxtp${ctx_tp_size}cp${ctx_cp_size}$(if [ "${ctx_chunked_prefill}" = "true" ]; then echo "chunked"; fi)_gentp${gen_tp_size}cp${gen_cp_size}ep${gen_ep_size}
 container_image=/lustre/fsw/portfolios/coreai/projects/coreai_horizon_dilations/users/mjoux/containers/tllm_pyt2508_py3_aarch64_trt10.13.2.6_202509112230_7568.sqsh
 # e.g. /mnt/data:/mnt/data
 mounts=/lustre/fsw/portfolios/coreai/projects/coreai_horizon_dilations:/lustre/fsw/portfolios/coreai/projects/coreai_horizon_dilations
@@ -26,13 +27,13 @@ data_dir=/lustre/fsw/portfolios/coreai/projects/coreai_horizon_dilations/users/$
 ntasks_per_node=4 # 4 GPUs per GB200 node
 
 batch=1
-isl=4194304
+isl=65536
 osl=1024
 concurrency=8
 multi_round=1
 streaming=true
-benchmark_mode=e2e
-build_wheel=true
+benchmark_mode=gen_only
+build_wheel=false
 cuda_architectures="100a-real"
 ctx_max_tokens=$((batch * (isl + 10)))
 gen_max_tokens=$((batch * (1 + 10)))
@@ -47,11 +48,13 @@ ntasks=$((total_node_num * ntasks_per_node))
 
 export TRTLLM_DISAGG_BENCHMARK_GEN_ONLY=1
 
+echo "Calling sbatch with TP $gen_tp_size, CP $gen_cp_size, EP $gen_ep_size, ISL $isl"
+
 args=(
     # Context - [num_instances, tp_size, pp_size, cp_size, batch_size, max_num_tokens, enable_attention_dp, gpu_memory_fraction]
-    1 $ctx_tp_size $ctx_pp_size $ctx_cp_size $batch $ctx_max_tokens false "0.1"
+    1 $ctx_tp_size $ctx_pp_size $ctx_cp_size $batch $ctx_max_tokens false "0.2"
     # Generation - [num_instances, tp_size, pp_size, cp_size, batch_size, max_num_tokens, enable_attention_dp, gpu_memory_fraction]
-    1 $gen_tp_size $gen_pp_size $gen_cp_size $batch $gen_max_tokens false "0.1"
+    1 $gen_tp_size $gen_pp_size $gen_cp_size $batch $gen_max_tokens false "0.2"
     # Other arguments - [eplb_num_slots, mtp_size]
     0 0
     # Benchmarking arguments
@@ -71,6 +74,7 @@ args=(
     $cuda_architectures
     $data_dir
     $cache_transceiver_max_num_tokens
+    $gen_ep_size
 )
 
 # This command starts a job with 8 nodes, 32 GPUs in total.
