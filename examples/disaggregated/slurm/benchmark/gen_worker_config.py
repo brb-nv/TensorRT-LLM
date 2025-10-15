@@ -16,6 +16,7 @@ def gen_config_file(work_dir: str,
                     gen_tp_size: int,
                     gen_pp_size: int,
                     gen_cp_size: int,
+                    gen_moe_ep_size: int,
                     gen_batch_size: int,
                     gen_max_num_tokens: int,
                     gen_max_seq_len: int,
@@ -68,16 +69,21 @@ def gen_config_file(work_dir: str,
         if ctx_moe_ep_size <= 8:
             ctx_moe_backend = "TRTLLM"
         else:
-            print(f"Only WideEP supports EP>8 for FP4 with ctx_moe_ep_size: {ctx_moe_ep_size}. But, that needs AttentionDP. So, keeping moe_ep_size = 8 and ctx_moe_backend = TRTLLM.")
+            print(
+                f"Only WideEP supports EP>8 for FP4 with ctx_moe_ep_size: {ctx_moe_ep_size}. But, that needs AttentionDP. So, keeping moe_ep_size = 8 and ctx_moe_backend = TRTLLM."
+            )
             ctx_moe_backend = "TRTLLM"
             ctx_moe_ep_size = 8
     elif 'fp8' in model_path or 'FP8' in model_path:
         if ctx_moe_ep_size <= 8:
             ctx_moe_backend = "DEEPGEMM"
         else:
-            raise ValueError(f"No existing moe support for FP8 with ctx_moe_ep_size: {ctx_moe_ep_size}.")
+            raise ValueError(
+                f"No existing moe support for FP8 with ctx_moe_ep_size: {ctx_moe_ep_size}."
+            )
     else:
-        raise ValueError(f"Can't determine model dtype from model path: {model_path}")
+        raise ValueError(
+            f"Can't determine model dtype from model path: {model_path}")
 
     ctx_config = {
         'build_config': {
@@ -115,30 +121,6 @@ def gen_config_file(work_dir: str,
     assert gen_batch_size > 0 and (gen_batch_size & (gen_batch_size - 1)) == 0, \
         f"gen_batch_size ({gen_batch_size}) must be a power of 2."
 
-    # Generate list of powers of 2 up to gen_batch_size.
-    gen_cuda_graph_batch_sizes = []
-    power = 1
-    while power <= gen_batch_size:
-        gen_cuda_graph_batch_sizes.append(power)
-        power *= 2
-
-    gen_moe_ep_size = gen_cp_size * gen_tp_size
-    assert gen_enable_attention_dp is False, "Let's keep it simple for now."
-    if 'fp4' in model_path or 'FP4' in model_path:
-        if gen_moe_ep_size <= 8:
-            gen_moe_backend = "TRTLLM"
-        else:
-            print(f"Only WideEP supports EP>8 for FP4 with gen_moe_ep_size: {gen_moe_ep_size}. But, that needs AttentionDP. So, keeping moe_ep_size = 8 and gen_moe_backend = TRTLLM.")
-            gen_moe_backend = "TRTLLM"
-            gen_moe_ep_size = 8
-    elif 'fp8' in model_path or 'FP8' in model_path:
-        if gen_moe_ep_size <= 8:
-            gen_moe_backend = "DEEPGEMM"
-        else:
-            raise ValueError(f"No existing moe support for FP8 with gen_moe_ep_size: {gen_moe_ep_size}.")
-    else:
-        raise ValueError(f"Can't determine model dtype from model path: {model_path}")
-
     gen_config = {
         'build_config': {
             'max_batch_size': gen_batch_size,
@@ -153,11 +135,7 @@ def gen_config_file(work_dir: str,
         'max_batch_size': gen_batch_size,
         'max_num_tokens': gen_max_num_tokens,
         'max_seq_len': gen_max_seq_len,
-        'cuda_graph_config': {
-            'enable_padding': True,
-            'batch_sizes': gen_cuda_graph_batch_sizes,
-            'max_batch_size': gen_batch_size,
-        },
+        'cuda_graph_config': {},
         'print_iter_log': True,
         'kv_cache_config': {
             'enable_block_reuse': False,
@@ -165,7 +143,7 @@ def gen_config_file(work_dir: str,
             'dtype': 'fp8',
         },
         'moe_config': {
-            'backend': gen_moe_backend,
+            'backend': 'TRTLLM',
         },
         'cache_transceiver_config': {
             'max_tokens_in_buffer': 1024,   # Setting this to low value for gen-only benchmark.
@@ -264,6 +242,10 @@ if __name__ == "__main__":
                         type=int,
                         default=1,
                         help="Context parallel size for generation servers")
+    parser.add_argument("--gen_moe_ep_size",
+                        type=int,
+                        default=1,
+                        help="MOE expert parallel size for generation servers")
     parser.add_argument("--gen_batch_size",
                         type=int,
                         default=256,
@@ -296,20 +278,15 @@ if __name__ == "__main__":
                         type=int,
                         default=8448,
                         help="Max number of tokens for cache transceiver")
-    parser.add_argument("--model_path",
-                        type=str,
-                        default="",
-                        help="Model path")
-
+    parser.add_argument("--model_path", type=str, default="", help="Model path")
     args = parser.parse_args()
 
-    gen_config_file(args.work_dir, args.ctx_tp_size, args.ctx_pp_size,
-                    args.ctx_cp_size, args.ctx_batch_size,
-                    args.ctx_max_num_tokens, args.ctx_max_seq_len,
-                    args.ctx_free_gpu_memory_fraction,
-                    args.ctx_enable_attention_dp, args.gen_tp_size,
-                    args.gen_pp_size, args.gen_cp_size, args.gen_batch_size,
-                    args.gen_max_num_tokens, args.gen_max_seq_len,
-                    args.gen_enable_attention_dp, args.gen_gpu_memory_fraction,
-                    args.eplb_num_slots, args.mtp_size,
-                    args.cache_transceiver_max_num_tokens, args.model_path)
+    gen_config_file(
+        args.work_dir, args.ctx_tp_size, args.ctx_pp_size, args.ctx_cp_size,
+        args.ctx_batch_size, args.ctx_max_num_tokens, args.ctx_max_seq_len,
+        args.ctx_free_gpu_memory_fraction, args.ctx_enable_attention_dp,
+        args.gen_tp_size, args.gen_pp_size, args.gen_cp_size,
+        args.gen_moe_ep_size, args.gen_batch_size, args.gen_max_num_tokens,
+        args.gen_max_seq_len, args.gen_enable_attention_dp,
+        args.gen_gpu_memory_fraction, args.eplb_num_slots, args.mtp_size,
+        args.cache_transceiver_max_num_tokens, args.model_path)

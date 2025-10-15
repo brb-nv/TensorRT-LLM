@@ -78,3 +78,6 @@ compile_commands.json
 
 # Enroot sqsh files
 enroot/tensorrt_llm.devel.sqsh
+
+# SLURM files for disaggregated benchmark
+examples/disaggregated/slurm/benchmark/slurm*

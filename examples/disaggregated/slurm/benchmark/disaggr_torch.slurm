@@ -60,6 +60,7 @@ build_wheel=${30:-"true"}
 cuda_architectures=${31:-"100a-real"}
 data_dir=${32:-"/tmp"}
 cache_transceiver_max_num_tokens=${33:-8448}
+gen_moe_ep_size=${34:-1}
 
 # Get GPUs per node dynamically from SLURM
 ntasks_per_node=${SLURM_NTASKS_PER_NODE:-4}  # Default to 4 for GB200
@@ -99,6 +100,7 @@ echo "build_wheel: ${build_wheel}"
 echo "cuda_architectures: ${cuda_architectures}"
 echo "data_dir: ${data_dir}"
 echo "cache_transceiver_max_num_tokens: ${cache_transceiver_max_num_tokens}"
+echo "gen_moe_ep_size: ${gen_moe_ep_size}"
 echo "==========================================="
 
 
@@ -197,6 +199,7 @@ srun -l -N 1 -n 1 \
                 --gen_tp_size ${gen_tp_size} \
                 --gen_pp_size ${gen_pp_size} \
                 --gen_cp_size ${gen_cp_size} \
+                --gen_moe_ep_size ${gen_moe_ep_size} \
                 --gen_batch_size ${gen_batch_size} \
                 --gen_max_num_tokens ${gen_max_num_tokens} \
                 --gen_max_seq_len ${gen_max_seq_len} \
