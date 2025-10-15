@@ -117,6 +117,7 @@ mkdir -p ${logdir}
 full_logdir=${logdir}/ctx${num_ctx_servers}_gen${num_gen_servers}_dep${gen_tp_size}_batch${gen_batch_size}_eplb${eplb_num_slots}_mtp${mtp_size}
 
 echo "concurrency: ${concurrency}"
+echo "TRTLLM_DISAGG_BENCHMARK_GEN_ONLY: ${TRTLLM_DISAGG_BENCHMARK_GEN_ONLY:-0}"
 
 ctx_gpus=$((num_ctx_servers * ctx_tp_size * ctx_pp_size * ctx_cp_size))
 gen_gpus=$((num_gen_servers * gen_tp_size * gen_pp_size * gen_cp_size))
@@ -246,19 +247,23 @@ for i in $(seq 0 $((num_gen_servers - 1))); do
         &> ${full_logdir}/output_gen_${i}.log &
 done
 
-# start the ctx workers
-num_ctx_tasks=$((ctx_tp_size * ctx_pp_size * ctx_cp_size))
-for i in $(seq 0 $((num_ctx_servers - 1))); do
-    srun -l -N ${ctx_nodes_num} \
-        --ntasks=${num_ctx_tasks} \
-        --ntasks-per-node=${ntasks_per_node} \
-        --container-image=${container_image} \
-        --container-name=${container_name} \
-        --container-mounts=${mounts} \
-        --mpi=pmix \
-        bash ${workdir}/start_worker.sh "CTX" ${i} ${model_dir} "8336" ${benchmark_mode} ${concurrency} ${enable_pdl} ${numa_bind} ${full_logdir} ${nsys_on} \
-            &> ${full_logdir}/output_ctx_${i}.log &
-done
+# start the ctx workers (skip if TRTLLM_DISAGG_BENCHMARK_GEN_ONLY is set)
+if [ "${TRTLLM_DISAGG_BENCHMARK_GEN_ONLY:-0}" != "1" ]; then
+    num_ctx_tasks=$((ctx_tp_size * ctx_pp_size * ctx_cp_size))
+    for i in $(seq 0 $((num_ctx_servers - 1))); do
+        srun -l -N ${ctx_nodes_num} \
+            --ntasks=${num_ctx_tasks} \
+            --ntasks-per-node=${ntasks_per_node} \
+            --container-image=${container_image} \
+            --container-name=${container_name} \
+            --container-mounts=${mounts} \
+            --mpi=pmix \
+            bash ${workdir}/start_worker.sh "CTX" ${i} ${model_dir} "8336" ${benchmark_mode} ${concurrency} ${enable_pdl} ${numa_bind} ${full_logdir} ${nsys_on} \
+                &> ${full_logdir}/output_ctx_${i}.log &
+    done
+else
+    echo "Skipping context workers startup (TRTLLM_DISAGG_BENCHMARK_GEN_ONLY is set)"
+fi
 
 # start the server
 srun -l --container-name=${container_name} \
