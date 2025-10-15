@@ -162,7 +162,7 @@ class Scenario:
     bias: bool = False
     num_hidden_layers: int = 1
     # test setup parameters
-    kv_cache_tokens_per_block: int = 64
+    kv_cache_tokens_per_block: int = 32
     # TODO only 1 is supported for now here
     predicted_tokens_per_seq: int = 1
     batch: int = 8
@@ -753,7 +753,7 @@ def _run_ds_layer_distributed(rank: int, world_size: int, scenario: Scenario,
         time_ms = 0.
         avg_gen_time = float('inf')
     else:
-        time_ms = end_event.elapsed_time(start_event)
+        time_ms = start_event.elapsed_time(end_event)
         avg_gen_time = time_ms / (gen_steps - scenario.ref_steps)
     throughput = 1000. * scenario.batch / avg_gen_time
     layer_str = "dense" if scenario.first_k_dense_replace > 0 else "moe"

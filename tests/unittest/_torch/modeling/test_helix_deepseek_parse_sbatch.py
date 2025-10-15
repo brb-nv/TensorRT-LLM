@@ -16,6 +16,8 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
+JOB_ID_SPEC_SEQ = re.compile(r'(\d+)\.\.(\d+)')
+
 
 def parse_benchmark_log(log_file):
     """
@@ -31,7 +33,7 @@ def parse_benchmark_log(log_file):
                          r'time taken for 10 steps of\s+(dense|moe),\s+'
                          r'ctx_len/ctx_len_per_gpu/tp/kvp/ep:\s+'
                          r'(\d+)/(\d+)/(\d+)/(\d+)/(\d+):\s+'
-                         r'([\d.]+)\s+s,\s+expected TPOT:\s+([\d.]+)\s+ms')
+                         r'([\d.]+)\s+ms,\s+expected TPOT:\s+([\d.]+)\s+ms')
 
     data = defaultdict(lambda: {'ranks': {}, 'total_gpus': None})
 
@@ -127,11 +129,30 @@ def main():
     """Main function to process benchmark logs from multiple folders."""
     if len(sys.argv) < 2:
         print(
-            "Usage: python parse_benchmark_logs.py <folder1> [folder2] [folder3] ...",
+            "Usage: python parse_benchmark_logs.py <job_id_spec|list of folders>",
             file=sys.stderr)
         sys.exit(1)
 
-    folders = sys.argv[1:]
+    job_id_spec = sys.argv[1]
+    if JOB_ID_SPEC_SEQ.match(job_id_spec):
+        job_id_start, job_id_end = map(int, job_id_spec.split('..'))
+        job_ids = list(range(job_id_start, job_id_end + 1))
+        folders = [Path(f"slurm-{job_id}") for job_id in job_ids]
+    else:
+        job_ids = job_id_spec.split(',')
+        try:
+            job_ids = list(map(int, job_ids))
+            folders = [Path(f"slurm-{job_id}") for job_id in job_ids]
+        except ValueError:
+            folders = [Path(folder) for folder in sys.argv[1:]]
+
+    folders = [folder for folder in folders if folder.is_dir()]
+    if len(folders) == 0:
+        print(
+            "No folders found. Usage: python parse_benchmark_logs.py <job_id_spec|list of folders>",
+            file=sys.stderr)
+        sys.exit(1)
+
     all_results = []
 
     for folder in folders:
