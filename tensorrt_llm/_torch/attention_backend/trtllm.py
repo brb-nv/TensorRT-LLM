@@ -868,10 +868,12 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 f"exceeds the KV cache manager's maximum supported length "
                 f"({self.kv_cache_manager.max_seq_len}).")
 
-            if self.kv_lens[:self.num_seqs].max() > self.kv_cache_manager.max_seq_len:
-                # Ok only if this happens on prefill side during gen-only benchmarking with helix.
-                assert os.getenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY") == "1" and self.helix_is_inactive_rank is None
-                print(error_message)
+            assert self.kv_lens[:self.num_seqs].max(
+            ) <= self.kv_cache_manager.max_seq_len, error_message
+            # if self.kv_lens[:self.num_seqs].max() > self.kv_cache_manager.max_seq_len:
+            #     # Ok only if this happens on prefill side during gen-only benchmarking with helix.
+            #     assert os.getenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY") == "1" and self.helix_is_inactive_rank is None
+            #     print(error_message)
 
         self.kv_lens_cuda_runtime = self.kv_lens_cuda[:self.num_seqs]
         self.kv_lens_runtime = self.kv_lens[:self.num_seqs]

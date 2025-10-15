@@ -980,6 +980,7 @@ class KVCacheManager(BaseResourceManager):
                 sink_token_len=sink_token_length,
                 max_seq_len=max_seq_len)
             if window_size > upper_bound:
+                assert False, f"Attention window size {window_size} exceeds upper bound {upper_bound} for available blocks. This is not ok."
                 logger.warning(
                     f"Attention window size {window_size} exceeds upper bound {upper_bound} "
                     f"for available blocks. Reducing to {upper_bound}.")
