@@ -24,6 +24,7 @@ sbatch <<EOF
 #SBATCH --job-name="coreai_horizon_dilations-trtllm-helix-test-layer"
 #SBATCH --comment=fact_off
 #SBATCH --gres=gpu:${gpus_per_node}
+#SBATCH --segment=${NODES}
 
 cleanup_on_failure() {
     echo "Error: \$1"
