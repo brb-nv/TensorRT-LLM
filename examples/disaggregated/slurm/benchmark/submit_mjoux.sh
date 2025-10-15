@@ -43,7 +43,7 @@ cache_transceiver_max_num_tokens=$((tokens_per_block * transceiver_blocks + 512)
 
 ctx_nodes_num=$(((ctx_tp_size * ctx_pp_size * ctx_cp_size + ntasks_per_node - 1) / ntasks_per_node))
 gen_nodes_num=$(((gen_tp_size * gen_pp_size * gen_cp_size + ntasks_per_node - 1) / ntasks_per_node))
-total_node_num=$((ctx_nodes_num + gen_nodes_num))
+total_node_num=$((gen_nodes_num))       # gen-only mode.
 ntasks=$((total_node_num * ntasks_per_node))
 
 export TRTLLM_DISAGG_BENCHMARK_GEN_ONLY=1
