@@ -12,7 +12,7 @@ gen_ep_size=2
 partition=batch
 account=coreai_horizon_dilations
 job_name=coreai_horizon_dilations-helix_benchmark_test_ctxtp${ctx_tp_size}cp${ctx_cp_size}$(if [ "${ctx_chunked_prefill}" = "true" ]; then echo "chunked"; fi)_gentp${gen_tp_size}cp${gen_cp_size}ep${gen_ep_size}
-container_image=/lustre/fsw/portfolios/coreai/projects/coreai_horizon_dilations/users/mjoux/containers/tllm_pyt2508_py3_aarch64_trt10.13.2.6_202509112230_7568_build7e31a9b56d10e83fe1e654dbccc10e7e5bbad0f0.sqsh
+container_image=/lustre/fsw/portfolios/coreai/projects/coreai_horizon_dilations/users/mjoux/containers/tllm_pyt2508_py3_aarch64_trt10.13.2.6_202509112230_7568_build0da081f562d3703fec3ea8fcc6ad785817c4c8be.sqsh
 # e.g. /mnt/data:/mnt/data
 mounts=/lustre/fsw/portfolios/coreai/projects/coreai_horizon_dilations:/lustre/fsw/portfolios/coreai/projects/coreai_horizon_dilations
 # Path to disaggr_torch.slurm
@@ -33,7 +33,7 @@ osl=1024
 concurrency=8
 multi_round=1
 streaming=true
-benchmark_mode=gen_only
+benchmark_mode=e2e
 build_wheel=false
 cuda_architectures="100a-real"
 ctx_max_tokens=$((batch * (isl + 10)))
@@ -44,6 +44,7 @@ cache_transceiver_max_num_tokens=$((tokens_per_block * transceiver_blocks + 512)
 
 ctx_nodes_num=$(((ctx_tp_size * ctx_pp_size * ctx_cp_size + ntasks_per_node - 1) / ntasks_per_node))
 gen_nodes_num=$(((gen_tp_size * gen_pp_size * gen_cp_size + ntasks_per_node - 1) / ntasks_per_node))
+ctx_nodes_num=$((((ctx_nodes_num + gen_nodes_num - 1) / gen_nodes_num) * gen_nodes_num))
 total_node_num=$((ctx_nodes_num + gen_nodes_num))
 ntasks=$((total_node_num * ntasks_per_node))
 

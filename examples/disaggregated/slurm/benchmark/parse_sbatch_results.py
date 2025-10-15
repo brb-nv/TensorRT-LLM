@@ -22,6 +22,7 @@ TPOT_MEDIAN_LINE = re.compile(r"Median TPOT \(ms\):\s+(\d+\.\d+)")
 TP_YAML = re.compile(r"tensor_parallel_size: (\d+)")
 EP_YAML = re.compile(r"moe_expert_parallel_size: (\d+)")
 CP_YAML = re.compile(r"context_parallel_size: (\d+)")
+PP_YAML = re.compile(r"pipeline_parallel_size: (\d+)")
 
 
 def parse_benchmark_log(log_file):
@@ -58,69 +59,6 @@ def parse_benchmark_log(log_file):
     tpot_median = float(median_match.group(1))
 
     return tpot_mean, tpot_median
-
-
-def calculate_stats(data):
-    """
-    Calculate medians for configurations with complete rank sets.
-
-    Args:
-        data: Dictionary mapping configuration keys to rank data.
-
-    Returns:
-        list: List of dictionaries containing configuration and median time.
-    """
-    results = []
-
-    for config_key, config_data in data.items():
-        type_name, ctx_len, ctx_len_per_gpu, tp, kvp, ep = config_key
-        ranks = config_data['ranks']
-        total_gpus = config_data['total_gpus']
-
-        if total_gpus is None:
-            print(f"Warning: Missing total_gpus for config {config_key}",
-                  file=sys.stderr)
-            continue
-        if total_gpus <= 0:
-            print(
-                f"Warning: Total GPUs {total_gpus} for config {config_key} is invalid",
-                file=sys.stderr)
-            continue
-
-        # Check if all ranks from 0 to total_gpus-1 are present
-        expected_ranks = set(range(total_gpus))
-        actual_ranks = set(ranks.keys())
-
-        if expected_ranks == actual_ranks:
-            # All ranks present, calculate median
-            times = sorted(ranks[r][1] for r in sorted(ranks.keys()))
-            print(
-                f"All ranks present for config {config_key}: times {' '.join(f'{t:.2f}' for t in times)}"
-            )
-            min_time = times[0]
-            if len(times) % 2 == 0:
-                median_time = (times[len(times) // 2] +
-                               times[len(times) // 2 - 1]) / 2.
-            else:
-                median_time = times[len(times) // 2]
-
-            results.append({
-                'type': type_name,
-                'ctx_len': ctx_len,
-                'ctx_len_per_gpu': ctx_len_per_gpu,
-                'tp': tp,
-                'kvp': kvp,
-                'ep': ep,
-                'median_time_ms': median_time,
-                'min_time_ms': min_time
-            })
-        else:
-            missing_ranks = expected_ranks - actual_ranks
-            print(
-                f"Warning: Missing ranks {missing_ranks} for config {config_key}",
-                file=sys.stderr)
-
-    return results
 
 
 def main():
@@ -193,7 +131,8 @@ def main():
         tp_match = TP_YAML.search(config)
         ep_match = EP_YAML.search(config)
         cp_match = CP_YAML.search(config)
-        if not tp_match or not ep_match or not cp_match:
+        pp_match = PP_YAML.search(config)
+        if not tp_match or not ep_match or not cp_match or not pp_match:
             print(
                 f"Warning: {config_file} does not contain configuration information",
                 file=sys.stderr)
@@ -201,8 +140,9 @@ def main():
         tp = int(tp_match.group(1))
         ep = int(ep_match.group(1))
         cp = int(cp_match.group(1))
+        pp = int(pp_match.group(1))
 
-        config_key = (tp, cp, ep, isl)
+        config_key = (tp, cp, ep, pp, isl)
 
         print(f"Processing {log_file} for config {config_key}...",
               file=sys.stderr)
@@ -226,12 +166,18 @@ def main():
             'tp',
             'kvp',
             'ep',
+            'pp',
         ] + all_isls
         writer = csv.DictWriter(sys.stdout, fieldnames=fieldnames)
         writer.writeheader()
 
         for config in all_configs:
-            row = {'tp': config[0], 'kvp': config[1], 'ep': config[2]}
+            row = {
+                'tp': config[0],
+                'kvp': config[1],
+                'ep': config[2],
+                'pp': config[3]
+            }
             for isl in all_isls:
                 config_key = config + (isl, )
                 if config_key in results:
