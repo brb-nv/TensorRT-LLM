@@ -106,7 +106,7 @@ def gen_config_file(work_dir: str,
             'backend': ctx_moe_backend,
         },
         'cache_transceiver_config': {
-            'max_tokens_in_buffer': cache_transceiver_max_num_tokens,
+            'max_tokens_in_buffer': 1024,   # Setting this to low value for gen-only benchmark.
             'backend': 'UCX',
         },
     }
@@ -168,7 +168,7 @@ def gen_config_file(work_dir: str,
             'backend': gen_moe_backend,
         },
         'cache_transceiver_config': {
-            'max_tokens_in_buffer': cache_transceiver_max_num_tokens,
+            'max_tokens_in_buffer': 1024,   # Setting this to low value for gen-only benchmark.
             'backend': 'UCX',
         },
         'stream_interval': 20,

@@ -131,7 +131,8 @@ fi
 mkdir -p ${full_logdir}
 echo "Log will be saved to: ${full_logdir}"
 
-nsys_on=${full_logdir} # Uncomment this line to enable Nsys profiling
+nsys_on=""
+# nsys_on=${full_logdir} # Uncomment this line to enable Nsys profiling
 
 # check benchmark_mode
 if [ "${benchmark_mode}" != "gen_only" ] && [ "${benchmark_mode}" != "e2e" ]; then
