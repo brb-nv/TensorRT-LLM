@@ -1,5 +1,18 @@
 #!/bin/bash
 
+if [ -z "$SLURM_PARTITION" || \
+     -z "$SLURM_ACCOUNT" || \
+     -z "$SLURM_JOB_NAME" || \
+     -z "$CONTAINER_IMAGE" || \
+     -z "$CONTAINER_MOUNTS" || \
+     -z "$WORK_DIR" || \
+     -z "$MODEL_DIR" || \
+     -z "$REPO_DIR" || \
+     -z "$DATA_DIR" ]; then
+  echo "Environment not set, please source submit_mjoux_env.sh first"
+  exit 1
+fi
+
 ctx_tp_size=8
 ctx_pp_size=1
 ctx_cp_size=1
@@ -9,20 +22,15 @@ gen_pp_size=1
 gen_cp_size=1
 gen_ep_size=2
 
-partition=batch
-account=coreai_horizon_dilations
-job_name=coreai_horizon_dilations-helix_benchmark_test_ctxtp${ctx_tp_size}cp${ctx_cp_size}$(if [ "${ctx_chunked_prefill}" = "true" ]; then echo "chunked"; fi)_gentp${gen_tp_size}cp${gen_cp_size}ep${gen_ep_size}
-container_image=/lustre/fsw/portfolios/coreai/projects/coreai_horizon_dilations/users/mjoux/containers/tllm_pyt2508_py3_aarch64_trt10.13.2.6_202509112230_7568.sqsh
-# e.g. /mnt/data:/mnt/data
-mounts=/lustre/fsw/portfolios/coreai/projects/coreai_horizon_dilations:/lustre/fsw/portfolios/coreai/projects/coreai_horizon_dilations
-# Path to disaggr_torch.slurm
-workdir=/lustre/fsw/portfolios/coreai/projects/coreai_horizon_dilations/users/$USER/TensorRT-LLM/examples/disaggregated/slurm/benchmark/
-# Path to the model checkpoint
-model_dir=/lustre/fsw/portfolios/coreai/projects/coreai_horizon_dilations/users/mjoux/data/models/DeepSeek-R1/DeepSeek-R1-FP4
-# Path to the repo to install TensorRT-LLM, if this is empty, the pre-installed version will be used
-repo_dir=/lustre/fsw/portfolios/coreai/projects/coreai_horizon_dilations/users/$USER/TensorRT-LLM
-# Path to the data directory
-data_dir=/lustre/fsw/portfolios/coreai/projects/coreai_horizon_dilations/users/$USER/data
+partition=$SLURM_PARTITION
+account=$SLURM_ACCOUNT
+job_name=${SLURM_JOB_NAME}_ctxtp${ctx_tp_size}cp${ctx_cp_size}$(if [ "${ctx_chunked_prefill}" = "true" ]; then echo "chunked"; fi)_gentp${gen_tp_size}cp${gen_cp_size}ep${gen_ep_size}
+container_image=$CONTAINER_IMAGE
+mounts=$CONTAINER_MOUNTS
+workdir=$WORK_DIR
+model_dir=$MODEL_DIR
+repo_dir=$REPO_DIR
+data_dir=$DATA_DIR
 
 ntasks_per_node=4 # 4 GPUs per GB200 node
 

@@ -1,13 +1,13 @@
 #!/bin/bash
 
-partition=batch
-account=coreai_horizon_dilations
-job_name=helix-benchmark-test-ctxtp4-gentp2cp2
-container_image=urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:pytorch-25.08-py3-aarch64-ubuntu24.04-trt10.13.2.6-skip-tritondevel-202509112230-7568
-mounts=/lustre/fsw/portfolios/coreai/projects/coreai_horizon_dilations:/lustre/fsw/portfolios/coreai/projects/coreai_horizon_dilations  # e.g. /mnt/data:/mnt/data
-workdir=/lustre/fsw/portfolios/coreai/projects/coreai_horizon_dilations/users/bbuddharaju/TensorRT-LLM/examples/disaggregated/slurm/benchmark/  # Path to disaggr_torch.slurm
-model_dir=/lustre/fsw/portfolios/coreai/projects/coreai_horizon_dilations/users/mjoux/data/models/DeepSeek-V3-Lite/fp8  # Path to the model checkpoint
-repo_dir=/lustre/fsw/portfolios/coreai/projects/coreai_horizon_dilations/users/bbuddharaju/TensorRT-LLM  # Path to the repo to install TensorRT-LLM, if this is empty, the pre-installed version will be used
+partition="" # slurm partition
+account="" # slurm account
+job_name="" # slurm job name
+container_image="" # /path/to/image.sqsh
+mounts=""  # e.g. /mnt/data:/mnt/data
+workdir=""  # Path to this directory
+model_dir=""  # Path to the model checkpoint
+repo_dir=""  # Path to the repo to install TensorRT-LLM, if this is empty, the pre-installed version will be used
 
 ntasks_per_node=4 # 4 GPUs per GB200 node
 total_node_num=2
