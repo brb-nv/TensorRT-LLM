@@ -46,7 +46,7 @@ QkvLayout AttentionInputLayoutToQkvLayout(AttentionInputLayout layout)
 
 FmhaDispatcher::FmhaDispatcher(MHARunnerFixedParams fixedParams)
     : mFixedParams(fixedParams)
-    , mUseTllmGen(tensorrt_llm::common::isSM100Family())
+    , mUseTllmGen(tensorrt_llm::common::isSM100Family() && fixedParams.headSize != 72)
 {
     if (mUseTllmGen)
     {

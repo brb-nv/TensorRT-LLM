@@ -6379,6 +6379,23 @@ def enumerate_kernels():
                   and kspec.version       == 2
                   and kspec.cross_mha     == False
                   and kspec.flash_attention == False)
+                  # [TensorRT-LLM][WARNING] FMHA Kernel doesn't exist for mFixedParams: dataType = bf16, dataTypeKv = bf16, dataTypeOut = bf16, forceFp32Acc = false, attentionMaskType = padding,
+                  # attentionInputLayout = packed_qkv, isSPadded = false, numQHeads = 16, numKvHeads = 16, numTokensPerBlock = 0, headSize = 72, headSizeV = 72, qScaling = 1.000000,
+                  # attnLogitSoftcappingScale = 0.000000, hasAlibi = false, scaleAlibi = false, tpSize = 1, tpRank = 0, sageBlockSizeQ = 0, sageBlockSizeK = 0, sageBlockSizeV = 0
+
+                  # [TensorRT-LLM][WARNING] Fall back to unfused MHA for dataType = bf16, dataTypeKv = bf16, dataTypeOut = bf16, forceFp32Acc = false, attentionMaskType = padding,
+                  # attentionInputLayout = packed_qkv, isSPadded = false, numQHeads = 16, numKvHeads = 16, numTokensPerBlock = 0, headSize = 72, headSizeV = 72, qScaling = 1.000000,
+                  # attnLogitSoftcappingScale = 0.000000, hasAlibi = false, scaleAlibi = false, tpSize = 1, tpRank = 0, sageBlockSizeQ = 0, sageBlockSizeK = 0, sageBlockSizeV = 0 in sm_100.
+                  # Gemma3 VL support.
+                  or  (kspec.sm           == 100
+                  and kspec.dtype         in ['fp16', 'bf16', 'fp16_fp32', 'e4m3', 'e4m3_fp32']
+                  and kspec.head_size     == 72
+                  and kspec.head_size_v   == 72
+                  and kspec.sage_block_sizes is None
+                  and kspec.version       == 2
+                  and kspec.cross_mha     == False
+                  and kspec.flash_attention == False
+                  and kspec.input_layout != InputLayout.SEPARATE_Q_K_V)
                   # Deepseek MLA (generation 576/512 paged)
                   or (kspec.sm            in [90, 100, 120]
                   and kspec.dtype         in ['bf16', 'e4m3_fp32']
