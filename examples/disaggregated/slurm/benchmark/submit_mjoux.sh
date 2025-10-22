@@ -1,6 +1,6 @@
 #!/bin/bash
 
-if [ -z "$SLURM_PARTITION" || \
+if [[ -z "$SLURM_PARTITION" || \
      -z "$SLURM_ACCOUNT" || \
      -z "$SLURM_JOB_NAME" || \
      -z "$CONTAINER_IMAGE" || \
@@ -8,7 +8,7 @@ if [ -z "$SLURM_PARTITION" || \
      -z "$WORK_DIR" || \
      -z "$MODEL_DIR" || \
      -z "$REPO_DIR" || \
-     -z "$DATA_DIR" ]; then
+     -z "$DATA_DIR" ]]; then
   echo "Environment not set, please source submit_mjoux_env.sh first"
   exit 1
 fi
