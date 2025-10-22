@@ -107,7 +107,7 @@ TP GPUs for the attention output, and they are re-purposed to TP or EP for FFN.
 This benchmark outputs the total time taken as well as the expected Time per output
 token (TPOT) for a full DeepSeek-V3 model, if all layers were of the given type.
 
-### Correctess test the MLA module
+### Correctness test for the MLA module
 
 The simplest test can be found in
 [test_mla_helix.py](../../../../tests/unittest/_torch/modules/test_mla_helix.py).
@@ -117,3 +117,12 @@ This is a unit test of just the
 which has been updated to support Helix parallelism.
 
 This unit test can be launched using `pytest` and is part of the TensorRT-LLM test suite.
+
+### End-to-end integration tests
+
+End-to-end integration tests are run in disaggregated mode with cache transmission
+using `pytest`. These tests validate the complete Helix parallelism pipeline:
+
+- `tests/integration/defs/disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_bf16_tllm_gen_helix`
+- `tests/integration/defs/disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_tllm_gen_helix`
+- `tests/integration/defs/disaggregated/test_disaggregated.py::test_disaggregated_deepseek_r1_fp4_tllm_gen_helix`
