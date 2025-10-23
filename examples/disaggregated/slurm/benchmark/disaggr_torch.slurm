@@ -158,9 +158,15 @@ if [ -d "${trtllm_repo}" ]; then
     TRT_LLM_GIT_COMMIT=$(git -C ${trtllm_repo} rev-parse --short HEAD 2>/dev/null || echo "unknown")
     echo "TRT_LLM_GIT_COMMIT: ${TRT_LLM_GIT_COMMIT}"
 
+    # [Optional] Construct output path for container save.
+    container_dir="/lustre/fsw/portfolios/coreai/projects/coreai_horizon_dilations/users/bbuddharaju/sqsh_files/"
+    container_basename=$(basename "${container_image}" .sqsh)
+    container_save_path="${container_dir}/${container_basename}_${TRT_LLM_GIT_COMMIT}.sqsh"
+    echo "Container will be saved to: ${container_save_path}"
+
     if [ "${build_wheel}" = "true" ]; then
         echo "Building TensorRT-LLM wheel on one node..."
-        build_command="python3 ${trtllm_repo}/scripts/build_wheel.py --trt_root /usr/local/tensorrt --benchmarks --use_ccache --cuda_architectures \"${cuda_architectures}\""
+        build_command="python3 ${trtllm_repo}/scripts/build_wheel.py --trt_root /usr/local/tensorrt --benchmarks --build_dir ${trtllm_repo}/cpp/build --cuda_architectures \"${cuda_architectures}\""
         if ! srun --container-name=${container_name} \
             --container-mounts=${mounts} \
             --mpi=pmix --overlap -N 1 --ntasks-per-node=1 \
@@ -174,8 +180,9 @@ if [ -d "${trtllm_repo}" ]; then
     echo "Installing TensorRT-LLM..."
     if ! srun --container-name=${container_name} \
         --container-mounts=${mounts} \
+        --container-save=${container_save_path} \
         --mpi=pmix --overlap -N $SLURM_NNODES --ntasks-per-node=1 \
-        bash -c "cd ${trtllm_repo} && pip install -e ." \
+        bash -c "cd ${trtllm_repo} && rm -rf *.egg-info tensorrt_llm.egg-info/ && pip install . --force-reinstall --no-build-isolation" \
         &> ${full_logdir}/install.log; then
         cleanup_on_failure "TensorRT-LLM installation failed. Check ${full_logdir}/install.log for details"
     fi
