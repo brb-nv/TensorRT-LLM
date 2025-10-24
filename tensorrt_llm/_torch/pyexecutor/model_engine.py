@@ -1240,15 +1240,6 @@ class PyTorchModelEngine(ModelEngine):
                     num_ctx_requests:num_seqs] -= (
                         self.previous_kv_lens_offsets_cuda[:num_gen_requests])
 
-    def _get_helix_prompt_length(self, request: LlmRequest):
-        # we split the request across KVP ranks for Helix parallelism
-        kvp_rank = self.mapping.cp_rank
-        len_per_rank = (request.py_prompt_len + self.mapping.cp_size -
-                        1) // self.mapping.cp_size
-        len_this_rank = len_per_rank if kvp_rank != self.mapping.cp_size - 1 else request.py_prompt_len - len_per_rank * (
-            self.mapping.cp_size - 1)
-        return len_this_rank
-
     def _get_all_rank_num_tokens(self, attn_metadata: AttentionMetadata):
         if self.enable_attention_dp:
             return list(self.dist.tp_allgather(attn_metadata.num_tokens))
@@ -1549,12 +1540,11 @@ class PyTorchModelEngine(ModelEngine):
                     # Warmup doesn't have `total_input_len_cp` set because merge_helix_requests is not called.
                     if not self.is_warmup:
                         position_id = request.total_input_len_cp + request.py_decoding_iter - 1
-                    # Assuming last CP rank is the active rank.
-                    if self.mapping.cp_rank == self.mapping.cp_size - 1:
-                        past_seen_token_num = request.orig_prompt_len + request.py_decoding_iter - 1
-                    else:
-                        # past_seen_token_num doesn't grow on inactive ranks.
-                        past_seen_token_num = request.orig_prompt_len
+                        if request.py_helix_is_inactive_rank:
+                            past_seen_token_num = request.orig_prompt_len + request.decode_len_this_cp_rank
+                        else:
+                            # decode_len_this_cp_rank already includes the current decoding token and it's cache isn't really seen yet.
+                            past_seen_token_num = request.orig_prompt_len + request.decode_len_this_cp_rank - 1
 
                 position_ids.append(position_id)
                 num_cached_tokens_per_seq.append(past_seen_token_num)

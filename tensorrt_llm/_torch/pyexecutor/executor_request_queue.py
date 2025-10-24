@@ -651,16 +651,16 @@ class ExecutorRequestQueue:
                 input_ids_this_rank = input_ids_this_rank[:-padding_len]
                 position_ids_this_rank = position_ids_this_rank[:-padding_len]
 
-            with use_torch_printoptions(sci_mode=False,
-                                        threshold=16,
-                                        edgeitems=2,
-                                        linewidth=120):
-                print(
-                    f"[ExecutorRequestQueue::_merge_helix_requests][{curr_cp_rank}]: input_ids_this_rank: {torch.tensor(input_ids_this_rank)}"
-                )
-                print(
-                    f"[ExecutorRequestQueue::_merge_helix_requests][{curr_cp_rank}]: position_ids_this_rank: {torch.tensor(position_ids_this_rank)}"
-                )
+            # with use_torch_printoptions(sci_mode=False,
+            #                             threshold=16,
+            #                             edgeitems=2,
+            #                             linewidth=120):
+            print(
+                f"[ExecutorRequestQueue::_merge_helix_requests][{curr_cp_rank}]: input_ids_this_rank: {torch.tensor(input_ids_this_rank)}"
+            )
+            print(
+                f"[ExecutorRequestQueue::_merge_helix_requests][{curr_cp_rank}]: position_ids_this_rank: {torch.tensor(position_ids_this_rank)}"
+            )
             # TODO: Figure how to pass down position_ids_this_rank to LLMRequest.
             req = executor_request_to_llm_request(
                 req_id=req_item.id,
@@ -671,6 +671,7 @@ class ExecutorRequestQueue:
                 input_token_ids=input_ids_this_rank,
                 position_ids=position_ids_this_rank)
             req.total_input_len_cp = input_len
+            req.decode_len_this_cp_rank = 0
             req_with_children.append(req)
             if req.child_requests:
                 req_with_children.extend(req.child_requests)

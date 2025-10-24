@@ -447,19 +447,22 @@ class KVCacheManager(BaseResourceManager):
                                 req, block_ids)
 
             for req in generation_batch:
-                # Skip allocating KV cache at decode for inactive helix ranks.
                 ##################################################################
-                # TODO: This should be set elsewhere. For now, we hardcode that last rank is active.
-                # Maybe right after pyexecutor._schedule() or in sampler.update_requests() at end of
-                # executor loop for next step.
+                # TODO: This should be set elsewhere. Maybe right after pyexecutor._schedule()
+                # or in sampler.update_requests() at end of executor loop for next step.
+                # Decode tokens are assigned to blocks in a round-robin fashion.
                 if self.mapping.has_cp_helix():
-                    if self.mapping.cp_rank != self.mapping.cp_size - 1:
-                        req.py_helix_is_inactive_rank = True
+                    decode_block_id = (req.py_decoding_iter - 1) // self.tokens_per_block
+                    req.py_helix_is_inactive_rank = (decode_block_id % self.mapping.cp_size != self.mapping.cp_rank)
+                else:
+                    req.py_helix_is_inactive_rank = None
                 ##################################################################
                 if req.py_helix_is_inactive_rank:
-                    # print(f"[ResourceManager::prepare_resources][rank {self.mapping.rank}] Skipping KV allocation for request {req.py_request_id}.")
+                    print(f"[ResourceManager::prepare_resources][rank {self.mapping.rank}] Skipping KV allocation for request {req.py_request_id} with decode_len_this_cp_rank: {req.decode_len_this_cp_rank} and py_decoding_iter: {req.py_decoding_iter}.")
                     continue
-                # print(f"[ResourceManager::prepare_resources][rank {self.mapping.rank}] Adding KV allocation for request {req.py_request_id}.")
+                else:
+                    req.decode_len_this_cp_rank += 1
+                print(f"[ResourceManager::prepare_resources][rank {self.mapping.rank}] Adding KV allocation for request {req.py_request_id} with decode_len_this_cp_rank: {req.decode_len_this_cp_rank} and py_decoding_iter: {req.py_decoding_iter}.")
                 self.impl.add_token(req.py_request_id)
                 for _ in range(get_draft_token_length(req)):
                     self.impl.add_token(req.py_request_id)
