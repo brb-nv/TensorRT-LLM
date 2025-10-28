@@ -283,11 +283,11 @@ def alltoall(
         # note: the requirement for the C++ op is that all parts have same shape,
         # dtype and device. If we make sure that size at `dim` evenly divides into
         # `n_ranks`, all the conditions are met
-        if dim != 0:
-            # this ensures all inputs are contiguous
-            inp = inp.transpose(dim, 0).contiguous()
-        op_inputs.extend(torch.split(inp, size_per_rank))
+        op_inputs.extend(torch.split(inp, size_per_rank, dim=dim))
 
+    # note: we need to ensure that the input tensors are contiguous to provide
+    # the right data pointers to the C++ op
+    op_inputs = [op_inp.contiguous() for op_inp in op_inputs]
     outputs = torch.ops.trtllm.alltoall(
         op_inputs,
         group,
