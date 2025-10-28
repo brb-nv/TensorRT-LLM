@@ -551,10 +551,10 @@ def _register_fake():
 
     @torch.library.register_fake("trtllm::alltoall")
     def _(input_list, group, num_lists):
-        assert len(input_list) > 0
-        assert len(input_list) == len(group)
-
-        return [i.new_empty(i.shape) for i in input_list]
+        return [
+            i.new_empty((len(group), ) + i.shape)
+            for i in range(len(input_list) // len(group))
+        ]
 
     @torch.library.register_fake("trtllm::helix_post_process")
     def _(gathered_o, gathered_stats, scale):

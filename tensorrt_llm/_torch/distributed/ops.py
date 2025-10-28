@@ -283,29 +283,36 @@ def alltoall(
         # note: the requirement for the C++ op is that all parts have same shape,
         # dtype and device. If we make sure that size at `dim` evenly divides into
         # `n_ranks`, all the conditions are met
-        op_inputs.extend(torch.split(inp, size_per_rank, dim=dim))
+        if dim != 0:
+            # this ensures all inputs are contiguous
+            inp = inp.transpose(dim, 0).contiguous()
+        op_inputs.extend(torch.split(inp, size_per_rank))
 
-    # note: we need to ensure that the input tensors are contiguous to provide
-    # the right data pointers to the C++ op
-    op_inputs = [op_inp.contiguous() for op_inp in op_inputs]
     outputs = torch.ops.trtllm.alltoall(
         op_inputs,
         group,
         num_lists=len(inputs),
     )
 
-    outputs_split = [
-        outputs[i * n_ranks:(i + 1) * n_ranks] for i in range(len(inputs))
-    ]
     for i in range(len(inputs)):
+        dim = dims[i] % inputs[i].ndim
+        # first we transpose the rest of the split back to the original dimension
+        if dim != 0:
+            outputs[i] = outputs[i].transpose(1, dim + 1)
+        new_dim = new_dims[i] if new_dims[i] is not None else dim
+        if new_dim != 0:
+            nd = outputs[i].ndim
+            outputs[i] = outputs[i].permute(*range(1, new_dim % nd), 0,
+                                            *range((new_dim % nd) + 1, nd))
         if new_dims[i] is None:
-            outputs_split[i] = torch.cat(outputs_split[i], dim=dims[i])
-        else:
-            outputs_split[i] = torch.stack(outputs_split[i], dim=new_dims[i])
+            outputs[i] = outputs[i].view(
+                *outputs[i].shape[:dim],
+                outputs[i].shape[dim] * outputs[i].shape[dim + 1],
+                *outputs[i].shape[dim + 2:])
     if is_single_tensor:
-        return outputs_split[0]
+        return outputs[0]
     else:
-        return outputs_split
+        return outputs
 
 
 def cp_allgather(

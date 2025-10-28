@@ -7,7 +7,7 @@ from torch import nn
 
 from tensorrt_llm._utils import get_sm_version, is_sm_100f
 from tensorrt_llm.logger import logger
-from tensorrt_llm.mapping import Mapping, CpType
+from tensorrt_llm.mapping import CpType, Mapping
 
 from ..attention_backend import (AttentionInputType, AttentionMetadata,
                                  FlashInferAttentionMetadata, TrtllmAttention,
@@ -941,7 +941,8 @@ class MLA(nn.Module):
                 )
                 self.v_b_proj_dequant = nn.Parameter(
                     torch.empty(
-                        (self.num_heads_tp_cp, self.v_head_dim, self.kv_lora_rank),
+                        (self.num_heads_tp_cp, self.v_head_dim,
+                         self.kv_lora_rank),
                         dtype=self.dtype,
                     ),
                     requires_grad=False,
@@ -998,8 +999,8 @@ class MLA(nn.Module):
                 dims=[-1, 1],
                 new_dims=[0, 0],
             )
-            return torch.ops.trtllm.helix_post_process(gathered_o,
-                                                       gathered_stats, 1.0)
+            return torch.ops.trtllm.helix_post_process(
+                gathered_o.contiguous(), gathered_stats.contiguous(), 1.0)
         else:
             attn_output = attn_instance.forward(q, k, v, attn_metadata,
                                                 **kwargs)

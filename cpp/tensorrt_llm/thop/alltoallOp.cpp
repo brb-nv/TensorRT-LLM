@@ -70,16 +70,19 @@ public:
         for (int il = 0; il < num_lists_; ++il)
         {
             auto off = il * num_ranks;
+            auto output_options = input_list[off].options();
+            auto output_shape = input_list[off].sizes().vec();
+            output_shape.insert(output_shape.begin(), num_ranks);
+            auto output = torch::empty(output_shape, output_options);
             auto type = tensorrt_llm::runtime::TorchUtils::dataType(input_list[off].scalar_type());
             auto nccl_type = (*getDtypeMap())[type];
             for (int r = 0; r < num_ranks; ++r)
             {
                 auto const& input = input_list[off + r];
-                auto output = torch::empty_like(input);
                 ncclSend(input.data_ptr(), input.numel(), nccl_type, r, *mNcclComm, stream);
-                ncclRecv(output.mutable_data_ptr(), output.numel(), nccl_type, r, *mNcclComm, stream);
-                output_list.push_back(output);
+                ncclRecv(output[r].mutable_data_ptr(), output[r].numel(), nccl_type, r, *mNcclComm, stream);
             }
+            output_list.push_back(output);
         }
         ncclGroupEnd();
         return output_list;
