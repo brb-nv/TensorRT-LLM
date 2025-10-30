@@ -1035,7 +1035,6 @@ class PyExecutor:
                     break
 
                 self._pause_requests(scheduled_batch.paused_requests)
-
                 finished_requests = []
 
                 if scheduled_batch.batch_size > 0 or (
@@ -1102,7 +1101,6 @@ class PyExecutor:
 
                 if self.kv_cache_transceiver and self.ctx_in_transmission_requests:
                     self._terminate_ctx_finished_requests()
-
                 self._kv_connector_terminate_requests()
 
                 if self.enable_iter_perf_stats:
@@ -1608,12 +1606,24 @@ class PyExecutor:
         )
         def forward(scheduled_requests, resource_manager, new_tensors_device,
                     gather_context_logits, cache_indirection_buffer):
-            return self.model_engine.forward(
+            iter_begin = time.time()
+            result = self.model_engine.forward(
                 scheduled_requests,
                 resource_manager,
                 new_tensors_device,
                 gather_context_logits=gather_context_logits,
                 cache_indirection_buffer=cache_indirection_buffer)
+            torch.cuda.synchronize()
+            iter_end = time.time()
+            iter_latency_ms = (iter_end - iter_begin) * 1e3
+            if self.model_engine.iter_counter > 10 and self.dist.rank == 0:
+                logger.info(f"[PyExecutor::_forward_step] CUSTOM LOG: iter={self.model_engine.iter_counter}, "
+                            f"rank={self.dist.rank}, "
+                            f"active_requests={len(self.active_requests)}, "
+                            f"scheduled_generation_requests={len(scheduled_requests.generation_requests)}, "
+                            f"scheduled_batch_size={scheduled_requests.batch_size}, "
+                            f"iter_latency_ms={iter_latency_ms}ms")
+            return result
 
         try:
             gather_context_logits = any(

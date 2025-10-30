@@ -8,6 +8,9 @@ num_gen_servers=$2
 work_dir=$3
 script_dir=$4
 
+export TRTLLM_SERVER_DISABLE_GC=1
+export TRTLLM_WORKER_DISABLE_GC=1
+
 python3 ${script_dir}/gen_server_config.py \
     --num_ctx_servers ${num_ctx_servers} \
     --num_gen_servers ${num_gen_servers} \

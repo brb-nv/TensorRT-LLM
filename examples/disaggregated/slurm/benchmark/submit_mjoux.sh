@@ -17,14 +17,15 @@ ctx_tp_size=8
 ctx_pp_size=1
 ctx_cp_size=1
 ctx_chunked_prefill=false
-gen_tp_size=8
+gen_tp_size=1
 gen_pp_size=1
-gen_cp_size=1
+gen_cp_size=4
 gen_ep_size=2
+batch=1
 
 partition=$SLURM_PARTITION
 account=$SLURM_ACCOUNT
-job_name=${SLURM_JOB_NAME}_ctxtp${ctx_tp_size}cp${ctx_cp_size}$(if [ "${ctx_chunked_prefill}" = "true" ]; then echo "chunked"; fi)_gentp${gen_tp_size}cp${gen_cp_size}ep${gen_ep_size}
+job_name=${SLURM_JOB_NAME}_ctxtp${ctx_tp_size}cp${ctx_cp_size}$(if [ "${ctx_chunked_prefill}" = "true" ]; then echo "chunked"; fi)_gentp${gen_tp_size}cp${gen_cp_size}ep${gen_ep_size}bs${batch}
 container_image=$CONTAINER_IMAGE
 mounts=$CONTAINER_MOUNTS
 workdir=$WORK_DIR
@@ -34,10 +35,9 @@ data_dir=$DATA_DIR
 
 ntasks_per_node=4 # 4 GPUs per GB200 node
 
-batch=1
-isl=524288
+isl=1048576
 osl=1024
-concurrency=8
+concurrency=$((batch * 16))
 multi_round=1
 streaming=true
 benchmark_mode=e2e

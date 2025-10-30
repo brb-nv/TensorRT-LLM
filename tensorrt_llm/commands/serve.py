@@ -1,5 +1,6 @@
 import asyncio
 import os
+import gc
 import signal  # Added import
 import subprocess  # nosec B404
 import sys
@@ -194,6 +195,8 @@ def launch_server(host: str,
     # Optionally disable GC (default: not disabled)
     if os.getenv("TRTLLM_SERVER_DISABLE_GC", "0") == "1":
         gc.disable()
+    else:
+        assert False, "TRTLLM_SERVER_DISABLE_GC must be set to 1."
 
     asyncio.run(server(host, port))
 

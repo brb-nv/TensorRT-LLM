@@ -134,7 +134,7 @@ mkdir -p ${full_logdir}
 echo "Log will be saved to: ${full_logdir}"
 
 nsys_on=""
-# nsys_on=${full_logdir} # Uncomment this line to enable Nsys profiling
+#nsys_on=${full_logdir} # Uncomment this line to enable Nsys profiling
 
 # check benchmark_mode
 if [ "${benchmark_mode}" != "gen_only" ] && [ "${benchmark_mode}" != "e2e" ]; then
@@ -173,9 +173,9 @@ if [ -d "${trtllm_repo}" ]; then
 
     echo "Installing TensorRT-LLM..."
     if ! srun --container-name=${container_name} \
-        --container-mounts=${mounts} \
+        --container-mounts=${mounts} --no-container-mount-home \
         --mpi=pmix --overlap -N $SLURM_NNODES --ntasks-per-node=1 \
-        bash -c "cd ${trtllm_repo} && pip install -e ." \
+        bash -c "cd ${trtllm_repo} && pip install /lustre/fsw/portfolios/coreai/projects/coreai_horizon_dilations/users/bbuddharaju/TensorRT-LLM/build/tensorrt_llm-1.1.0rc5-cp312-cp312-linux_aarch64.whl" \
         &> ${full_logdir}/install.log; then
         cleanup_on_failure "TensorRT-LLM installation failed. Check ${full_logdir}/install.log for details"
     fi

@@ -135,7 +135,10 @@ def gen_config_file(work_dir: str,
         'max_batch_size': gen_batch_size,
         'max_num_tokens': gen_max_num_tokens,
         'max_seq_len': gen_max_seq_len,
-        'cuda_graph_config': {},
+        'cuda_graph_config': {
+            'enable_padding': True,
+            'batch_sizes': [gen_batch_size],
+        },
         'print_iter_log': True,
         'kv_cache_config': {
             'enable_block_reuse': False,
