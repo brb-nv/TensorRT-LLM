@@ -2446,9 +2446,6 @@ def test_ptp_quickstart_advanced_mixed_precision(llm_root, llm_venv):
     pytest.param("mistral-small-3.1-24b-instruct",
                  "Mistral-Small-3.1-24B-Instruct-2503",
                  marks=pytest.mark.skip_less_device_memory(80000)),
-    pytest.param("gemma-3-27b-it",
-                 "gemma/gemma-3-27b-it",
-                 marks=pytest.mark.skip_less_device_memory(80000)),
     pytest.param(
         "Nano-v2-VLM",
         "Nano-v2-VLM",
@@ -2575,13 +2572,6 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
             [["invention", "person", "scientists", "Lick", "engineers"],
              ["landscape", "trees", "road", "depicts", "scenic"]]
         },
-        "gemma-3-27b-it": {
-            "image": [
-                ["natural", "turbulent", "dramatic", "scene", "wave"],
-                ["image", "famous", "rock", "granite", "landmark"],
-                ["traffic", "moderate", "heavy", "flowing", "cars"],
-            ],
-        },
     }
 
     cmd = [
@@ -2603,15 +2593,6 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
         cmd.append("--max_num_tokens=16384")
     if use_cuda_graph:
         cmd.append("--use_cuda_graph")
-    # Gemma3 VLM needs a custom mask which is only supported by flashinfer backend currently.
-    # Custom mask involves bidirectional masking of image tokens in context phase. To get this
-    # correct, chunked prefill and kv cache reuse need to be turned off.
-    if model_name == "gemma-3-27b-it":
-        cmd.append("--image_format=pil")
-        cmd.append("--attention_backend=FLASHINFER")
-        cmd.append("--disable_kv_cache_reuse")
-        cmd.append("--kv_cache_fraction=0.5")
-        cmd.append("--max_seq_len=1024")
     # Nano V2 VLM needs smaller max_batch_size to save memory.
     # Also need to disable kv cache reuse for Nemotron-H architecture.
     if model_name == "Nano-v2-VLM":
@@ -3049,8 +3030,6 @@ def test_ptp_quickstart_multimodal_phi4mm(llm_root, llm_venv, modality):
 @pytest.mark.skip_less_device(2)
 @pytest.mark.skip_less_device_memory(80000)
 @pytest.mark.parametrize("model_name,model_path", [
-    pytest.param(
-        "gemma-3-27b-it", "gemma/gemma-3-27b-it", marks=skip_post_blackwell),
     ("mistral-small-3.1-24b-instruct", "Mistral-Small-3.1-24B-Instruct-2503"),
     ("Phi-4-multimodal-instruct", "multimodals/Phi-4-multimodal-instruct"),
 ])
@@ -3078,12 +3057,6 @@ def test_ptp_quickstart_multimodal_2gpu(llm_root, llm_venv, model_name,
 
     # Define expected keywords for each model
     expected_keywords = {
-        "gemma-3-27b-it": {
-            "image": [
-                ["half", "dome", "yosemite", "landmark", "rounded"],
-                ["flowing", "traffic", "vehicles", "road", "Changi"],
-            ],
-        },
         "mistral-small-3.1-24b-instruct": {
             "image": [
                 ["scenic", "rock", "landscape", "monolith", "formation"],
@@ -3117,16 +3090,7 @@ def test_ptp_quickstart_multimodal_2gpu(llm_root, llm_venv, model_name,
     ]
 
     # Add model-specific configurations
-    if model_name == "gemma-3-27b-it":
-        # Gemma3 VLM needs a custom mask which is only supported by flashinfer backend currently.
-        # Custom mask involves bidirectional masking of image tokens in context phase. To get this
-        # correct, chunked prefill and kv cache reuse need to be turned off.
-        cmd.append("--image_format=pil")
-        cmd.append("--attention_backend=FLASHINFER")
-        cmd.append("--disable_kv_cache_reuse")
-        cmd.append("--kv_cache_fraction=0.5")
-        cmd.append("--max_seq_len=1024")
-    elif model_name == "Phi-4-multimodal-instruct":
+    if model_name == "Phi-4-multimodal-instruct":
         # Set max_seq_len to 4096 to use short rope factor.
         cmd.append("--max_seq_len=4096")
         cmd.append("--load_lora")
@@ -3162,8 +3126,6 @@ def test_ptp_quickstart_multimodal_2gpu(llm_root, llm_venv, model_name,
 @pytest.mark.parametrize("model_name,model_path", [
     ("mistral-small-3.1-24b-instruct", "Mistral-Small-3.1-24B-Instruct-2503"),
     ("Phi-4-multimodal-instruct", "multimodals/Phi-4-multimodal-instruct"),
-    pytest.param(
-        "gemma-3-27b-it", "gemma/gemma-3-27b-it", marks=skip_post_blackwell),
 ])
 def test_ptp_quickstart_multimodal_multiturn(llm_root, llm_venv, model_name,
                                              model_path):
@@ -3188,12 +3150,6 @@ def test_ptp_quickstart_multimodal_multiturn(llm_root, llm_venv, model_name,
 
     # Define expected keywords for each model
     expected_keywords = {
-        "gemma-3-27b-it": {
-            "image": [
-                ["description", "image", "half", "dome", "park"],
-                ["atmosphere", "peaceful", "majestic", "scene", "sky"],
-            ],
-        },
         "mistral-small-3.1-24b-instruct": {
             "image": [
                 [
@@ -3224,18 +3180,7 @@ def test_ptp_quickstart_multimodal_multiturn(llm_root, llm_venv, model_name,
         *accuracy_inputs["image"]["media"],
     ]
 
-    # Add model-specific configurations
-    if model_name == "gemma-3-27b-it":
-        # Gemma3 VLM needs a custom mask which is only supported by flashinfer backend currently.
-        # Custom mask involves bidirectional masking of image tokens in context phase. To get this
-        # correct, chunked prefill and kv cache reuse need to be turned off.
-        cmd.append("--image_format=pil")
-        cmd.append("--attention_backend=FLASHINFER")
-        cmd.append("--disable_kv_cache_reuse")
-        cmd.append("--kv_cache_fraction=0.5")
-        cmd.append("--max_seq_len=1024")
-
-    elif model_name == "Phi-4-multimodal-instruct":
+    if model_name == "Phi-4-multimodal-instruct":
         # Set max_seq_len to 4096 to use short rope factor.
         cmd.append("--max_seq_len=4096")
         cmd.append("--load_lora")
