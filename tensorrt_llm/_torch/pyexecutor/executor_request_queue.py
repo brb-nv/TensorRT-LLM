@@ -313,7 +313,6 @@ class ExecutorRequestQueue:
         new_requests = self._validate_and_filter_requests(new_requests)
 
         # Attach Python objects to requests
-        # @B: What's the significance of this condition?
         if py_request_objects and (self.dist.tp_size > 1 or self.dist.has_pp
                                    or self.dist.cp_size
                                    > 1) and self.dist.rank > 0:
@@ -693,13 +692,6 @@ class ExecutorRequestQueue:
                 input_ids_this_rank = input_ids_this_rank[:-padding_len]
                 position_ids_this_rank = position_ids_this_rank[:-padding_len]
 
-            print(
-                f"[ExecutorRequestQueue::_merge_helix_requests][{curr_cp_rank}]: input_ids_this_rank: {torch.tensor(input_ids_this_rank)}"
-            )
-            print(
-                f"[ExecutorRequestQueue::_merge_helix_requests][{curr_cp_rank}]: position_ids_this_rank: {torch.tensor(position_ids_this_rank)}"
-            )
-            # TODO: Figure how to pass down position_ids_this_rank to LLMRequest.
             req = executor_request_to_llm_request(
                 req_id=req_item.id,
                 executor_request=req_item.request,

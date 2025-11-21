@@ -1577,7 +1577,6 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
                                                         PretrainedConfig]):
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig]):
-        ###############################################################################
         self.mapping_with_cp = None
         # Note: Currently the usage of mapping is all over the place making its usage brittle
         # in this file. As a temporary WAR, we hold on to an original copy of mapping when CP
@@ -1606,7 +1605,6 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
                 moe_ep_size=model_config.mapping.moe_ep_size,
                 enable_attention_dp=model_config.mapping.enable_attention_dp)
             model_config._frozen = True
-        ###############################################################################
 
         # Rename some keys of quant_config_dict to support legacy checkpoints
         if model_config.quant_config_dict is not None:
@@ -1656,7 +1654,6 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
             self.epilogue.extend(self.draft_model.mtp_layers)
             self.epilogue.append(self.spec_worker)
 
-        ###############################################################################
         # Undo any manipulations done to mapping.
         if self.mapping_with_cp is not None:
             print(
@@ -1665,7 +1662,6 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
             model_config._frozen = False
             model_config.mapping = self.mapping_with_cp
             model_config._frozen = True
-        ###############################################################################
 
     def forward(
         self,
@@ -1677,33 +1673,6 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
         return_context_logits: bool = False,
         **kwargs,
     ) -> torch.Tensor:
-        # with use_torch_printoptions(sci_mode=False,
-        #                             threshold=16,
-        #                             edgeitems=2,
-        #                             linewidth=120):
-        #     print(
-        #         f"[DeepseekV3ForCausalLM::forward][rank {self.model_config.mapping.rank}] input_ids: {input_ids}"
-        #     )
-        #     print(
-        #         f"[DeepseekV3ForCausalLM::forward][rank {self.model_config.mapping.rank}] position_ids: {position_ids}"
-        #     )
-        #     print(
-        #         f"[DeepseekV3ForCausalLM::forward][rank {self.model_config.mapping.rank}] helix_is_inactive_rank: {attn_metadata.helix_is_inactive_rank}"
-        #     )
-        #     print(
-        #         f"[DeepseekV3ForCausalLM::forward][rank {self.model_config.mapping.rank}] kv_cache_params.num_cached_tokens_per_seq: {attn_metadata.kv_cache_params.num_cached_tokens_per_seq}"
-        #     )
-        #     print(
-        #         f"[DeepseekV3ForCausalLM::forward][rank {self.model_config.mapping.rank}] kv_lens_cuda: {attn_metadata.kv_lens_cuda}"
-        #     )
-        #     assert attn_metadata.kv_cache_manager.tokens_per_block == 32
-        #     block_ids_per_seq = attn_metadata.kv_cache_manager.get_batch_cache_indices(
-        #         attn_metadata.request_ids)
-        #     for request_id, block_ids in zip(attn_metadata.request_ids,
-        #                                      block_ids_per_seq):
-        #         print(
-        #             f"[DeepseekV3ForCausalLM::forward][rank {self.model_config.mapping.rank}] request_id: {request_id}, block_ids: {torch.tensor(block_ids)}"
-        #         )
         return super().forward(attn_metadata=attn_metadata,
                                input_ids=input_ids,
                                position_ids=position_ids,
@@ -1711,147 +1680,6 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
                                spec_metadata=spec_metadata,
                                return_context_logits=return_context_logits,
                                **kwargs)
-
-    def _save_block_information_to_disk(self, attn_metadata: AttentionMetadata,
-                                        position_ids: torch.Tensor):
-        """Save KV cache block information to disk using safetensors format."""
-        import json
-        from pathlib import Path
-
-        import safetensors.torch
-
-        # Only save on rank 0 in prefill mode.
-        if (attn_metadata.helix_is_inactive_rank is not None
-                or self.model_config.mapping.rank != 0
-                or len(position_ids[0]) != 52):
-            return
-
-        # Create directory for saving block data
-        save_dir = Path(
-            "/home/bbuddharaju/scratch/TensorRT-LLM_MK/prefill_helix_all_layers"
-        )
-        save_dir.mkdir(exist_ok=True)
-
-        block_ids_per_seq = attn_metadata.kv_cache_manager.get_batch_cache_indices(
-            attn_metadata.request_ids)
-        for request_id, block_ids in zip(attn_metadata.request_ids,
-                                         block_ids_per_seq):
-            # Save blocks for requests with exactly 2 blocks.
-            if len(block_ids) == 2:
-                request_save_dir = save_dir / f"request_{request_id}"
-                request_save_dir.mkdir(exist_ok=True)
-
-                # Iterate through all layers and save KV cache buffers for each layer.
-                for layer_idx in range(self.config.num_hidden_layers):
-                    # Get KV cache buffers for this layer.
-                    kv_buffer = attn_metadata.kv_cache_manager.get_buffers(
-                        layer_idx)
-
-                    # Save each block separately for this layer.
-                    for i, block_id in enumerate(block_ids):
-                        # Get block data from KV cache for this layer.
-                        request_kv_data = kv_buffer[block_id]
-
-                        # Create separate data dictionary for this block.
-                        block_data = {"block_data": request_kv_data.cpu()}
-
-                        # Create separate metadata for this block, including layer information.
-                        block_metadata = {
-                            "request_id": int(request_id),
-                            "layer_idx": int(layer_idx),
-                            "block_id": int(block_id),
-                            "block_index": i,
-                            "block_shape": list(request_kv_data.shape),
-                            "tokens_per_block":
-                            attn_metadata.kv_cache_manager.tokens_per_block,
-                            "rank": self.model_config.mapping.rank,
-                        }
-
-                        # Save each block's data separately using safetensors, including layer in filename.
-                        block_safetensors_path = request_save_dir / f"layer_{layer_idx}_block_id_{block_id}_rank_{self.model_config.mapping.rank}.safetensors"
-                        safetensors.torch.save_file(block_data,
-                                                    str(block_safetensors_path))
-
-                        # Save each block's metadata separately as JSON, including layer in filename.
-                        block_metadata_path = request_save_dir / f"layer_{layer_idx}_block_id_{block_id}_rank_{self.model_config.mapping.rank}_metadata.json"
-                        with open(block_metadata_path, 'w') as f:
-                            json.dump(block_metadata, f, indent=2)
-
-                        print(
-                            f"[DeepseekV3ForCausalLM::_save_block_information_to_disk][rank {self.model_config.mapping.rank}] "
-                            f"Saved layer {layer_idx} block (ID: {block_id}) for request {request_id}, shape: {request_kv_data.shape} "
-                            f"to {block_safetensors_path.name}")
-
-                print(
-                    f"[DeepseekV3ForCausalLM::_save_block_information_to_disk][rank {self.model_config.mapping.rank}] "
-                    f"Saved block information for request {request_id} to {request_save_dir}"
-                )
-
-    def _read_block_information_from_disk(self,
-                                          attn_metadata: AttentionMetadata,
-                                          position_ids: torch.Tensor):
-        """Read KV cache block information from disk using safetensors format."""
-        from pathlib import Path
-
-        import safetensors.torch
-
-        # Early return in prefill mode.
-        if (attn_metadata.helix_is_inactive_rank is None):
-            return
-
-        # Early return if this isn't the first decode step.
-        if (position_ids[0][0].item() != 52):
-            print(
-                f"[DeepseekV3ForCausalLM::_save_block_information_to_disk][rank {self.model_config.mapping.rank}] "
-                f"Early return in decode mode because this isn't the first decode step {position_ids[0][0].item()}"
-            )
-            return
-
-        block_ids_per_seq = attn_metadata.kv_cache_manager.get_batch_cache_indices(
-            attn_metadata.request_ids)
-        for request_id, block_ids in zip(attn_metadata.request_ids,
-                                         block_ids_per_seq):
-
-            # Read blocks for requests with exactly 1 block.
-            assert len(block_ids) == 1
-
-            # Read KV cache for all layers.
-            for layer_idx in range(self.config.num_hidden_layers):
-                # Determine file path based on rank and layer.
-                if self.model_config.mapping.rank == 0:
-                    # Inactive rank.
-                    read_file = Path(
-                        f"/home/bbuddharaju/scratch/TensorRT-LLM_MK/prefill_helix_all_layers/request_2048/layer_{layer_idx}_block_id_257_rank_0.safetensors"
-                    )
-                else:
-                    # Active rank.
-                    read_file = Path(
-                        f"/home/bbuddharaju/scratch/TensorRT-LLM_MK/prefill_helix_all_layers/request_2048/layer_{layer_idx}_block_id_258_rank_0.safetensors"
-                    )
-
-                # Get KV cache buffers for this layer.
-                kv_buffer = attn_metadata.kv_cache_manager.get_buffers(
-                    layer_idx)
-
-                # Get block data from KV cache.
-                request_kv_data = kv_buffer[block_ids[0]]
-
-                # Load block data from disk.
-                loaded_data = safetensors.torch.load_file(read_file)
-                block_read_data = loaded_data['block_data'].to(
-                    request_kv_data.device)
-
-                # Copy block data to KV cache.
-                request_kv_data.copy_(block_read_data)
-
-                print(
-                    f"[DeepseekV3ForCausalLM::_read_block_information_from_disk][rank {self.model_config.mapping.rank}] "
-                    f"Layer {layer_idx}: request_kv_data: {request_kv_data}")
-
-                print(
-                    f"[DeepseekV3ForCausalLM::_read_block_information_from_disk][rank {self.model_config.mapping.rank}] "
-                    f"Read block data for request {request_id}, layer {layer_idx}, shape: {block_read_data.shape} "
-                    f"from {read_file.name}")
 
     def load_weights(self, weights: Dict):
         weight_loader = DeepseekV3WeightLoader(self)

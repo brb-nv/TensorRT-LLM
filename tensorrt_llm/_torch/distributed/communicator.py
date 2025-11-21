@@ -347,8 +347,6 @@ class MPIDist(Distributed):
         mapping_with_helix = None
         if self.mapping.cp_size > 1:
             print(f"[MPIDist::__init__] Repurposing CP ranks to TP for Helix.")
-            # TODO: More principled thing to do would be to update mapping to account for
-            # repurposing of CP ranks to TP.
             mapping_with_helix = copy.deepcopy(self.mapping)
             mapping_without_helix = Mapping(
                 world_size=self.mapping.world_size,
@@ -401,14 +399,19 @@ class MPIDist(Distributed):
         return mpi_recv_object(src, tag)
 
     def create_tp_comm(self):
-        print(f"[MPIDist::create_tp_comm] rank: {self.mapping.rank}, tp_rank: {self.mapping.tp_rank}, tp_group: {self.mapping.tp_group}")
         new_group = mpi_comm().group.Incl(self.mapping.tp_group)
         self.tp_comm = mpi_comm().Create_group(new_group)
 
     def create_pp_comm(self):
-        print(f"[MPIDist::create_pp_comm] rank: {self.mapping.rank}, pp_rank: {self.mapping.pp_rank}, pp_group: {self.mapping.pp_group}")
         new_group = mpi_comm().group.Incl(self.mapping.pp_group)
         self.pp_comm = mpi_comm().Create_group(new_group)
+
+    def create_cp_comm(self):
+        new_group = mpi_comm().group.Incl(self.mapping.cp_group)
+        self.cp_comm = mpi_comm().Create_group(new_group)
+
+    def cp_allgather(self, obj):
+        return self.cp_comm.allgather(obj)
 
     def tp_allgather(self, obj):
         return self.tp_comm.allgather(obj)
@@ -429,14 +432,6 @@ class MPIDist(Distributed):
 
     def pp_broadcast(self, obj, root=0):
         return self.pp_comm.bcast(obj, root)
-
-    def create_cp_comm(self):
-        print(f"[MPIDist::create_cp_comm] rank: {self.mapping.rank}, cp_rank: {self.mapping.cp_rank}, cp_group: {self.mapping.cp_group}")
-        new_group = mpi_comm().group.Incl(self.mapping.cp_group)
-        self.cp_comm = mpi_comm().Create_group(new_group)
-
-    def cp_allgather(self, obj):
-        return self.cp_comm.allgather(obj)
 
 
 class MultiHandleWrapper:

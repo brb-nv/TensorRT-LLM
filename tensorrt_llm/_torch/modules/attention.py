@@ -709,6 +709,7 @@ class MLA(nn.Module):
         self.hidden_size = hidden_size
         self.num_heads = num_attention_heads
         self.num_key_value_heads = num_key_value_heads
+        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         assert self.num_heads == self.num_key_value_heads, "num_heads must be equal to num_key_value_heads"
         self.qk_nope_head_dim = qk_nope_head_dim
         self.qk_rope_head_dim = qk_rope_head_dim
@@ -761,7 +762,7 @@ class MLA(nn.Module):
         if self.mapping.has_cp_ulysses():
             raise NotImplementedError("MLA doesn't support CP Ulyssees yet")
         if self.mapping.cp_size > 1:
-            assert self.mapping.cp_config['cp_type'] == CpType.HELIX
+            assert self.mapping.cp_config['cp_type'] == CpType.HELIX, f"CP type must be HELIX for MLA, but got {self.mapping.cp_config['cp_type']}."
 
         mapping = Mapping(
             world_size=tp_size * pp_size * cp_size,
@@ -1093,9 +1094,6 @@ class MLA(nn.Module):
 
     def create_output(self, hidden_states: torch.Tensor, num_contexts: int):
         num_tokens = hidden_states.shape[0]
-        # note: for testing Helix parallelism, we ensure that the output is
-        # large enough for the context phase, but we then cut it again in
-        # `forward_context`
         hidden_size = self.o_proj.in_features
         if self.enable_unit_test and num_contexts > 0:
             # note: for testing Helix parallelism, we ensure that the output is
