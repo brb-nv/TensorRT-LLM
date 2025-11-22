@@ -1197,9 +1197,9 @@ class MLA(nn.Module):
                 q_gen,
                 compressed_kv_gen,
                 k_pe_gen,
-                position_ids,
                 attn_metadata,
                 output[num_ctx_tokens:num_tokens, :],
+                position_ids=position_ids,
                 latent_cache=latent_cache_gen,
             )
 
@@ -1303,7 +1303,6 @@ class MLA(nn.Module):
                 q_gen,
                 compressed_kv_gen,
                 k_pe_gen,
-                position_ids,
                 attn_metadata,
                 output[num_ctx_tokens:num_tokens, :],
                 latent_cache_gen,
@@ -1338,10 +1337,6 @@ class MLA(nn.Module):
                                                        self.qk_rope_head_dim)
         k = k.view(-1, self.num_heads_tp * self.qk_head_dim)
 
-        helix_position_offsets = position_ids if self.mapping.cp_size > 1 else None
-
-        # helix_position_offsets = position_ids if self.mapping.has_cp_helix(
-        #     ) else None
         helix_position_offsets = position_ids if self.mapping.cp_size > 1 else None
 
         attn_output = self.mha.forward(
@@ -1389,7 +1384,6 @@ class MLA(nn.Module):
         q: torch.Tensor,
         compressed_kv: torch.Tensor,
         k_pe: torch.Tensor,
-        position_ids: Optional[torch.Tensor],
         attn_metadata: AttentionMetadata,
         output: torch.Tensor,
         latent_cache: Optional[torch.Tensor] = None,
@@ -1399,7 +1393,6 @@ class MLA(nn.Module):
             return self.forward_absorption_generation(q,
                                                       compressed_kv,
                                                       k_pe,
-                                                      position_ids,
                                                       attn_metadata,
                                                       output,
                                                       latent_cache=latent_cache,
@@ -1673,9 +1666,9 @@ class MLA(nn.Module):
         q: torch.Tensor,
         compressed_kv: torch.Tensor,
         k_pe: torch.Tensor,
-        position_ids: torch.Tensor,
         attn_metadata: AttentionMetadata,
         output: torch.Tensor,
+        position_ids: Optional[torch.Tensor] = None,
         latent_cache: Optional[torch.Tensor] = None,
         topk_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
@@ -1725,7 +1718,11 @@ class MLA(nn.Module):
         )
 
         # Compute helix_position_offsets for helix parallelism.
-        helix_position_offsets = position_ids if self.mapping.cp_size > 1 else None
+        if self.mapping.cp_size > 1:
+            assert position_ids is not None, "position_ids is required for helix parallelism."
+            helix_position_offsets = position_ids
+        else:
+            helix_position_offsets = None
 
         rope_stream = self.aux_stream if not has_fp8_kv_cache else None
         if self.k_b_proj_trans.dtype == torch.bfloat16:
