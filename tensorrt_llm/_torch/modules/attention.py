@@ -1717,12 +1717,11 @@ class MLA(nn.Module):
             device=q.device,
         )
 
-        # Compute helix_position_offsets for helix parallelism.
+        helix_position_offsets, helix_is_inactive_rank = None, None
         if self.mapping.cp_size > 1:
-            assert position_ids is not None, "position_ids is required for helix parallelism."
             helix_position_offsets = position_ids
-        else:
-            helix_position_offsets = None
+            helix_is_inactive_rank = attn_metadata.helix_is_inactive_rank
+            assert helix_position_offsets is not None and helix_is_inactive_rank is not None, "helix_position_offsets and helix_is_inactive_rank must be provided for helix parallelism."
 
         rope_stream = self.aux_stream if not has_fp8_kv_cache else None
         if self.k_b_proj_trans.dtype == torch.bfloat16:
@@ -1748,7 +1747,9 @@ class MLA(nn.Module):
                                                      mla_bmm2_scale,
                                                      quant_q_buffer,
                                                      helix_position_offsets=
-                                                     helix_position_offsets),
+                                                     helix_position_offsets,
+                                                     helix_is_inactive_rank=
+                                                     helix_is_inactive_rank),
                 self.ln_events[0],
                 self.ln_events[1],
                 rope_stream,
@@ -1777,7 +1778,9 @@ class MLA(nn.Module):
                                                      mla_bmm2_scale,
                                                      quant_q_buffer,
                                                      helix_position_offsets=
-                                                     helix_position_offsets),
+                                                     helix_position_offsets,
+                                                     helix_is_inactive_rank=
+                                                     helix_is_inactive_rank),
                 self.ln_events[0],
                 self.ln_events[1],
                 rope_stream,
