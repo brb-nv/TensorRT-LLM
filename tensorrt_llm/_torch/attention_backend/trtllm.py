@@ -1768,6 +1768,15 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         assert self.is_mla_enable and self.mla_params is not None
         assert metadata.kv_cache_manager is not None
         sink_token_length = 0
+        
+        # Ensure helix_is_inactive_rank is on the same device as other tensors
+        if helix_is_inactive_rank is not None:
+            if isinstance(helix_is_inactive_rank, list):
+                helix_is_inactive_rank = torch.tensor(
+                    helix_is_inactive_rank, dtype=torch.bool, device=helix_position_offsets.device)
+            elif helix_is_inactive_rank.device.type != 'cuda':
+                helix_is_inactive_rank = helix_is_inactive_rank.to(helix_position_offsets.device)
+        
         mla_tensor_params = [helix_position_offsets, helix_is_inactive_rank]
 
         torch.ops.trtllm.mla_rope_generation(
