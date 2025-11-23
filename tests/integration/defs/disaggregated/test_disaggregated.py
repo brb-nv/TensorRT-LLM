@@ -1934,4 +1934,5 @@ def test_disaggregated_deepseek_v3_lite_bf16_tllm_gen_helix(
     run_disaggregated_test(disaggregated_example_root,
                            "deepseek_v3_lite_bf16_tllm_gen_helix",
                            env=llm_venv._new_env,
-                           cwd=llm_venv.get_working_directory())
+                           cwd=llm_venv.get_working_directory(),
+                           prompt_file="long_prompts.json")
