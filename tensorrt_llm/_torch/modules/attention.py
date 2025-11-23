@@ -750,7 +750,8 @@ class MLA(nn.Module):
         # tensor parallel
         config = config or ModelConfig()
         if mapping_with_cp is not None:
-            print("[MLA::__init__] OVERRIDING MAPPING WITH CP DETECTED.")
+            logger.warning(
+                "[MLA::__init__] Overriding mapping with CP detected.")
             self.mapping = mapping_with_cp
         else:
             self.mapping = config.mapping
@@ -762,7 +763,8 @@ class MLA(nn.Module):
         if self.mapping.has_cp_ulysses():
             raise NotImplementedError("MLA doesn't support CP Ulyssees yet")
         if self.mapping.cp_size > 1:
-            assert self.mapping.cp_config['cp_type'] == CpType.HELIX, f"CP type must be HELIX for MLA, but got {self.mapping.cp_config['cp_type']}."
+            assert self.mapping.cp_config[
+                'cp_type'] == CpType.HELIX, f"CP type must be HELIX for MLA, but got {self.mapping.cp_config['cp_type']}."
 
         mapping = Mapping(
             world_size=tp_size * pp_size * cp_size,
@@ -1727,20 +1729,19 @@ class MLA(nn.Module):
             maybe_execute_in_parallel(
                 lambda: torch.ops.trtllm.bmm_out(
                     q_nope_t, self.k_b_proj_trans.transpose(1, 2), q_nope_out),
-                lambda: self.mqa.mla_rope_generation(fused_q,
-                                                     q_pe,
-                                                     latent_cache,
-                                                     attn_metadata,
-                                                     cu_q_seqlens,
-                                                     cu_kv_seqlens,
-                                                     fmha_scheduler_counter,
-                                                     mla_bmm1_scale,
-                                                     mla_bmm2_scale,
-                                                     quant_q_buffer,
-                                                     helix_position_offsets=
-                                                     helix_position_offsets,
-                                                     helix_is_inactive_rank=
-                                                     helix_is_inactive_rank),
+                lambda: self.mqa.mla_rope_generation(
+                    fused_q,
+                    q_pe,
+                    latent_cache,
+                    attn_metadata,
+                    cu_q_seqlens,
+                    cu_kv_seqlens,
+                    fmha_scheduler_counter,
+                    mla_bmm1_scale,
+                    mla_bmm2_scale,
+                    quant_q_buffer,
+                    helix_position_offsets=helix_position_offsets,
+                    helix_is_inactive_rank=helix_is_inactive_rank),
                 self.ln_events[0],
                 self.ln_events[1],
                 rope_stream,
@@ -1758,20 +1759,19 @@ class MLA(nn.Module):
                     q_nope_out,
                     self.k_b_proj_trans_dequant,
                 ),
-                lambda: self.mqa.mla_rope_generation(fused_q,
-                                                     q_pe,
-                                                     latent_cache,
-                                                     attn_metadata,
-                                                     cu_q_seqlens,
-                                                     cu_kv_seqlens,
-                                                     fmha_scheduler_counter,
-                                                     mla_bmm1_scale,
-                                                     mla_bmm2_scale,
-                                                     quant_q_buffer,
-                                                     helix_position_offsets=
-                                                     helix_position_offsets,
-                                                     helix_is_inactive_rank=
-                                                     helix_is_inactive_rank),
+                lambda: self.mqa.mla_rope_generation(
+                    fused_q,
+                    q_pe,
+                    latent_cache,
+                    attn_metadata,
+                    cu_q_seqlens,
+                    cu_kv_seqlens,
+                    fmha_scheduler_counter,
+                    mla_bmm1_scale,
+                    mla_bmm2_scale,
+                    quant_q_buffer,
+                    helix_position_offsets=helix_position_offsets,
+                    helix_is_inactive_rank=helix_is_inactive_rank),
                 self.ln_events[0],
                 self.ln_events[1],
                 rope_stream,

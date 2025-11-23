@@ -298,7 +298,8 @@ class TrtllmAttentionWrapper:
         self.sparse_mla_topk = sparse_mla_topk
         self.helix_position_offsets = helix_position_offsets
         self.helix_is_inactive_rank = helix_is_inactive_rank
-        if self.helix_is_inactive_rank is not None and not isinstance(self.helix_is_inactive_rank, torch.Tensor):
+        if self.helix_is_inactive_rank is not None and not isinstance(
+                self.helix_is_inactive_rank, torch.Tensor):
             self.helix_is_inactive_rank = torch.tensor(
                 self.helix_is_inactive_rank, dtype=torch.bool, pin_memory=True)
 
@@ -480,7 +481,9 @@ class TrtllmAttentionWrapper:
             spec_decoding_tensor_params.append(self.spec_decoding_bl_tree_mask)
             spec_decoding_tensor_params.append(
                 self.spec_bl_tree_first_sparse_mask_offset_kv)
-        mla_tensor_params = [self.helix_position_offsets, self.helix_is_inactive_rank]
+        mla_tensor_params = [
+            self.helix_position_offsets, self.helix_is_inactive_rank
+        ]
 
         thop.attention(
             q,
@@ -857,10 +860,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         if self.helix_is_inactive_rank is not None and len(
                 self.helix_is_inactive_rank):
             # If helix is inactive, attend to the previously cached tokens only.
-            # This gets further complicated with multiple requests as each request might
-            # have a different active helix rank.
             assert cached_token_lens is not None, "cached_token_lens should be set for helix"
-            kv_lens = cached_token_lens
+            kv_lens = cached_token_lens.clone()
             helix_is_inactive_rank_cpu = torch.tensor(
                 self.helix_is_inactive_rank,
                 dtype=torch.bool,
@@ -1860,15 +1861,18 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         assert self.is_mla_enable and self.mla_params is not None
         assert metadata.kv_cache_manager is not None
         sink_token_length = 0
-        
+
         # Ensure helix_is_inactive_rank is on the same device as other tensors
         if helix_is_inactive_rank is not None:
             if isinstance(helix_is_inactive_rank, list):
                 helix_is_inactive_rank = torch.tensor(
-                    helix_is_inactive_rank, dtype=torch.bool, device=helix_position_offsets.device)
+                    helix_is_inactive_rank,
+                    dtype=torch.bool,
+                    device=helix_position_offsets.device)
             elif helix_is_inactive_rank.device.type != 'cuda':
-                helix_is_inactive_rank = helix_is_inactive_rank.to(helix_position_offsets.device)
-        
+                helix_is_inactive_rank = helix_is_inactive_rank.to(
+                    helix_position_offsets.device)
+
         mla_tensor_params = [helix_position_offsets, helix_is_inactive_rank]
 
         torch.ops.trtllm.mla_rope_generation(

@@ -1,10 +1,10 @@
+import copy
 import math
 import pickle  # nosec B403
 from abc import ABC, abstractmethod
 from functools import wraps
 from typing import Optional
 
-import copy
 import numpy as np
 import torch
 import torch.distributed as dist
@@ -346,7 +346,8 @@ class MPIDist(Distributed):
         # Repurpose CP ranks to TP for Helix so that the right comms are created.
         mapping_with_helix = None
         if self.mapping.cp_size > 1:
-            print(f"[MPIDist::__init__] Repurposing CP ranks to TP for Helix.")
+            logger.info(
+                f"[MPIDist::__init__] Repurposing CP ranks to TP for Helix.")
             mapping_with_helix = copy.deepcopy(self.mapping)
             mapping_without_helix = Mapping(
                 world_size=self.mapping.world_size,
@@ -364,7 +365,9 @@ class MPIDist(Distributed):
 
         # Restore the original mapping.
         if mapping_with_helix is not None:
-            print(f"[MPIDist::__init__] Restoring original mapping.")
+            logger.info(
+                f"[MPIDist::__init__] Restoring original mapping undoing Helix manipulation."
+            )
             self.mapping = mapping_with_helix
 
     def broadcast(self, obj, root=0, chunk_size: int = 4 * 1024 * 1024):

@@ -2,7 +2,6 @@ import asyncio
 import gc
 import json
 import os
-import gc
 import signal  # Added import
 import subprocess  # nosec B404
 import sys
@@ -131,6 +130,9 @@ def get_llm_args(
         except KeyError:
             raise ValueError(f"Invalid cp_type: {cp_config['cp_type']}. " \
                              f"Must be one of: {', '.join([t.name for t in CpType])}")
+        if cp_config["cp_type"] == CpType.HELIX:
+            cp_config['tokens_per_block'] = kv_cache_config.tokens_per_block
+
     llm_args = {
         "model": model,
         "scheduler_config": scheduler_config,
@@ -394,8 +396,8 @@ class ChoiceWithAlias(click.Choice):
 def serve(
         model: str, tokenizer: Optional[str], host: str, port: int,
         log_level: str, backend: str, max_beam_width: int, max_batch_size: int,
-        max_num_tokens: int, max_seq_len: int, tp_size: int, pp_size: int, cp_size: int,
-        ep_size: Optional[int], cluster_size: Optional[int],
+        max_num_tokens: int, max_seq_len: int, tp_size: int, pp_size: int,
+        cp_size: int, ep_size: Optional[int], cluster_size: Optional[int],
         gpus_per_node: Optional[int], kv_cache_free_gpu_memory_fraction: float,
         num_postprocess_workers: int, trust_remote_code: bool,
         extra_llm_api_options: Optional[str], reasoning_parser: Optional[str],

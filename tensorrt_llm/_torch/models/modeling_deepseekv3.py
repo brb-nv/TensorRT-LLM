@@ -545,8 +545,6 @@ class DeepseekV3Attention(MLA):
                          config=model_config,
                          aux_stream=aux_stream,
                          mapping_with_cp=mapping_with_cp)
-        # @B: Does this layer need to know about mapping_with_cp?
-        # Likely no because no use of mapping.
         self.kv_a_proj_with_mqa = DeepseekV3Linear(
             config.hidden_size,
             self.kv_lora_rank + self.qk_rope_head_dim +

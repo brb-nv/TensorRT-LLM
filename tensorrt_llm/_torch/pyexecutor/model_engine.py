@@ -9,7 +9,6 @@ import weakref
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from typing import Any, Callable, Dict, List, Optional, Tuple
-from .llm_request import LlmRequest
 
 import torch
 import torch._dynamo.config
@@ -566,6 +565,9 @@ class PyTorchModelEngine(ModelEngine):
         cp_type = self.mapping.cp_config.get('cp_type', None)
         if cp_type is not None:
             if cp_type in [CpType.ULYSSES, CpType.STAR]:
+                logger.info(
+                    "[ModelEngine::warmup] Skipping warmup for cp_type: ",
+                    cp_type.name)
                 return
 
         self._run_torch_compile_warmup(resource_manager)
@@ -1662,7 +1664,8 @@ class PyTorchModelEngine(ModelEngine):
                 request.cached_tokens = num_cached_tokens_per_seq[-1]
                 prompt_lengths.append(request.py_prompt_len)
                 if self.mapping.has_cp_helix():
-                    helix_is_inactive_rank.append(request.py_helix_is_inactive_rank)
+                    helix_is_inactive_rank.append(
+                        request.py_helix_is_inactive_rank)
                 draft_lens.append(0)
                 sequence_lengths.append(1)
                 num_accepted_draft_tokens.append(0)

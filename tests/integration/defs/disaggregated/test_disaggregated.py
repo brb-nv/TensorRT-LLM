@@ -274,7 +274,7 @@ def get_test_config(test_desc, example_dir, test_root):
         "deepseek_v3_lite_fp8_tllm_gen_helix":
         (4,
          f"{test_configs_root}/disagg_config_ctxtp2_gentp1cp2_deepseek_v3_lite_fp8_tllm_gen.yaml"
-        ),
+         ),
     }
 
     if test_desc not in config_map:

@@ -528,7 +528,9 @@ def _run_mla_distributed(
                     num_cached_tokens_per_seq=cached_tokens_per_seq,
                 ),
                 enable_context_mla_with_cached_kv=True,
-                helix_is_inactive_rank=torch.tensor(helix_is_inactive_rank, dtype=torch.bool, device="cuda"),
+                helix_is_inactive_rank=torch.tensor(
+                    helix_is_inactive_rank, dtype=torch.bool, device="cuda"
+                ),
             )
         else:
             attn_metadata.kv_cache_params = KVCacheParams(
@@ -536,7 +538,8 @@ def _run_mla_distributed(
                 num_cached_tokens_per_seq=cached_tokens_per_seq,
             )
             attn_metadata.helix_is_inactive_rank = torch.tensor(
-                helix_is_inactive_rank, dtype=torch.bool, device="cuda")
+                helix_is_inactive_rank, dtype=torch.bool, device="cuda"
+            )
         attn_metadata.prepare()
         extra_attrs["attention_metadata"] = weakref.ref(attn_metadata)
         if not use_cuda_graph:

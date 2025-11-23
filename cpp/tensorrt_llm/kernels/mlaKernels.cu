@@ -425,6 +425,7 @@ __global__ void applyMLARopeAndAssignQKVKernelGeneration(T* qkv_output, T* q_pe,
 
             if (valid_token)
             {
+
                 auto const position_id
                     = (helix_position_offsets != nullptr ? helix_position_offsets[global_token_idx]
                                                          : kv_cache_lengths[batch_idx] - seq_len + local_token_idx);
@@ -463,6 +464,7 @@ __global__ void applyMLARopeAndAssignQKVKernelGeneration(T* qkv_output, T* q_pe,
                 if (head_idx == head_num && (helix_is_inactive_rank == nullptr || !helix_is_inactive_rank[batch_idx]))
                 {
                     auto const token_kv_idx = kv_cache_lengths[batch_idx] - seq_len + local_token_idx;
+
                     {
                         auto kDst = reinterpret_cast<T*>(kv_cache.getKBlockPtr(batch_idx, token_kv_idx));
                         auto inBlockIdx = kv_cache.getKVLocalIdx(
