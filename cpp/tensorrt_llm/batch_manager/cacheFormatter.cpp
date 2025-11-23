@@ -38,6 +38,7 @@
 #include <cstdint>
 #include <future>
 #include <numeric>
+#include <random>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager
 {
@@ -492,13 +493,20 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
 
         if (connections.size() > 1)
         {
+            // Shuffle connections to potentially improve bandwidth
+            std::vector<size_t> shuffledIndices(connections.size());
+            std::iota(shuffledIndices.begin(), shuffledIndices.end(), 0);
+            std::random_device rd;
+            std::mt19937 g(rd());
+            std::shuffle(shuffledIndices.begin(), shuffledIndices.end(), g);
+
             if (!common::getEnvEnableReceiveKVCacheParallel())
             {
                 TLLM_LOG_DEBUG("Disable parallel receiving of the KV cache.");
 
-                for (size_t i = 0; i < connections.size(); i++)
+                for (size_t i = 0; i < shuffledIndices.size(); i++)
                 {
-                    sendBufferFun(deviceId, i);
+                    sendBufferFun(deviceId, shuffledIndices[i]);
                 }
             }
             else
@@ -516,9 +524,9 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
                     futures.reserve(sendConcurrencyNum);
                     for (size_t i = 0; i < sendConcurrencyNum; i++)
                     {
-                        TLLM_CHECK((i + (connections.size() - remainSendNum)) < connections.size());
-                        futures.push_back(std::async(
-                            std::launch::async, sendBufferFun, deviceId, i + (connections.size() - remainSendNum)));
+                        size_t shuffledIdx = shuffledIndices[connections.size() - remainSendNum + i];
+                        TLLM_CHECK(shuffledIdx < connections.size());
+                        futures.push_back(std::async(std::launch::async, sendBufferFun, deviceId, shuffledIdx));
                     }
                     for (auto& future : futures)
                     {
@@ -840,12 +848,19 @@ void CacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& sess
             };
             if (pickUpConnections.size() > 1)
             {
+                // Shuffle connections to potentially improve bandwidth
+                std::vector<size_t> shuffledIndices(pickUpConnections.size());
+                std::iota(shuffledIndices.begin(), shuffledIndices.end(), 0);
+                std::random_device rd;
+                std::mt19937 g(rd());
+                std::shuffle(shuffledIndices.begin(), shuffledIndices.end(), g);
+
                 if (!common::getEnvEnableReceiveKVCacheParallel())
                 {
 
-                    for (size_t i = 0; i < pickUpConnections.size(); i++)
+                    for (size_t i = 0; i < shuffledIndices.size(); i++)
                     {
-                        recvBufferFun(deviceId, i);
+                        recvBufferFun(deviceId, shuffledIndices[i]);
                     }
                 }
                 else
@@ -868,9 +883,9 @@ void CacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& sess
                         futures.reserve(recvConcurrencyNum);
                         for (size_t i = 0; i < recvConcurrencyNum; i++)
                         {
-                            TLLM_CHECK((i + (pickUpConnections.size() - remainRecvNum)) < pickUpConnections.size());
-                            futures.push_back(std::async(std::launch::async, recvBufferFun, deviceId,
-                                i + (pickUpConnections.size() - remainRecvNum)));
+                            size_t shuffledIdx = shuffledIndices[pickUpConnections.size() - remainRecvNum + i];
+                            TLLM_CHECK(shuffledIdx < pickUpConnections.size());
+                            futures.push_back(std::async(std::launch::async, recvBufferFun, deviceId, shuffledIdx));
                         }
                         for (auto& future : futures)
                         {
