@@ -130,8 +130,6 @@ def get_llm_args(
         except KeyError:
             raise ValueError(f"Invalid cp_type: {cp_config['cp_type']}. " \
                              f"Must be one of: {', '.join([t.name for t in CpType])}")
-        if cp_config["cp_type"] == CpType.HELIX:
-            cp_config['tokens_per_block'] = kv_cache_config.tokens_per_block
 
     llm_args = {
         "model": model,
