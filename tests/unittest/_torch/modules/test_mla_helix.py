@@ -99,6 +99,8 @@ class Scenario:
 
 
 all_scenarios = [
+    Scenario(batch=1, ctx_len=64),
+    Scenario(batch=1, ctx_len=512),
     Scenario(batch=1, ctx_len=1024),
     Scenario(batch=1, ctx_len=2048),
     Scenario(batch=1, ctx_len=4096),
@@ -125,20 +127,18 @@ all_scenarios = [
     Scenario(batch=16, ctx_len=16384),
     Scenario(batch=16, ctx_len=32768),
     Scenario(batch=16, ctx_len=65536),
-    Scenario(batch=1, ctx_len=64),
 ]
 
 # limit the number of test scenarios to avoid taking too long
 test_scenarios = [
-    # note: tests with ctx_len=1024 (or less) are currently failing, most likely due to
-    # bad numerics especially with bf16. We ignore those tests for now.
-    # all_scenarios[2],
-    # all_scenarios[5],
-    # all_scenarios[12],
-    # all_scenarios[15],
-    # all_scenarios[21],
-    # all_scenarios[22],
-    all_scenarios[-1],
+    all_scenarios[0],
+    all_scenarios[1],
+    all_scenarios[4],
+    all_scenarios[7],
+    all_scenarios[14],
+    all_scenarios[17],
+    all_scenarios[23],
+    all_scenarios[24],
 ]
 
 
