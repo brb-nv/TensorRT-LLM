@@ -357,8 +357,14 @@ class MPIDist(Distributed):
                 cp_config={},
                 tp_size=self.mapping.tp_size * self.mapping.cp_size,
                 pp_size=self.mapping.pp_size,
+                pp_partition=self.mapping.pp_partition,
+                moe_cluster_size=self.mapping.moe_cluster_size,
+                moe_tp_size=self.mapping.moe_tp_size,
                 moe_ep_size=self.mapping.moe_ep_size,
-                enable_attention_dp=self.mapping.enable_attention_dp)
+                # attn_tp_size, attn_cp_size shall be set in the constructor of Mapping.
+                enable_attention_dp=self.mapping.enable_attention_dp,
+                enable_lm_head_tp_in_adp=self.mapping.enable_lm_head_tp_in_adp)
+
             self.mapping = mapping_without_helix
         self.create_tp_comm()
         self.create_pp_comm()
