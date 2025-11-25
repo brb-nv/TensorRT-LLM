@@ -344,11 +344,11 @@ class MPIDist(Distributed):
         super().__init__(mapping)
         self.create_cp_comm()
         # Repurpose CP ranks to TP for Helix so that the right comms are created.
-        mapping_with_helix = None
+        mapping_with_cp = None
         if self.mapping.cp_size > 1:
             logger.info(
                 f"[MPIDist::__init__] Repurposing CP ranks to TP for Helix.")
-            mapping_with_helix = copy.deepcopy(self.mapping)
+            mapping_with_cp = copy.deepcopy(self.mapping)
             mapping_without_helix = Mapping(
                 world_size=self.mapping.world_size,
                 rank=self.mapping.rank,
@@ -364,11 +364,11 @@ class MPIDist(Distributed):
         self.create_pp_comm()
 
         # Restore the original mapping.
-        if mapping_with_helix is not None:
+        if mapping_with_cp is not None:
             logger.info(
                 f"[MPIDist::__init__] Restoring original mapping undoing Helix manipulation."
             )
-            self.mapping = mapping_with_helix
+            self.mapping = mapping_with_cp
 
     def broadcast(self, obj, root=0, chunk_size: int = 4 * 1024 * 1024):
         comm = mpi_comm()

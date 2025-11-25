@@ -710,7 +710,6 @@ class MLA(nn.Module):
         self.num_heads = num_attention_heads
         self.num_key_value_heads = num_key_value_heads
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
-        assert self.num_heads == self.num_key_value_heads, "num_heads must be equal to num_key_value_heads"
         self.qk_nope_head_dim = qk_nope_head_dim
         self.qk_rope_head_dim = qk_rope_head_dim
         self.qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
