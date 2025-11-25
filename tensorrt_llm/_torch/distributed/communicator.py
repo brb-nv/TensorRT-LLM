@@ -349,23 +349,8 @@ class MPIDist(Distributed):
             logger.info(
                 f"[MPIDist::__init__] Repurposing CP ranks to TP for Helix.")
             mapping_with_cp = copy.deepcopy(self.mapping)
-            mapping_without_helix = Mapping(
-                world_size=self.mapping.world_size,
-                rank=self.mapping.rank,
-                gpus_per_node=self.mapping.gpus_per_node,
-                cp_size=1,
-                cp_config={},
-                tp_size=self.mapping.tp_size * self.mapping.cp_size,
-                pp_size=self.mapping.pp_size,
-                pp_partition=self.mapping.pp_partition,
-                moe_cluster_size=self.mapping.moe_cluster_size,
-                moe_tp_size=self.mapping.moe_tp_size,
-                moe_ep_size=self.mapping.moe_ep_size,
-                # attn_tp_size, attn_cp_size shall be set in the constructor of Mapping.
-                enable_attention_dp=self.mapping.enable_attention_dp,
-                enable_lm_head_tp_in_adp=self.mapping.enable_lm_head_tp_in_adp)
+            self.mapping = self.mapping.repurpose_helix_cp_to_tp()
 
-            self.mapping = mapping_without_helix
         self.create_tp_comm()
         self.create_pp_comm()
 
