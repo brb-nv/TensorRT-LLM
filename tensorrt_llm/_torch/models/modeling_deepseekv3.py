@@ -1585,7 +1585,7 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
         # is in action. This shall be passed on to attention which is the only layer that's
         # affected by CP. For other layers, CP ranks are repurposed to TP. This shall be undone
         # at the end of __init__.
-        if model_config.mapping.cp_size > 1:
+        if model_config.mapping.has_cp_helix():
             print(
                 f"[DeepseekV3ForCausalLM::__init__] Repurposing KVP ranks to TP while keeping other details the same."
             )

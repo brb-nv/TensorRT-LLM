@@ -345,7 +345,7 @@ class MPIDist(Distributed):
         self.create_cp_comm()
         # Repurpose CP ranks to TP for Helix so that the right comms are created.
         mapping_with_cp = None
-        if self.mapping.cp_size > 1:
+        if self.mapping.has_cp_helix():
             logger.info(
                 f"[MPIDist::__init__] Repurposing CP ranks to TP for Helix.")
             mapping_with_cp = copy.deepcopy(self.mapping)

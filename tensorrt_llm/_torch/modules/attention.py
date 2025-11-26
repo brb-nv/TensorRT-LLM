@@ -762,8 +762,7 @@ class MLA(nn.Module):
         if self.mapping.has_cp_ulysses():
             raise NotImplementedError("MLA doesn't support CP Ulyssees yet")
         if self.mapping.cp_size > 1:
-            assert self.mapping.cp_config[
-                'cp_type'] == CpType.HELIX, f"CP type must be HELIX for MLA, but got {self.mapping.cp_config['cp_type']}."
+            assert self.mapping.has_cp_helix(), f"CP type must be HELIX for MLA, but got {self.mapping.cp_config['cp_type']}."
 
         mapping = Mapping(
             world_size=tp_size * pp_size * cp_size,
@@ -1053,7 +1052,7 @@ class MLA(nn.Module):
                           k: torch.Tensor, v: torch.Tensor,
                           position_ids: Optional[torch.Tensor],
                           attn_metadata: AttentionMetadata, **kwargs):
-        if self.mapping.cp_size > 1:
+        if self.mapping.has_cp_helix():
             # partial_o: [num_tokens, num_heads_tp * kv_lora_rank]
             # softmax_stats: [num_tokens, num_heads_tp, 2]
             softmax_stats = torch.empty((q.shape[0], self.num_heads_tp, 2),
@@ -1329,7 +1328,7 @@ class MLA(nn.Module):
                                                        self.qk_rope_head_dim)
         k = k.view(-1, self.num_heads_tp * self.qk_head_dim)
 
-        helix_position_offsets = position_ids if self.mapping.cp_size > 1 else None
+        helix_position_offsets = position_ids if self.mapping.has_cp_helix() else None
 
         attn_output = self.mha.forward(
             q,
@@ -1710,7 +1709,7 @@ class MLA(nn.Module):
         )
 
         helix_position_offsets, helix_is_inactive_rank = None, None
-        if self.mapping.cp_size > 1:
+        if self.mapping.has_cp_helix():
             helix_position_offsets = position_ids
             helix_is_inactive_rank = attn_metadata.helix_is_inactive_rank
             assert helix_position_offsets is not None and helix_is_inactive_rank is not None, "helix_position_offsets and helix_is_inactive_rank must be provided for helix parallelism."
@@ -2121,7 +2120,7 @@ class MLA(nn.Module):
                               output=attn_output,
                               latent_cache_gen=latent_cache_gen)
 
-        if self.enable_unit_test and self.mapping.cp_size > 1:
+        if self.enable_unit_test and self.mapping.has_cp_helix():
             # note: for allowing testing Helix parallelism, we ensure that
             # the output is compatible with o_proj even in the context phase,
             # thus we cut it to num_heads_tp_cp * v_head_dim

@@ -488,8 +488,7 @@ class Mapping(MappingBase):
     def repurpose_helix_cp_to_tp(self):
         # In helix parallelism, CP is relevant only for the attention layer. These ranks are repurposed to TP
         # for FFN layers.
-        assert self.cp_size > 1 and self.cp_config[
-            'cp_type'] == CpType.HELIX, f"CP type must be HELIX for repurposing, but got {self.cp_config['cp_type']}."
+        assert self.has_cp_helix()
         return Mapping(
             world_size=self.world_size,
             rank=self.rank,
