@@ -1591,12 +1591,13 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
             )
             self.mapping_with_cp = copy.deepcopy(model_config.mapping)
 
-            original_tp_size = self.mapping_with_cp.tp_size
-            original_cp_size = self.mapping_with_cp.cp_size
+            self.mapping_with_cp.tp_size
+            self.mapping_with_cp.cp_size
 
             # Repurpose KVP ranks to TP while keeping other details the same.
             model_config._frozen = False
-            model_config.mapping = model_config.mapping.repurpose_helix_cp_to_tp()
+            model_config.mapping = model_config.mapping.repurpose_helix_cp_to_tp(
+            )
             model_config._frozen = True
 
         # Rename some keys of quant_config_dict to support legacy checkpoints

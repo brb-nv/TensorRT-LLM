@@ -8,7 +8,7 @@ from torch import nn
 from tensorrt_llm._utils import (get_sm_version, is_sm_100f, nvtx_range,
                                  nvtx_range_debug)
 from tensorrt_llm.logger import logger
-from tensorrt_llm.mapping import CpType, Mapping
+from tensorrt_llm.mapping import Mapping
 
 from ..attention_backend import (AttentionInputType, AttentionMetadata,
                                  FlashInferAttentionMetadata, TrtllmAttention,
@@ -762,7 +762,8 @@ class MLA(nn.Module):
         if self.mapping.has_cp_ulysses():
             raise NotImplementedError("MLA doesn't support CP Ulyssees yet")
         if self.mapping.cp_size > 1:
-            assert self.mapping.has_cp_helix(), f"CP type must be HELIX for MLA, but got {self.mapping.cp_config['cp_type']}."
+            assert self.mapping.has_cp_helix(
+            ), f"CP type must be HELIX for MLA, but got {self.mapping.cp_config['cp_type']}."
 
         mapping = Mapping(
             world_size=tp_size * pp_size * cp_size,
@@ -1328,7 +1329,8 @@ class MLA(nn.Module):
                                                        self.qk_rope_head_dim)
         k = k.view(-1, self.num_heads_tp * self.qk_head_dim)
 
-        helix_position_offsets = position_ids if self.mapping.has_cp_helix() else None
+        helix_position_offsets = position_ids if self.mapping.has_cp_helix(
+        ) else None
 
         attn_output = self.mha.forward(
             q,
