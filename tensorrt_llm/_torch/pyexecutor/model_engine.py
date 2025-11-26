@@ -1652,7 +1652,7 @@ class PyTorchModelEngine(ModelEngine):
                     # Warmup doesn't have `total_input_len_cp` set because merge_helix_requests is not called.
                     if not self.is_warmup and not request.is_cuda_graph_dummy:
                         position_id = request.total_input_len_cp + request.py_decoding_iter - 1
-                    # Assuming last CP rank is the active rank.
+                    # TODO: [TRTLLM-5972] Lift the limitation that last rank is always the active one for helix.
                     if self.mapping.cp_rank == self.mapping.cp_size - 1:
                         past_seen_token_num = request.orig_prompt_len + request.py_decoding_iter - 1
                     else:

@@ -1862,7 +1862,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         assert metadata.kv_cache_manager is not None
         sink_token_length = 0
 
-        # Ensure helix_is_inactive_rank is on the same device as other tensors
+        # Ensure helix_is_inactive_rank is on the same device as other tensors.
         if helix_is_inactive_rank is not None:
             if isinstance(helix_is_inactive_rank, list):
                 helix_is_inactive_rank = torch.tensor(
