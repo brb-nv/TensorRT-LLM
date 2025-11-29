@@ -1084,15 +1084,21 @@ class MLA(nn.Module):
             # transpose the tensors to make the split across cp_size contiguous
             # for both tensors, we need to split across the second dimension
             chunks = []
+            print(f"[_attn_forward_gen]: partial_o.shape: {partial_o.shape}, softmax_stats.shape: {softmax_stats.shape}")
             for t in [partial_o, softmax_stats]:
+                print(f"[_attn_forward_gen]: t.shape before transpose: {t.shape}")
                 t = t.transpose(1, 0).contiguous()
+                print(f"[_attn_forward_gen]: t.shape after transpose: {t.shape}")
                 chunks.extend(torch.split(t,
                                           t.shape[0] // self.mapping.cp_size))
+                print(f"[_attn_forward_gen]: chunks.shape: {[chunk.shape for chunk in chunks]}")
             gathered = alltoall_helix(chunks, self.mapping.cp_group)
+            print(f"[_attn_forward_gen]: gathered.shape before transpose: {[t.shape for t in gathered]}")
             # transpose the tensors back to ensure dimensions are ordered correctly
             # note: an additional dimension was added at the first index for all-to-all,
             # so the transpose dimensions are shifted by 1
             gathered = [t.transpose(1, 2).contiguous() for t in gathered]
+            print(f"[_attn_forward_gen]: gathered.shape after transpose: {[t.shape for t in gathered]}")
             return torch.ops.trtllm.helix_post_process(gathered[0], gathered[1],
                                                        1.0)
         else:

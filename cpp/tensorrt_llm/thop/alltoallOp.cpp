@@ -61,6 +61,7 @@ public:
         TLLM_CHECK_WITH_INFO(mNcclComm.get() != nullptr, "mNcclComm should be initialized before used");
         auto num_lists_ = static_cast<int>(num_lists.value_or(1));
         auto num_ranks = static_cast<int>(mGroup.size());
+        std::cerr << "[alltoall_helix] num_lists: " << num_lists_ << ", num_ranks: " << num_ranks << ", input_list.size(): " << input_list.size() << std::endl;
         // note: ensures that input_list size > 0
         TLLM_CHECK_WITH_INFO(static_cast<int>(input_list.size()) == num_ranks * num_lists_,
             "input_list size should be equal to group size * num_lists");
@@ -105,10 +106,13 @@ std::vector<torch::Tensor> alltoall_helix(
 {
 #if ENABLE_MULTI_DEVICE
     std::set<int> group;
+    std::cerr << "[alltoall_helix] group: ";
     for (int64_t rank : group_)
     {
+        std::cerr << rank << ", ";
         group.insert(static_cast<int>(rank));
     }
+    std::cerr << std::endl;
     AllToAllHelixOp op(group);
     op.initialize();
     return op.run(input_list, num_lists);

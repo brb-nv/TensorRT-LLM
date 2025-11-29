@@ -72,6 +72,22 @@ static constexpr int MAX_CP = WARP_SIZE * MAX_CP_VAL_PER_THREAD;
 static constexpr int BYTES_O_PER_THREAD = 16;
 static constexpr int NUM_PRE_LOAD = 8;
 
+/*
+Info:
+1) If restrict were used, it'll look like this:
+template <typename T>
+__global__ void helix_postprocess_kernel(
+    T* __restrict__ output,
+    T const* __restrict__ gathered_o,
+    float2 const* __restrict__ gathered_stats,
+    int cp_size,
+    int kv_lora_rank)
+
+Questions:
+1) What does NUM_O_PER_THREAD represent?
+2) 
+*/
+
 // Kernel: fused helix post-processing
 // output: [num_tokens, num_heads * kv_lora_rank] (half)
 // gathered_o: [cp_size, num_tokens, num_heads * kv_lora_rank] (half)
@@ -206,6 +222,15 @@ __global__ void helix_postprocess_kernel(
     }
 }
 
+/*
+Questions:
+1) Why is 16-byte alignment required for async memcpy?
+2) What's the max gridDim we can use? What's the usual size of num_tokens? Is it batch_size?
+3) Why choose the blockDim as WARP_SIZE + kv_lora_rank * sizeof(T) / 16? What's the math behind it?
+4) Where do we mention the number of SMs to be used? For B200, warps per SM is 64.
+5) What does dynamicSmemBytes do?
+6) Why have the additional hierarchy level of warps? What are the differences in resources available to both?
+*/
 template <typename T>
 void helixPostProcess(HelixPostProcParams<T> const& params, cudaStream_t stream)
 {
