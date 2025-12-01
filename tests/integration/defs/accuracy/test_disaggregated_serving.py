@@ -833,7 +833,9 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
     @pytest.mark.skip_less_device(4)
-    def test_auto_dtype_with_helix(self):
+    @pytest.mark.parametrize("use_nccl_for_alltoall", [True, False],
+                             ids=["nccl", "fifo"])
+    def test_auto_dtype_with_helix(self, use_nccl_for_alltoall):
         kv_cache_config = {
             "free_gpu_memory_fraction": 0.5,
             "enable_block_reuse": False,
@@ -858,7 +860,8 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             "context_parallel_size": 2,
             "cp_config": {
                 "cp_type": "HELIX",
-                "tokens_per_block": 32
+                "tokens_per_block": 32,
+                "use_nccl_for_alltoall": use_nccl_for_alltoall
             },
             "disable_overlap_scheduler": True,
             "kv_cache_config": kv_cache_config,
