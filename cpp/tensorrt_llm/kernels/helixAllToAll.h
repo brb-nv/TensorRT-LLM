@@ -92,47 +92,6 @@ struct HelixAllToAllParams
     int maxChannelCount;
 };
 
-namespace fused
-{
-
-struct HelixFusedFieldInfo
-{
-    uint8_t* dataPtr;
-    int numTokens;
-    int numHeads;
-    int headDim;
-    int elementSize; // Size of each element in bytes (2 for half, 8 for float2)
-    // note: the kernel assumes the data is contiguous,
-    // thus the helper sizes and strides are set automatically.
-    int rankSize;   // size in bytes for a single rank (numHeads * headDim *
-                    // elementSize)
-    int rankStride; // Stride between ranks in bytes.
-    int headStride; // Stride between heads in bytes.
-};
-
-// TODO this should use TRT-LLM or torch data types instead
-enum class DataType : uint8_t
-{
-    FP8,
-    FP16,
-    BF16,
-};
-
-struct HelixFusedAllToAllParams
-{
-    HelixFusedFieldInfo sendFields[2];
-    HelixFusedFieldInfo recvField;
-    DataType postProcDataType;
-    uint64_t* workspace;
-    int workspaceStrideInU64;
-    int cpRank;
-    int cpSize;
-    int channelCount; // use 0 to auto-compute
-    int maxChannelCount;
-};
-
-} // namespace fused
-
 // ============================================================================
 // Utility Functions
 // ============================================================================
@@ -206,59 +165,6 @@ inline size_t computeHelixWorkspaceSizePerRank(int cpSize)
     return fifoSize + senderInfoSize + receiverInfoSize;
 }
 
-namespace fused
-{
-
-/**
- * Compute number of channels for fused all-to-all operation.
- *
- * @param cpSize Number of context parallel ranks
- * @param smCount Number of SMs available (0 = auto-detect)
- * @return Number of channels to use
- */
-inline int computeHelixFusedMaxChannelCount(int cpSize, int smCount = 0)
-{
-    if (smCount == 0)
-    {
-        int deviceId = 0;
-        TLLM_CUDA_CHECK(cudaGetDevice(&deviceId));
-        TLLM_CUDA_CHECK(cudaDeviceGetAttribute(&smCount, cudaDevAttrMultiProcessorCount, deviceId));
-    }
-
-    int blockCountPerChannel = 1;
-    blockCountPerChannel *= 2; // for send and recv
-
-    int preferredChannel = smCount / blockCountPerChannel;
-    return std::max(preferredChannel, 1); // at least one channel
-}
-
-/**
- * Compute the workspace size required per rank for the fused all-to-all
- * operation.
- *
- * @param cpSize Number of context parallel ranks
- * @return Size in bytes
- */
-inline size_t computeHelixFusedWorkspaceSizePerRank(int cpSize)
-{
-    static int maxChannelCount = 0;
-    if (maxChannelCount == 0)
-    {
-        maxChannelCount = computeHelixFusedMaxChannelCount(cpSize);
-    }
-
-    // FIFO buffers: cpSize * channelCount pairs
-    size_t fifoSize = static_cast<size_t>(FIFO_TOTAL_BYTES) * cpSize * maxChannelCount;
-
-    // Sender and receiver FIFO info structures
-    size_t senderInfoSize = sizeof(FifoInfo) * cpSize * maxChannelCount;
-    size_t receiverInfoSize = sizeof(FifoInfo) * cpSize * maxChannelCount;
-
-    return fifoSize + senderInfoSize + receiverInfoSize;
-}
-
-} // namespace fused
-
 /**
  * Initialize workspace memory for a given rank.
  * Should be called once during setup.
@@ -277,29 +183,6 @@ void initializeHelixWorkspace(uint64_t* workspace, int cpSize, cudaStream_t stre
  * @param stream CUDA stream for kernel launch
  */
 void launchHelixAllToAll(HelixAllToAllParams const& params, bool allowVariableField1, cudaStream_t stream);
-
-namespace fused
-{
-
-/**
- * Initialize workspace memory for a given rank for the fused all-to-all
- * operation. Should be called once during setup.
- *
- * @param workspace Pointer to workspace memory (per-rank view)
- * @param cpSize Number of context parallel ranks
- * @param stream CUDA stream for asynchronous operations
- */
-void initializeHelixFusedWorkspace(uint64_t* workspace, int cpSize, cudaStream_t stream);
-
-/**
- * Launch the helix fused all-to-all kernel.
- *
- * @param params Kernel parameters including field info and workspace
- * @param stream CUDA stream for kernel launch
- */
-void launchHelixFusedAllToAll(HelixFusedAllToAllParams& params, cudaStream_t stream);
-
-} // namespace fused
 
 } // namespace kernels
 } // namespace tensorrt_llm
