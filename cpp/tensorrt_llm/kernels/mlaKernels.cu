@@ -552,9 +552,6 @@ __global__ void applyMLARopeAndAssignQKVKernelGeneration(T* qkv_output, T* q_pe,
             if (valid_token && head_dim_vec_idx == 0)
             {
                 seqQOffset[batch_idx + 1] = head_num * seq_len * (batch_idx + 1);
-                printf("HAIDER [applyMLARopeAndAssignQKVKernelGeneration] Setting seqQOffset[%d]=%d (batch_idx=%d, head_num=%zu, seq_len=%d, is_inactive=%d)\n",
-                       batch_idx + 1, head_num * seq_len * (batch_idx + 1), batch_idx, head_num, seq_len,
-                       helix_is_inactive_rank ? helix_is_inactive_rank[batch_idx] : 0);
             }
 
             // Only write to KV cache if rank is active
