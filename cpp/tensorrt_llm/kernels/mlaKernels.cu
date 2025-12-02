@@ -486,13 +486,6 @@ __global__ void applyMLARopeAndAssignQKVKernelGeneration(T* qkv_output, T* q_pe,
 
             if (valid_token)
             {
-                // Debug: Print helix_is_inactive_rank check for head_idx == head_num
-                if (head_idx == head_num && head_dim_vec_idx == 0 && helix_is_inactive_rank != nullptr)
-                {
-                    printf("HAIDER [applyMLARopeAndAssignQKVKernelGeneration] [head=%zu]: batch_idx=%d, helix_is_inactive_rank[%d]=%d, global_token_idx=%d, local_token_idx=%d\n",
-                           head_idx, batch_idx, batch_idx, helix_is_inactive_rank[batch_idx], global_token_idx, local_token_idx);
-                }
-
                 if (head_idx == head_num && (helix_is_inactive_rank == nullptr || !helix_is_inactive_rank[batch_idx]))
                 {
                     auto const token_kv_idx = kv_cache_lengths[batch_idx] - seq_len + local_token_idx;
