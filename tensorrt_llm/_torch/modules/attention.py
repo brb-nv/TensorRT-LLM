@@ -1785,6 +1785,28 @@ class MLA(nn.Module):
         if self.k_b_proj_trans.dtype == torch.bfloat16:
             # [num_heads, num_tokens, self.qk_nope_head_dim]
             q_nope_t = q_nope.transpose(0, 1)
+            
+            # Check q_nope_t tokens for equality (all tokens)
+            if self.mapping.has_cp_helix():
+                if q_nope_t.shape[1] > 1:
+                    print(f"HAIDER:[rank: {self.mapping.rank}] [mla_rope_generation] q_nope_t token equality check (checking all {q_nope_t.shape[1]} tokens):")
+                    for token_idx in range(1, q_nope_t.shape[1]):
+                        token_0 = q_nope_t[:, 0, :]
+                        token_i = q_nope_t[:, token_idx, :]
+                        are_equal = torch.equal(token_0, token_i)
+                        are_close = torch.allclose(token_0, token_i, rtol=1e-5, atol=1e-8)
+                        max_diff = (token_0 - token_i).abs().max().item()
+                        mean_diff = (token_0 - token_i).abs().mean().item()
+                        print(f"HAIDER:[rank: {self.mapping.rank}] [mla_rope_generation] q_nope_t[:,0,:] vs q_nope_t[:,{token_idx},:]: equal={are_equal}, close={are_close}, max_diff={max_diff:.6e}, mean_diff={mean_diff:.6e}")
+                        
+                        # Soft check: just log if tokens are not close
+                        if not are_close:
+                            print(f"HAIDER:[rank: {self.mapping.rank}] [mla_rope_generation] WARNING: q_nope_t[:,0,:] and q_nope_t[:,{token_idx},:] are NOT close! max_diff={max_diff:.6e}, mean_diff={mean_diff:.6e}")
+                        else:
+                            print(f"HAIDER:[rank: {self.mapping.rank}] [mla_rope_generation] q_nope_t[:,0,:] and q_nope_t[:,{token_idx},:] are close")
+                else:
+                    print(f"HAIDER:[rank: {self.mapping.rank}] [mla_rope_generation] Only 1 token, skipping comparison")
+            
             # [num_heads, num_tokens, self.kv_lora_rank]
             q_nope_out = fused_q[..., :self.kv_lora_rank].transpose(0, 1)
 
