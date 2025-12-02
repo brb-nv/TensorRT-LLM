@@ -368,7 +368,7 @@ __global__ void applyMLARopeAndAssignQKVKernelGeneration(T* qkv_output, T* q_pe,
     float const* dequant_scale_kv, float host_bmm1_scale, int32_t const* helix_position_offsets,
     bool const* helix_is_inactive_rank)
 {
-
+    
     // Constants.
     using VecT = typename VecType<T>::Type;
     using GPTJEltT = typename VecType<T>::GPTJEltType;
@@ -395,6 +395,17 @@ __global__ void applyMLARopeAndAssignQKVKernelGeneration(T* qkv_output, T* q_pe,
     {
         fmha_tile_counter[0] = 0;
         seqQOffset[0] = 0;
+
+        // Print all helix_is_inactive_rank values at once
+        if (helix_is_inactive_rank != nullptr)
+        {
+            int batch_size = total_s_len / seq_len;
+            printf("HAIDER [applyMLARopeAndAssignQKVKernelGeneration] helix_is_inactive_rank array (batch_size=%d):\n", batch_size);
+            for (int i = 0; i < batch_size; i++)
+            {
+                printf("  helix_is_inactive_rank[%d] = %d\n", i, helix_is_inactive_rank[i]);
+            }
+        }
 
         // Calculate bmm scale for FP8 MLA
         if (cache_type == KvCacheDataType::FP8)
@@ -475,6 +486,13 @@ __global__ void applyMLARopeAndAssignQKVKernelGeneration(T* qkv_output, T* q_pe,
 
             if (valid_token)
             {
+                // Debug: Print helix_is_inactive_rank check for head_idx == head_num
+                if (head_idx == head_num && head_dim_vec_idx == 0 && helix_is_inactive_rank != nullptr)
+                {
+                    printf("HAIDER [applyMLARopeAndAssignQKVKernelGeneration] [head=%zu]: batch_idx=%d, helix_is_inactive_rank[%d]=%d, global_token_idx=%d, local_token_idx=%d\n",
+                           head_idx, batch_idx, batch_idx, helix_is_inactive_rank[batch_idx], global_token_idx, local_token_idx);
+                }
+
                 if (head_idx == head_num && (helix_is_inactive_rank == nullptr || !helix_is_inactive_rank[batch_idx]))
                 {
                     auto const token_kv_idx = kv_cache_lengths[batch_idx] - seq_len + local_token_idx;
@@ -529,13 +547,26 @@ __global__ void applyMLARopeAndAssignQKVKernelGeneration(T* qkv_output, T* q_pe,
             auto local_token_idx = global_token_idx % seq_len;
             bool valid_token = global_token_idx < total_s_len;
 
+            // Debug: Print helix_is_inactive_rank values
+            if (head_dim_vec_idx == 0 && helix_is_inactive_rank != nullptr && helix_is_inactive_rank[batch_idx])
+            {
+                printf("HAIDER [applyMLARopeAndAssignQKVKernelGeneration] batch_idx=%d, helix_is_inactive_rank[%d]=%d, global_token_idx=%d, local_token_idx=%d\n",
+                       batch_idx, batch_idx, helix_is_inactive_rank[batch_idx], global_token_idx, local_token_idx);
+            }
+
+            // FIX: Always set seqQOffset for all batches to maintain sequential pattern
+            // even if the rank is inactive (we just skip writing to KV cache)
+            if (valid_token && head_dim_vec_idx == 0)
+            {
+                seqQOffset[batch_idx + 1] = head_num * seq_len * (batch_idx + 1);
+                printf("HAIDER [applyMLARopeAndAssignQKVKernelGeneration] Setting seqQOffset[%d]=%d (batch_idx=%d, head_num=%zu, seq_len=%d, is_inactive=%d)\n",
+                       batch_idx + 1, head_num * seq_len * (batch_idx + 1), batch_idx, head_num, seq_len,
+                       helix_is_inactive_rank ? helix_is_inactive_rank[batch_idx] : 0);
+            }
+
+            // Only write to KV cache if rank is active
             if (valid_token && (helix_is_inactive_rank == nullptr || !helix_is_inactive_rank[batch_idx]))
             {
-                if (head_dim_vec_idx == 0)
-                {
-                    seqQOffset[batch_idx + 1] = head_num * seq_len * (batch_idx + 1);
-                }
-
                 auto const token_kv_idx = kv_cache_lengths[batch_idx] - seq_len + local_token_idx;
                 auto const src_kv_global_offset = static_cast<size_t>(global_token_idx) * (c_k + ROPE_DIM);
 

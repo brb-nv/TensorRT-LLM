@@ -1828,7 +1828,8 @@ class MLA(nn.Module):
                     mla_bmm2_scale,
                     quant_q_buffer,
                     helix_position_offsets=helix_position_offsets,
-                    helix_is_inactive_rank=helix_is_inactive_rank),
+                    # for cp_rank=1, it's as good as setting it to None because the rank is active. This is to enable prints in kernel.
+                    helix_is_inactive_rank=helix_is_inactive_rank if self.mapping.has_cp_helix() and self.mapping.rank == 0 else None),
                 self.ln_events[0],
                 self.ln_events[1],
                 rope_stream,
