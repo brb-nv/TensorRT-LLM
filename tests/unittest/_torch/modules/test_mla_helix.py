@@ -388,6 +388,10 @@ def _make_latent_cache_gen(
                 )
                 kv_block = kv_cache_block_offsets[0, b, 0, block].item()
                 ret[r, b] = kv_buffer[kv_block, 0, t, 0, :]
+                # Debug: print what we're reading for each batch
+                if rank == 0 and r == 0:
+                    print(f"Reading latent cache for batch {b}: block_idx={block}, token_offset={t}, kv_block={kv_block}")
+                    print(f"  Value sample: {ret[r, b, :8]}")
         rope_values = ret[:, :, mla.kv_lora_rank :].clone().to(dtype=torch.float32)
         # now we apply the inverse of RoPE embedding to get the original values
         # rope_values has shape (world_size - 1, batch_size, rope_dim)
@@ -419,8 +423,11 @@ def _make_latent_cache_gen(
         world_size=world_size, rank=rank, cp_size=world_size, cp_config={"cp_type": CpType.HELIX}
     )
     # use cp_allgather here to broadcast from rank 0 to all other ranks
+    # Save the batch and feature dimensions before gathering
+    batch_size, feature_dim = ret.shape[1], ret.shape[2]
     ret_all = cp_allgather(ret, mapping=mapping, dim=0)
-    ret = ret_all.view(world_size, *ret.shape)[0]
+    # Reshape using the dimensions we know after gathering
+    ret = ret_all.view(world_size, world_size - 1, batch_size, feature_dim)[0]
     if rank == world_size - 1:
         return None
     return ret[rank]
@@ -552,7 +559,13 @@ def _run_mla_distributed(
                 )
             if step < scenario.ref_steps:
                 outputs.append(result)
-            print(f"Rank {rank} {world_size}-GPU: result: {result[0, :8]} / {result[-1, -8:]}")
+            # Debug: Print results per batch
+            if step == 0 and scenario.batch > 1:
+                result_bs = result.view(scenario.batch, scenario.predicted_tokens_per_seq, scenario.hidden_size)
+                for b in range(scenario.batch):
+                    print(f"Rank {rank} {world_size}-GPU step {step} batch {b} result: {result_bs[b, 0, :8]}")
+            else:
+                print(f"Rank {rank} {world_size}-GPU: result: {result[0, :8]} / {result[-1, -8:]}")
             # update position_ids_gen
             position_ids_gen += 1
             continue
@@ -615,23 +628,49 @@ def _run_mla_distributed(
     if ref_attn_metadata is not None:
         ref_attn_metadata.kv_cache_manager.shutdown()
 
+    # Debug: Check if outputs are the same across batches when inputs are identical
+    if rank == 0 and scenario.batch > 1:
+        print("\nChecking if outputs are identical across batches (they should be if inputs are identical):")
+        for b in range(1, scenario.batch):
+            for step in range(scenario.ref_steps):
+                match = torch.allclose(output[step, 0], output[step, b], atol=1e-5, rtol=1e-3)
+                if not match:
+                    print(f"  Step {step}, Batch {b} vs Batch 0: outputs NOT identical")
+                    print(f"    output[{step}, 0] sample: {output[step, 0, :8]}")
+                    print(f"    output[{step}, {b}] sample: {output[step, b, :8]}")
+                    diff = (output[step, 0] - output[step, b]).abs()
+                    print(f"    Max diff: {diff.max().item()}, Mean diff: {diff.mean().item()}")
+                    break
+
+
     # every rank should have the same output and checks against the reference output
     atol, rtol = scenario.atol, scenario.rtol
     mismatch_count = 0
+    mismatch_per_batch = [0] * scenario.batch
+    elements_per_batch = output[0, 0].numel()
+    
     for ref_step in range(scenario.ref_steps):
         for b in range(scenario.batch):
-            mismatch_count += _error_report(
+            batch_errors = _error_report(
                 output[ref_step, b],
                 ref_output[ref_step, b],
                 atol,
                 rtol,
                 f"Rank {rank} {world_size}-GPU step {ref_step}, batch {b}",
             )
+            mismatch_count += batch_errors
+            mismatch_per_batch[b] += batch_errors
 
     ratio_mismatch = mismatch_count / output.numel()
     print(
         f"Rank {rank} {world_size}-GPU: {mismatch_count}/{output.numel()} mismatches: {ratio_mismatch}"
     )
+    
+    # Report per-batch mismatch ratios
+    for b in range(scenario.batch):
+        batch_ratio = mismatch_per_batch[b] / (elements_per_batch * scenario.ref_steps)
+        print(f"Rank {rank} {world_size}-GPU: Batch {b} mismatch ratio: {batch_ratio}")
+    
     return ratio_mismatch
 
 
@@ -659,21 +698,46 @@ def _full_test_multi_gpu(rank: int, world_size: int, scenario: Scenario, gen_ste
         model_type=scenario.model_type,
     )
     torch.manual_seed(42)
-    input_ctx = torch.empty(
-        scenario.batch * scenario.ctx_len, scenario.hidden_size, dtype=scenario.dtype, device="cuda"
+    # Generate identical inputs for all batches by creating one batch and repeating it
+    input_ctx_single = torch.empty(
+        scenario.ctx_len, scenario.hidden_size, dtype=scenario.dtype, device="cuda"
     ).uniform_(-1, 1)
-    input_gen = torch.empty(
-        scenario.batch * scenario.predicted_tokens_per_seq,
+    input_ctx = input_ctx_single.repeat(scenario.batch, 1).contiguous()
+    
+    input_gen_single = torch.empty(
+        scenario.predicted_tokens_per_seq,
         scenario.hidden_size,
         dtype=scenario.dtype,
         device="cuda",
     ).uniform_(-1, 1)
+    input_gen = input_gen_single.repeat(scenario.batch, 1).contiguous()
+    
     position_ids_ctx = torch.arange(scenario.ctx_len, dtype=torch.int, device="cuda").repeat(
         scenario.batch
     )
     position_ids_gen = torch.full(
         (scenario.batch,), scenario.ctx_len, dtype=torch.int, device="cuda"
     )
+    
+    # Verify that all batches have identical inputs
+    if rank == 0:
+        input_ctx_bs = input_ctx.view(scenario.batch, scenario.ctx_len, scenario.hidden_size)
+        input_gen_bs = input_gen.view(scenario.batch, scenario.predicted_tokens_per_seq, scenario.hidden_size)
+        position_ids_ctx_bs = position_ids_ctx.view(scenario.batch, scenario.ctx_len)
+        
+        print("Verifying inputs are identical across batches:")
+        for b in range(1, scenario.batch):
+            ctx_match = torch.allclose(input_ctx_bs[0], input_ctx_bs[b])
+            gen_match = torch.allclose(input_gen_bs[0], input_gen_bs[b])
+            pos_ctx_match = torch.equal(position_ids_ctx_bs[0], position_ids_ctx_bs[b])
+            print(f"  Batch {b} vs Batch 0: ctx_input_match={ctx_match}, gen_input_match={gen_match}, pos_ids_match={pos_ctx_match}")
+            if not (ctx_match and gen_match and pos_ctx_match):
+                print(f"    WARNING: Inputs are NOT identical!")
+                print(f"    input_ctx[0] sample: {input_ctx_bs[0, 0, :8]}")
+                print(f"    input_ctx[{b}] sample: {input_ctx_bs[b, 0, :8]}")
+                print(f"    position_ids_ctx[0]: {position_ids_ctx_bs[0, :8]}")
+                print(f"    position_ids_ctx[{b}]: {position_ids_ctx_bs[b, :8]}")
+
 
     pos_embd_params = PositionalEmbeddingParams(
         type=PositionEmbeddingType.yarn,
@@ -751,7 +815,13 @@ def _full_test_multi_gpu(rank: int, world_size: int, scenario: Scenario, gen_ste
                 result = mla(position_ids_gen, input_gen, ref_attn_metadata)
                 if step < scenario.ref_steps:
                     ref_outputs.append(result)
-                print(f"Ref result: {result[0, :8]} / {result[-1, -8:]}")
+                # Debug: Print results per batch
+                if step == 0 and scenario.batch > 1:
+                    result_bs = result.view(scenario.batch, scenario.predicted_tokens_per_seq, scenario.hidden_size)
+                    for b in range(scenario.batch):
+                        print(f"Ref step {step} batch {b} result: {result_bs[b, 0, :8]}")
+                else:
+                    print(f"Ref result: {result[0, :8]} / {result[-1, -8:]}")
                 # update position_ids_gen
                 position_ids_gen += 1
                 continue
@@ -794,6 +864,32 @@ def _full_test_multi_gpu(rank: int, world_size: int, scenario: Scenario, gen_ste
             f"{end - start} s, throughput: {throughput} MLA/s"
         )
         ref_output = torch.stack(ref_outputs, dim=0)
+        
+        # Debug: Check if reference outputs are the same across batches
+        if scenario.batch > 1:
+            print("\n[REFERENCE PATH] Checking if outputs are identical across batches:")
+            for b in range(1, scenario.batch):
+                for step in range(min(scenario.ref_steps, len(ref_outputs))):
+                    # ref_output shape: [steps, batch, hidden_size]
+                    # But the original result has shape [batch*predicted_tokens, hidden_size]
+                    # After stacking it becomes [steps, batch*predicted_tokens, hidden_size]
+                    # We need to reshape to [steps, batch, predicted_tokens, hidden_size]
+                    ref_output_bs = ref_output.view(
+                        ref_output.shape[0], scenario.batch, scenario.predicted_tokens_per_seq, scenario.hidden_size
+                    )
+                    match = torch.allclose(ref_output_bs[step, 0], ref_output_bs[step, b], atol=1e-5, rtol=1e-3)
+                    if not match:
+                        print(f"  Step {step}, Batch {b} vs Batch 0: outputs NOT identical")
+                        print(f"    ref_output[{step}, 0] sample: {ref_output_bs[step, 0, 0, :8]}")
+                        print(f"    ref_output[{step}, {b}] sample: {ref_output_bs[step, b, 0, :8]}")
+                        diff = (ref_output_bs[step, 0] - ref_output_bs[step, b]).abs()
+                        print(f"    Max diff: {diff.max().item()}, Mean diff: {diff.mean().item()}")
+                        break
+                else:
+                    continue
+                break
+            else:
+                print("  All batches produce identical outputs in reference path ✓")
     else:
         ref_output = torch.empty(
             scenario.ref_steps,
