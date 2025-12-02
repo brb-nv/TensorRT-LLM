@@ -1077,6 +1077,40 @@ class MLA(nn.Module):
                 softmax_stats_tensor=softmax_stats,
                 helix_position_offsets=position_ids,
                 **kwargs)
+            print(f"HAIDER:[rank: {self.mapping.rank}] [_attn_forward_gen] partial_o.shape: {partial_o.shape}")
+            # Verification: Check if tokens are identical to each other
+            print(f"HAIDER:[rank: {self.mapping.rank}] [_attn_forward_gen] partial_o token equality check:")
+            num_tokens_to_check = partial_o.shape[0]
+            if partial_o.shape[0] > 1:
+                # Compare each token with the first token
+                for token_idx in range(1, num_tokens_to_check):
+                    # partial_o: [num_tokens, num_heads_tp * kv_lora_rank]
+                    token_0 = partial_o[0, :]  # First token
+                    token_i = partial_o[token_idx, :]  # i-th token
+                    
+                    # Check if they're equal
+                    are_equal = torch.equal(token_0, token_i)
+                    are_close = torch.allclose(token_0, token_i, rtol=1e-5, atol=1e-8)
+                    
+                    # Compute max absolute difference
+                    max_diff = (token_0 - token_i).abs().max().item()
+                    mean_diff = (token_0 - token_i).abs().mean().item()
+                    
+                    print(f"HAIDER:[rank: {self.mapping.rank}] [_attn_forward_gen] partial_o[0] vs partial_o[{token_idx}]: equal={are_equal}, close={are_close}, max_diff={max_diff:.6e}, mean_diff={mean_diff:.6e}")
+                
+                # Check if all tokens are identical to each other
+                all_identical = all(torch.equal(partial_o[0], partial_o[i]) for i in range(1, num_tokens_to_check))
+                print(f"HAIDER:[rank: {self.mapping.rank}] [_attn_forward_gen] All checked tokens identical: {all_identical}")
+            else:
+                print(f"HAIDER:[rank: {self.mapping.rank}] [_attn_forward_gen] Only 1 token, skipping comparison")
+            
+            # HACK: Copy partial_o[0] to all subsequent tokens for debugging
+            if partial_o.shape[0] > 1:
+                print(f"HAIDER:[rank: {self.mapping.rank}] [_attn_forward_gen] COPYING partial_o[0] to all tokens")
+                partial_o[1:] = partial_o[0]
+                # Also copy softmax_stats[0] to maintain consistency
+                softmax_stats[1:] = softmax_stats[0]
+            
             # this is the post-processing of helix parallel attention,
             # similar to the post-processing of ring attention
             kv_lora_rank = partial_o.shape[-1] // self.num_heads_tp
@@ -1093,6 +1127,8 @@ class MLA(nn.Module):
             # note: an additional dimension was added at the first index for all-to-all,
             # so the transpose dimensions are shifted by 1
             gathered = [t.transpose(1, 2).contiguous() for t in gathered]
+            print(f"HAIDER:[rank: {self.mapping.rank}] [_attn_forward_gen] gathered[0].shape: {gathered[0].shape}")
+            print(f"HAIDER:[rank: {self.mapping.rank}] [_attn_forward_gen] gathered[1].shape: {gathered[1].shape}")
             return torch.ops.trtllm.helix_post_process(gathered[0], gathered[1],
                                                        1.0)
         else:
