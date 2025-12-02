@@ -1064,36 +1064,6 @@ class MLA(nn.Module):
                           position_ids: Optional[torch.Tensor],
                           attn_metadata: AttentionMetadata, **kwargs):
         if self.mapping.has_cp_helix():
-            # Verification: Assert that k and v are None, and check q tokens are identical
-            assert k is None, f"HAIDER:[rank: {self.mapping.rank}] Expected k to be None but got shape {k.shape if k is not None else 'None'}"
-            assert v is None, f"HAIDER:[rank: {self.mapping.rank}] Expected v to be None but got shape {v.shape if v is not None else 'None'}"
-            print(f"HAIDER:[rank: {self.mapping.rank}] [_attn_forward_gen] q shape: {q.shape}")
-            
-            # Check q tokens for equality (all tokens)
-            if q.shape[0] > 1:
-                print(f"HAIDER:[rank: {self.mapping.rank}] [_attn_forward_gen] q token equality check (checking all {q.shape[0]} tokens):")
-                for token_idx in range(1, q.shape[0]):
-                    token_0 = q[0]
-                    token_i = q[token_idx]
-                    are_equal = torch.equal(token_0, token_i)
-                    are_close = torch.allclose(token_0, token_i, rtol=1e-5, atol=1e-8)
-                    max_diff = (token_0 - token_i).abs().max().item()
-                    mean_diff = (token_0 - token_i).abs().mean().item()
-                    print(f"HAIDER:[rank: {self.mapping.rank}] [_attn_forward_gen] q[0] vs q[{token_idx}]: equal={are_equal}, close={are_close}, max_diff={max_diff:.6e}, mean_diff={mean_diff:.6e}")
-                    
-                    # Soft check: just log if tokens are not close
-                    if not are_close:
-                        print(f"HAIDER:[rank: {self.mapping.rank}] [_attn_forward_gen] WARNING: q[0] and q[{token_idx}] are NOT close! max_diff={max_diff:.6e}, mean_diff={mean_diff:.6e}")
-                    else:
-                        print(f"HAIDER:[rank: {self.mapping.rank}] [_attn_forward_gen] q[0] and q[{token_idx}] are close")
-            else:
-                print(f"HAIDER:[rank: {self.mapping.rank}] [_attn_forward_gen] Only 1 token, skipping comparison")
-            
-            # HACK: Copy q[0] to all subsequent tokens for debugging
-            if q.shape[0] > 1:
-                print(f"HAIDER:[rank: {self.mapping.rank}] [_attn_forward_gen] COPYING q[0] to all tokens")
-                q[1:] = q[0]
-            
             # partial_o: [num_tokens, num_heads_tp * kv_lora_rank]
             # softmax_stats: [num_tokens, num_heads_tp, 2]
             softmax_stats = torch.empty((q.shape[0], self.num_heads_tp, 2),
@@ -1107,33 +1077,6 @@ class MLA(nn.Module):
                 softmax_stats_tensor=softmax_stats,
                 helix_position_offsets=position_ids,
                 **kwargs)
-            print(f"HAIDER:[rank: {self.mapping.rank}] [_attn_forward_gen] partial_o.shape: {partial_o.shape}")
-            # Verification: Check if tokens are identical to each other
-            print(f"HAIDER:[rank: {self.mapping.rank}] [_attn_forward_gen] partial_o token equality check:")
-            num_tokens_to_check = partial_o.shape[0]
-            if partial_o.shape[0] > 1:
-                # Compare each token with the first token
-                for token_idx in range(1, num_tokens_to_check):
-                    # partial_o: [num_tokens, num_heads_tp * kv_lora_rank]
-                    token_0 = partial_o[0, :]  # First token
-                    token_i = partial_o[token_idx, :]  # i-th token
-                    
-                    # Check if they're equal
-                    are_equal = torch.equal(token_0, token_i)
-                    are_close = torch.allclose(token_0, token_i, rtol=1e-5, atol=1e-8)
-                    
-                    # Compute max absolute difference
-                    max_diff = (token_0 - token_i).abs().max().item()
-                    mean_diff = (token_0 - token_i).abs().mean().item()
-                    
-                    print(f"HAIDER:[rank: {self.mapping.rank}] [_attn_forward_gen] partial_o[0] vs partial_o[{token_idx}]: equal={are_equal}, close={are_close}, max_diff={max_diff:.6e}, mean_diff={mean_diff:.6e}")
-                
-                # Check if all tokens are identical to each other
-                all_identical = all(torch.equal(partial_o[0], partial_o[i]) for i in range(1, num_tokens_to_check))
-                print(f"HAIDER:[rank: {self.mapping.rank}] [_attn_forward_gen] All checked tokens identical: {all_identical}")
-            else:
-                print(f"HAIDER:[rank: {self.mapping.rank}] [_attn_forward_gen] Only 1 token, skipping comparison")
-            
             # this is the post-processing of helix parallel attention,
             # similar to the post-processing of ring attention
             kv_lora_rank = partial_o.shape[-1] // self.num_heads_tp
@@ -1150,8 +1093,6 @@ class MLA(nn.Module):
             # note: an additional dimension was added at the first index for all-to-all,
             # so the transpose dimensions are shifted by 1
             gathered = [t.transpose(1, 2).contiguous() for t in gathered]
-            print(f"HAIDER:[rank: {self.mapping.rank}] [_attn_forward_gen] gathered[0].shape: {gathered[0].shape}")
-            print(f"HAIDER:[rank: {self.mapping.rank}] [_attn_forward_gen] gathered[1].shape: {gathered[1].shape}")
             return torch.ops.trtllm.helix_post_process(gathered[0], gathered[1],
                                                        1.0)
         else:
@@ -1785,28 +1726,6 @@ class MLA(nn.Module):
         if self.k_b_proj_trans.dtype == torch.bfloat16:
             # [num_heads, num_tokens, self.qk_nope_head_dim]
             q_nope_t = q_nope.transpose(0, 1)
-            
-            # Check q_nope_t tokens for equality (all tokens)
-            if self.mapping.has_cp_helix():
-                if q_nope_t.shape[1] > 1:
-                    print(f"HAIDER:[rank: {self.mapping.rank}] [mla_rope_generation] q_nope_t token equality check (checking all {q_nope_t.shape[1]} tokens):")
-                    for token_idx in range(1, q_nope_t.shape[1]):
-                        token_0 = q_nope_t[:, 0, :]
-                        token_i = q_nope_t[:, token_idx, :]
-                        are_equal = torch.equal(token_0, token_i)
-                        are_close = torch.allclose(token_0, token_i, rtol=1e-5, atol=1e-8)
-                        max_diff = (token_0 - token_i).abs().max().item()
-                        mean_diff = (token_0 - token_i).abs().mean().item()
-                        print(f"HAIDER:[rank: {self.mapping.rank}] [mla_rope_generation] q_nope_t[:,0,:] vs q_nope_t[:,{token_idx},:]: equal={are_equal}, close={are_close}, max_diff={max_diff:.6e}, mean_diff={mean_diff:.6e}")
-                        
-                        # Soft check: just log if tokens are not close
-                        if not are_close:
-                            print(f"HAIDER:[rank: {self.mapping.rank}] [mla_rope_generation] WARNING: q_nope_t[:,0,:] and q_nope_t[:,{token_idx},:] are NOT close! max_diff={max_diff:.6e}, mean_diff={mean_diff:.6e}")
-                        else:
-                            print(f"HAIDER:[rank: {self.mapping.rank}] [mla_rope_generation] q_nope_t[:,0,:] and q_nope_t[:,{token_idx},:] are close")
-                else:
-                    print(f"HAIDER:[rank: {self.mapping.rank}] [mla_rope_generation] Only 1 token, skipping comparison")
-            
             # [num_heads, num_tokens, self.kv_lora_rank]
             q_nope_out = fused_q[..., :self.kv_lora_rank].transpose(0, 1)
 
@@ -1828,8 +1747,7 @@ class MLA(nn.Module):
                     mla_bmm2_scale,
                     quant_q_buffer,
                     helix_position_offsets=helix_position_offsets,
-                    # for cp_rank=1, it's as good as setting it to None because the rank is active. This is to enable prints in kernel.
-                    helix_is_inactive_rank=helix_is_inactive_rank if self.mapping.has_cp_helix() and self.mapping.rank == 0 else None),
+                    helix_is_inactive_rank=helix_is_inactive_rank),
                 self.ln_events[0],
                 self.ln_events[1],
                 rope_stream,
