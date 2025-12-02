@@ -1853,6 +1853,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         helix_position_offsets: Optional[torch.Tensor] = None,
         helix_is_inactive_rank: Optional[torch.Tensor] = None,
         out_scale: Optional[torch.Tensor] = None,
+        skip_rope: bool = False,
     ) -> None:
         """
             fused_q (torch.Tensor): The tensor to store the fused q, with shape (num_tokens, num_heads, kv_lora_rank + qk_rope_head_dim) on GPU.
@@ -1866,6 +1867,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             quant_q_buffer (torch.Tensor): The tensor to store the quant_q_buffer, with shape (tokens, num_heads, kv_lora_rank + qk_rope_head_dim) on GPU.
             helix_position_offsets (torch.Tensor): The tensor to store the helix position offsets, with shape (num_tokens) on GPU.
             out_scale (torch.Tensor): The tensor to store the out_scale, with shape (1) on GPU.
+            skip_rope (bool): Whether to skip RoPE application. If True, passes None for rotary_cos_sin to the CUDA kernel.
         """
 
         assert self.is_mla_enable and self.mla_params is not None
@@ -1884,12 +1886,15 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                     helix_position_offsets.device)
 
         mla_tensor_params = [helix_position_offsets, helix_is_inactive_rank]
+        
+        # Pass None for rotary_cos_sin if skip_rope is True
+        rotary_cos_sin = None if skip_rope else self.wrapper.rotary_cos_sin
 
         torch.ops.trtllm.mla_rope_generation(
             fused_q,
             q_pe,
             latent_cache,
-            self.wrapper.rotary_cos_sin,
+            rotary_cos_sin,
             cu_q_seqlens,
             cu_kv_seqlens,
             fmha_scheduler_counter,

@@ -440,12 +440,6 @@ __global__ void applyMLARopeAndAssignQKVKernelGeneration(T* qkv_output, T* q_pe,
             if (valid_token)
             {
 
-                auto const position_id
-                    = (helix_position_offsets != nullptr ? helix_position_offsets[global_token_idx]
-                                                         : kv_cache_lengths[batch_idx] - seq_len + local_token_idx);
-                float2 const* rotary_coef_cache_buffer
-                    = cos_sin_cache + static_cast<size_t>(ROPE_DIM) * position_id + (head_dim_idx / 2);
-
                 if (head_idx == head_num)
                 {
                     auto const src_k_global_offset = static_cast<size_t>(global_token_idx) * (c_k + ROPE_DIM) + c_k;
@@ -460,14 +454,24 @@ __global__ void applyMLARopeAndAssignQKVKernelGeneration(T* qkv_output, T* q_pe,
                     data = *reinterpret_cast<VecT const*>(&q_pe[src_q_global_offset + head_dim_idx]);
                 }
 
-                // Pack two elements into one for gptj rotary embedding.
-#pragma unroll
-                for (int elt_id = 0; elt_id < ELTS_PER_VEC / 2; elt_id++)
+                // Apply RoPE only if cos_sin_cache is not nullptr
+                if (cos_sin_cache != nullptr)
                 {
-                    GPTJEltT& data_ = reinterpret_cast<GPTJEltT*>(&data)[elt_id];
+                    auto const position_id
+                        = (helix_position_offsets != nullptr ? helix_position_offsets[global_token_idx]
+                                                             : kv_cache_lengths[batch_idx] - seq_len + local_token_idx);
+                    float2 const* rotary_coef_cache_buffer
+                        = cos_sin_cache + static_cast<size_t>(ROPE_DIM) * position_id + (head_dim_idx / 2);
 
-                    float2 rotary_coef_cache = rotary_coef_cache_buffer[elt_id];
-                    data_ = mmha::rotary_embedding_transform(data_, rotary_coef_cache);
+                    // Pack two elements into one for gptj rotary embedding.
+#pragma unroll
+                    for (int elt_id = 0; elt_id < ELTS_PER_VEC / 2; elt_id++)
+                    {
+                        GPTJEltT& data_ = reinterpret_cast<GPTJEltT*>(&data)[elt_id];
+
+                        float2 rotary_coef_cache = rotary_coef_cache_buffer[elt_id];
+                        data_ = mmha::rotary_embedding_transform(data_, rotary_coef_cache);
+                    }
                 }
             }
 

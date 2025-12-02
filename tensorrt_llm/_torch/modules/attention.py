@@ -1,4 +1,5 @@
 import math
+import os
 import weakref
 from typing import Optional, Union, cast
 
@@ -960,6 +961,12 @@ class MLA(nn.Module):
 
         self.rope_fusion = self.mqa.support_fused_rope()
         self.rotary_emb = None
+        
+        # Add flag to skip RoPE application (controlled by environment variable)
+        self.skip_rope_in_mla_generation = os.environ.get('SKIP_ROPE_IN_MLA_GENERATION', '0') == '1'
+        if self.skip_rope_in_mla_generation:
+            logger.info(f"Layer {self.layer_idx}: SKIP_ROPE_IN_MLA_GENERATION is enabled - RoPE will be skipped in mla_rope_generation")
+        
         self.apply_rotary_emb = not self.rope_fusion
         if self.apply_rotary_emb:
             self.rotary_emb = RotaryEmbedding(
@@ -1788,6 +1795,12 @@ class MLA(nn.Module):
             # [num_heads, num_tokens, self.kv_lora_rank]
             q_nope_out = fused_q[..., :self.kv_lora_rank].transpose(0, 1)
 
+            if self.mapping.cp_size > 1:
+                print(f"HAIDER:[rank: {self.mapping.rank}] [forward_absorption_generation] fused_q shape before mla_rope_generation: {fused_q.shape}")
+                print(f"HAIDER:[rank: {self.mapping.rank}] [forward_absorption_generation] q_pe shape: {q_pe.shape}")
+                print(f"HAIDER:[rank: {self.mapping.rank}] [forward_absorption_generation] latent_cache shape: {latent_cache.shape}")
+                if self.skip_rope_in_mla_generation:
+                    print(f"HAIDER:[rank: {self.mapping.rank}] [forward_absorption_generation] SKIP_ROPE_IN_MLA_GENERATION=True - RoPE will be skipped")
             # [num_heads, num_tokens, self.qk_nope_head_dim] x [num_heads, kv_lora_rank, qk_nope_head_dim]
             # -> [num_heads, num_tokens, kv_lora_rank] -> [num_tokens, num_heads, kv_lora_rank]
             # The output of bmm is written directly into fused_q
@@ -1806,16 +1819,25 @@ class MLA(nn.Module):
                     mla_bmm2_scale,
                     quant_q_buffer,
                     helix_position_offsets=helix_position_offsets,
-                    helix_is_inactive_rank=helix_is_inactive_rank),
+                    helix_is_inactive_rank=helix_is_inactive_rank,
+                    skip_rope=self.skip_rope_in_mla_generation),
                 self.ln_events[0],
                 self.ln_events[1],
                 rope_stream,
             )
+            if self.mapping.cp_size > 1:
+                print(f"HAIDER:[rank: {self.mapping.rank}] [forward_absorption_generation] fused_q shape after mla_rope_generation: {fused_q.shape}")
 
         elif self.k_b_proj_trans.dtype == torch.float8_e4m3fn:
             # [num_heads, num_tokens, self.kv_lora_rank]
             q_nope_out = fused_q[..., :self.kv_lora_rank].transpose(0, 1)
 
+            if self.mapping.cp_size > 1:
+                print(f"HAIDER:[rank: {self.mapping.rank}] [forward_absorption_generation] fused_q shape before mla_rope_generation: {fused_q.shape}")
+                print(f"HAIDER:[rank: {self.mapping.rank}] [forward_absorption_generation] q_pe shape: {q_pe.shape}")
+                print(f"HAIDER:[rank: {self.mapping.rank}] [forward_absorption_generation] latent_cache shape: {latent_cache.shape}")
+                if self.skip_rope_in_mla_generation:
+                    print(f"HAIDER:[rank: {self.mapping.rank}] [forward_absorption_generation] SKIP_ROPE_IN_MLA_GENERATION=True - RoPE will be skipped")
             maybe_execute_in_parallel(
                 lambda: fp8_block_scaling_bmm_out(
                     q_nope,
@@ -1836,11 +1858,14 @@ class MLA(nn.Module):
                     mla_bmm2_scale,
                     quant_q_buffer,
                     helix_position_offsets=helix_position_offsets,
-                    helix_is_inactive_rank=helix_is_inactive_rank),
+                    helix_is_inactive_rank=helix_is_inactive_rank,
+                    skip_rope=self.skip_rope_in_mla_generation),
                 self.ln_events[0],
                 self.ln_events[1],
                 rope_stream,
             )
+            if self.mapping.cp_size > 1:
+                print(f"HAIDER:[rank: {self.mapping.rank}] [forward_absorption_generation] fused_q shape after mla_rope_generation: {fused_q.shape}")
         else:
             raise NotImplementedError(
                 f"Missing bmm impl for dtype: {self.k_b_proj_trans.dtype}.")
