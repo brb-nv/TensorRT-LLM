@@ -540,13 +540,6 @@ __global__ void applyMLARopeAndAssignQKVKernelGeneration(T* qkv_output, T* q_pe,
             auto local_token_idx = global_token_idx % seq_len;
             bool valid_token = global_token_idx < total_s_len;
 
-            // Debug: Print helix_is_inactive_rank values
-            if (head_dim_vec_idx == 0 && helix_is_inactive_rank != nullptr && helix_is_inactive_rank[batch_idx])
-            {
-                printf("HAIDER [applyMLARopeAndAssignQKVKernelGeneration] batch_idx=%d, helix_is_inactive_rank[%d]=%d, global_token_idx=%d, local_token_idx=%d\n",
-                       batch_idx, batch_idx, helix_is_inactive_rank[batch_idx], global_token_idx, local_token_idx);
-            }
-
             // FIX: Always set seqQOffset for all batches to maintain sequential pattern
             // even if the rank is inactive (we just skip writing to KV cache)
             if (valid_token && head_dim_vec_idx == 0)
