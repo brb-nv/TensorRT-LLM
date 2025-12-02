@@ -1064,6 +1064,36 @@ class MLA(nn.Module):
                           position_ids: Optional[torch.Tensor],
                           attn_metadata: AttentionMetadata, **kwargs):
         if self.mapping.has_cp_helix():
+            # Verification: Assert that k and v are None, and check q tokens are identical
+            assert k is None, f"HAIDER:[rank: {self.mapping.rank}] Expected k to be None but got shape {k.shape if k is not None else 'None'}"
+            assert v is None, f"HAIDER:[rank: {self.mapping.rank}] Expected v to be None but got shape {v.shape if v is not None else 'None'}"
+            print(f"HAIDER:[rank: {self.mapping.rank}] [_attn_forward_gen] q shape: {q.shape}")
+            
+            # Check q tokens for equality (all tokens)
+            if q.shape[0] > 1:
+                print(f"HAIDER:[rank: {self.mapping.rank}] [_attn_forward_gen] q token equality check (checking all {q.shape[0]} tokens):")
+                for token_idx in range(1, q.shape[0]):
+                    token_0 = q[0]
+                    token_i = q[token_idx]
+                    are_equal = torch.equal(token_0, token_i)
+                    are_close = torch.allclose(token_0, token_i, rtol=1e-5, atol=1e-8)
+                    max_diff = (token_0 - token_i).abs().max().item()
+                    mean_diff = (token_0 - token_i).abs().mean().item()
+                    print(f"HAIDER:[rank: {self.mapping.rank}] [_attn_forward_gen] q[0] vs q[{token_idx}]: equal={are_equal}, close={are_close}, max_diff={max_diff:.6e}, mean_diff={mean_diff:.6e}")
+                    
+                    # Soft check: just log if tokens are not close
+                    if not are_close:
+                        print(f"HAIDER:[rank: {self.mapping.rank}] [_attn_forward_gen] WARNING: q[0] and q[{token_idx}] are NOT close! max_diff={max_diff:.6e}, mean_diff={mean_diff:.6e}")
+                    else:
+                        print(f"HAIDER:[rank: {self.mapping.rank}] [_attn_forward_gen] q[0] and q[{token_idx}] are close")
+            else:
+                print(f"HAIDER:[rank: {self.mapping.rank}] [_attn_forward_gen] Only 1 token, skipping comparison")
+            
+            # HACK: Copy q[0] to all subsequent tokens for debugging
+            if q.shape[0] > 1:
+                print(f"HAIDER:[rank: {self.mapping.rank}] [_attn_forward_gen] COPYING q[0] to all tokens")
+                q[1:] = q[0]
+            
             # partial_o: [num_tokens, num_heads_tp * kv_lora_rank]
             # softmax_stats: [num_tokens, num_heads_tp, 2]
             softmax_stats = torch.empty((q.shape[0], self.num_heads_tp, 2),
@@ -1103,13 +1133,6 @@ class MLA(nn.Module):
                 print(f"HAIDER:[rank: {self.mapping.rank}] [_attn_forward_gen] All checked tokens identical: {all_identical}")
             else:
                 print(f"HAIDER:[rank: {self.mapping.rank}] [_attn_forward_gen] Only 1 token, skipping comparison")
-            
-            # HACK: Copy partial_o[0] to all subsequent tokens for debugging
-            if partial_o.shape[0] > 1:
-                print(f"HAIDER:[rank: {self.mapping.rank}] [_attn_forward_gen] COPYING partial_o[0] to all tokens")
-                partial_o[1:] = partial_o[0]
-                # Also copy softmax_stats[0] to maintain consistency
-                softmax_stats[1:] = softmax_stats[0]
             
             # this is the post-processing of helix parallel attention,
             # similar to the post-processing of ring attention
