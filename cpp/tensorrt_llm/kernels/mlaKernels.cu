@@ -417,7 +417,6 @@ __global__ void applyMLARopeAndAssignQKVKernelGeneration(T* qkv_output, T* q_pe,
                 bmm2_scale[0] = quant_scale_o_val * dequant_scale_kv_val;
             }
         }
-        __threadfence_block();
     }
 
     if (head_idx <= head_num)
@@ -534,31 +533,32 @@ __global__ void applyMLARopeAndAssignQKVKernelGeneration(T* qkv_output, T* q_pe,
             auto local_token_idx = global_token_idx % seq_len;
             bool valid_token = global_token_idx < total_s_len;
 
-            // FIX: Always set seqQOffset for all batches to maintain sequential pattern
-            // even if the rank is inactive (we just skip writing to KV cache)
-            if (valid_token && head_dim_vec_idx == 0)
+            if (valid_token)
             {
-                seqQOffset[batch_idx + 1] = head_num * seq_len * (batch_idx + 1);
-            }
-
-            // Only write to KV cache if rank is active.
-            if (valid_token && (helix_is_inactive_rank == nullptr || !helix_is_inactive_rank[batch_idx]))
-            {
-                auto const token_kv_idx = kv_cache_lengths[batch_idx] - seq_len + local_token_idx;
-                auto const src_kv_global_offset = static_cast<size_t>(global_token_idx) * (c_k + ROPE_DIM);
-
+                if (head_dim_vec_idx == 0)
                 {
-                    auto kDst = reinterpret_cast<T*>(kv_cache.getKBlockPtr(batch_idx, token_kv_idx));
-                    auto inBlockIdx = kv_cache.getKVLocalIdx(token_kv_idx, 0, TOTAL_VEC_PER_HEAD, head_dim_vec_idx);
+                    seqQOffset[batch_idx + 1] = head_num * seq_len * (batch_idx + 1);
+                }
 
-                    if (cache_type == KvCacheDataType::FP8)
+                // If helix parallelism is being used, only write to KV cache if current rank is active.
+                if (helix_is_inactive_rank == nullptr || !helix_is_inactive_rank[batch_idx])
+                {
+                    auto const token_kv_idx = kv_cache_lengths[batch_idx] - seq_len + local_token_idx;
+                    auto const src_kv_global_offset = static_cast<size_t>(global_token_idx) * (c_k + ROPE_DIM);
+
                     {
-                        quantCopy<T, ELTS_PER_VEC>(reinterpret_cast<__nv_fp8_e4m3*>(kDst) + inBlockIdx * ELTS_PER_VEC,
-                            fuse_buf + src_kv_global_offset + head_dim_idx, quant_scale_kv_val);
+                        auto kDst = reinterpret_cast<T*>(kv_cache.getKBlockPtr(batch_idx, token_kv_idx));
+                        auto inBlockIdx = kv_cache.getKVLocalIdx(token_kv_idx, 0, TOTAL_VEC_PER_HEAD, head_dim_vec_idx);
+
+                        if (cache_type == KvCacheDataType::FP8)
+                        {
+                            quantCopy<T, ELTS_PER_VEC>(reinterpret_cast<__nv_fp8_e4m3*>(kDst) + inBlockIdx * ELTS_PER_VEC,
+                                fuse_buf + src_kv_global_offset + head_dim_idx, quant_scale_kv_val);
+                        }
+                        else
+                            reinterpret_cast<VecT*>(kDst)[inBlockIdx]
+                                = *reinterpret_cast<VecT const*>(&fuse_buf[src_kv_global_offset + head_dim_idx]);
                     }
-                    else
-                        reinterpret_cast<VecT*>(kDst)[inBlockIdx]
-                            = *reinterpret_cast<VecT const*>(&fuse_buf[src_kv_global_offset + head_dim_idx]);
                 }
             }
         }
