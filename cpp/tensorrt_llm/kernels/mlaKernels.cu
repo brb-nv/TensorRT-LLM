@@ -396,17 +396,6 @@ __global__ void applyMLARopeAndAssignQKVKernelGeneration(T* qkv_output, T* q_pe,
         fmha_tile_counter[0] = 0;
         seqQOffset[0] = 0;
 
-        // Print all helix_is_inactive_rank values at once
-        if (helix_is_inactive_rank != nullptr)
-        {
-            int batch_size = total_s_len / seq_len;
-            printf("HAIDER [applyMLARopeAndAssignQKVKernelGeneration] helix_is_inactive_rank array (batch_size=%d):\n", batch_size);
-            for (int i = 0; i < batch_size; i++)
-            {
-                printf("  helix_is_inactive_rank[%d] = %d\n", i, helix_is_inactive_rank[i]);
-            }
-        }
-
         // Calculate bmm scale for FP8 MLA
         if (cache_type == KvCacheDataType::FP8)
         {
@@ -428,6 +417,7 @@ __global__ void applyMLARopeAndAssignQKVKernelGeneration(T* qkv_output, T* q_pe,
                 bmm2_scale[0] = quant_scale_o_val * dequant_scale_kv_val;
             }
         }
+        __threadfence_block();
     }
 
     if (head_idx <= head_num)
@@ -486,23 +476,27 @@ __global__ void applyMLARopeAndAssignQKVKernelGeneration(T* qkv_output, T* q_pe,
 
             if (valid_token)
             {
-                if (head_idx == head_num && (helix_is_inactive_rank == nullptr || !helix_is_inactive_rank[batch_idx]))
+                if (head_idx == head_num)
                 {
-                    auto const token_kv_idx = kv_cache_lengths[batch_idx] - seq_len + local_token_idx;
-
+                    // Skip writing to KV cache if helix parallelism is being used and current rank is inactive.
+                    if (helix_is_inactive_rank == nullptr || !helix_is_inactive_rank[batch_idx])
                     {
-                        auto kDst = reinterpret_cast<T*>(kv_cache.getKBlockPtr(batch_idx, token_kv_idx));
-                        auto inBlockIdx = kv_cache.getKVLocalIdx(
-                            token_kv_idx, 0, TOTAL_VEC_PER_HEAD, K_VECS_PER_HEAD + head_dim_vec_idx);
-                        if (cache_type == KvCacheDataType::FP8)
-                        {
+                        auto const token_kv_idx = kv_cache_lengths[batch_idx] - seq_len + local_token_idx;
 
-                            quantCopy<T, ELTS_PER_VEC>(
-                                reinterpret_cast<__nv_fp8_e4m3*>(kDst) + inBlockIdx * ELTS_PER_VEC,
-                                reinterpret_cast<T const*>(&data), quant_scale_kv_val);
+                        {
+                            auto kDst = reinterpret_cast<T*>(kv_cache.getKBlockPtr(batch_idx, token_kv_idx));
+                            auto inBlockIdx = kv_cache.getKVLocalIdx(
+                                token_kv_idx, 0, TOTAL_VEC_PER_HEAD, K_VECS_PER_HEAD + head_dim_vec_idx);
+                            if (cache_type == KvCacheDataType::FP8)
+                            {
+
+                                quantCopy<T, ELTS_PER_VEC>(
+                                    reinterpret_cast<__nv_fp8_e4m3*>(kDst) + inBlockIdx * ELTS_PER_VEC,
+                                    reinterpret_cast<T const*>(&data), quant_scale_kv_val);
+                            }
+                            else
+                                reinterpret_cast<VecT*>(kDst)[inBlockIdx] = data;
                         }
-                        else
-                            reinterpret_cast<VecT*>(kDst)[inBlockIdx] = data;
                     }
                 }
                 else
@@ -547,7 +541,7 @@ __global__ void applyMLARopeAndAssignQKVKernelGeneration(T* qkv_output, T* q_pe,
                 seqQOffset[batch_idx + 1] = head_num * seq_len * (batch_idx + 1);
             }
 
-            // Only write to KV cache if rank is active
+            // Only write to KV cache if rank is active.
             if (valid_token && (helix_is_inactive_rank == nullptr || !helix_is_inactive_rank[batch_idx]))
             {
                 auto const token_kv_idx = kv_cache_lengths[batch_idx] - seq_len + local_token_idx;
