@@ -368,7 +368,6 @@ __global__ void applyMLARopeAndAssignQKVKernelGeneration(T* qkv_output, T* q_pe,
     float const* dequant_scale_kv, float host_bmm1_scale, int32_t const* helix_position_offsets,
     bool const* helix_is_inactive_rank)
 {
-    
     // Constants.
     using VecT = typename VecType<T>::Type;
     using GPTJEltT = typename VecType<T>::GPTJEltType;
@@ -477,7 +476,7 @@ __global__ void applyMLARopeAndAssignQKVKernelGeneration(T* qkv_output, T* q_pe,
             {
                 if (head_idx == head_num)
                 {
-                    // Skip writing to KV cache if helix parallelism is being used and current rank is inactive.
+                    // If helix parallelism is being used, only write to KV cache if current rank is active.
                     if (helix_is_inactive_rank == nullptr || !helix_is_inactive_rank[batch_idx])
                     {
                         auto const token_kv_idx = kv_cache_lengths[batch_idx] - seq_len + local_token_idx;
@@ -552,7 +551,8 @@ __global__ void applyMLARopeAndAssignQKVKernelGeneration(T* qkv_output, T* q_pe,
 
                         if (cache_type == KvCacheDataType::FP8)
                         {
-                            quantCopy<T, ELTS_PER_VEC>(reinterpret_cast<__nv_fp8_e4m3*>(kDst) + inBlockIdx * ELTS_PER_VEC,
+                            quantCopy<T, ELTS_PER_VEC>(
+                                reinterpret_cast<__nv_fp8_e4m3*>(kDst) + inBlockIdx * ELTS_PER_VEC,
                                 fuse_buf + src_kv_global_offset + head_dim_idx, quant_scale_kv_val);
                         }
                         else
