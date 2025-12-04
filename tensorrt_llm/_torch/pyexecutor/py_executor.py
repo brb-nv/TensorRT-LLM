@@ -1909,7 +1909,6 @@ class PyExecutor:
                 req.context_current_position = req.prompt_len
                 req.decoding_iter = 1
                 req.py_decoding_iter = 1
-                print("[prepare_disagg_gen_transmission_complete] req.py_decoding_iter: ", req.py_decoding_iter)
                 req.py_kv_transfer_start_time = None
                 first_gen_tokens = req.context_phase_params.first_gen_tokens
                 ctx_draft_tokens = req.context_phase_params.draft_tokens

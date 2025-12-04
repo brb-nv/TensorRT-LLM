@@ -470,9 +470,7 @@ class KVCacheManager(BaseResourceManager):
             for req in generation_batch:
                 # TODO: [TRTLLM-5972] Lift the limitation that last rank is always the active one for helix.
                 if self.mapping.has_cp_helix():
-                    decode_block_idx = (req.orig_prompt_len + req.py_decoding_iter - 1) // self.tokens_per_block
-                    active_rank = decode_block_idx % self.mapping.cp_size
-                    if active_rank != self.mapping.cp_rank:
+                    if self.mapping.cp_rank != self.mapping.cp_size - 1:
                         req.py_helix_is_inactive_rank = True
                 # Skip allocating KV cache at decode for inactive helix ranks.
                 if req.py_helix_is_inactive_rank:
