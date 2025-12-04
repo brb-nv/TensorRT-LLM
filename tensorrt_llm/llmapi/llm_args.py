@@ -2946,7 +2946,7 @@ class TorchLlmArgs(BaseLlmArgs):
     @model_validator(mode='after')
     def validate_helix_tokens_per_block(self) -> 'TorchLlmArgs':
         """Validate that cp_config.tokens_per_block matches kv_cache_config.tokens_per_block when HELIX parallelism is active."""
-        if self.cp_config is None or not self.cp_config:
+        if self.context_parallel_size == 1 or self.cp_config is None or not self.cp_config:
             return self
 
         cp_type = self.cp_config.get('cp_type', None)
