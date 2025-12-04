@@ -2,7 +2,7 @@
 slurm:
   script_file: "disaggr_torch.slurm"
   partition: "batch"
-  account: "coreai_comparch_trtllm"
+  account: "coreai_horizon_dilations"
   job_time: "01:00:00"
   job_name: "trtllm-py-test"
   numa_bind: true
@@ -29,14 +29,14 @@ sequence:
 
 # Environment Configuration
 environment:
-  container_mount: "/lustre/fsw/portfolios/coreai/users/xqiao/"  # Format: path1:path1,path2:path2
+  container_mount: "/lustre/fsw/portfolios/coreai/projects/coreai_horizon_dilations:/lustre/fsw/portfolios/coreai/projects/coreai_horizon_dilations,/lustre/fsw/portfolios/coreai/users/xqiao:/lustre/fsw/portfolios/coreai/users/xqiao"  # Format: path1:path1,path2:path2
   # container_image: "gitlab-master.nvidia.com/compute/anna/infrastructure/benchmarking_toolkit/trt-llm/main_aarch:2025-11-04"
   container_image: "/lustre/fsw/portfolios/coreai/users/xqiao/docker_images/xqiao+trtllm+largeep-fix3-aarch64-20251114.sqsh"
   model_path: "/lustre/fsw/portfolios/coreai/users/xqiao/DeepSeek-R1-0528-FP4-V2/"
-  trtllm_repo: "/lustre/fsw/portfolios/coreai/users/xqiao/none"
+  trtllm_repo: "/lustre/fsw/portfolios/coreai/projects/coreai_horizon_dilations/users/bbuddharaju/none/"
   build_wheel: false  # Don't build the wheel when launching multiple jobs
   dataset_file: "/lustre/fsw/portfolios/coreai/users/xqiao/dataset/random-v2/deepseek-r1-1024-1024-200000-ratio-1_for_serve.json"
-  work_dir: "/lustre/fsw/portfolios/coreai/users/xqiao/bench-trtllm-py/"
+  work_dir: "/lustre/fsw/portfolios/coreai/projects/coreai_horizon_dilations/users/bbuddharaju/TensorRT-LLM_main/examples/disaggregated/slurm/benchmark/"
 
 # Profiling Configuration
 profiling:

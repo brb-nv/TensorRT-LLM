@@ -91,6 +91,8 @@ echo "  accuracy_model: ${accuracy_model}"
 echo "  accuracy_tasks: ${accuracy_tasks}"
 echo "  model_args_extra: ${model_args_extra}"
 
+#export TRTLLM_KVCACHE_TIME_OUTPUT_PATH="/lustre/fsw/portfolios/coreai/projects/coreai_horizon_dilations/users/bbuddharaju/TensorRT-LLM_main/examples/disaggregated/slurm/benchmark/ctxpp_send_recv_stats/"
+
 container_name="disaggr-test"
 
 echo "Log directory: ${full_logdir}"
