@@ -695,6 +695,7 @@ class ExecutorRequestQueue:
             )
             req.total_input_len_cp = input_len
             req_with_children.append(req)
+            print("[merge_helix_requests] req.py_decoding_iter: ", req.py_decoding_iter)
             if req.child_requests:
                 req_with_children.extend(req.child_requests)
         return req_with_children

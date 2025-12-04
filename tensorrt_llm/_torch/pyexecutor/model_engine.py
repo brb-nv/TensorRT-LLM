@@ -1671,11 +1671,11 @@ class PyTorchModelEngine(ModelEngine):
                     if not self.is_warmup and not request.is_cuda_graph_dummy:
                         position_id = request.total_input_len_cp + request.py_decoding_iter - 1
                     # TODO: [TRTLLM-5972] Lift the limitation that last rank is always the active one for helix.
-                    if self.mapping.cp_rank == self.mapping.cp_size - 1:
-                        past_seen_token_num = request.orig_prompt_len + request.py_decoding_iter - 1
-                    else:
-                        # past_seen_token_num doesn't grow on inactive ranks.
-                        past_seen_token_num = request.orig_prompt_len
+                    # if self.mapping.cp_rank == self.mapping.cp_size - 1:
+                    #     past_seen_token_num = request.orig_prompt_len + request.py_decoding_iter - 1
+                    # else:
+                    #     # past_seen_token_num doesn't grow on inactive ranks.
+                    #     past_seen_token_num = request.orig_prompt_len
 
                 position_ids.append(position_id)
                 num_cached_tokens_per_seq.append(past_seen_token_num)
