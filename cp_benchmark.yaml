@@ -14,7 +14,7 @@ benchmark:
   multi_round: 8  # Number of benchmark rounds
   benchmark_ratio: 0.8  # Benchmark ratio
   streaming: true  # Enable streaming mode
-  concurrency_list: "1024"
+  concurrency_list: "16"
   input_length: 1024  # Input sequence length
   output_length: 1024  # Output sequence length
   dataset_file: "/lustre/fsw/portfolios/coreai/users/xqiao/dataset/random-v2/deepseek-r1-1024-1024-200000-ratio-1_for_serve.json"
@@ -32,11 +32,22 @@ environment:
   model_path: "/lustre/fsw/portfolios/coreai/projects/coreai_horizon_dilations/users/mjoux/data/models/DeepSeek-V3-Lite/bf16/"
   trtllm_repo: "/lustre/fsw/portfolios/coreai/projects/coreai_horizon_dilations/users/bbuddharaju/TensorRT-LLM_main/"
   build_wheel: true  # Don't build the wheel when launching multiple jobs
+  trtllm_wheel_path: ""  # Path to pre-built TensorRT-LLM wheel. If provided, install from this wheel instead
   work_dir: "/lustre/fsw/portfolios/coreai/projects/coreai_horizon_dilations/users/bbuddharaju/TensorRT-LLM_main/examples/disaggregated/slurm/benchmark/"
+  worker_env_var: "TLLM_LOG_LEVEL=INFO TRTLLM_SERVER_DISABLE_GC=1 TRTLLM_WORKER_DISABLE_GC=1 TRTLLM_ENABLE_PDL=1 ENROOT_ALLOW_DEV=yes"
+  server_env_var: "TRTLLM_SERVER_DISABLE_GC=1"
 
 # Profiling Configuration
 profiling:
   nsys_on: false  # Set to true to enable profiling
+  ctx_profile_range: "10-30"  # Set TLLM_PROFILE_START_STOP for ctx workers
+  gen_profile_range: "200-250"  # Set TLLM_PROFILE_START_STOP for gen workers
+
+accuracy:
+  enable_accuracy_test: false  # Set to true to enable accuracy evaluation
+  model: "local-completions"  # Model type for lm_eval
+  tasks: "gsm8k"  # Evaluation tasks (comma-separated)
+  model_args_extra: "num_concurrent=512,max_retries=3,tokenized_requests=false,timeout=1200,max_gen_toks=256,max_length=4096"  # Extra model arguments for lm_eval
 
 worker_config:
   gen:
