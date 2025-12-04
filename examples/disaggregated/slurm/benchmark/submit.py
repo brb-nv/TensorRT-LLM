@@ -94,13 +94,15 @@ def submit_job(config, log_dir):
 
     # Calculate nodes based on world sizes
     ctx_tp_size = config['worker_config']['ctx']['tensor_parallel_size']
+    ctx_cp_size = config['worker_config']['ctx']['context_parallel_size']
     ctx_pp_size = config['worker_config']['ctx']['pipeline_parallel_size']
-    ctx_world_size = ctx_tp_size * ctx_pp_size
+    ctx_world_size = ctx_tp_size * ctx_cp_size * ctx_pp_size
     ctx_nodes = calculate_nodes(ctx_world_size, ctx_num,
                                 hw_config['gpus_per_node'])
     gen_tp_size = config['worker_config']['gen']['tensor_parallel_size']
+    gen_cp_size = config['worker_config']['gen']['context_parallel_size']
     gen_pp_size = config['worker_config']['gen']['pipeline_parallel_size']
-    gen_world_size = gen_tp_size * gen_pp_size
+    gen_world_size = gen_tp_size * gen_cp_size * gen_pp_size
     gen_nodes = calculate_nodes(gen_world_size, gen_num,
                                 hw_config['gpus_per_node'])
     total_nodes = ctx_nodes + gen_nodes
