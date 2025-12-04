@@ -163,6 +163,7 @@ def submit_job(config, log_dir):
         f'--ntasks={total_tasks}',
         f'--ntasks-per-node={hw_config["gpus_per_node"]}',
         f'--segment={total_nodes}',
+        f'--gpus-per-node={hw_config["gpus_per_node"]}',
         *([arg for arg in slurm_config['extra_args'].split() if arg]),
         slurm_config['script_file'],
         # Hardware configuration
