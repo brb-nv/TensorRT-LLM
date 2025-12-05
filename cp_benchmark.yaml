@@ -3,7 +3,7 @@ slurm:
   script_file: "disaggr_torch.slurm"
   partition: "batch"
   account: "coreai_horizon_dilations"
-  job_time: "01:00:00"
+  job_time: "02:00:00"
   job_name: "trtllm-py-test"
   numa_bind: true
 
@@ -28,7 +28,7 @@ hardware:
 # Environment Configuration
 environment:
   container_mount: "/lustre/fsw/portfolios/coreai/projects/coreai_horizon_dilations:/lustre/fsw/portfolios/coreai/projects/coreai_horizon_dilations,/lustre/fsw/portfolios/coreai/users/xqiao:/lustre/fsw/portfolios/coreai/users/xqiao"  # Format: path1:path1,path2:path2
-  container_image: "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:pytorch-25.10-py3-x86_64-ubuntu24.04-trt10.13.3.9-skip-tritondevel-202511281406-9077"
+  container_image: "/lustre/fsw/portfolios/coreai/projects/coreai_horizon_dilations/users/bbuddharaju/TensorRT-LLM_main/tensorrt-llm_pytorch-25.10-py3-aarch64-ubuntu24.04-trt10.13.3.9-skip-tritondevel-202511281406-9077.sqsh"
   model_path: "/lustre/fsw/portfolios/coreai/projects/coreai_horizon_dilations/users/mjoux/data/models/DeepSeek-V3-Lite/bf16/"
   trtllm_repo: "/lustre/fsw/portfolios/coreai/projects/coreai_horizon_dilations/users/bbuddharaju/TensorRT-LLM_main/"
   build_wheel: true  # Don't build the wheel when launching multiple jobs
