@@ -394,14 +394,17 @@ class MPIDist(Distributed):
         return mpi_recv_object(src, tag)
 
     def create_tp_comm(self):
+        print(f"[MPIDist::create_tp_comm] rank: {self.mapping.rank}, tp_rank: {self.mapping.tp_rank}, tp_group: {self.mapping.tp_group}")
         new_group = mpi_comm().group.Incl(self.mapping.tp_group)
         self.tp_comm = mpi_comm().Create_group(new_group)
 
     def create_pp_comm(self):
+        print(f"[MPIDist::create_pp_comm] rank: {self.mapping.rank}, pp_rank: {self.mapping.pp_rank}, pp_group: {self.mapping.pp_group}")
         new_group = mpi_comm().group.Incl(self.mapping.pp_group)
         self.pp_comm = mpi_comm().Create_group(new_group)
 
     def create_cp_comm(self):
+        print(f"[MPIDist::create_cp_comm] rank: {self.mapping.rank}, cp_rank: {self.mapping.cp_rank}, cp_group: {self.mapping.cp_group}")
         new_group = mpi_comm().group.Incl(self.mapping.cp_group)
         self.cp_comm = mpi_comm().Create_group(new_group)
 

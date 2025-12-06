@@ -684,6 +684,9 @@ class ExecutorRequestQueue:
                 input_ids_this_rank = input_ids_this_rank[:-padding_len]
                 position_ids_this_rank = position_ids_this_rank[:-padding_len]
 
+            print(f"[ExecutorRequestQueue::_merge_helix_requests][rank {self.dist.rank}][cp_rank {curr_cp_rank}]: input_ids_this_rank: {input_ids_this_rank}")
+            print(f"[ExecutorRequestQueue::_merge_helix_requests][rank {self.dist.rank}][cp_rank {curr_cp_rank}]: position_ids_this_rank: {position_ids_this_rank}")
+
             req = executor_request_to_llm_request(
                 req_id=req_item.id,
                 executor_request=req_item.request,
