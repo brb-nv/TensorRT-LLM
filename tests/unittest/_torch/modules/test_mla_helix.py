@@ -862,8 +862,32 @@ def _run_mla_distributed(
 
 
 
+# ============================================================================
+# Main Test Function
+# ============================================================================
+
 @torch.inference_mode
-def _full_test_multi_gpu(rank: int, world_size: int, scenario: Scenario, gen_steps: int):
+def _full_test_multi_gpu(
+    rank: int, 
+    world_size: int, 
+    tp_size: int, 
+    cp_size: int, 
+    scenario: Scenario, 
+    gen_steps: int
+):
+    """Run the full multi-GPU test with mixed TP+CP parallelism.
+    
+    Args:
+        rank: Global rank
+        world_size: Total world size (= tp_size * cp_size)
+        tp_size: Tensor parallelism size
+        cp_size: Context parallelism size
+        scenario: Test scenario configuration
+        gen_steps: Number of generation steps
+    
+    Returns:
+        Mismatch ratio compared to reference output
+    """
     if scenario.rope_scaling:
         rope_scaling = {
             "beta_fast": scenario.rope_beta_fast,
@@ -908,6 +932,7 @@ def _full_test_multi_gpu(rank: int, world_size: int, scenario: Scenario, gen_ste
         is_neox=False,
     )
 
+    # Create reference MLA (single GPU, no parallelism)
     mla = MLA(
         hidden_size=scenario.hidden_size,
         num_attention_heads=scenario.num_heads,
@@ -927,11 +952,12 @@ def _full_test_multi_gpu(rank: int, world_size: int, scenario: Scenario, gen_ste
     ).cuda()
     _generate_random_weights(mla)
     weights = mla.state_dict()
+    
     # up to this point, all ranks should have same tensors because the seed is the same
     # now we run the reference MLA on rank 0
     if rank == 0:
-        # Reference output (single GPU, but with correct KV/metadata setup)
-        ref_mapping = Mapping(world_size=1, tp_size=1, rank=0)
+        # Reference output (single GPU, no parallelism)
+        ref_mapping = Mapping(world_size=1, tp_size=1, cp_size=1, rank=0)
         ref_kv_cache_manager, ref_attn_metadata = _setup_kv_and_metadata(
             scenario, ref_mapping, gen_steps
         )
@@ -1031,14 +1057,20 @@ def _full_test_multi_gpu(rank: int, world_size: int, scenario: Scenario, gen_ste
         )
         ref_attn_metadata = None
 
-    # Distributed mapping for helix
+    # Distributed mapping for mixed TP+CP helix
     mapping = Mapping(
-        world_size=world_size, rank=rank, cp_size=world_size, cp_config={"cp_type": CpType.HELIX}
+        world_size=world_size, 
+        rank=rank, 
+        tp_size=tp_size,
+        cp_size=cp_size, 
+        cp_config={"cp_type": CpType.HELIX}
     )
-    # we use cp_allgather here because there is no broadcast op across CP group
+    
+    # Broadcast reference output from rank 0 to all ranks using allgather
     ref_output_all = cp_allgather(ref_output, mapping=mapping, dim=0)
     # we only need the values from rank 0
     ref_output = ref_output_all.view(world_size, *ref_output.shape)[0]
+    
     test_params = (
         input_ctx,
         input_gen,
@@ -1048,8 +1080,9 @@ def _full_test_multi_gpu(rank: int, world_size: int, scenario: Scenario, gen_ste
         ref_attn_metadata,
     )
     return _run_mla_distributed(
-        rank, world_size, scenario, mapping, test_params, ref_output, gen_steps
+        rank, world_size, tp_size, cp_size, scenario, mapping, test_params, ref_output, gen_steps
     )
+
 
 
 def _run_single_rank(func, *args, **kwargs):
