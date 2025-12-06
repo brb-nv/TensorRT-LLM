@@ -188,13 +188,34 @@ class RopeConfig:
     model_type: str = "deepseek_v3"
 
 
-def _setup_kv_and_metadata(scenario: Scenario, mapping: Mapping, gen_steps: int):
-    # Set up KVCacheManager and attn_metadata for MLA
-    n_gpu = mapping.world_size
-    assert scenario.ctx_len % n_gpu == 0
-    ctx_len_per_gpu = scenario.ctx_len // n_gpu
+# ============================================================================
+# KV Cache and Metadata Setup
+# ============================================================================
+
+def _setup_kv_and_metadata(
+    scenario: Scenario, 
+    mapping: Mapping, 
+    gen_steps: int,
+    ctx_len_per_cp: Optional[int] = None,
+):
+    """Set up KVCacheManager and attn_metadata for MLA.
+    
+    Args:
+        scenario: Test scenario configuration
+        mapping: Distributed mapping configuration
+        gen_steps: Number of generation steps
+        ctx_len_per_cp: Context length per CP rank. If None, uses scenario.ctx_len
+                       (for reference single-GPU case)
+    """
+    # For distributed case, context is split across CP ranks
+    # For reference case (single GPU), use full context length
+    if ctx_len_per_cp is None:
+        ctx_len_local = scenario.ctx_len
+    else:
+        ctx_len_local = ctx_len_per_cp
+    
     max_tokens = (
-        (ctx_len_per_gpu + gen_steps + scenario.kv_cache_tokens_per_block - 1)
+        (ctx_len_local + gen_steps + scenario.kv_cache_tokens_per_block - 1)
         // scenario.kv_cache_tokens_per_block
         * scenario.kv_cache_tokens_per_block
         * scenario.batch
@@ -209,8 +230,8 @@ def _setup_kv_and_metadata(scenario: Scenario, mapping: Mapping, gen_steps: int)
         num_layers=scenario.num_layers,
         num_kv_heads=1,
         head_dim=scenario.kv_lora_rank + scenario.qk_rope_head_dim,
-        tokens_per_block=scenario.kv_cache_tokens_per_block,  # for test, just use seq_len
-        max_seq_len=ctx_len_per_gpu + gen_steps,
+        tokens_per_block=scenario.kv_cache_tokens_per_block,
+        max_seq_len=ctx_len_local + gen_steps,
         max_batch_size=scenario.batch,
         mapping=mapping,
         dtype=str_dtype_to_binding(torch_dtype_to_str(scenario.kv_cache_dtype)),
@@ -219,24 +240,24 @@ def _setup_kv_and_metadata(scenario: Scenario, mapping: Mapping, gen_steps: int)
         req = LlmRequest(
             request_id=req_id,
             max_new_tokens=1,
-            input_tokens=[1] * ctx_len_per_gpu,  # all requests have the same length here
+            input_tokens=[1] * ctx_len_local,  # all requests have the same length here
             sampling_config=SamplingConfig(SamplingParams()._get_sampling_config()),
             is_streaming=False,
         )
         req.is_dummy_request = True
         req.paged_kv_block_ids = []
         beam_width = 1
-        kv_cache_manager.impl.add_sequence(req_id, ctx_len_per_gpu, beam_width, req)
+        kv_cache_manager.impl.add_sequence(req_id, ctx_len_local, beam_width, req)
         req.state = LlmRequestState.GENERATION_IN_PROGRESS
-        req.prompt_len = ctx_len_per_gpu
+        req.prompt_len = ctx_len_local
         req.py_prompt_len = req.prompt_len
     attn_metadata = get_attention_backend("TRTLLM").Metadata(
-        seq_lens=torch.tensor([ctx_len_per_gpu] * scenario.batch, dtype=torch.int),
+        seq_lens=torch.tensor([ctx_len_local] * scenario.batch, dtype=torch.int),
         request_ids=list(range(scenario.batch)),
         max_num_requests=scenario.batch,
         num_contexts=scenario.batch,
-        prompt_lens=[ctx_len_per_gpu] * scenario.batch,
-        max_num_tokens=ctx_len_per_gpu,
+        prompt_lens=[ctx_len_local] * scenario.batch,
+        max_num_tokens=ctx_len_local,
         kv_cache_manager=kv_cache_manager,
         kv_cache_params=KVCacheParams(
             use_cache=True,
