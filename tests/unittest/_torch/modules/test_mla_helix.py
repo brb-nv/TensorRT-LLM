@@ -99,7 +99,9 @@ class Scenario:
 
 
 all_scenarios = [
-    Scenario(batch=1, ctx_len=64),
+    # Scenario(batch=1, ctx_len=64),
+    # Scenario(batch=1, ctx_len=64),
+    Scenario(batch=1, ctx_len=128),
     Scenario(batch=1, ctx_len=512),
     Scenario(batch=1, ctx_len=1024),
     Scenario(batch=1, ctx_len=2048),
@@ -414,7 +416,7 @@ def _make_latent_cache_gen(
         )
 
     mapping = Mapping(
-        world_size=world_size, rank=rank, cp_size=world_size, cp_config={"cp_type": CpType.HELIX}
+        world_size=world_size, rank=rank, cp_size=world_size, cp_config={"cp_type": CpType.HELIX, "tokens_per_block": 32}
     )
     # use cp_allgather here to broadcast from rank 0 to all other ranks
     ret_all = cp_allgather(ret, mapping=mapping, dim=0)
@@ -837,7 +839,7 @@ def _run_single_rank(func, *args, **kwargs):
         raise Exception(f"\n\nError occurred. Original traceback is\n{tb}\n")
 
 
-@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 GPUs to run this test")
+@pytest.mark.skipif(torch.cuda.device_count() < 8, reason="needs 8 GPUs to run this test")
 @pytest.mark.parametrize("scenario", test_scenarios, ids=lambda x: f"scenario: {x}")
 def test_mla_helix_distributed(
     scenario: Scenario,
@@ -845,7 +847,7 @@ def test_mla_helix_distributed(
     max_mismatch_ratio: float = 0.02,
     mismatch_ratios: Optional[List[float]] = None,
 ):
-    world_size = 2
+    world_size = 8
     gen_steps = scenario.ref_steps if gen_steps is None else gen_steps
     with MPIPoolExecutor(max_workers=world_size) as executor:
         results = executor.map(
