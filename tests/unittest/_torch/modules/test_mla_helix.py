@@ -649,20 +649,25 @@ def _run_mla_distributed(
     _copy_to_tp_then_cp(weights, "o_proj.weight", dim=1, tp_rank=tp_rank, tp_size=tp_size, 
                         cp_rank=cp_rank, cp_size=cp_size)
     
-    # 2. v_b_proj: Shape (num_heads, v_head_dim, kv_lora_rank)
+    # 2. q_proj.weight: Column parallel by both TP and CP
+    #    Shape: (num_heads * qk_head_dim, hidden_size) -> shard dim 0
+    _copy_to_tp_then_cp(weights, "q_proj.weight", dim=0, tp_rank=tp_rank, tp_size=tp_size,
+                        cp_rank=cp_rank, cp_size=cp_size)
+    
+    # 3. v_b_proj: Shape (num_heads, v_head_dim, kv_lora_rank)
     #    Sharded by both TP and CP on head dimension (dim 0)
     _copy_to_tp_then_cp(weights, "v_b_proj", dim=0, tp_rank=tp_rank, tp_size=tp_size,
                         cp_rank=cp_rank, cp_size=cp_size)
     
-    # 3. k_b_proj_trans: Shape (num_heads_tp, kv_lora_rank, qk_nope_head_dim)
+    # 4. k_b_proj_trans: Shape (num_heads_tp, kv_lora_rank, qk_nope_head_dim)
     #    Sharded by TP only (not CP) - used in generation phase
     _copy_to_tp(weights, "k_b_proj_trans", dim=0, tp_rank=tp_rank, tp_size=tp_size)
     
-    # 4. q_b_proj.weight: Column parallel by TP only
+    # 5. q_b_proj.weight: Column parallel by TP only
     #    Shape: (num_heads * qk_head_dim, q_lora_rank) -> shard dim 0
     _copy_to_tp(weights, "q_b_proj.weight", dim=0, tp_rank=tp_rank, tp_size=tp_size)
     
-    # 5. kv_b_proj.weight: Column parallel by TP only
+    # 6. kv_b_proj.weight: Column parallel by TP only
     #    Shape: (num_heads * (qk_nope_head_dim + v_head_dim), kv_lora_rank) -> shard dim 0
     _copy_to_tp(weights, "kv_b_proj.weight", dim=0, tp_rank=tp_rank, tp_size=tp_size)
     
