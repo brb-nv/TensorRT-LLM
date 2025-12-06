@@ -146,7 +146,15 @@ all_scenarios = [
 
 # limit the number of test scenarios to avoid taking too long
 test_scenarios = [
-    all_scenarios[0]
+    all_scenarios[0],
+    all_scenarios[1],
+    all_scenarios[4],
+    all_scenarios[7],
+    all_scenarios[14],
+    all_scenarios[17],
+    all_scenarios[23],
+    all_scenarios[24],
+]
 
 # TP/CP combinations to test (tp_size, cp_size)
 # These assume 8 GPUs total: world_size = tp_size * cp_size = 8
@@ -155,14 +163,6 @@ tp_cp_combinations = [
     (2, 4),   # Mixed TP2 + CP4
     (4, 2),   # Mixed TP4 + CP2
     (8, 1),   # Pure TP (no CP)
-],
-    all_scenarios[1],
-    all_scenarios[4],
-    all_scenarios[7],
-    all_scenarios[14],
-    all_scenarios[17],
-    all_scenarios[23],
-    all_scenarios[24],
 ]
 
 
