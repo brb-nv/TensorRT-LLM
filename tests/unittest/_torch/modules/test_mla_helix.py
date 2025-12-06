@@ -1175,13 +1175,36 @@ def test_mla_helix_distributed(
 
 
 if __name__ == "__main__":
-    for scenario in all_scenarios[:11]:
-        timing_steps = 256
-        gen_steps = scenario.ref_steps + timing_steps
-        print(f"Running scenario: {scenario} and timing {timing_steps} steps")
-        mismatch_ratios = []
-        test_mla_helix_distributed(scenario, gen_steps=gen_steps, mismatch_ratios=mismatch_ratios)
-        if any(mismatch > 0 for mismatch in mismatch_ratios):
-            print(f"Numerical test failed with mismatch ratios: {mismatch_ratios}")
-        else:
-            print("Numerical test passed")
+    # Run benchmarks for different TP/CP combinations
+    for tp_size, cp_size in tp_cp_combinations:
+        print(f"\n{'='*60}")
+        print(f"Testing TP{tp_size} x CP{cp_size}")
+        print(f"{'='*60}")
+        
+        for scenario in all_scenarios[:11]:
+            # Skip scenarios that don't meet divisibility requirements
+            if scenario.ctx_len % cp_size != 0:
+                print(f"Skipping scenario (ctx_len {scenario.ctx_len} not divisible by cp_size {cp_size})")
+                continue
+            if scenario.num_heads % (tp_size * cp_size) != 0:
+                print(f"Skipping scenario (num_heads {scenario.num_heads} not divisible by {tp_size * cp_size})")
+                continue
+                
+            timing_steps = 256
+            gen_steps = scenario.ref_steps + timing_steps
+            print(f"\nRunning scenario: {scenario} and timing {timing_steps} steps")
+            mismatch_ratios = []
+            try:
+                test_mla_helix_distributed_mixed_tp_cp(
+                    scenario, 
+                    tp_size=tp_size,
+                    cp_size=cp_size,
+                    gen_steps=gen_steps, 
+                    mismatch_ratios=mismatch_ratios
+                )
+                if any(mismatch > 0 for mismatch in mismatch_ratios):
+                    print(f"Numerical test failed with mismatch ratios: {mismatch_ratios}")
+                else:
+                    print("Numerical test passed")
+            except Exception as e:
+                print(f"Test failed with exception: {e}")
