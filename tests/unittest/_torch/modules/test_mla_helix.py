@@ -593,18 +593,47 @@ def _make_latent_cache_gen(
 
 
 
+# ============================================================================
+# Distributed MLA Execution
+# ============================================================================
+
 def _run_mla_distributed(
     rank: int,
     world_size: int,
+    tp_size: int,
+    cp_size: int,
     scenario: Scenario,
     mapping: Mapping,
     test_params: tuple,
     ref_output: torch.Tensor,
     gen_steps: int,
 ):
+    """Run distributed MLA with mixed TP+CP parallelism.
+    
+    Args:
+        rank: Global rank
+        world_size: Total number of ranks
+        tp_size: Tensor parallelism size
+        cp_size: Context parallelism size
+        scenario: Test scenario configuration
+        mapping: Distributed mapping
+        test_params: Tuple of (input_ctx, input_gen, position_ids_ctx, weights, pos_embd_params, ref_attn_metadata)
+        ref_output: Reference output from single-GPU execution
+        gen_steps: Number of generation steps
+    
+    Returns:
+        Mismatch ratio compared to reference output
+    """
+    tp_rank = mapping.tp_rank
+    cp_rank = mapping.cp_rank
+    
     input_ctx, input_gen, position_ids_ctx, weights, pos_embd_params, ref_attn_metadata = (
         test_params
     )
+    
+    # Context is split across CP ranks only (not TP ranks)
+    ctx_len_per_cp = scenario.ctx_len // cp_size
+    
     # we start with the same position_ids as the reference MLA.
     position_ids_gen = torch.full(
         (scenario.batch,), scenario.ctx_len, dtype=torch.int, device="cuda"
@@ -630,36 +659,65 @@ def _run_mla_distributed(
         config=config,
         enable_unit_test=True,
     ).cuda()
-    # above should have the same config as the reference MLA except for the mapping
-    # we update the weights accordingly and should be able to load them
-    _copy_to_cp(weights, "o_proj.weight", 1, rank, world_size)
-    _copy_to_cp(weights, "v_b_proj", 0, rank, world_size)
+    
+    # ========================================================================
+    # Weight Sharding for Mixed TP+CP
+    # ========================================================================
+    # Based on modeling_deepseekv3.py weight loading patterns:
+    #
+    # 1. o_proj.weight: Row parallel across (tp_size * cp_size)
+    #    Shape: (hidden_size, num_heads * v_head_dim) -> shard dim 1
+    #    This is sharded across both TP and CP for the reduction
+    _copy_to_tp_then_cp(weights, "o_proj.weight", dim=1, tp_rank=tp_rank, tp_size=tp_size, 
+                        cp_rank=cp_rank, cp_size=cp_size)
+    
+    # 2. v_b_proj: Shape (num_heads, v_head_dim, kv_lora_rank)
+    #    Sharded by both TP and CP on head dimension (dim 0)
+    _copy_to_tp_then_cp(weights, "v_b_proj", dim=0, tp_rank=tp_rank, tp_size=tp_size,
+                        cp_rank=cp_rank, cp_size=cp_size)
+    
+    # 3. k_b_proj_trans: Shape (num_heads_tp, kv_lora_rank, qk_nope_head_dim)
+    #    Sharded by TP only (not CP) - used in generation phase
+    _copy_to_tp(weights, "k_b_proj_trans", dim=0, tp_rank=tp_rank, tp_size=tp_size)
+    
+    # 4. q_b_proj.weight: Column parallel by TP only
+    #    Shape: (num_heads * qk_head_dim, q_lora_rank) -> shard dim 0
+    _copy_to_tp(weights, "q_b_proj.weight", dim=0, tp_rank=tp_rank, tp_size=tp_size)
+    
+    # 5. kv_b_proj.weight: Column parallel by TP only
+    #    Shape: (num_heads * (qk_nope_head_dim + v_head_dim), kv_lora_rank) -> shard dim 0
+    _copy_to_tp(weights, "kv_b_proj.weight", dim=0, tp_rank=tp_rank, tp_size=tp_size)
+    
     mla.load_state_dict(weights)
+    
     # Set up KVCacheManager and attn_metadata for distributed
-    kv_cache_manager, attn_metadata = _setup_kv_and_metadata(scenario, mapping, gen_steps)
+    kv_cache_manager, attn_metadata = _setup_kv_and_metadata(
+        scenario, mapping, gen_steps, ctx_len_per_cp=ctx_len_per_cp
+    )
     extra_attrs["attention_metadata"] = weakref.ref(attn_metadata)
-    ctx_len_per_gpu = scenario.ctx_len // world_size
+    
     input_ctx_bs = input_ctx.view(scenario.batch, scenario.ctx_len, scenario.hidden_size)
 
-    # split inputs into chunks for each rank
-    input_ctx_bs_rank = input_ctx_bs[:, rank * ctx_len_per_gpu : (rank + 1) * ctx_len_per_gpu, :]
+    # Split inputs by CP rank (all TP ranks in same CP group see same input)
+    input_ctx_bs_rank = input_ctx_bs[:, cp_rank * ctx_len_per_cp : (cp_rank + 1) * ctx_len_per_cp, :]
     input_ctx_rank = input_ctx_bs_rank.reshape(
-        scenario.batch * ctx_len_per_gpu, scenario.hidden_size
+        scenario.batch * ctx_len_per_cp, scenario.hidden_size
     ).contiguous()
     position_ids_ctx_bs = position_ids_ctx.view(scenario.batch, scenario.ctx_len)
     position_ids_ctx_bs_rank = position_ids_ctx_bs[
-        :, rank * ctx_len_per_gpu : (rank + 1) * ctx_len_per_gpu
+        :, cp_rank * ctx_len_per_cp : (cp_rank + 1) * ctx_len_per_cp
     ]
     position_ids_ctx_rank = position_ids_ctx_bs_rank.reshape(
-        scenario.batch * ctx_len_per_gpu
+        scenario.batch * ctx_len_per_cp
     ).contiguous()
+    
     # this represents the context step
     with model_extra_attrs(extra_attrs):
         mla(position_ids_ctx_rank, input_ctx_rank, attn_metadata)
 
-    # for non-last rank, generate the right latent cache for generation
+    # for non-last CP rank, generate the right latent cache for generation
     latent_cache_gen = _make_latent_cache_gen(
-        mla, rank, world_size, ctx_len_per_gpu, input_ctx_bs, ref_attn_metadata
+        mla, tp_rank, cp_rank, tp_size, cp_size, ctx_len_per_cp, input_ctx_bs, ref_attn_metadata
     )
 
     outputs = []
@@ -675,22 +733,23 @@ def _run_mla_distributed(
         helix_is_inactive_rank = []
         for req_id in range(scenario.batch):
             kv_cache_manager.impl.add_token(req_id)
-            # Assume last rank is active for all gen steps.
-            if rank == world_size - 1:
+            # For Helix: last CP rank is active, others are inactive
+            # This is based on CP rank, not global rank
+            if cp_rank == cp_size - 1:
                 helix_is_inactive_rank.append(False)
                 cache_add = step
             else:
                 helix_is_inactive_rank.append(True)
                 cache_add = 0
-        cached_tokens_per_seq = [ctx_len_per_gpu + cache_add for _ in range(scenario.batch)]
+        cached_tokens_per_seq = [ctx_len_per_cp + cache_add for _ in range(scenario.batch)]
         if step == 0:
             attn_metadata = get_attention_backend("TRTLLM").Metadata(
                 seq_lens=torch.tensor([1] * scenario.batch, dtype=torch.int),
                 request_ids=list(range(scenario.batch)),
                 max_num_requests=scenario.batch,
                 num_contexts=0,
-                prompt_lens=[ctx_len_per_gpu] * scenario.batch,
-                max_num_tokens=ctx_len_per_gpu,
+                prompt_lens=[ctx_len_per_cp] * scenario.batch,
+                max_num_tokens=ctx_len_per_cp,
                 kv_cache_manager=kv_cache_manager,
                 kv_cache_params=KVCacheParams(
                     use_cache=True,
@@ -719,14 +778,14 @@ def _run_mla_distributed(
                 )
             if step < scenario.ref_steps:
                 outputs.append(result)
-            print(f"Rank {rank} {world_size}-GPU: result: {result[0, :8]} / {result[-1, -8:]}")
+            print(f"Rank {rank} (TP{tp_rank}/CP{cp_rank}) {world_size}-GPU: result: {result[0, :8]} / {result[-1, -8:]}")
             # update position_ids_gen
             position_ids_gen += 1
             continue
 
         # CUDA graph capture on first step when timing
         if step == 0:
-            print(f"Rank {rank} {world_size}-GPU: Creating CUDA graph and capturing")
+            print(f"Rank {rank} (TP{tp_rank}/CP{cp_rank}) {world_size}-GPU: Creating CUDA graph and capturing")
             # Create CUDA graph metadata for capture
             attn_metadata = attn_metadata.create_cuda_graph_metadata(max_batch_size=scenario.batch)
             attn_metadata.prepare()
@@ -773,7 +832,7 @@ def _run_mla_distributed(
         avg_gen_time = (end - start) / (gen_steps - scenario.ref_steps)
     throughput = scenario.batch / avg_gen_time
     print(
-        f"Rank {rank} {world_size}-GPU: time taken for "
+        f"Rank {rank} (TP{tp_rank}/CP{cp_rank}) {world_size}-GPU: time taken for "
         f"{gen_steps - scenario.ref_steps} steps: "
         f"{end - start} s, throughput: {throughput} MLA/s"
     )
@@ -792,14 +851,15 @@ def _run_mla_distributed(
                 ref_output[ref_step, b],
                 atol,
                 rtol,
-                f"Rank {rank} {world_size}-GPU step {ref_step}, batch {b}",
+                f"Rank {rank} (TP{tp_rank}/CP{cp_rank}) {world_size}-GPU step {ref_step}, batch {b}",
             )
 
     ratio_mismatch = mismatch_count / output.numel()
     print(
-        f"Rank {rank} {world_size}-GPU: {mismatch_count}/{output.numel()} mismatches: {ratio_mismatch}"
+        f"Rank {rank} (TP{tp_rank}/CP{cp_rank}) {world_size}-GPU: {mismatch_count}/{output.numel()} mismatches: {ratio_mismatch}"
     )
     return ratio_mismatch
+
 
 
 @torch.inference_mode
