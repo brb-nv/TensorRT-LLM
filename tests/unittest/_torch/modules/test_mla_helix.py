@@ -1086,6 +1086,7 @@ def _full_test_multi_gpu(
 
 
 def _run_single_rank(func, *args, **kwargs):
+    """Wrapper to run a function on a single MPI rank."""
     rank = tensorrt_llm.mpi_rank()
     torch.cuda.set_device(rank)
     print(f"rank {rank} starting")
@@ -1099,6 +1100,60 @@ def _run_single_rank(func, *args, **kwargs):
         raise Exception(f"\n\nError occurred. Original traceback is\n{tb}\n")
 
 
+# ============================================================================
+# Pytest Test Functions
+# ============================================================================
+
+@pytest.mark.skipif(torch.cuda.device_count() < 8, reason="needs 8 GPUs to run this test")
+@pytest.mark.parametrize("scenario", test_scenarios, ids=lambda x: f"scenario: {x}")
+@pytest.mark.parametrize(
+    "tp_size,cp_size", 
+    tp_cp_combinations,
+    ids=[f"tp{tp}_cp{cp}" for tp, cp in tp_cp_combinations]
+)
+def test_mla_helix_distributed_mixed_tp_cp(
+    scenario: Scenario,
+    tp_size: int,
+    cp_size: int,
+    gen_steps: Optional[int] = None,
+    max_mismatch_ratio: float = 0.02,
+    mismatch_ratios: Optional[List[float]] = None,
+):
+    """Test MLA with mixed TP+CP parallelism.
+    
+    Args:
+        scenario: Test scenario configuration
+        tp_size: Tensor parallelism size
+        cp_size: Context parallelism size
+        gen_steps: Number of generation steps (defaults to scenario.ref_steps)
+        max_mismatch_ratio: Maximum allowed mismatch ratio
+        mismatch_ratios: Optional list to collect mismatch ratios (for benchmarking)
+    """
+    world_size = tp_size * cp_size
+    
+    # Validate that context length is divisible by CP size
+    if scenario.ctx_len % cp_size != 0:
+        pytest.skip(f"ctx_len {scenario.ctx_len} not divisible by cp_size {cp_size}")
+    
+    # Validate that num_heads is divisible by (tp_size * cp_size)
+    if scenario.num_heads % (tp_size * cp_size) != 0:
+        pytest.skip(f"num_heads {scenario.num_heads} not divisible by tp_size*cp_size {tp_size * cp_size}")
+    
+    gen_steps = scenario.ref_steps if gen_steps is None else gen_steps
+    
+    with MPIPoolExecutor(max_workers=world_size) as executor:
+        results = executor.map(
+            _run_single_rank,
+            *zip(*[(_full_test_multi_gpu, world_size, tp_size, cp_size, scenario, gen_steps)] * world_size),
+        )
+        if mismatch_ratios is None:
+            for ratio_mismatch in results:
+                assert ratio_mismatch <= max_mismatch_ratio
+        else:
+            mismatch_ratios.extend(results)
+
+
+# Backward compatibility: test with pure CP (original behavior)
 @pytest.mark.skipif(torch.cuda.device_count() < 8, reason="needs 8 GPUs to run this test")
 @pytest.mark.parametrize("scenario", test_scenarios, ids=lambda x: f"scenario: {x}")
 def test_mla_helix_distributed(
@@ -1107,18 +1162,16 @@ def test_mla_helix_distributed(
     max_mismatch_ratio: float = 0.02,
     mismatch_ratios: Optional[List[float]] = None,
 ):
-    world_size = 8
-    gen_steps = scenario.ref_steps if gen_steps is None else gen_steps
-    with MPIPoolExecutor(max_workers=world_size) as executor:
-        results = executor.map(
-            _run_single_rank,
-            *zip(*[(_full_test_multi_gpu, world_size, scenario, gen_steps)] * world_size),
-        )
-        if mismatch_ratios is None:
-            for ratio_mismatch in results:
-                assert ratio_mismatch <= max_mismatch_ratio
-        else:
-            mismatch_ratios.extend(results)
+    """Test MLA with pure CP (tp_size=1, cp_size=8) for backward compatibility."""
+    test_mla_helix_distributed_mixed_tp_cp(
+        scenario=scenario,
+        tp_size=1,
+        cp_size=8,
+        gen_steps=gen_steps,
+        max_mismatch_ratio=max_mismatch_ratio,
+        mismatch_ratios=mismatch_ratios,
+    )
+
 
 
 if __name__ == "__main__":
