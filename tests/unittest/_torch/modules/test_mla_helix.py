@@ -26,6 +26,7 @@ Key features:
 - Latent cache communication happens within CP groups
 """
 
+import os
 import pickle
 import sys
 import time
@@ -38,10 +39,12 @@ from typing import List, Optional, Tuple
 import cloudpickle
 import pytest
 import torch
+import torch.distributed as dist
 from mpi4py import MPI
 from mpi4py.futures import MPIPoolExecutor
 
 import tensorrt_llm
+from tensorrt_llm._utils import get_free_port
 from tensorrt_llm._torch.attention_backend.interface import (
     AttentionMetadata,
     KVCacheParams,
@@ -1048,12 +1051,47 @@ def _full_test_multi_gpu(
 
 
 
-def _run_single_rank(func, *args, **kwargs):
+def _init_torch_distributed(world_size: int):
+    """Initialize torch.distributed with NCCL backend for helix all-to-all communication."""
+    if dist.is_initialized():
+        return
+    
+    rank = tensorrt_llm.mpi_rank()
+    comm = MPI.COMM_WORLD
+    
+    # Rank 0 generates a free port and broadcasts to all ranks
+    if rank == 0:
+        master_port = get_free_port()
+    else:
+        master_port = None
+    master_port = comm.bcast(master_port, root=0)
+    
+    # Set up environment variables for torch.distributed
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = str(master_port)
+    os.environ["RANK"] = str(rank)
+    os.environ["WORLD_SIZE"] = str(world_size)
+    os.environ["LOCAL_RANK"] = str(rank)
+    
+    # Initialize torch.distributed with NCCL backend
+    dist.init_process_group(
+        backend="nccl",
+        init_method=f"tcp://127.0.0.1:{master_port}",
+        rank=rank,
+        world_size=world_size
+    )
+    print(f"[Rank {rank}] torch.distributed initialized with NCCL")
+
+
+def _run_single_rank(func, world_size: int, *args, **kwargs):
     """Wrapper to run a function on a single MPI rank."""
     rank = tensorrt_llm.mpi_rank()
     torch.cuda.set_device(rank)
     print(f"rank {rank} starting")
     try:
+        # Initialize torch.distributed with NCCL for helix communication
+        _init_torch_distributed(world_size)
+        
         ret = func(rank, *args, **kwargs)
         print(f"rank {rank} done")
         return ret
@@ -1061,6 +1099,10 @@ def _run_single_rank(func, *args, **kwargs):
         traceback.print_exc()
         tb = traceback.format_exc()
         raise Exception(f"\n\nError occurred. Original traceback is\n{tb}\n")
+    finally:
+        # Cleanup torch.distributed
+        if dist.is_initialized():
+            dist.destroy_process_group()
 
 
 # ============================================================================
@@ -1107,7 +1149,9 @@ def test_mla_helix_distributed_mixed_tp_cp(
     with MPIPoolExecutor(max_workers=world_size) as executor:
         results = executor.map(
             _run_single_rank,
-            *zip(*[(_full_test_multi_gpu, world_size, tp_size, cp_size, scenario, gen_steps)] * world_size),
+            # First arg is the function, second is world_size for NCCL init,
+            # then the remaining args are passed to the function
+            *zip(*[(_full_test_multi_gpu, world_size, world_size, tp_size, cp_size, scenario, gen_steps)] * world_size),
         )
         if mismatch_ratios is None:
             for ratio_mismatch in results:
