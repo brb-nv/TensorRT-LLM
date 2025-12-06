@@ -49,7 +49,7 @@ from tensorrt_llm._torch.attention_backend.interface import (
     RopeParams,
 )
 from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
-from tensorrt_llm._torch.distributed.ops import cp_allgather
+# cp_allgather import removed - not needed after refactoring
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.modules.attention import MLA
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState, SamplingConfig
@@ -488,12 +488,12 @@ def _make_latent_cache_gen(
     cp_size: int,
     ctx_len_per_cp: int,
     input_ctx_bs: torch.Tensor,
-    ref_attn_metadata: Optional[AttentionMetadata],
+    ref_attn_metadata: AttentionMetadata,
 ):
     """Generate latent cache for Helix CP generation phase.
     
-    The latent cache is communicated across CP ranks. All TP ranks in the same 
-    CP group share the same latent cache values.
+    Since all ranks compute the reference MLA locally (same random seed and inputs),
+    all ranks have the same KV cache and can compute the latent cache locally.
     
     Args:
         mla: MLA module
@@ -503,93 +503,67 @@ def _make_latent_cache_gen(
         cp_size: Total CP size
         ctx_len_per_cp: Context length per CP rank
         input_ctx_bs: Input context tensor (batch, ctx_len, hidden_size)
-        ref_attn_metadata: Reference attention metadata (only on cp_rank 0)
+        ref_attn_metadata: Reference attention metadata (available on all ranks)
     
     Returns:
         Latent cache tensor for this CP rank, or None for last CP rank
     """
-    world_size = tp_size * cp_size
-    
-    # Only the first CP rank (across all TP ranks) has the reference metadata
-    # and generates the latent cache
-    if cp_rank == 0:
-        assert ref_attn_metadata is not None
-        kv_cache_block_offsets = ref_attn_metadata.host_kv_cache_block_offsets
-        kv_buffer = ref_attn_metadata.kv_cache_manager.get_buffers(0)
-        ret = input_ctx_bs.new_empty(
-            (cp_size - 1, input_ctx_bs.shape[0], mla.kv_lora_rank + mla.qk_rope_head_dim)
-        )
-        # the RoPE values in the KV cache are embedded and we need to get the
-        # original values instead for the latent cache
-        # so we first get the cos/sin cache used in MLA
-        _, cos_sin_cache = mla.pos_embd_params.rope.create_rope_const_params()
-        cos_sin_cache = cos_sin_cache.reshape(-1, mla.qk_rope_head_dim, 2)
-        assert cos_sin_cache.dtype == torch.float32
-
-        def rotate_half(x):
-            """Rotates half the hidden dims of the input."""
-            x1 = x[..., : x.shape[-1] // 2]
-            x2 = x[..., x.shape[-1] // 2 :]
-            return torch.cat((-x2, x1), dim=-1)
-
-        def rotate_half_inv(x):
-            """Rotates half the hidden dims of the input."""
-            x1 = x[..., : x.shape[-1] // 2]
-            x2 = x[..., x.shape[-1] // 2 :]
-            return torch.cat((x2, -x1), dim=-1)
-
-        # Generate latent cache for each CP rank (except the first)
-        for r in range(cp_size - 1):
-            for b in range(input_ctx_bs.shape[0]):
-                block, t = divmod(
-                    (r + 1) * ctx_len_per_cp, ref_attn_metadata.kv_cache_manager.tokens_per_block
-                )
-                kv_block = kv_cache_block_offsets[0, b, 0, block].item()
-                ret[r, b] = kv_buffer[kv_block, 0, t, 0, :]
-        rope_values = ret[:, :, mla.kv_lora_rank :].clone().to(dtype=torch.float32)
-        # now we apply the inverse of RoPE embedding to get the original values
-        # rope_values has shape (cp_size - 1, batch_size, rope_dim)
-        # cos_sin_cache has shape (max_pos, rope_dim, 2)
-
-        # Setup position and cos/sin values
-        positions = torch.arange(1, cp_size, device=rope_values.device) * ctx_len_per_cp
-        cos_sin_cache_pos = torch.index_select(cos_sin_cache, 0, positions)
-        cos = cos_sin_cache_pos[..., 0].unsqueeze(1)
-        sin = cos_sin_cache_pos[..., 1].unsqueeze(1)
-        # cos/sin shape is (cp_size - 1, 1, rope_dim) to broadcast with batch
-
-        # Reshape for pairwise rotation
-        rope_values_reshaped = (
-            rope_values.unflatten(-1, [-1, 2]).transpose(-1, -2).flatten(start_dim=-2)
-        )
-        orig_rope_values = rope_values_reshaped * cos + rotate_half_inv(rope_values_reshaped) * sin
-        orig_rope_values_reshaped = (
-            orig_rope_values.unflatten(-1, [2, -1]).transpose(-2, -1).flatten(start_dim=-2)
-        )
-
-        ret[:, :, mla.kv_lora_rank :] = orig_rope_values_reshaped.to(dtype=ret.dtype)
-    else:
-        ret = input_ctx_bs.new_empty(
-            (cp_size - 1, input_ctx_bs.shape[0], mla.kv_lora_rank + mla.qk_rope_head_dim)
-        )
-
-    # Create mapping for allgather across CP group
-    # All TP ranks in the same CP group will have the same latent cache
-    rank = tp_rank + cp_rank * tp_size  # Reconstruct global rank
-    mapping = Mapping(
-        world_size=world_size, 
-        rank=rank, 
-        tp_size=tp_size,
-        cp_size=cp_size, 
-        cp_config={"cp_type": CpType.HELIX, "tokens_per_block": 32}
-    )
-    # use cp_allgather here to broadcast from cp_rank 0 to all other cp_ranks
-    ret_all = cp_allgather(ret, mapping=mapping, dim=0)
-    ret = ret_all.view(cp_size, *ret.shape)[0]
-    
+    # Last CP rank doesn't need latent cache
     if cp_rank == cp_size - 1:
         return None
-    return ret[cp_rank]
+    
+    # All ranks have ref_attn_metadata and can compute the latent cache locally
+    kv_cache_block_offsets = ref_attn_metadata.host_kv_cache_block_offsets
+    kv_buffer = ref_attn_metadata.kv_cache_manager.get_buffers(0)
+    
+    # Only need latent cache for this specific cp_rank
+    ret = input_ctx_bs.new_empty(
+        (input_ctx_bs.shape[0], mla.kv_lora_rank + mla.qk_rope_head_dim)
+    )
+    
+    # the RoPE values in the KV cache are embedded and we need to get the
+    # original values instead for the latent cache
+    # so we first get the cos/sin cache used in MLA
+    _, cos_sin_cache = mla.pos_embd_params.rope.create_rope_const_params()
+    cos_sin_cache = cos_sin_cache.reshape(-1, mla.qk_rope_head_dim, 2)
+    assert cos_sin_cache.dtype == torch.float32
+
+    def rotate_half_inv(x):
+        """Rotates half the hidden dims of the input."""
+        x1 = x[..., : x.shape[-1] // 2]
+        x2 = x[..., x.shape[-1] // 2 :]
+        return torch.cat((x2, -x1), dim=-1)
+
+    # Get latent cache for this cp_rank's boundary position
+    target_pos = (cp_rank + 1) * ctx_len_per_cp
+    for b in range(input_ctx_bs.shape[0]):
+        block, t = divmod(
+            target_pos, ref_attn_metadata.kv_cache_manager.tokens_per_block
+        )
+        kv_block = kv_cache_block_offsets[0, b, 0, block].item()
+        ret[b] = kv_buffer[kv_block, 0, t, 0, :]
+    
+    # Apply inverse RoPE to get original values
+    rope_values = ret[:, mla.kv_lora_rank:].clone().to(dtype=torch.float32)
+    
+    # Setup position and cos/sin values for this specific position
+    position = torch.tensor([target_pos], device=rope_values.device)
+    cos_sin_cache_pos = torch.index_select(cos_sin_cache, 0, position)
+    cos = cos_sin_cache_pos[..., 0]  # shape: (1, rope_dim)
+    sin = cos_sin_cache_pos[..., 1]  # shape: (1, rope_dim)
+
+    # Reshape for pairwise rotation
+    rope_values_reshaped = (
+        rope_values.unflatten(-1, [-1, 2]).transpose(-1, -2).flatten(start_dim=-2)
+    )
+    orig_rope_values = rope_values_reshaped * cos + rotate_half_inv(rope_values_reshaped) * sin
+    orig_rope_values_reshaped = (
+        orig_rope_values.unflatten(-1, [2, -1]).transpose(-2, -1).flatten(start_dim=-2)
+    )
+
+    ret[:, mla.kv_lora_rank:] = orig_rope_values_reshaped.to(dtype=ret.dtype)
+    
+    return ret
 
 
 
@@ -953,109 +927,102 @@ def _full_test_multi_gpu(
     _generate_random_weights(mla)
     weights = mla.state_dict()
     
-    # up to this point, all ranks should have same tensors because the seed is the same
-    # now we run the reference MLA on rank 0
-    if rank == 0:
-        # Reference output (single GPU, no parallelism)
-        ref_mapping = Mapping(world_size=1, tp_size=1, cp_size=1, rank=0)
-        ref_kv_cache_manager, ref_attn_metadata = _setup_kv_and_metadata(
-            scenario, ref_mapping, gen_steps
-        )
-        # this represents the context step
-        mla(position_ids_ctx, input_ctx, ref_attn_metadata)
-        ref_outputs = []
-        start = time.time()
+    # Since all ranks have the same random seed and inputs, each rank computes 
+    # the reference output locally. This avoids the need for collective communication.
+    # Reference output (single GPU, no parallelism)
+    ref_mapping = Mapping(world_size=1, tp_size=1, cp_size=1, rank=0)
+    ref_kv_cache_manager, ref_attn_metadata = _setup_kv_and_metadata(
+        scenario, ref_mapping, gen_steps
+    )
+    # this represents the context step
+    mla(position_ids_ctx, input_ctx, ref_attn_metadata)
+    ref_outputs = []
+    start = time.time()
 
-        # CUDA graph setup for timing
-        use_cuda_graph = gen_steps > scenario.ref_steps
-        graph = None
-        graph_output = None
+    # CUDA graph setup for timing
+    use_cuda_graph = gen_steps > scenario.ref_steps
+    graph = None
+    graph_output = None
 
-        for step in range(gen_steps):
-            for req_id in range(scenario.batch):
-                ref_kv_cache_manager.impl.add_token(req_id)
-            if step == 0:
-                ref_attn_metadata = get_attention_backend("TRTLLM").Metadata(
-                    seq_lens=torch.tensor([1] * scenario.batch, dtype=torch.int),
-                    request_ids=list(range(scenario.batch)),
-                    max_num_requests=scenario.batch,
-                    num_contexts=0,
-                    prompt_lens=[scenario.ctx_len] * scenario.batch,
-                    max_num_tokens=scenario.ctx_len,
-                    kv_cache_manager=ref_kv_cache_manager,
-                    kv_cache_params=KVCacheParams(
-                        use_cache=True,
-                        num_cached_tokens_per_seq=[
-                            scenario.ctx_len + step for _ in range(scenario.batch)
-                        ],
-                    ),
-                    enable_context_mla_with_cached_kv=True,
-                )
-            else:
-                ref_attn_metadata.kv_cache_params = KVCacheParams(
+    for step in range(gen_steps):
+        for req_id in range(scenario.batch):
+            ref_kv_cache_manager.impl.add_token(req_id)
+        if step == 0:
+            ref_attn_metadata = get_attention_backend("TRTLLM").Metadata(
+                seq_lens=torch.tensor([1] * scenario.batch, dtype=torch.int),
+                request_ids=list(range(scenario.batch)),
+                max_num_requests=scenario.batch,
+                num_contexts=0,
+                prompt_lens=[scenario.ctx_len] * scenario.batch,
+                max_num_tokens=scenario.ctx_len,
+                kv_cache_manager=ref_kv_cache_manager,
+                kv_cache_params=KVCacheParams(
                     use_cache=True,
                     num_cached_tokens_per_seq=[
                         scenario.ctx_len + step for _ in range(scenario.batch)
                     ],
-                )
-            ref_attn_metadata.prepare()
+                ),
+                enable_context_mla_with_cached_kv=True,
+            )
+        else:
+            ref_attn_metadata.kv_cache_params = KVCacheParams(
+                use_cache=True,
+                num_cached_tokens_per_seq=[
+                    scenario.ctx_len + step for _ in range(scenario.batch)
+                ],
+            )
+        ref_attn_metadata.prepare()
 
-            if not use_cuda_graph:
-                result = mla(position_ids_gen, input_gen, ref_attn_metadata)
-                if step < scenario.ref_steps:
-                    ref_outputs.append(result)
-                print(f"Ref result: {result[0, :8]} / {result[-1, -8:]}")
-                # update position_ids_gen
-                position_ids_gen += 1
-                continue
-
-            # CUDA graph capture on first step when timing
-            if step == 0:
-                print("Creating CUDA graph and capturing")
-                # Create CUDA graph metadata for capture
-                ref_attn_metadata = ref_attn_metadata.create_cuda_graph_metadata(
-                    max_batch_size=scenario.batch
-                )
-                ref_attn_metadata.prepare()
-
-                # Warm-up runs before graph capture
-                for _ in range(2):
-                    result = mla(position_ids_gen, input_gen, ref_attn_metadata)
-
-                # Capture the graph
-                graph = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(graph):
-                    graph_output = mla(position_ids_gen, input_gen, ref_attn_metadata)
-                result = graph_output
-            elif step == scenario.ref_steps:
-                # Start timing with CUDA graph
-                start = time.time()
-            graph.replay()
-            result = graph_output
-            # update position_ids_gen
-            position_ids_gen += 1
+        if not use_cuda_graph:
+            result = mla(position_ids_gen, input_gen, ref_attn_metadata)
             if step < scenario.ref_steps:
                 ref_outputs.append(result)
-        end = time.time()
-        if gen_steps == scenario.ref_steps:
-            avg_gen_time = float("inf")
-        else:
-            avg_gen_time = (end - start) / (gen_steps - scenario.ref_steps)
-        throughput = scenario.batch / avg_gen_time
+            if rank == 0:
+                print(f"Ref result: {result[0, :8]} / {result[-1, -8:]}")
+            # update position_ids_gen
+            position_ids_gen += 1
+            continue
+
+        # CUDA graph capture on first step when timing
+        if step == 0:
+            if rank == 0:
+                print("Creating CUDA graph and capturing")
+            # Create CUDA graph metadata for capture
+            ref_attn_metadata = ref_attn_metadata.create_cuda_graph_metadata(
+                max_batch_size=scenario.batch
+            )
+            ref_attn_metadata.prepare()
+
+            # Warm-up runs before graph capture
+            for _ in range(2):
+                result = mla(position_ids_gen, input_gen, ref_attn_metadata)
+
+            # Capture the graph
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                graph_output = mla(position_ids_gen, input_gen, ref_attn_metadata)
+            result = graph_output
+        elif step == scenario.ref_steps:
+            # Start timing with CUDA graph
+            start = time.time()
+        graph.replay()
+        result = graph_output
+        # update position_ids_gen
+        position_ids_gen += 1
+        if step < scenario.ref_steps:
+            ref_outputs.append(result)
+    end = time.time()
+    if gen_steps == scenario.ref_steps:
+        avg_gen_time = float("inf")
+    else:
+        avg_gen_time = (end - start) / (gen_steps - scenario.ref_steps)
+    throughput = scenario.batch / avg_gen_time
+    if rank == 0:
         print(
             f"Time taken for {gen_steps - scenario.ref_steps} steps: "
             f"{end - start} s, throughput: {throughput} MLA/s"
         )
-        ref_output = torch.stack(ref_outputs, dim=0)
-    else:
-        ref_output = torch.empty(
-            scenario.ref_steps,
-            scenario.batch,
-            scenario.hidden_size,
-            dtype=scenario.dtype,
-            device="cuda",
-        )
-        ref_attn_metadata = None
+    ref_output = torch.stack(ref_outputs, dim=0)
 
     # Distributed mapping for mixed TP+CP helix
     mapping = Mapping(
@@ -1065,11 +1032,6 @@ def _full_test_multi_gpu(
         cp_size=cp_size, 
         cp_config={"cp_type": CpType.HELIX}
     )
-    
-    # Broadcast reference output from rank 0 to all ranks using allgather
-    ref_output_all = cp_allgather(ref_output, mapping=mapping, dim=0)
-    # we only need the values from rank 0
-    ref_output = ref_output_all.view(world_size, *ref_output.shape)[0]
     
     test_params = (
         input_ctx,
