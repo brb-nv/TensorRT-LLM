@@ -632,6 +632,7 @@ def _run_mla_distributed(
         dtype=scenario.dtype,
         config=config,
         enable_unit_test=True,
+        reduce_output=False,  # Disable all-reduce to avoid NCCL in MPI workers
     ).cuda()
     
     # ========================================================================
