@@ -13,6 +13,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""
+Test MLA with mixed Tensor Parallelism (TP) and Context Parallelism (CP) using Helix.
+
+This test supports the general case where:
+    world_size = tp_size * cp_size
+
+Key features:
+- Supports tp_size > 1 (not just tp_size=1)
+- Context is split across CP ranks only (all TP ranks in same CP group see same context)
+- Weights are sharded appropriately for both TP and CP dimensions
+- Latent cache communication happens within CP groups
+"""
+
 import pickle
 import sys
 import time
@@ -20,7 +33,7 @@ import traceback
 import weakref
 from dataclasses import dataclass
 from functools import partial
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import cloudpickle
 import pytest
