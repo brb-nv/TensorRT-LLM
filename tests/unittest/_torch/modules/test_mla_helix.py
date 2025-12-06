@@ -476,20 +476,48 @@ def _error_report(output, ref_output, atol, rtol, prefix):
     return n_error
 
 
+# ============================================================================
+# Latent Cache Generation for Helix CP
+# ============================================================================
+
 def _make_latent_cache_gen(
     mla: MLA,
-    rank: int,
-    world_size: int,
-    ctx_len_per_gpu: int,
+    tp_rank: int,
+    cp_rank: int,
+    tp_size: int,
+    cp_size: int,
+    ctx_len_per_cp: int,
     input_ctx_bs: torch.Tensor,
     ref_attn_metadata: Optional[AttentionMetadata],
 ):
-    if rank == 0:
+    """Generate latent cache for Helix CP generation phase.
+    
+    The latent cache is communicated across CP ranks. All TP ranks in the same 
+    CP group share the same latent cache values.
+    
+    Args:
+        mla: MLA module
+        tp_rank: Current TP rank
+        cp_rank: Current CP rank
+        tp_size: Total TP size
+        cp_size: Total CP size
+        ctx_len_per_cp: Context length per CP rank
+        input_ctx_bs: Input context tensor (batch, ctx_len, hidden_size)
+        ref_attn_metadata: Reference attention metadata (only on cp_rank 0)
+    
+    Returns:
+        Latent cache tensor for this CP rank, or None for last CP rank
+    """
+    world_size = tp_size * cp_size
+    
+    # Only the first CP rank (across all TP ranks) has the reference metadata
+    # and generates the latent cache
+    if cp_rank == 0:
         assert ref_attn_metadata is not None
         kv_cache_block_offsets = ref_attn_metadata.host_kv_cache_block_offsets
         kv_buffer = ref_attn_metadata.kv_cache_manager.get_buffers(0)
         ret = input_ctx_bs.new_empty(
-            (world_size - 1, input_ctx_bs.shape[0], mla.kv_lora_rank + mla.qk_rope_head_dim)
+            (cp_size - 1, input_ctx_bs.shape[0], mla.kv_lora_rank + mla.qk_rope_head_dim)
         )
         # the RoPE values in the KV cache are embedded and we need to get the
         # original values instead for the latent cache
@@ -510,24 +538,25 @@ def _make_latent_cache_gen(
             x2 = x[..., x.shape[-1] // 2 :]
             return torch.cat((x2, -x1), dim=-1)
 
-        for r in range(world_size - 1):
+        # Generate latent cache for each CP rank (except the first)
+        for r in range(cp_size - 1):
             for b in range(input_ctx_bs.shape[0]):
                 block, t = divmod(
-                    (r + 1) * ctx_len_per_gpu, ref_attn_metadata.kv_cache_manager.tokens_per_block
+                    (r + 1) * ctx_len_per_cp, ref_attn_metadata.kv_cache_manager.tokens_per_block
                 )
                 kv_block = kv_cache_block_offsets[0, b, 0, block].item()
                 ret[r, b] = kv_buffer[kv_block, 0, t, 0, :]
         rope_values = ret[:, :, mla.kv_lora_rank :].clone().to(dtype=torch.float32)
         # now we apply the inverse of RoPE embedding to get the original values
-        # rope_values has shape (world_size - 1, batch_size, rope_dim)
+        # rope_values has shape (cp_size - 1, batch_size, rope_dim)
         # cos_sin_cache has shape (max_pos, rope_dim, 2)
 
         # Setup position and cos/sin values
-        positions = torch.arange(1, world_size, device=rope_values.device) * ctx_len_per_gpu
+        positions = torch.arange(1, cp_size, device=rope_values.device) * ctx_len_per_cp
         cos_sin_cache_pos = torch.index_select(cos_sin_cache, 0, positions)
         cos = cos_sin_cache_pos[..., 0].unsqueeze(1)
         sin = cos_sin_cache_pos[..., 1].unsqueeze(1)
-        # cos/sin shape is (world_size - 1, 1, rope_dim) to broadcast with batch
+        # cos/sin shape is (cp_size - 1, 1, rope_dim) to broadcast with batch
 
         # Reshape for pairwise rotation
         rope_values_reshaped = (
@@ -541,18 +570,27 @@ def _make_latent_cache_gen(
         ret[:, :, mla.kv_lora_rank :] = orig_rope_values_reshaped.to(dtype=ret.dtype)
     else:
         ret = input_ctx_bs.new_empty(
-            (world_size - 1, input_ctx_bs.shape[0], mla.kv_lora_rank + mla.qk_rope_head_dim)
+            (cp_size - 1, input_ctx_bs.shape[0], mla.kv_lora_rank + mla.qk_rope_head_dim)
         )
 
+    # Create mapping for allgather across CP group
+    # All TP ranks in the same CP group will have the same latent cache
+    rank = tp_rank + cp_rank * tp_size  # Reconstruct global rank
     mapping = Mapping(
-        world_size=world_size, rank=rank, cp_size=world_size, cp_config={"cp_type": CpType.HELIX, "tokens_per_block": 32}
+        world_size=world_size, 
+        rank=rank, 
+        tp_size=tp_size,
+        cp_size=cp_size, 
+        cp_config={"cp_type": CpType.HELIX, "tokens_per_block": 32}
     )
-    # use cp_allgather here to broadcast from rank 0 to all other ranks
+    # use cp_allgather here to broadcast from cp_rank 0 to all other cp_ranks
     ret_all = cp_allgather(ret, mapping=mapping, dim=0)
-    ret = ret_all.view(world_size, *ret.shape)[0]
-    if rank == world_size - 1:
+    ret = ret_all.view(cp_size, *ret.shape)[0]
+    
+    if cp_rank == cp_size - 1:
         return None
-    return ret[rank]
+    return ret[cp_rank]
+
 
 
 def _run_mla_distributed(
