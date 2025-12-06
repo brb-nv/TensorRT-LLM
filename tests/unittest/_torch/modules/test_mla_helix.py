@@ -332,13 +332,99 @@ def _generate_random_weights(mla: MLA):
         init_block_scale(mla.v_b_proj_scale, mla.v_b_proj)
 
 
-def _copy_to_cp(weights, param_name, dim, rank, world_size):
-    w_dim_per_rank = weights[param_name].shape[dim] // world_size
-    w_dim_start = rank * w_dim_per_rank
+# ============================================================================
+# Weight Sharding Helpers for TP and CP
+# ============================================================================
+
+def _copy_to_tp(weights: dict, param_name: str, dim: int, tp_rank: int, tp_size: int):
+    """Split weights for tensor parallelism only.
+    
+    Args:
+        weights: Dictionary of weight tensors
+        param_name: Name of the parameter to shard
+        dim: Dimension to split along
+        tp_rank: Current TP rank
+        tp_size: Total TP size
+    """
+    if tp_size == 1:
+        return
+    if param_name not in weights:
+        return
+    w_dim_per_rank = weights[param_name].shape[dim] // tp_size
+    w_dim_start = tp_rank * w_dim_per_rank
     w_dim_end = w_dim_start + w_dim_per_rank
     slices = [slice(None)] * weights[param_name].ndim
     slices[dim] = slice(w_dim_start, w_dim_end)
-    weights[param_name] = weights[param_name][slices]
+    weights[param_name] = weights[param_name][tuple(slices)].contiguous()
+
+
+def _copy_to_cp(weights: dict, param_name: str, dim: int, cp_rank: int, cp_size: int):
+    """Split weights for context parallelism only.
+    
+    Args:
+        weights: Dictionary of weight tensors
+        param_name: Name of the parameter to shard
+        dim: Dimension to split along
+        cp_rank: Current CP rank
+        cp_size: Total CP size
+    """
+    if cp_size == 1:
+        return
+    if param_name not in weights:
+        return
+    w_dim_per_rank = weights[param_name].shape[dim] // cp_size
+    w_dim_start = cp_rank * w_dim_per_rank
+    w_dim_end = w_dim_start + w_dim_per_rank
+    slices = [slice(None)] * weights[param_name].ndim
+    slices[dim] = slice(w_dim_start, w_dim_end)
+    weights[param_name] = weights[param_name][tuple(slices)].contiguous()
+
+
+def _copy_to_tp_then_cp(
+    weights: dict, 
+    param_name: str, 
+    dim: int, 
+    tp_rank: int, 
+    tp_size: int, 
+    cp_rank: int, 
+    cp_size: int
+):
+    """Split weights first by TP, then by CP along the same dimension.
+    
+    This is used for head-dimension sharding where heads are distributed
+    across both TP and CP ranks: num_heads_local = num_heads / (tp_size * cp_size)
+    
+    The sharding follows the pattern used in modeling_deepseekv3.py:
+    - First split by TP rank
+    - Then within each TP shard, split by CP rank
+    
+    Args:
+        weights: Dictionary of weight tensors
+        param_name: Name of the parameter to shard
+        dim: Dimension to split along
+        tp_rank: Current TP rank
+        tp_size: Total TP size
+        cp_rank: Current CP rank
+        cp_size: Total CP size
+    """
+    total_parallel = tp_size * cp_size
+    if total_parallel == 1:
+        return
+    if param_name not in weights:
+        return
+    
+    w_dim_total = weights[param_name].shape[dim]
+    w_dim_per_tp = w_dim_total // tp_size
+    w_dim_per_rank = w_dim_per_tp // cp_size
+    
+    # First get TP shard, then CP shard within it
+    tp_start = tp_rank * w_dim_per_tp
+    cp_start = tp_start + cp_rank * w_dim_per_rank
+    cp_end = cp_start + w_dim_per_rank
+    
+    slices = [slice(None)] * weights[param_name].ndim
+    slices[dim] = slice(cp_start, cp_end)
+    weights[param_name] = weights[param_name][tuple(slices)].contiguous()
 
 
 def _error_report(output, ref_output, atol, rtol, prefix):
