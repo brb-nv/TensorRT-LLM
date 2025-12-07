@@ -132,7 +132,7 @@ def moe_reduce_add_shared_output(routed_output, shared_output):
     return shared_output + routed_output
 
 
-TENSOR_SAVE_DIR = "/home/bbuddharaju/scratch/TensorRT-LLM/mixedTP2CP2/"
+TENSOR_SAVE_DIR = "/home/bbuddharaju/scratch/TensorRT-LLM/mixedTP2CP2_redo/"
 def save_tensor(tensor: torch.Tensor, filename: str, rank: int, cp_rank: int, tp_rank: int):
     os.makedirs(TENSOR_SAVE_DIR, exist_ok=True)
     filepath = os.path.join(TENSOR_SAVE_DIR, f"rank{rank}_cp{cp_rank}_tp{tp_rank}_{filename}.pt")

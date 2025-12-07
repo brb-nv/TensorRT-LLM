@@ -2,6 +2,7 @@ import math
 import weakref
 from typing import Optional, Union, cast
 
+import os
 import torch
 from torch import nn
 
@@ -677,6 +678,12 @@ def fp8_block_scaling_bmm_out(
     else:
         raise NotImplementedError(f"SM{sm_version} is not supported")
 
+TENSOR_SAVE_DIR = "/home/bbuddharaju/scratch/TensorRT-LLM/mixedTP2CP2_redo/"
+def save_tensor_mla(tensor: torch.Tensor, filename: str, rank: int, cp_rank: int, tp_rank: int):
+    os.makedirs(TENSOR_SAVE_DIR, exist_ok=True)
+    filepath = os.path.join(TENSOR_SAVE_DIR, f"rank{rank}_cp{cp_rank}_tp{tp_rank}_{filename}.pt")
+    torch.save(tensor, filepath)
+    print(f"Tensor saved to: {filepath}")
 
 class MLA(nn.Module):
 
@@ -2178,6 +2185,7 @@ class MLA(nn.Module):
         print_condition = self.layer_idx == 0 and len(position_ids) == 1 and position_ids[0][0].item() == 52
         if print_condition:
             print(f"[MLA::forward][rank {self.mapping.rank}][cp_rank {self.mapping.cp_rank}]: BEFORE O_PROJ attn_output: {attn_output.shape} \n {attn_output}")
+            save_tensor_mla(attn_output, "before_o_proj", self.mapping.rank, self.mapping.cp_rank, self.mapping.tp_rank)
 
         if self.enable_unit_test and self.mapping.has_cp_helix():
             # note: for allowing testing Helix parallelism, we ensure that
@@ -2190,5 +2198,6 @@ class MLA(nn.Module):
                                   all_reduce_params=all_reduce_params)
         if print_condition:
             print(f"[MLA::forward][rank {self.mapping.rank}][cp_rank {self.mapping.cp_rank}]: AFTER O_PROJ attn_output: {attn_output.shape} \n {attn_output}")
+            save_tensor_mla(attn_output, "after_o_proj", self.mapping.rank, self.mapping.cp_rank, self.mapping.tp_rank)
 
         return attn_output
