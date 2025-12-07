@@ -678,7 +678,7 @@ def fp8_block_scaling_bmm_out(
     else:
         raise NotImplementedError(f"SM{sm_version} is not supported")
 
-TENSOR_SAVE_DIR = "/home/bbuddharaju/scratch/TensorRT-LLM/pureTP4_redo/"
+TENSOR_SAVE_DIR = "/home/bbuddharaju/scratch/TensorRT-LLM/mixedTP2CP2_fix/"
 def save_tensor_mla(tensor: torch.Tensor, filename: str, rank: int, cp_rank: int, tp_rank: int):
     os.makedirs(TENSOR_SAVE_DIR, exist_ok=True)
     filepath = os.path.join(TENSOR_SAVE_DIR, f"rank{rank}_cp{cp_rank}_tp{tp_rank}_{filename}.pt")
@@ -899,12 +899,20 @@ class MLA(nn.Module):
             requires_grad=False,
         )
 
+        # Compute the correct rank for the combined TP*CP mapping.
+        # The attention heads are split first by TP, then by CP within each TP group.
+        # Original rank order: pp_rank * tp_size * cp_size + cp_rank * tp_size + tp_rank
+        # For o_proj, we need: pp_rank * tp_size * cp_size + tp_rank * cp_size + cp_rank
+        # This ensures weight slices align with the actual head partitions.
+        new_rank_for_o = (self.mapping.pp_rank * tp_size * cp_size +
+                         self.mapping.tp_rank * cp_size + self.mapping.cp_rank)
+        print(f"[MLA::create_weights][rank {self.mapping.rank}][cp_rank {self.mapping.cp_rank}][tp_rank {self.mapping.tp_rank}]: new_rank_for_o: {new_rank_for_o}")
         mapping_o = Mapping(
             world_size=tp_size * pp_size * cp_size,
             tp_size=tp_size * cp_size,
             pp_size=pp_size,
             cp_size=1,
-            rank=self.mapping.rank,
+            rank=new_rank_for_o,
             gpus_per_node=self.mapping.gpus_per_node,
             enable_attention_dp=self.mapping.enable_attention_dp,
         )
