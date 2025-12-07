@@ -678,7 +678,7 @@ def fp8_block_scaling_bmm_out(
     else:
         raise NotImplementedError(f"SM{sm_version} is not supported")
 
-TENSOR_SAVE_DIR = "/home/bbuddharaju/scratch/TensorRT-LLM/mixedTP2CP2_redo/"
+TENSOR_SAVE_DIR = "/home/bbuddharaju/scratch/TensorRT-LLM/pureTP4_redo/"
 def save_tensor_mla(tensor: torch.Tensor, filename: str, rank: int, cp_rank: int, tp_rank: int):
     os.makedirs(TENSOR_SAVE_DIR, exist_ok=True)
     filepath = os.path.join(TENSOR_SAVE_DIR, f"rank{rank}_cp{cp_rank}_tp{tp_rank}_{filename}.pt")
