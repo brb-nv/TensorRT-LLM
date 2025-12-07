@@ -2174,6 +2174,11 @@ class MLA(nn.Module):
                               output=attn_output,
                               latent_cache_gen=latent_cache_gen)
 
+        # Print only for the first layer and first decode iteration.
+        print_condition = self.layer_idx == 0 and len(position_ids) == 1 and position_ids[0][0].item() == 52
+        if print_condition:
+            print(f"[MLA::forward][rank {self.mapping.rank}][cp_rank {self.mapping.cp_rank}]: BEFORE O_PROJ attn_output: {attn_output.shape} \n {attn_output}")
+
         if self.enable_unit_test and self.mapping.has_cp_helix():
             # note: for allowing testing Helix parallelism, we ensure that
             # the output is compatible with o_proj even in the context phase,
@@ -2183,4 +2188,7 @@ class MLA(nn.Module):
 
         attn_output = self.o_proj(attn_output,
                                   all_reduce_params=all_reduce_params)
+        if print_condition:
+            print(f"[MLA::forward][rank {self.mapping.rank}][cp_rank {self.mapping.cp_rank}]: AFTER O_PROJ attn_output: {attn_output.shape} \n {attn_output}")
+
         return attn_output
