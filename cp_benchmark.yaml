@@ -29,10 +29,11 @@ hardware:
 environment:
   container_mount: "/lustre/fsw/portfolios/coreai/projects/coreai_horizon_dilations:/lustre/fsw/portfolios/coreai/projects/coreai_horizon_dilations,/lustre/fsw/portfolios/coreai/users/xqiao:/lustre/fsw/portfolios/coreai/users/xqiao"  # Format: path1:path1,path2:path2
   container_image: "/lustre/fsw/portfolios/coreai/projects/coreai_horizon_dilations/users/bbuddharaju/TensorRT-LLM_main/tensorrt-llm_pytorch-25.10-py3-aarch64-ubuntu24.04-trt10.13.3.9-skip-tritondevel-202511281406-9077.sqsh"
-  model_path: "/lustre/fsw/portfolios/coreai/projects/coreai_horizon_dilations/users/mjoux/data/models/DeepSeek-V3-Lite/bf16/"
+  model_path: "/lustre/fsw/portfolios/coreai/projects/coreai_horizon_dilations/users/mjoux/data/models/DeepSeek-R1/DeepSeek-R1-FP4/"
   trtllm_repo: "/lustre/fsw/portfolios/coreai/projects/coreai_horizon_dilations/users/bbuddharaju/TensorRT-LLM_main/"
-  build_wheel: true  # Don't build the wheel when launching multiple jobs
-  trtllm_wheel_path: ""  # Path to pre-built TensorRT-LLM wheel. If provided, install from this wheel instead
+  build_wheel: false  # Don't build the wheel when launching multiple jobs
+  cuda_architectures: "100-real"
+  trtllm_wheel_path: "/lustre/fsw/portfolios/coreai/projects/coreai_horizon_dilations/users/bbuddharaju/TensorRT-LLM_main/build/tensorrt_llm-1.2.0rc5-cp312-cp312-linux_aarch64.whl"  # Path to pre-built TensorRT-LLM wheel. If provided, install from this wheel instead
   work_dir: "/lustre/fsw/portfolios/coreai/projects/coreai_horizon_dilations/users/bbuddharaju/TensorRT-LLM_main/examples/disaggregated/slurm/benchmark/"
   worker_env_var: "TLLM_LOG_LEVEL=INFO TRTLLM_SERVER_DISABLE_GC=1 TRTLLM_WORKER_DISABLE_GC=1 TRTLLM_ENABLE_PDL=1 ENROOT_ALLOW_DEV=yes"
   server_env_var: "TRTLLM_SERVER_DISABLE_GC=1"
@@ -51,11 +52,11 @@ accuracy:
 
 worker_config:
   gen:
-    tensor_parallel_size: 4
-    moe_expert_parallel_size: 4
-    enable_attention_dp: false
+    tensor_parallel_size: 16
+    moe_expert_parallel_size: 16
+    enable_attention_dp: true
     pipeline_parallel_size: 1
-    context_parallel_size: 2
+    context_parallel_size: 4
     cp_config:
       cp_type: "HELIX"
       tokens_per_block: 32  # must match kv_config.tokens_per_block.
@@ -68,6 +69,10 @@ worker_config:
       enable_block_reuse: false
       free_gpu_memory_fraction: 0.7
       tokens_per_block: 32
+      dtype: fp8
+    moe_config:
+      backend: WIDEEP
+      use_low_precision_moe_combine: true
     cache_transceiver_config:
       max_tokens_in_buffer: 16384
       backend: UCX
@@ -85,9 +90,12 @@ worker_config:
     print_iter_log: true
     cuda_graph_config: null
     disable_overlap_scheduler: true
+    moe_config:
+      backend: TRTLLM
     kv_cache_config:
       enable_block_reuse: false
       free_gpu_memory_fraction: 0.6
+      dtype: fp8
     cache_transceiver_config:
       max_tokens_in_buffer: 16384
       backend: UCX

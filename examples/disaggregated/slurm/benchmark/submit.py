@@ -74,6 +74,7 @@ def submit_job(config, log_dir):
     # Set default environment configuration for backward compatibility
     env_config.setdefault('trtllm_repo', '')
     env_config.setdefault('build_wheel', False)
+    env_config.setdefault('cuda_architectures', '')
     env_config.setdefault('trtllm_wheel_path', '')
     env_config.setdefault('worker_env_var', '')
     env_config.setdefault('server_env_var', '')
@@ -201,6 +202,7 @@ def submit_job(config, log_dir):
         '--container-mount', env_config['container_mount'],
         '--container-image', env_config['container_image'],
         '--build-wheel', str(env_config['build_wheel']).lower(),
+        '--cuda-architectures', env_config['cuda_architectures'],
         '--trtllm-wheel-path', env_config['trtllm_wheel_path'],
 
         # Profiling
