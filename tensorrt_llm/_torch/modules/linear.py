@@ -116,9 +116,13 @@ def load_weight_shard(
         return maybe_convert_to_torch_tensor(weight)
 
     if weight_name is not None and tensor_parallel_rank == 1:
-        print(f"[load_weight_shard] THIS IS WHERE YOU SWAP RANK 1.")
-    if weight_name is not None and tensor_parallel_rank == 2:
-        print(f"[load_weight_shard] THIS IS WHERE YOU SWAP RANK 2.")
+        print(f"[load_weight_shard] SWAPPING O_PROJ RANK 1 TO 2.")
+        tensor_parallel_rank = 2
+        assert tensor_parallel_size == 4 and tensor_parallel_rank == 2
+    elif weight_name is not None and tensor_parallel_rank == 2:
+        print(f"[load_weight_shard] SWAPPING O_PROJ RANK 2 TO 1.")
+        tensor_parallel_rank = 1
+        assert tensor_parallel_size == 4 and tensor_parallel_rank == 1
     slice_width = math.ceil(width / tensor_parallel_size)
     slice_start = tensor_parallel_rank * slice_width
     slice_end = min((tensor_parallel_rank + 1) * slice_width, width)
@@ -330,7 +334,7 @@ class LinearMethodBase(ABC):
         if isinstance(self, UnquantizedLinearMethod):
             kargs['allow_partial_loading'] = allow_partial_loading
         if weight_mode == WeightMode.VANILLA:
-            self.load_weights_vanilla(module, weights, **kargs)
+            self.load_weights_vanilla(module, weights, weight_name=weight_name, **kargs)
         elif weight_mode == WeightMode.FUSED_QKV_LINEAR:
             self.load_weights_fused_qkv_linear(module, weights, **kargs)
         elif weight_mode == WeightMode.FUSED_GATE_UP_LINEAR:
@@ -350,7 +354,8 @@ class LinearMethodBase(ABC):
     def load_weights_vanilla(self,
                              module: Linear,
                              weights: List[Dict],
-                             allow_partial_loading: bool = False) -> None:
+                             allow_partial_loading: bool = False,
+                             weight_name: Optional[str] = None) -> None:
         """
         Load weights for the VANILLA weight mode.
         """
@@ -2074,7 +2079,6 @@ class Linear(nn.Module):
         fused_weight_shard_indices_mapping: Optional[dict] = None,
         nvfp4_allowed_backends: Optional[List[str]] = None,
         weight_name: Optional[str] = None,
-        mapping_with_cp: Optional[Mapping] = None,
     ):
         """
         Args:
@@ -2115,7 +2119,7 @@ class Linear(nn.Module):
             'cutlass', 'cublaslt', 'cuda_core'
         ]
 
-        if mapping_with_cp is not None and weight_name == "o_proj":
+        if weight_name is not None and "o_proj" in weight_name:
             print("[Linear::__init__] Found o_proj with CP mapping. Setting weight_name to o_proj_with_cp.")
             self.weight_name = "o_proj_with_cp"
         else:
@@ -2303,6 +2307,10 @@ class Linear(nn.Module):
         weight_mode = self.weights_loading_config.weight_mode
         if not isinstance(self.quant_method, UnquantizedLinearMethod):
             assert allow_partial_loading is False, "allow_partial_loading is only supported for non-unquantized linear methods now"
+        if self.weight_name is not None:
+            print("[Linear::load_weights] self.weight_name: ", self.weight_name, " uses quant method: ", self.quant_method)
+        else:
+            print("[Linear::load_weights] self.weight_name: None")
         self.quant_method.load_weights(
             self,
             weights,

@@ -678,7 +678,7 @@ def fp8_block_scaling_bmm_out(
     else:
         raise NotImplementedError(f"SM{sm_version} is not supported")
 
-TENSOR_SAVE_DIR = "/home/bbuddharaju/scratch/TensorRT-LLM/mixedTP2CP2_fix/"
+TENSOR_SAVE_DIR = "/home/bbuddharaju/scratch/TensorRT-LLM/mixedTP2CP2_weightswitch/"
 def save_tensor_mla(tensor: torch.Tensor, filename: str, rank: int, cp_rank: int, tp_rank: int):
     os.makedirs(TENSOR_SAVE_DIR, exist_ok=True)
     filepath = os.path.join(TENSOR_SAVE_DIR, f"rank{rank}_cp{cp_rank}_tp{tp_rank}_{filename}.pt")
@@ -899,14 +899,6 @@ class MLA(nn.Module):
             requires_grad=False,
         )
 
-        # # Compute the correct rank for the combined TP*CP mapping.
-        # # The attention heads are split first by TP, then by CP within each TP group.
-        # # Original rank order: pp_rank * tp_size * cp_size + cp_rank * tp_size + tp_rank
-        # # For o_proj, we need: pp_rank * tp_size * cp_size + tp_rank * cp_size + cp_rank
-        # # This ensures weight slices align with the actual head partitions.
-        # new_rank_for_o = (self.mapping.pp_rank * tp_size * cp_size +
-        #                  self.mapping.tp_rank * cp_size + self.mapping.cp_rank)
-        # print(f"[MLA::create_weights][rank {self.mapping.rank}][cp_rank {self.mapping.cp_rank}][tp_rank {self.mapping.tp_rank}]: new_rank_for_o: {new_rank_for_o}")
         mapping_o = Mapping(
             world_size=tp_size * pp_size * cp_size,
             tp_size=tp_size * cp_size,
@@ -916,8 +908,13 @@ class MLA(nn.Module):
             gpus_per_node=self.mapping.gpus_per_node,
             enable_attention_dp=self.mapping.enable_attention_dp,
         )
-        # TODO: Update this for all layers.
-        weight_name = "o_proj_with_cp" if self.mapping.has_cp_helix() and self.layer_idx == 0 else None
+        weight_name = None
+        if mapping_with_cp is not None:
+            print("[MLA::__init__] Found o_proj with CP mapping. Setting weight_name to o_proj_with_cp.")
+            weight_name = "o_proj_with_cp"
+        else:
+            print("[MLA::__init__] No CP mapping found. Setting weight_name to None.")
+            weight_name = None
         self.o_proj = Linear(
             self.num_key_value_heads * self.v_head_dim,
             self.hidden_size,
@@ -929,7 +926,9 @@ class MLA(nn.Module):
             skip_create_weights_in_init=config.skip_create_weights_in_init,
             reduce_output=reduce_output,
             allreduce_strategy=config.allreduce_strategy,
-            force_dynamic_quantization=config.force_dynamic_quantization)
+            force_dynamic_quantization=config.force_dynamic_quantization,
+            weight_name=weight_name
+        )
 
         def yarn_get_mscale(scale=1, mscale=1):
             if scale <= 1:
@@ -2194,8 +2193,10 @@ class MLA(nn.Module):
         # Print only for the first layer and first decode iteration.
         print_condition = self.layer_idx == 0 and len(position_ids) == 1 and position_ids[0][0].item() == 52
         if print_condition:
-            print(f"[MLA::forward][rank {self.mapping.rank}][cp_rank {self.mapping.cp_rank}]: BEFORE O_PROJ attn_output: {attn_output.shape} \n {attn_output}")
+            print(f"[MLA::forward][rank {self.mapping.rank}][cp_rank {self.mapping.cp_rank}][tp_rank {self.mapping.tp_rank}]: BEFORE O_PROJ attn_output: {attn_output.shape} \n {attn_output} \n weight.shape: {self.o_proj.weight.shape} weight.tp_rank: {self.o_proj.tp_rank} weight.tp_size: {self.o_proj.tp_size} \n {self.o_proj.weight}")
             save_tensor_mla(attn_output, "before_o_proj", self.mapping.rank, self.mapping.cp_rank, self.mapping.tp_rank)
+            save_tensor_mla(self.o_proj.weight, "before_o_proj_weight", self.mapping.rank, self.mapping.cp_rank, self.mapping.tp_rank)
+            save_tensor_mla(self.o_proj.bias, "before_o_proj_bias", self.mapping.rank, self.mapping.cp_rank, self.mapping.tp_rank)
 
         if self.enable_unit_test and self.mapping.has_cp_helix():
             # note: for allowing testing Helix parallelism, we ensure that
@@ -2204,10 +2205,12 @@ class MLA(nn.Module):
             attn_output = attn_output[:, :self.num_heads_tp_cp *
                                       self.v_head_dim].contiguous()
 
+        # output = F.linear(input, module.weight, bias)
+
         attn_output = self.o_proj(attn_output,
                                   all_reduce_params=all_reduce_params)
         if print_condition:
-            print(f"[MLA::forward][rank {self.mapping.rank}][cp_rank {self.mapping.cp_rank}]: AFTER O_PROJ attn_output: {attn_output.shape} \n {attn_output}")
+            print(f"[MLA::forward][rank {self.mapping.rank}][cp_rank {self.mapping.cp_rank}][tp_rank {self.mapping.tp_rank}]: AFTER O_PROJ attn_output: {attn_output.shape} \n {attn_output}")
             save_tensor_mla(attn_output, "after_o_proj", self.mapping.rank, self.mapping.cp_rank, self.mapping.tp_rank)
 
         return attn_output
