@@ -899,23 +899,25 @@ class MLA(nn.Module):
             requires_grad=False,
         )
 
-        # Compute the correct rank for the combined TP*CP mapping.
-        # The attention heads are split first by TP, then by CP within each TP group.
-        # Original rank order: pp_rank * tp_size * cp_size + cp_rank * tp_size + tp_rank
-        # For o_proj, we need: pp_rank * tp_size * cp_size + tp_rank * cp_size + cp_rank
-        # This ensures weight slices align with the actual head partitions.
-        new_rank_for_o = (self.mapping.pp_rank * tp_size * cp_size +
-                         self.mapping.tp_rank * cp_size + self.mapping.cp_rank)
-        print(f"[MLA::create_weights][rank {self.mapping.rank}][cp_rank {self.mapping.cp_rank}][tp_rank {self.mapping.tp_rank}]: new_rank_for_o: {new_rank_for_o}")
+        # # Compute the correct rank for the combined TP*CP mapping.
+        # # The attention heads are split first by TP, then by CP within each TP group.
+        # # Original rank order: pp_rank * tp_size * cp_size + cp_rank * tp_size + tp_rank
+        # # For o_proj, we need: pp_rank * tp_size * cp_size + tp_rank * cp_size + cp_rank
+        # # This ensures weight slices align with the actual head partitions.
+        # new_rank_for_o = (self.mapping.pp_rank * tp_size * cp_size +
+        #                  self.mapping.tp_rank * cp_size + self.mapping.cp_rank)
+        # print(f"[MLA::create_weights][rank {self.mapping.rank}][cp_rank {self.mapping.cp_rank}][tp_rank {self.mapping.tp_rank}]: new_rank_for_o: {new_rank_for_o}")
         mapping_o = Mapping(
             world_size=tp_size * pp_size * cp_size,
             tp_size=tp_size * cp_size,
             pp_size=pp_size,
             cp_size=1,
-            rank=new_rank_for_o,
+            rank=self.mapping.rank,
             gpus_per_node=self.mapping.gpus_per_node,
             enable_attention_dp=self.mapping.enable_attention_dp,
         )
+        # TODO: Update this for all layers.
+        weight_name = "o_proj_with_cp" if self.mapping.has_cp_helix() and self.layer_idx == 0 else None
         self.o_proj = Linear(
             self.num_key_value_heads * self.v_head_dim,
             self.hidden_size,

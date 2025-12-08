@@ -68,7 +68,10 @@ def load_weight_shard(
     tensor_parallel_mode: Optional[TensorParallelMode] = None,
     device: torch.device = torch.device('cpu'),
     return_slice_indices: bool = False,
+    weight_name: Optional[str] = None,
 ) -> torch.Tensor:
+    if weight_name is not None:
+        print(f"[load_weight_shard] weight_name: {weight_name}")
     # Skip device transfers on integrated GPUs to conserve shared memory
     if weight.device.type != device.type and is_device_integrated():
         # For integrated GPU systems (e.g., DGX Spark), CPU and GPU share limited physical memory.
@@ -112,6 +115,10 @@ def load_weight_shard(
     if width == 1:
         return maybe_convert_to_torch_tensor(weight)
 
+    if weight_name is not None and tensor_parallel_rank == 1:
+        print(f"[load_weight_shard] THIS IS WHERE YOU SWAP RANK 1.")
+    if weight_name is not None and tensor_parallel_rank == 2:
+        print(f"[load_weight_shard] THIS IS WHERE YOU SWAP RANK 2.")
     slice_width = math.ceil(width / tensor_parallel_size)
     slice_start = tensor_parallel_rank * slice_width
     slice_end = min((tensor_parallel_rank + 1) * slice_width, width)
@@ -140,7 +147,10 @@ def load_weights_vanilla_helper(module: Linear,
                                 weights: List[Dict],
                                 weight_transform=lambda x: x,
                                 bias_transform=lambda x: x,
-                                allow_partial_loading: bool = False):
+                                allow_partial_loading: bool = False,
+                                weight_name: Optional[str] = None):
+    if weight_name is not None:
+        print(f"[load_weights_vanilla_helper] weight_name: {weight_name}")
     assert len(weights) == 1
     if not allow_partial_loading:
         assert "weight" in weights[0]
@@ -150,7 +160,7 @@ def load_weights_vanilla_helper(module: Linear,
 
     weight = load_weight_shard(weights[0]['weight'], module.tp_size,
                                module.tp_rank, module.tp_mode,
-                               device) if "weight" in weights[0] else None
+                               device, weight_name=weight_name) if "weight" in weights[0] else None
 
     if weight is not None:
         if module.has_weight_only_quant:
@@ -167,7 +177,7 @@ def load_weights_vanilla_helper(module: Linear,
     if module.bias is not None:
         bias = load_weight_shard(weights[0]['bias'], module.tp_size,
                                  module.tp_rank, module.tp_mode,
-                                 device) if "bias" in weights[0] else None
+                                 device, weight_name=weight_name) if "bias" in weights[0] else None
         if bias is not None:
             copy_weight(module.bias, bias_transform(bias))
 
@@ -311,7 +321,8 @@ class LinearMethodBase(ABC):
                      module: Linear,
                      weights: List[Dict],
                      weight_mode: WeightMode,
-                     allow_partial_loading: bool = False):
+                     allow_partial_loading: bool = False,
+                     weight_name: Optional[str] = None):
         """
         Load weights from the checkpoint.
         """
@@ -396,10 +407,14 @@ class UnquantizedLinearMethod(LinearMethodBase):
     def load_weights_vanilla(self,
                              module: Linear,
                              weights: List[Dict],
-                             allow_partial_loading: bool = False) -> None:
+                             allow_partial_loading: bool = False,
+                             weight_name: Optional[str] = None) -> None:
+        if weight_name is not None:
+            print(f"[UnquantizedLinearMethod::load_weights_vanilla] weight_name: {weight_name}")
         load_weights_vanilla_helper(module,
                                     weights,
-                                    allow_partial_loading=allow_partial_loading)
+                                    allow_partial_loading=allow_partial_loading,
+                                    weight_name=weight_name)
 
     def load_weights_fused_qkv_linear(
             self,
@@ -2058,6 +2073,8 @@ class Linear(nn.Module):
         disable_deep_gemm: bool = False,
         fused_weight_shard_indices_mapping: Optional[dict] = None,
         nvfp4_allowed_backends: Optional[List[str]] = None,
+        weight_name: Optional[str] = None,
+        mapping_with_cp: Optional[Mapping] = None,
     ):
         """
         Args:
@@ -2097,6 +2114,12 @@ class Linear(nn.Module):
         self.nvfp4_allowed_backends = nvfp4_allowed_backends or [
             'cutlass', 'cublaslt', 'cuda_core'
         ]
+
+        if mapping_with_cp is not None and weight_name == "o_proj":
+            print("[Linear::__init__] Found o_proj with CP mapping. Setting weight_name to o_proj_with_cp.")
+            self.weight_name = "o_proj_with_cp"
+        else:
+            self.weight_name = None
 
         local_in_features = in_features
         local_out_features = out_features
@@ -2284,7 +2307,8 @@ class Linear(nn.Module):
             self,
             weights,
             weight_mode,
-            allow_partial_loading=allow_partial_loading)
+            allow_partial_loading=allow_partial_loading,
+            weight_name=self.weight_name)
 
     def post_load_weights(self):
         self.quant_method.post_load_weights(self)
