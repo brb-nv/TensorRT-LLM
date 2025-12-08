@@ -2191,7 +2191,8 @@ class MLA(nn.Module):
                               latent_cache_gen=latent_cache_gen)
 
         # Print only for the first layer and first decode iteration.
-        print_condition = self.layer_idx == 0 and len(position_ids) == 1 and position_ids[0][0].item() == 52
+        # print_condition = self.layer_idx == 0 and len(position_ids) == 1 and position_ids[0][0].item() == 52
+        print_condition = False
         if print_condition:
             print(f"[MLA::forward][rank {self.mapping.rank}][cp_rank {self.mapping.cp_rank}][tp_rank {self.mapping.tp_rank}]: BEFORE O_PROJ attn_output: {attn_output.shape} \n {attn_output} \n weight.shape: {self.o_proj.weight.shape} weight.tp_rank: {self.o_proj.tp_rank} weight.tp_size: {self.o_proj.tp_size} \n {self.o_proj.weight}")
             save_tensor_mla(attn_output, "before_o_proj", self.mapping.rank, self.mapping.cp_rank, self.mapping.tp_rank)

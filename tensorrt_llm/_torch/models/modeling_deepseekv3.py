@@ -1131,7 +1131,8 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # Print only for the first layer and first decode iteration.
-        print_condition = self.layer_idx == 0 and len(position_ids) == 1 and position_ids[0][0].item() == 52
+        # print_condition = self.layer_idx == 0 and len(position_ids) == 1 and position_ids[0][0].item() == 52
+        print_condition = False
         if print_condition:
             print(f"[DeepseekV3DecoderLayer::forward][rank {self.mapping.rank}][cp_rank {self.mapping.cp_rank}]: BEFORE INPUT LAYERNORM hidden_states: {hidden_states.shape} \n {hidden_states}")
             save_tensor(hidden_states, "before_input_layernorm", self.mapping.rank, self.mapping.cp_rank, self.mapping.tp_rank)
@@ -1624,15 +1625,15 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
         return_context_logits: bool = False,
         **kwargs,
     ) -> torch.Tensor:
-        print(f"[DeepseekV3ForCausalLM::forward][rank {self.model_config.mapping.rank}][cp_rank {self.model_config.mapping.cp_rank}] input_ids: {input_ids}")
-        print(f"[DeepseekV3ForCausalLM::forward][rank {self.model_config.mapping.rank}][cp_rank {self.model_config.mapping.cp_rank}] position_ids: {position_ids}")
-        print(f"[DeepseekV3ForCausalLM::forward][rank {self.model_config.mapping.rank}][cp_rank {self.model_config.mapping.cp_rank}] helix_is_inactive_rank: {attn_metadata.helix_is_inactive_rank}")
-        print(f"[DeepseekV3ForCausalLM::forward][rank {self.model_config.mapping.rank}][cp_rank {self.model_config.mapping.cp_rank}] kv_cache_params.num_cached_tokens_per_seq: {attn_metadata.kv_cache_params.num_cached_tokens_per_seq}")
-        print(f"[DeepseekV3ForCausalLM::forward][rank {self.model_config.mapping.rank}][cp_rank {self.model_config.mapping.cp_rank}] kv_lens_cuda: {attn_metadata.kv_lens_cuda}")
-        assert attn_metadata.kv_cache_manager.tokens_per_block == 32
-        block_ids_per_seq = attn_metadata.kv_cache_manager.get_batch_cache_indices(attn_metadata.request_ids)
-        for request_id, block_ids in zip(attn_metadata.request_ids, block_ids_per_seq):
-            print(f"[DeepseekV3ForCausalLM::forward][rank {self.model_config.mapping.rank}][cp_rank {self.model_config.mapping.cp_rank}] request_id: {request_id}, block_ids: {block_ids}")
+        # print(f"[DeepseekV3ForCausalLM::forward][rank {self.model_config.mapping.rank}][cp_rank {self.model_config.mapping.cp_rank}] input_ids: {input_ids}")
+        # print(f"[DeepseekV3ForCausalLM::forward][rank {self.model_config.mapping.rank}][cp_rank {self.model_config.mapping.cp_rank}] position_ids: {position_ids}")
+        # print(f"[DeepseekV3ForCausalLM::forward][rank {self.model_config.mapping.rank}][cp_rank {self.model_config.mapping.cp_rank}] helix_is_inactive_rank: {attn_metadata.helix_is_inactive_rank}")
+        # print(f"[DeepseekV3ForCausalLM::forward][rank {self.model_config.mapping.rank}][cp_rank {self.model_config.mapping.cp_rank}] kv_cache_params.num_cached_tokens_per_seq: {attn_metadata.kv_cache_params.num_cached_tokens_per_seq}")
+        # print(f"[DeepseekV3ForCausalLM::forward][rank {self.model_config.mapping.rank}][cp_rank {self.model_config.mapping.cp_rank}] kv_lens_cuda: {attn_metadata.kv_lens_cuda}")
+        # assert attn_metadata.kv_cache_manager.tokens_per_block == 32
+        # block_ids_per_seq = attn_metadata.kv_cache_manager.get_batch_cache_indices(attn_metadata.request_ids)
+        # for request_id, block_ids in zip(attn_metadata.request_ids, block_ids_per_seq):
+        #     print(f"[DeepseekV3ForCausalLM::forward][rank {self.model_config.mapping.rank}][cp_rank {self.model_config.mapping.cp_rank}] request_id: {request_id}, block_ids: {block_ids}")
         return super().forward(attn_metadata=attn_metadata,
                                input_ids=input_ids,
                                position_ids=position_ids,

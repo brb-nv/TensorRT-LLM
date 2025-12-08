@@ -2030,7 +2030,7 @@ class PyExecutor:
 
         for req in scheduled_batch.generation_requests:
             if req.is_disagg_generation_transmission_complete:
-                print(f"[PyExecutor::_prepare_disagg_gen_transmission_complete][rank {self.dist.rank}][cp_rank {self.dist.cp_rank}]: TRANSMISSION COMPLETE for request ID: {req.py_request_id}")
+                # print(f"[PyExecutor::_prepare_disagg_gen_transmission_complete][rank {self.dist.rank}][cp_rank {self.dist.cp_rank}]: TRANSMISSION COMPLETE for request ID: {req.py_request_id}")
                 req.state = LlmRequestState.GENERATION_IN_PROGRESS
                 req.context_current_position = req.prompt_len
                 req.decoding_iter = 1
