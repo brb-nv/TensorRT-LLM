@@ -342,12 +342,7 @@ class MnnvlMemory:
 
 
 class HelixCpMnnvlMemory:
-    """MNNVL memory for context parallel (CP) operations.
-
-    This class provides CP-specific memory management for Helix all-to-all
-    operations that need to share memory across CP ranks. It has its own
-    separate memory tracking state from MnnvlMemory (which handles TP).
-    """
+    """MNNVL memory management for Helix context parallel (CP) operations."""
 
     current_mem_offset: int = 0
     current_rank_stride: int = 0
@@ -360,13 +355,6 @@ class HelixCpMnnvlMemory:
     address_refcnt = {}
 
     def __init__(self, mapping: Mapping, size: int):
-        """
-        Initialize HelixCpMnnvlMemory for context parallel memory sharing.
-
-        Args:
-            mapping: TensorRT-LLM mapping object
-            size: Size of memory to allocate per rank in bytes
-        """
         self.mapping = mapping
         self.segment_size = size
         self.ptr, self.rank_stride = HelixCpMnnvlMemory.open_mnnvl_memory(self.mapping, size)
@@ -377,21 +365,16 @@ class HelixCpMnnvlMemory:
                 HelixCpMnnvlMemory.close_mnnvl_memory(self.ptr)
 
     def as_torch_strided_tensor(self, dtype):
-        comm = HelixCpMnnvlMemory.get_comm(self.mapping)
-        num_segments = comm.Get_size()
+        num_segments = HelixCpMnnvlMemory.comm.Get_size()
         return pack_strided_memory(
             self.ptr, self.segment_size, self.rank_stride, num_segments, dtype, MnnvlMemory.dev_id
         )
 
     @staticmethod
     def get_comm(mapping: Mapping):
-        """Get CP-based communicator (ranks grouped by PP+TP+MOE_TP, ordered by CP rank).
-
-        Used by Helix all-to-all operations that need to share memory across CP ranks.
-        """
+        """Get CP-based communicator (ranks grouped by PP+TP+MOE_TP, ordered by CP rank)."""
         if HelixCpMnnvlMemory.comm is not None:
             return HelixCpMnnvlMemory.comm
-        # Group ranks by (pp_rank, tp_rank, moe_tp_rank), order by cp_rank
         comm = mpi_comm().Split(
             mapping.pp_rank * mapping.tp_size * mapping.moe_tp_size
             + mapping.tp_rank * mapping.moe_tp_size
@@ -437,15 +420,16 @@ class HelixCpMnnvlMemory:
         granularity = MnnvlMemory.get_allocation_granularity(dev_id)
         aligned_size = (size + granularity - 1) // granularity * granularity
 
-        current_mem_offset = HelixCpMnnvlMemory.current_mem_offset
-        current_rank_stride = HelixCpMnnvlMemory.current_rank_stride
-
-        if current_mem_offset + aligned_size > current_rank_stride:
+        if (
+            HelixCpMnnvlMemory.current_mem_offset + aligned_size
+            > HelixCpMnnvlMemory.current_rank_stride
+        ):
             HelixCpMnnvlMemory.new_mnnvl_memory_address(mapping, aligned_size)
-            current_mem_offset = HelixCpMnnvlMemory.current_mem_offset
-            current_rank_stride = HelixCpMnnvlMemory.current_rank_stride
 
-        assert current_mem_offset + aligned_size <= current_rank_stride
+        assert (
+            HelixCpMnnvlMemory.current_mem_offset + aligned_size
+            <= HelixCpMnnvlMemory.current_rank_stride
+        )
 
         allocation_prop = MnnvlMemory.get_allocation_prop(dev_id)
         allocated_mem_handle = _check_cu_result(
@@ -495,6 +479,8 @@ class HelixCpMnnvlMemory:
                 remote_fds.append(remote_fd)
 
             all_handles_data = remote_fds
+        # all_handles_data like b'\x00\x00\x00 \x00\x00\x00\x00\x8f\xec\x02\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\t\x00\x00\x00\x00\x00\x1d\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'  # noqa: E501
+        # can use buf = memoryview(data) to import if using plain buffer for data.
 
         madesc = cuda.CUmemAccessDesc()
         madesc.location = allocation_prop.location
@@ -502,12 +488,12 @@ class HelixCpMnnvlMemory:
 
         mem_handles = [None] * comm_size
 
-        current_start_address = HelixCpMnnvlMemory.current_start_address
-        current_rank_stride = HelixCpMnnvlMemory.current_rank_stride
-        current_mem_offset = HelixCpMnnvlMemory.current_mem_offset
-
         for i, remote_handle_data in enumerate(all_handles_data):
-            rank_ptr = current_start_address + current_rank_stride * i + current_mem_offset
+            rank_ptr = (
+                HelixCpMnnvlMemory.current_start_address
+                + HelixCpMnnvlMemory.current_rank_stride * i
+                + HelixCpMnnvlMemory.current_mem_offset
+            )
             if i == comm_rank:
                 # Local memory mapping
                 mem_handles[i] = allocated_mem_handle
@@ -524,18 +510,18 @@ class HelixCpMnnvlMemory:
 
             _check_cu_result(cuda.cuMemSetAccess(rank_ptr, aligned_size, [madesc], 1))
 
-        ptr = current_start_address + current_mem_offset
-        stride = current_rank_stride
+        ptr = HelixCpMnnvlMemory.current_start_address + HelixCpMnnvlMemory.current_mem_offset
+        stride = HelixCpMnnvlMemory.current_rank_stride
         HelixCpMnnvlMemory.allocated_map[ptr] = (
             mapping,
             aligned_size,
             mem_handles,
-            current_start_address,
-            current_rank_stride,
-            current_mem_offset,
+            HelixCpMnnvlMemory.current_start_address,
+            HelixCpMnnvlMemory.current_rank_stride,
+            HelixCpMnnvlMemory.current_mem_offset,
         )
-        HelixCpMnnvlMemory.address_refcnt[current_start_address] = (
-            HelixCpMnnvlMemory.address_refcnt.get(current_start_address, 0) + 1
+        HelixCpMnnvlMemory.address_refcnt[HelixCpMnnvlMemory.current_start_address] = (
+            HelixCpMnnvlMemory.address_refcnt.get(HelixCpMnnvlMemory.current_start_address, 0) + 1
         )
 
         HelixCpMnnvlMemory.current_mem_offset += aligned_size
@@ -543,14 +529,9 @@ class HelixCpMnnvlMemory:
 
     @staticmethod
     def close_mnnvl_memory(ptr: int):
-        (
-            mapping,
-            aligned_size,
-            mem_handles,
-            start_address,
-            rank_stride,
-            address_offset,
-        ) = HelixCpMnnvlMemory.allocated_map.pop(ptr)
+        mapping, aligned_size, mem_handles, start_address, rank_stride, address_offset = (
+            HelixCpMnnvlMemory.allocated_map.pop(ptr)
+        )
         comm = HelixCpMnnvlMemory.get_comm(mapping)
         comm_size = comm.Get_size()
         for i in range(comm_size):
