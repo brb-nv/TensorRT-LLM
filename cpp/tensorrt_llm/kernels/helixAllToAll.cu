@@ -17,7 +17,9 @@
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/envUtils.h"
+#include "tensorrt_llm/kernels/cudaAsyncOps.cuh"
 #include "tensorrt_llm/kernels/helixAllToAll.h"
+#include "tensorrt_llm/kernels/ll128Proto.cuh"
 
 #include <cstdint>
 #include <cstdio>
@@ -34,124 +36,8 @@ namespace tensorrt_llm
 {
 namespace kernels
 {
-// Note: WARP_SIZE and other constants are defined in helixAllToAll.h
-
-// ============================================================================
-// Barrier and Memory Operations
-// ============================================================================
-
-static __device__ __forceinline__ uint32_t __as_ptr_smem(void const* __ptr)
-{
-    return static_cast<uint32_t>(__cvta_generic_to_shared(__ptr));
-}
-
-static __device__ __forceinline__ uint64_t __as_ptr_gmem(void const* __ptr)
-{
-    return static_cast<uint64_t>(__cvta_generic_to_global(__ptr));
-}
-
-__device__ __forceinline__ void mbarrier_init(uint64_t* addr, uint32_t const& count)
-{
-#if defined(__CUDACC__) && __CUDA_ARCH__ >= 800
-    asm("mbarrier.init.shared.b64 [%0], %1;" : : "r"(__as_ptr_smem(addr)), "r"(count) : "memory");
-#endif
-}
-
-__device__ __forceinline__ uint64_t mbarrier_arrive_expect_tx(uint64_t* addr, const uint32_t txCount)
-{
-#if defined(__CUDACC__) && __CUDA_ARCH__ >= 900
-    uint64_t state;
-    asm("mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 %0, [%1], %2;"
-        : "=l"(state)
-        : "r"(__as_ptr_smem(addr)), "r"(txCount)
-        : "memory");
-    return state;
-#else
-    return 0;
-#endif
-}
-
-__device__ __forceinline__ bool mbarrier_try_wait_parity(uint64_t* addr, uint32_t const& phaseParity)
-{
-#if defined(__CUDACC__) && __CUDA_ARCH__ >= 900
-    uint32_t waitComplete;
-    asm("{\n\t .reg .pred P_OUT; \n\t"
-        "mbarrier.try_wait.parity.shared::cta.b64  P_OUT, [%1], %2;\n\t"
-        "selp.b32 %0, 1, 0, P_OUT; \n"
-        "}"
-        : "=r"(waitComplete)
-        : "r"(__as_ptr_smem(addr)), "r"(phaseParity)
-        : "memory");
-    return static_cast<bool>(waitComplete);
-#else
-    return false;
-#endif
-}
-
-__device__ __forceinline__ void cp_async_bulk_g2s(void* dstMem, void const* srcMem, int copySize, uint64_t* smemBar)
-{
-#if defined(__CUDACC__) && __CUDA_ARCH__ >= 900
-    asm("cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes [%0], "
-        "[%1], %2, [%3];"
-        :
-        : "r"(__as_ptr_smem(dstMem)), "l"(__as_ptr_gmem(srcMem)), "r"(copySize), "r"(__as_ptr_smem(smemBar))
-        : "memory");
-#endif
-}
-
-__device__ __forceinline__ void cp_async_bulk_s2g(void* dstMem, void const* srcMem, int copySize)
-{
-#if defined(__CUDACC__) && __CUDA_ARCH__ >= 900
-    asm("cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
-        :
-        : "l"(__as_ptr_gmem(dstMem)), "r"(__as_ptr_smem(srcMem)), "r"(copySize)
-        : "memory");
-#endif
-}
-
-__device__ __forceinline__ void cp_async_bulk_commit_group()
-{
-#if defined(__CUDACC__) && __CUDA_ARCH__ >= 900
-    asm volatile("cp.async.bulk.commit_group;" : : :);
-#endif
-}
-
-template <int N = 0>
-__device__ __forceinline__ void cp_async_bulk_wait_group_read()
-{
-#if defined(__CUDACC__) && __CUDA_ARCH__ >= 900
-    asm volatile("cp.async.bulk.wait_group.read %0;" : : "n"(N) : "memory");
-#endif
-}
-
-template <int COPY_SIZE = 4>
-__device__ __forceinline__ void ldgsts(void* dstShm, void const* srcMem, bool predGuard)
-{
-#if defined(__CUDACC__) && __CUDA_ARCH__ >= 800
-    asm volatile(
-        "{\n"
-        "  .reg .pred p;\n"
-        "  setp.ne.b32 p, %0, 0;\n"
-        "  @p cp.async.ca.shared.global [%1], [%2], %3;\n"
-        "}\n" ::"r"((int) predGuard),
-        "r"(__as_ptr_smem(dstShm)), "l"(__as_ptr_gmem(srcMem)), "n"(COPY_SIZE));
-#endif
-}
-
-__device__ __forceinline__ void cp_async_commit_group()
-{
-#if defined(__CUDACC__) && __CUDA_ARCH__ >= 800
-    asm volatile("cp.async.commit_group;" : : :);
-#endif
-}
-
-template <int N = 0>
-__device__ __forceinline__ void cp_async_wait_group()
-{
-#if defined(__CUDACC__) && __CUDA_ARCH__ >= 800
-    asm volatile("cp.async.wait_group %0;" : : "n"(N) : "memory");
-#endif
-}
+// Note: PTX intrinsics and async copy operations are now in cudaAsyncOps.cuh
+// WARP_SIZE, WARP_MASK, and other constants are defined in moeCommKernelsCommon.h
 
 // ============================================================================
 // Helper Functions
@@ -167,22 +53,7 @@ __host__ __device__ inline uint8_t* getPtr(HelixFieldInfo const& fieldInfo, int 
     return fieldInfo.dataPtr + blockIdx * fieldInfo.stride;
 }
 
-__device__ __forceinline__ void initSmemBar(uint64_t* smemBar, int laneId)
-{
-    if (laneId == 0)
-    {
-        mbarrier_init(smemBar, WARP_SIZE);
-    }
-    __syncwarp();
-}
-
-__device__ __forceinline__ void smemBarWait(uint64_t* smemBar, uint32_t* phaseParity)
-{
-    while (!mbarrier_try_wait_parity(smemBar, *phaseParity))
-    {
-    }
-    *phaseParity = 1 - *phaseParity;
-}
+// initSmemBar and smemBarWait are now in cudaAsyncOps.cuh
 
 __device__ __forceinline__ void waitG2sAllFields(uint64_t* smemBar, uint32_t* phaseParity)
 {
@@ -295,8 +166,8 @@ __device__ __forceinline__ uint64_t* getFifoBasePtr(HelixAllToAllParams const& p
 
     auto* mappedMemory = params.workspace + mappedMemoryRank * params.workspaceStrideInU64;
     // Navigate to the right FIFO: [peer_rank][channel]
-    size_t fifoOffset = rankInsideMappedMemory * params.maxChannelCount * FIFO_TOTAL_U64;
-    fifoOffset += pairInfo.channel * FIFO_TOTAL_U64;
+    size_t fifoOffset = rankInsideMappedMemory * params.maxChannelCount * HELIX_FIFO_TOTAL_U64;
+    fifoOffset += pairInfo.channel * HELIX_FIFO_TOTAL_U64;
 
     return mappedMemory + fifoOffset;
 }
@@ -308,7 +179,7 @@ __device__ __forceinline__ FifoInfo* getSenderFifoInfo(HelixAllToAllParams const
     int rankInsideMappedMemory = pairInfo.receiverRank;
 
     auto* mappedMemory = reinterpret_cast<uint8_t*>(params.workspace + mappedMemoryRank * params.workspaceStrideInU64);
-    size_t fieldOffset = static_cast<size_t>(FIFO_TOTAL_BYTES) * params.cpSize * params.maxChannelCount;
+    size_t fieldOffset = static_cast<size_t>(HELIX_FIFO_TOTAL_BYTES) * params.cpSize * params.maxChannelCount;
     mappedMemory += fieldOffset;
     mappedMemory += rankInsideMappedMemory * params.maxChannelCount * sizeof(FifoInfo);
     mappedMemory += pairInfo.channel * sizeof(FifoInfo);
@@ -324,7 +195,7 @@ __device__ __forceinline__ FifoInfo* getReceiverFifoInfo(
     int rankInsideMappedMemory = pairInfo.senderRank;
 
     auto* mappedMemory = reinterpret_cast<uint8_t*>(params.workspace + mappedMemoryRank * params.workspaceStrideInU64);
-    size_t fieldOffset = static_cast<size_t>(FIFO_TOTAL_BYTES) * params.cpSize * params.maxChannelCount;
+    size_t fieldOffset = static_cast<size_t>(HELIX_FIFO_TOTAL_BYTES) * params.cpSize * params.maxChannelCount;
     fieldOffset += sizeof(FifoInfo) * params.cpSize * params.maxChannelCount;
     mappedMemory += fieldOffset;
     mappedMemory += rankInsideMappedMemory * params.maxChannelCount * sizeof(FifoInfo);
@@ -371,145 +242,7 @@ __device__ __forceinline__ uint64_t startWorkspaceG2S(uint8_t* shmemBase, uint64
     return mbarrier_arrive_expect_tx(smemBar, laneId == 0 ? copyByteCount : 0);
 }
 
-// ============================================================================
-// LL128Proto protocol implementation / primitives
-// ============================================================================
-
-class LL128Proto
-{
-public:
-    static constexpr uint32_t INITIALIZED_VALUE = 0xFFFFFFFFU;
-
-    template <bool USE_FINISH>
-    static __device__ __forceinline__ int checkDataReceivedInShm(uint8_t* sharedMemoryBase, uint64_t step,
-        int countIn128Bytes, int fifoEntry128ByteIndexBase, int loaded128ByteCount, int laneId)
-    {
-        // return value should be how many package already been received.
-        // 0 means no data received, -1 means has received finish package(should be
-        // the very first 128 Byte).
-        uint64_t* aligned128BytesShm = reinterpret_cast<uint64_t*>(sharedMemoryBase);
-        int totalValidCount = 0;
-        for (int idxBase = loaded128ByteCount; idxBase < countIn128Bytes; idxBase += WARP_SIZE)
-        {
-            int idx = idxBase + laneId;
-            bool valid = false;
-            bool finish = false;
-            if (idx < countIn128Bytes)
-            {
-                int indexInFifoEntry = fifoEntry128ByteIndexBase + idx;
-                uint64_t value
-                    = aligned128BytesShm[idx * UINT64_PER_128B_BLOCK + indexInFifoEntry % UINT64_PER_128B_BLOCK];
-                if (USE_FINISH)
-                {
-                    finish = (value == (step & (1ULL << 63ULL)));
-                    valid = (value == step) || finish;
-                }
-                else
-                {
-                    valid = (value == step);
-                }
-            }
-            unsigned validMask = __ballot_sync(WARP_MASK, valid);
-            // here we check valid in order, if previous valid is not true, we ignore
-            // the current valid.
-            int validCount = (validMask == WARP_MASK) ? WARP_SIZE : (__ffs(~validMask) - 1);
-            if (USE_FINISH)
-            {
-                unsigned finishedMask = __ballot_sync(WARP_MASK, finish);
-                // finish should be the very first 128 Byte.
-                if (finishedMask & 0x1)
-                {
-                    return -1;
-                }
-            }
-            totalValidCount += validCount;
-
-            if (validCount != WARP_SIZE)
-            {
-                break;
-            }
-        }
-        return totalValidCount;
-    }
-
-    static __device__ __forceinline__ void protoPack(
-        uint8_t* sharedMemoryBase, uint64_t step, int countIn128Bytes, int fifoEntry128ByteIndexBase, int laneId)
-    {
-        uint64_t* aligned128BytesShm = reinterpret_cast<uint64_t*>(sharedMemoryBase);
-        int halfLaneId = laneId % 16;
-        int halfIndex = laneId / 16;
-        int tailOffsetIn128Bytes = countIn128Bytes + halfIndex;
-        // for LL128Proto 15 * 128 Bytes will be packed to 16 * 128 Bytes, each 16
-        // threads is used for one 15 * 128 bytes.
-        for (int idxIn128BytesBase = halfIndex * 15; idxIn128BytesBase < countIn128Bytes; idxIn128BytesBase += 30)
-        {
-            int tailFlagIndexFromFifoEntry = fifoEntry128ByteIndexBase + tailOffsetIn128Bytes;
-            int tailFlagInnerIndex = tailFlagIndexFromFifoEntry % UINT64_PER_128B_BLOCK;
-            int idxIn128Bytes = idxIn128BytesBase + halfLaneId;
-            int idxFromFifoEntry = fifoEntry128ByteIndexBase + idxIn128Bytes;
-            uint64_t tailValue = step;
-            uint64_t tailInnerIndex = (halfLaneId >= tailFlagInnerIndex) ? halfLaneId + 1 : halfLaneId;
-            if (halfLaneId == 15)
-            {
-                tailInnerIndex = tailFlagInnerIndex;
-            }
-            int targetTailIndex = tailOffsetIn128Bytes * UINT64_PER_128B_BLOCK + tailInnerIndex;
-            if (idxIn128Bytes < countIn128Bytes && halfLaneId < 15)
-            {
-                int flagIndex = idxIn128Bytes * UINT64_PER_128B_BLOCK + idxFromFifoEntry % UINT64_PER_128B_BLOCK;
-                tailValue = aligned128BytesShm[flagIndex];
-                aligned128BytesShm[flagIndex] = step;
-            }
-            aligned128BytesShm[targetTailIndex] = tailValue;
-            tailOffsetIn128Bytes += 2;
-        }
-        __syncwarp();
-    }
-
-    static __device__ __forceinline__ void protoUnpack(uint8_t* sharedMemoryBase, uint64_t step, int countIn128Bytes,
-        int fifoEntry128ByteIndexBase, int loaded128ByteCount, int laneId)
-    {
-        uint64_t* aligned128BytesShm = reinterpret_cast<uint64_t*>(sharedMemoryBase);
-        int halfLaneId = laneId % 16;
-        int halfIndex = laneId / 16;
-        int tailOffsetIn128Bytes = countIn128Bytes + halfIndex;
-        for (int idxIn128BytesBase = halfIndex * 15; idxIn128BytesBase < countIn128Bytes; idxIn128BytesBase += 30)
-        {
-            int tailFlagIndexFromFifoEntry = fifoEntry128ByteIndexBase + tailOffsetIn128Bytes;
-            int tailFlagInnerIndex = tailFlagIndexFromFifoEntry % UINT64_PER_128B_BLOCK;
-            int idxIn128Bytes = idxIn128BytesBase + halfLaneId;
-            int idxFromFifoEntry = fifoEntry128ByteIndexBase + idxIn128Bytes;
-            uint64_t tailValue = 0;
-            int tailInnerIndex = (halfLaneId >= tailFlagInnerIndex) ? halfLaneId + 1 : halfLaneId;
-            int targetTailIndex = tailOffsetIn128Bytes * UINT64_PER_128B_BLOCK + tailInnerIndex;
-            if (halfLaneId < 15)
-            {
-                tailValue = aligned128BytesShm[targetTailIndex];
-            }
-            if (idxIn128Bytes < countIn128Bytes && halfLaneId < 15)
-            {
-                int flagIndex = idxIn128Bytes * UINT64_PER_128B_BLOCK + idxFromFifoEntry % UINT64_PER_128B_BLOCK;
-                aligned128BytesShm[flagIndex] = tailValue;
-            }
-            tailOffsetIn128Bytes += 2;
-        }
-        __syncwarp();
-    }
-
-    static __device__ __forceinline__ void rearm(
-        uint32_t* u32FifoPtr, uint64_t step, int countIn128Bytes, int fifoEntry128ByteIndexBase, int laneId)
-    {
-        // LL128Proto don't need rearm
-    }
-
-    static __device__ __host__ __forceinline__ int computeProtoTransfer128ByteAlignedSize(
-        int compact128ByteSizeBeforeProto)
-    {
-        // each 15 * 128 byte need one tail 128 byte
-        int tail128ByteSize = ceil_div(compact128ByteSizeBeforeProto, 15 * 128) * 128;
-        return compact128ByteSizeBeforeProto + tail128ByteSize;
-    }
-};
+// LL128Proto is now defined in ll128Proto.cuh
 
 // ============================================================================
 // Size helpers
@@ -601,7 +334,7 @@ __global__ void helixAllToAllKernel(HelixAllToAllParams params)
     FifoInfo* senderFifo = getSenderFifoInfo(params, pairInfo);
     FifoInfo* receiverFifo = getReceiverFifoInfo(params, pairInfo);
 
-    int fifoEntry128ByteIndexBase = FIFO_ENTRY_128B_COUNT;
+    int fifoEntry128ByteIndexBase = HELIX_FIFO_ENTRY_128B_COUNT;
     int fifoEntryIndex = -1;
 
     // regardless of sender or receiver, we wait for the previous kernel here
@@ -657,7 +390,7 @@ __global__ void helixAllToAllKernel(HelixAllToAllParams params)
             uint64_t arriveState = mbarrier_arrive_expect_tx(&allWarpSmemBar[group], laneId == 0 ? loadedSize : 0);
 
             // update FIFO entry index and head if needed
-            if (fifoEntry128ByteIndexBase + singleProtoTransfer128ByteCount > FIFO_ENTRY_128B_COUNT)
+            if (fifoEntry128ByteIndexBase + singleProtoTransfer128ByteCount > HELIX_FIFO_ENTRY_128B_COUNT)
             {
                 if (fifoEntryIndex >= 0)
                 {
@@ -665,9 +398,9 @@ __global__ void helixAllToAllKernel(HelixAllToAllParams params)
                     __syncwarp();
                     senderFifo->head = head;
                 }
-                fifoEntryIndex = head % FIFO_DEPTH;
+                fifoEntryIndex = head % HELIX_FIFO_DEPTH;
                 fifoEntry128ByteIndexBase = 0;
-                while (tail + FIFO_DEPTH <= head)
+                while (tail + HELIX_FIFO_DEPTH <= head)
                 {
                     tail = senderFifo->tail;
                 }
@@ -685,7 +418,7 @@ __global__ void helixAllToAllKernel(HelixAllToAllParams params)
 
             LL128Proto::protoPack(shmem, head, singlePacked128ByteCount, fifoEntry128ByteIndexBase, laneId);
 
-            uint64_t* fifoEntry = fifoBase + fifoEntryIndex * (FIFO_ENTRY_BYTES / sizeof(uint64_t));
+            uint64_t* fifoEntry = fifoBase + fifoEntryIndex * (HELIX_FIFO_ENTRY_BYTES / sizeof(uint64_t));
 
             if (enableDebug)
             {
@@ -757,21 +490,21 @@ __global__ void helixAllToAllKernel(HelixAllToAllParams params)
                     params.cpRank, entryIdx, dataIndex, (long long) tail);
             }
 
-            if (fifoEntry128ByteIndexBase + singleProtoTransfer128ByteCount > FIFO_ENTRY_128B_COUNT)
+            if (fifoEntry128ByteIndexBase + singleProtoTransfer128ByteCount > HELIX_FIFO_ENTRY_128B_COUNT)
             {
                 if (fifoEntryIndex >= 0)
                 {
                     tail++;
                     needRelease = true;
                 }
-                fifoEntryIndex = tail % FIFO_DEPTH;
+                fifoEntryIndex = tail % HELIX_FIFO_DEPTH;
                 fifoEntry128ByteIndexBase = 0;
                 // receiver doesn't need to wait on FIFO entry being readable: it's
                 // always readable
                 __syncwarp();
             }
 
-            uint64_t* fifoEntry = fifoBase + fifoEntryIndex * (FIFO_ENTRY_BYTES / sizeof(uint64_t));
+            uint64_t* fifoEntry = fifoBase + fifoEntryIndex * (HELIX_FIFO_ENTRY_BYTES / sizeof(uint64_t));
             while (loaded128ByteCount < singleProtoTransfer128ByteCount)
             {
                 startWorkspaceG2S(shmem, fifoEntry, singleProtoTransfer128ByteCount, fifoEntry128ByteIndexBase,
@@ -940,7 +673,7 @@ void initializeHelixWorkspace(uint64_t* local_workspace_ptr, int cpSize, cudaStr
 {
     int maxChannelCount = computeHelixMaxChannelCount(cpSize);
     // Calculate sizes with channel dimension
-    size_t fifoSize = static_cast<size_t>(FIFO_TOTAL_BYTES) * cpSize * maxChannelCount;
+    size_t fifoSize = static_cast<size_t>(HELIX_FIFO_TOTAL_BYTES) * cpSize * maxChannelCount;
     size_t senderInfoSize = sizeof(FifoInfo) * cpSize * maxChannelCount;
     size_t receiverInfoSize = sizeof(FifoInfo) * cpSize * maxChannelCount;
 

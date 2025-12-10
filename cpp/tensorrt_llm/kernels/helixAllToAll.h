@@ -16,6 +16,7 @@
 #pragma once
 
 #include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/kernels/moeCommKernelsCommon.h"
 
 #include <cuda_runtime.h>
 
@@ -29,21 +30,19 @@ namespace kernels
 {
 
 // ============================================================================
-// Field and memory constants
+// Helix-specific FIFO constants
+// Note: Helix uses 128KB FIFO entries vs 256KB in FusedMoe
 // ============================================================================
 
-constexpr int FIFO_DEPTH = 4;
-constexpr int FIFO_ENTRY_BYTES = 128 * 1024;
-constexpr int FIFO_ENTRY_128B_COUNT = FIFO_ENTRY_BYTES / 128;
-constexpr int FIFO_TOTAL_BYTES = FIFO_ENTRY_BYTES * FIFO_DEPTH;
-constexpr int FIFO_TOTAL_U64 = FIFO_TOTAL_BYTES / sizeof(uint64_t);
-constexpr int BYTES_PER_128B_BLOCK = 128;
-constexpr int UINT64_PER_128B_BLOCK = 16;
+constexpr int HELIX_FIFO_DEPTH = 4;
+constexpr int HELIX_FIFO_ENTRY_BYTES = 128 * 1024;
+constexpr int HELIX_FIFO_ENTRY_128B_COUNT = HELIX_FIFO_ENTRY_BYTES / BYTES_PER_128B_BLOCK;
+constexpr int HELIX_FIFO_TOTAL_BYTES = HELIX_FIFO_ENTRY_BYTES * HELIX_FIFO_DEPTH;
+constexpr int HELIX_FIFO_TOTAL_U64 = HELIX_FIFO_TOTAL_BYTES / sizeof(uint64_t);
 
-// Block organization constants
-constexpr int MAX_GROUP_COUNT_PER_BLOCK = 8; // Max warps per block
-constexpr int WARP_SIZE = 32;
-constexpr uint32_t WARP_MASK = 0xffffffff;
+// Backward compatibility aliases (reference common constants from moeCommKernelsCommon.h)
+// WARP_SIZE, WARP_MASK, BYTES_PER_128B_BLOCK, UINT64_PER_128B_BLOCK, MAX_GROUP_COUNT_PER_BLOCK
+// are now defined in moeCommKernelsCommon.h
 
 // ============================================================================
 // Structure declarations and definitions
@@ -57,12 +56,7 @@ struct HelixPairInfo
     int runChannelCount;
 };
 
-// 256-byte aligned for optimal performance (matches TensorRT-LLM)
-#ifdef __CUDACC__
-#define ALIGN_256 __align__(256)
-#else
-#define ALIGN_256 alignas(256)
-#endif
+// ALIGN_256 is defined in moeCommKernelsCommon.h
 
 struct ALIGN_256 FifoInfo
 {
@@ -94,25 +88,8 @@ struct HelixAllToAllParams
 
 // ============================================================================
 // Utility Functions
+// ceil_div and align_up are now defined in moeCommKernelsCommon.h
 // ============================================================================
-
-/**
- * Ceiling division: compute ceil(a / b) for integers
- */
-template <typename T>
-inline constexpr T ceil_div(T a, T b)
-{
-    return (a + b - 1) / b;
-}
-
-/**
- * Align value up to nearest multiple of alignment
- */
-template <typename T>
-inline constexpr T align_up(T value, T alignment)
-{
-    return ceil_div(value, alignment) * alignment;
-}
 
 // ============================================================================
 // Workspace Management Functions
@@ -156,7 +133,7 @@ inline size_t computeHelixWorkspaceSizePerRank(int cpSize)
     }
 
     // FIFO buffers: cpSize * channelCount pairs
-    size_t fifoSize = static_cast<size_t>(FIFO_TOTAL_BYTES) * cpSize * maxChannelCount;
+    size_t fifoSize = static_cast<size_t>(HELIX_FIFO_TOTAL_BYTES) * cpSize * maxChannelCount;
 
     // Sender and receiver FIFO info structures
     size_t senderInfoSize = sizeof(FifoInfo) * cpSize * maxChannelCount;
