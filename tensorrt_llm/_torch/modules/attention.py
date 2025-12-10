@@ -152,21 +152,21 @@ class HelixAllToAll:
         # Get workspace size (in bytes)
         dummy = torch.empty(0, device="cuda")
         if is_fused:
-            workspace_size_per_rank = torch.ops.trtllm.getHelixFusedWorkspaceSizePerRankNative(
+            workspace_size_per_rank = torch.ops.trtllm.getHelixFusedWorkspaceSizePerRank(
                 dummy, mapping.cp_size)
         else:
-            workspace_size_per_rank = torch.ops.trtllm.getHelixWorkspaceSizePerRankNative(
+            workspace_size_per_rank = torch.ops.trtllm.getHelixWorkspaceSizePerRank(
                 dummy, mapping.cp_size)
 
-        # Allocate MNNVL memory
-        HelixAllToAll.workspace = MnnvlMemory(mapping, workspace_size_per_rank)
+        # Allocate MNNVL memory using CP communicator for Helix
+        HelixAllToAll.workspace = MnnvlMemory(mapping, workspace_size_per_rank, comm_type="cp")
         HelixAllToAll.workspace_tensor = (
             HelixAllToAll.workspace.as_torch_strided_tensor(torch.uint64))
 
-        torch.ops.trtllm.initializeHelixWorkspaceNative(
+        torch.ops.trtllm.initializeHelixWorkspace(
             HelixAllToAll.workspace_tensor, mapping.cp_rank, mapping.cp_size)
         torch.cuda.synchronize()
-        MnnvlMemory.get_comm(mapping).barrier()
+        MnnvlMemory.get_cp_comm(mapping).barrier()
 
     @staticmethod
     def alltoall(field0: torch.Tensor,
