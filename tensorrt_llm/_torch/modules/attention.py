@@ -1195,12 +1195,16 @@ class MLA(nn.Module):
             # Reshape for native all-to-all:
             # partial_o: [num_tokens, num_heads * kv_lora_rank] -> [num_tokens, cp_size, heads_per_rank, kv_lora_rank]
             # softmax_stats: [num_tokens, num_heads, 2] -> [num_tokens, cp_size, heads_per_rank, 2]
-            assert num_heads % cp_size == 0, f"num_heads ({num_heads}) must be divisible by cp_size ({cp_size})"
-            heads_per_rank = num_heads // cp_size
+            assert self.num_heads_tp % cp_size == 0, f"num_heads ({num_heads}) must be divisible by cp_size ({cp_size})"
+            heads_per_rank = self.num_heads_tp // cp_size
 
+            # TODO: allToall currently expects the cp_size dimension to be the last-but-one dimension.
+            # Ideally, it must be last-but-two dimension.
             field0 = partial_o.view(num_tokens, cp_size, heads_per_rank,
-                                    kv_lora_rank)
-            field1 = softmax_stats.view(num_tokens, cp_size, heads_per_rank, 2)
+                                    kv_lora_rank).transpose(1, 2).contiguous()
+            field1 = softmax_stats.view(num_tokens, cp_size, heads_per_rank, 2).transpose(1, 2).contiguous()
+
+            print("HAIDER field0 shape: ", field0.shape, "field1 shape: ", field1.shape, " cp_size: ", cp_size, " heads_per_rank: ", heads_per_rank, " kv_lora_rank: ", kv_lora_rank)
 
             # Call native helixAllToAll
             field0_out, field1_out = HelixAllToAll.alltoall(field0, field1)
@@ -1209,9 +1213,9 @@ class MLA(nn.Module):
             # field1_out: [num_tokens, heads_per_rank, cp_size, 2]
             # cp_dim = 2 (the dimension where cp_size is located)
 
-            # Call helixPostProcess2 with cp_dim=2
-            return torch.ops.helix.helixPostProcess2(field0_out, field1_out,
-                                                     1.0, 2)
+            # Call helixPostProcessNative with cp_dim=2
+            return torch.ops.trtllm.helixPostProcessNative(field0_out, field1_out,
+                                                           1.0, 2)
         else:
             attn_output = attn_backend.forward(q, k, v, attn_metadata, **kwargs)
             return attn_output
