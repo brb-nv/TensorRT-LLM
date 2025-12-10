@@ -31,11 +31,13 @@ namespace kernels
 
 static __device__ __forceinline__ uint32_t __as_ptr_smem(void const* __ptr)
 {
+    // Consider adding debug asserts here.
     return static_cast<uint32_t>(__cvta_generic_to_shared(__ptr));
 }
 
 static __device__ __forceinline__ uint64_t __as_ptr_gmem(void const* __ptr)
 {
+    // Consider adding debug asserts here.
     return static_cast<uint64_t>(__cvta_generic_to_global(__ptr));
 }
 
@@ -116,7 +118,7 @@ __device__ __forceinline__ bool mbarrier_try_wait_parity(uint64_t* addr, uint32_
 // ============================================================================
 
 template <int COPY_SIZE = 4>
-__device__ __forceinline__ void ldgsts(void* dstShm, void const* srcMem, bool predGuard)
+__device__ __forceinline__ void ldgsts(int* dstShm, int const* srcMem, bool predGuard)
 {
 #if defined(__CUDACC__) && __CUDA_ARCH__ >= 800
     asm volatile(
