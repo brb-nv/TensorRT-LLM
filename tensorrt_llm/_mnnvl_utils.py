@@ -51,6 +51,8 @@ def _check_cu_result(cu_func_ret):
 
 
 class MnnvlMemory:
+    """MNNVL memory management for tensor parallel (TP) operations."""
+
     initialized: bool = False
 
     current_mem_offset: int = 0
@@ -72,13 +74,6 @@ class MnnvlMemory:
     address_refcnt = {}
 
     def __init__(self, mapping: Mapping, size: int):
-        """
-        Initialize MnnvlMemory for tensor parallel memory sharing.
-
-        Args:
-            mapping: TensorRT-LLM mapping object
-            size: Size of memory to allocate per rank in bytes
-        """
         self.mapping = mapping
         self.segment_size = size
         self.ptr, self.rank_stride = MnnvlMemory.open_mnnvl_memory(self.mapping, size)
@@ -89,8 +84,7 @@ class MnnvlMemory:
                 MnnvlMemory.close_mnnvl_memory(self.ptr)
 
     def as_torch_strided_tensor(self, dtype):
-        comm = MnnvlMemory.get_comm(self.mapping)
-        num_segments = comm.Get_size()
+        num_segments = MnnvlMemory.comm.Get_size()
         return pack_strided_memory(
             self.ptr, self.segment_size, self.rank_stride, num_segments, dtype, MnnvlMemory.dev_id
         )
@@ -190,15 +184,10 @@ class MnnvlMemory:
         granularity = MnnvlMemory.get_allocation_granularity(dev_id)
         aligned_size = (size + granularity - 1) // granularity * granularity
 
-        current_mem_offset = MnnvlMemory.current_mem_offset
-        current_rank_stride = MnnvlMemory.current_rank_stride
-
-        if current_mem_offset + aligned_size > current_rank_stride:
+        if MnnvlMemory.current_mem_offset + aligned_size > MnnvlMemory.current_rank_stride:
             MnnvlMemory.new_mnnvl_memory_address(mapping, aligned_size)
-            current_mem_offset = MnnvlMemory.current_mem_offset
-            current_rank_stride = MnnvlMemory.current_rank_stride
 
-        assert current_mem_offset + aligned_size <= current_rank_stride
+        assert MnnvlMemory.current_mem_offset + aligned_size <= MnnvlMemory.current_rank_stride
 
         allocation_prop = MnnvlMemory.get_allocation_prop(dev_id)
         allocated_mem_handle = _check_cu_result(
@@ -257,12 +246,12 @@ class MnnvlMemory:
 
         mem_handles = [None] * comm_size
 
-        current_start_address = MnnvlMemory.current_start_address
-        current_rank_stride = MnnvlMemory.current_rank_stride
-        current_mem_offset = MnnvlMemory.current_mem_offset
-
         for i, remote_handle_data in enumerate(all_handles_data):
-            rank_ptr = current_start_address + current_rank_stride * i + current_mem_offset
+            rank_ptr = (
+                MnnvlMemory.current_start_address
+                + MnnvlMemory.current_rank_stride * i
+                + MnnvlMemory.current_mem_offset
+            )
             if i == comm_rank:
                 # Local memory mapping
                 mem_handles[i] = allocated_mem_handle
@@ -279,18 +268,18 @@ class MnnvlMemory:
 
             _check_cu_result(cuda.cuMemSetAccess(rank_ptr, aligned_size, [madesc], 1))
 
-        ptr = current_start_address + current_mem_offset
-        stride = current_rank_stride
+        ptr = MnnvlMemory.current_start_address + MnnvlMemory.current_mem_offset
+        stride = MnnvlMemory.current_rank_stride
         MnnvlMemory.allocated_map[ptr] = (
             mapping,
             aligned_size,
             mem_handles,
-            current_start_address,
-            current_rank_stride,
-            current_mem_offset,
+            MnnvlMemory.current_start_address,
+            MnnvlMemory.current_rank_stride,
+            MnnvlMemory.current_mem_offset,
         )
-        MnnvlMemory.address_refcnt[current_start_address] = (
-            MnnvlMemory.address_refcnt.get(current_start_address, 0) + 1
+        MnnvlMemory.address_refcnt[MnnvlMemory.current_start_address] = (
+            MnnvlMemory.address_refcnt.get(MnnvlMemory.current_start_address, 0) + 1
         )
 
         MnnvlMemory.current_mem_offset += aligned_size
@@ -298,14 +287,9 @@ class MnnvlMemory:
 
     @staticmethod
     def close_mnnvl_memory(ptr: int):
-        (
-            mapping,
-            aligned_size,
-            mem_handles,
-            start_address,
-            rank_stride,
-            address_offset,
-        ) = MnnvlMemory.allocated_map.pop(ptr)
+        mapping, aligned_size, mem_handles, start_address, rank_stride, address_offset = (
+            MnnvlMemory.allocated_map.pop(ptr)
+        )
         comm = MnnvlMemory.get_comm(mapping)
         comm_size = comm.Get_size()
         for i in range(comm_size):
