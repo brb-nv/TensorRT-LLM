@@ -26,13 +26,6 @@ namespace kernels
 {
 
 // ============================================================================
-// LL128 Protocol Constants
-// ============================================================================
-
-// Number of uint64_t elements per 128-byte block
-constexpr int UINT64_PER_128B_BLOCK = 16;
-
-// ============================================================================
 // LL128 Protocol Implementation
 //
 // The LL128 protocol is a low-latency protocol for GPU-to-GPU communication
