@@ -409,8 +409,8 @@ public:
             sharedMemoryBase, step, countIn128Bytes, fifoEntry128ByteIndexBase, loaded128ByteCount, laneId);
     }
 
-    static __device__ __forceinline__ void rearm(
-        uint32_t* u32FifoPtr, uint64_t step, int countIn128Bytes, int fifoEntry128ByteIndexBase, int /*warpId*/, int laneId)
+    static __device__ __forceinline__ void rearm(uint32_t* u32FifoPtr, uint64_t step, int countIn128Bytes,
+        int fifoEntry128ByteIndexBase, int /*warpId*/, int laneId)
     {
         LL128Proto::rearm(u32FifoPtr, step, countIn128Bytes, fifoEntry128ByteIndexBase, laneId);
     }

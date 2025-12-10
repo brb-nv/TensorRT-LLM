@@ -206,7 +206,9 @@ class MnnvlMemory:
     def new_mnnvl_memory_address(mapping: Mapping, size: int, comm_type: str = "tp"):
         page_count = (size + MnnvlMemory.fabric_page_size - 1) // MnnvlMemory.fabric_page_size
         current_rank_stride = page_count * MnnvlMemory.fabric_page_size
-        logger.info(f"[MnnvlMemory] creating address with stride={current_rank_stride}, comm_type={comm_type}")
+        logger.info(
+            f"[MnnvlMemory] creating address with stride={current_rank_stride}, comm_type={comm_type}"
+        )
         comm = MnnvlMemory.get_comm_by_type(mapping, comm_type)
         comm_size = comm.Get_size()
         address_size = current_rank_stride * comm_size
@@ -328,11 +330,7 @@ class MnnvlMemory:
             current_mem_offset = MnnvlMemory.current_mem_offset
 
         for i, remote_handle_data in enumerate(all_handles_data):
-            rank_ptr = (
-                current_start_address
-                + current_rank_stride * i
-                + current_mem_offset
-            )
+            rank_ptr = current_start_address + current_rank_stride * i + current_mem_offset
             if i == comm_rank:
                 # Local memory mapping
                 mem_handles[i] = allocated_mem_handle
@@ -372,9 +370,15 @@ class MnnvlMemory:
 
     @staticmethod
     def close_mnnvl_memory(ptr: int):
-        mapping, aligned_size, mem_handles, start_address, rank_stride, address_offset, comm_type = (
-            MnnvlMemory.allocated_map.pop(ptr)
-        )
+        (
+            mapping,
+            aligned_size,
+            mem_handles,
+            start_address,
+            rank_stride,
+            address_offset,
+            comm_type,
+        ) = MnnvlMemory.allocated_map.pop(ptr)
         comm = MnnvlMemory.get_comm_by_type(mapping, comm_type)
         comm_size = comm.Get_size()
         for i in range(comm_size):

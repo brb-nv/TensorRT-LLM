@@ -159,7 +159,9 @@ class HelixAllToAll:
                 dummy, mapping.cp_size)
 
         # Allocate MNNVL memory using CP communicator for Helix
-        HelixAllToAll.workspace = MnnvlMemory(mapping, workspace_size_per_rank, comm_type="cp")
+        HelixAllToAll.workspace = MnnvlMemory(mapping,
+                                              workspace_size_per_rank,
+                                              comm_type="cp")
         HelixAllToAll.workspace_tensor = (
             HelixAllToAll.workspace.as_torch_strided_tensor(torch.uint64))
 
@@ -1202,9 +1204,8 @@ class MLA(nn.Module):
             # Ideally, it must be last-but-two dimension.
             field0 = partial_o.view(num_tokens, cp_size, heads_per_rank,
                                     kv_lora_rank).transpose(1, 2).contiguous()
-            field1 = softmax_stats.view(num_tokens, cp_size, heads_per_rank, 2).transpose(1, 2).contiguous()
-
-            print("HAIDER field0 shape: ", field0.shape, "field1 shape: ", field1.shape, " cp_size: ", cp_size, " heads_per_rank: ", heads_per_rank, " kv_lora_rank: ", kv_lora_rank)
+            field1 = softmax_stats.view(num_tokens, cp_size, heads_per_rank,
+                                        2).transpose(1, 2).contiguous()
 
             # Call native helixAllToAll
             field0_out, field1_out = HelixAllToAll.alltoall(field0, field1)
@@ -1214,8 +1215,8 @@ class MLA(nn.Module):
             # cp_dim = 2 (the dimension where cp_size is located)
 
             # Call helixPostProcessNative with cp_dim=2
-            return torch.ops.trtllm.helixPostProcessNative(field0_out, field1_out,
-                                                           1.0, 2)
+            return torch.ops.trtllm.helixPostProcessNative(
+                field0_out, field1_out, 1.0, 2)
         else:
             attn_output = attn_backend.forward(q, k, v, attn_metadata, **kwargs)
             return attn_output

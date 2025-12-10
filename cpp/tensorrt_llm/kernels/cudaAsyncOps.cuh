@@ -214,4 +214,3 @@ __device__ __forceinline__ void smemBarWait(uint64_t* smemBar, uint32_t* phasePa
 
 } // namespace kernels
 } // namespace tensorrt_llm
-
