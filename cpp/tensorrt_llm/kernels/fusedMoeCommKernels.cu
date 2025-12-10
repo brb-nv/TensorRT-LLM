@@ -338,8 +338,6 @@ __device__ __forceinline__ void dequantize_nvfp4_sharedmem(uint8_t* compact_ptr,
 #endif
 }
 
-// PTX intrinsics and async copy operations are now in cudaAsyncOps.cuh
-
 __host__ void MoeCommFieldInfo::fillFieldInfo(
     uint8_t* dataPtr, size_t elementSize, int vectorSize, int stride, cudaDataType_t dataType)
 {
@@ -555,8 +553,6 @@ __device__ __forceinline__ void unpackAllFields(
     }
     __syncwarp();
 }
-
-// initSmemBar and smemBarWait are now in cudaAsyncOps.cuh
 
 __device__ __forceinline__ void startWorkspaceS2G(
     uint64_t* fifoEntry, uint8_t* sharedMemoryBase, int send128ByteCount, int fifo128ByteOffset, int warpId, int laneId)

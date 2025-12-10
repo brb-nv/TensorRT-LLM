@@ -36,7 +36,6 @@ namespace tensorrt_llm
 {
 namespace kernels
 {
-// Note: PTX intrinsics and async copy operations are now in cudaAsyncOps.cuh
 // WARP_SIZE, WARP_MASK, and other constants are defined in moeCommKernelsCommon.h
 
 // ============================================================================
@@ -52,8 +51,6 @@ __host__ __device__ inline uint8_t* getPtr(HelixFieldInfo const& fieldInfo, int 
 {
     return fieldInfo.dataPtr + blockIdx * fieldInfo.stride;
 }
-
-// initSmemBar and smemBarWait are now in cudaAsyncOps.cuh
 
 __device__ __forceinline__ void waitG2sAllFields(uint64_t* smemBar, uint32_t* phaseParity)
 {
