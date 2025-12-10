@@ -5,7 +5,7 @@ from typing import Optional, Union, cast
 import torch
 from torch import nn
 
-from tensorrt_llm._mnnvl_utils import MnnvlMemory
+from tensorrt_llm._mnnvl_utils import HelixCpMnnvlMemory, MnnvlMemory
 from tensorrt_llm._utils import (get_sm_version, is_sm_100f, nvtx_range,
                                  nvtx_range_debug)
 from tensorrt_llm.logger import logger
@@ -127,7 +127,7 @@ class HelixAllToAll:
     - Field 1: [..., cp_size, 2] float32
     """
 
-    workspace: MnnvlMemory = None
+    workspace: HelixCpMnnvlMemory = None
     workspace_tensor: torch.Tensor = None
     mapping: Mapping = None
 
@@ -143,7 +143,7 @@ class HelixAllToAll:
         if MnnvlMemory.initialized and HelixAllToAll.workspace_tensor is not None:
             return
         logger.info(
-            f"Rank {mapping.cp_rank} initializing MnnvlMemory for Helix, is_fused={is_fused}"
+            f"Rank {mapping.cp_rank} initializing HelixCpMnnvlMemory for Helix, is_fused={is_fused}"
         )
         MnnvlMemory.initialize()
 
@@ -159,16 +159,15 @@ class HelixAllToAll:
                 dummy, mapping.cp_size)
 
         # Allocate MNNVL memory using CP communicator for Helix
-        HelixAllToAll.workspace = MnnvlMemory(mapping,
-                                              workspace_size_per_rank,
-                                              comm_type="cp")
+        HelixAllToAll.workspace = HelixCpMnnvlMemory(mapping,
+                                                     workspace_size_per_rank)
         HelixAllToAll.workspace_tensor = (
             HelixAllToAll.workspace.as_torch_strided_tensor(torch.uint64))
 
         torch.ops.trtllm.initializeHelixWorkspace(
             HelixAllToAll.workspace_tensor, mapping.cp_rank, mapping.cp_size)
         torch.cuda.synchronize()
-        MnnvlMemory.get_cp_comm(mapping).barrier()
+        HelixCpMnnvlMemory.get_comm(mapping).barrier()
 
     @staticmethod
     def alltoall(field0: torch.Tensor,
