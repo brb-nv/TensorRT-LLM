@@ -25,14 +25,14 @@ namespace tensorrt_llm
 namespace kernels
 {
 
-class Ll128Proto
+class LL128Proto
 {
 public:
     static constexpr uint32_t INITIALIZED_VALUE = 0xFFFFFFFFU;
 
     template <bool USE_FINISH>
     static __device__ __forceinline__ int checkDataReceivedInShm(uint8_t* sharedMemoryBase, uint64_t step,
-        int countIn128Bytes, int fifoEntry128ByteIndexBase, int loaded128ByteCount, int warpId, int laneId)
+        int countIn128Bytes, int fifoEntry128ByteIndexBase, int loaded128ByteCount, int laneId)
     {
         // return value should be how many package already been received.
         // 0 means no data received, -1 means has received finish package(should be the very first 128 Byte).
@@ -46,8 +46,8 @@ public:
             if (idx < countIn128Bytes)
             {
                 int indexInFifoEntry = fifoEntry128ByteIndexBase + idx;
-                uint64_t value = aligned128BytesShm[idx * MoeCommFieldInfo::UINT64_PER_128B_BLOCK
-                    + indexInFifoEntry % MoeCommFieldInfo::UINT64_PER_128B_BLOCK];
+                uint64_t value = aligned128BytesShm[idx * UINT64_PER_128B_BLOCK
+                    + indexInFifoEntry % UINT64_PER_128B_BLOCK];
                 if (USE_FINISH)
                 {
                     finish = (value == (step & (1ULL << 63ULL)));
@@ -82,7 +82,7 @@ public:
     }
 
     static __device__ __forceinline__ void protoPack(uint8_t* sharedMemoryBase, uint64_t step, int countIn128Bytes,
-        int fifoEntry128ByteIndexBase, int warpId, int laneId)
+        int fifoEntry128ByteIndexBase, int laneId)
     {
         uint64_t* aligned128BytesShm = reinterpret_cast<uint64_t*>(sharedMemoryBase);
         int halfLaneId = laneId % 16;
@@ -92,7 +92,7 @@ public:
         for (int idxIn128BytesBase = halfIndex * 15; idxIn128BytesBase < countIn128Bytes; idxIn128BytesBase += 30)
         {
             int tailFlagIndexFromFifoEntry = fifoEntry128ByteIndexBase + tailOffsetIn128Bytes;
-            int tailFlagInnerIndex = tailFlagIndexFromFifoEntry % MoeCommFieldInfo::UINT64_PER_128B_BLOCK;
+            int tailFlagInnerIndex = tailFlagIndexFromFifoEntry % UINT64_PER_128B_BLOCK;
             int idxIn128Bytes = idxIn128BytesBase + halfLaneId;
             int idxFromFifoEntry = fifoEntry128ByteIndexBase + idxIn128Bytes;
             uint64_t tailValue = step;
@@ -101,11 +101,11 @@ public:
             {
                 tailInnerIndex = tailFlagInnerIndex;
             }
-            int targetTailIndex = tailOffsetIn128Bytes * MoeCommFieldInfo::UINT64_PER_128B_BLOCK + tailInnerIndex;
+            int targetTailIndex = tailOffsetIn128Bytes * UINT64_PER_128B_BLOCK + tailInnerIndex;
             if (idxIn128Bytes < countIn128Bytes && halfLaneId < 15)
             {
-                int flagIndex = idxIn128Bytes * MoeCommFieldInfo::UINT64_PER_128B_BLOCK
-                    + idxFromFifoEntry % MoeCommFieldInfo::UINT64_PER_128B_BLOCK;
+                int flagIndex = idxIn128Bytes * UINT64_PER_128B_BLOCK
+                    + idxFromFifoEntry % UINT64_PER_128B_BLOCK;
                 tailValue = aligned128BytesShm[flagIndex];
                 aligned128BytesShm[flagIndex] = step;
             }
@@ -116,7 +116,7 @@ public:
     }
 
     static __device__ __forceinline__ void protoUnpack(uint8_t* sharedMemoryBase, uint64_t step, int countIn128Bytes,
-        int fifoEntry128ByteIndexBase, int loaded128ByteCount, int warpId, int laneId)
+        int fifoEntry128ByteIndexBase, int loaded128ByteCount, int laneId)
     {
         uint64_t* aligned128BytesShm = reinterpret_cast<uint64_t*>(sharedMemoryBase);
         int halfLaneId = laneId % 16;
@@ -125,20 +125,20 @@ public:
         for (int idxIn128BytesBase = halfIndex * 15; idxIn128BytesBase < countIn128Bytes; idxIn128BytesBase += 30)
         {
             int tailFlagIndexFromFifoEntry = fifoEntry128ByteIndexBase + tailOffsetIn128Bytes;
-            int tailFlagInnerIndex = tailFlagIndexFromFifoEntry % MoeCommFieldInfo::UINT64_PER_128B_BLOCK;
+            int tailFlagInnerIndex = tailFlagIndexFromFifoEntry % UINT64_PER_128B_BLOCK;
             int idxIn128Bytes = idxIn128BytesBase + halfLaneId;
             int idxFromFifoEntry = fifoEntry128ByteIndexBase + idxIn128Bytes;
             uint64_t tailValue = 0;
             int tailInnerIndex = (halfLaneId >= tailFlagInnerIndex) ? halfLaneId + 1 : halfLaneId;
-            int targetTailIndex = tailOffsetIn128Bytes * MoeCommFieldInfo::UINT64_PER_128B_BLOCK + tailInnerIndex;
+            int targetTailIndex = tailOffsetIn128Bytes * UINT64_PER_128B_BLOCK + tailInnerIndex;
             if (halfLaneId < 15)
             {
                 tailValue = aligned128BytesShm[targetTailIndex];
             }
             if (idxIn128Bytes < countIn128Bytes && halfLaneId < 15)
             {
-                int flagIndex = idxIn128Bytes * MoeCommFieldInfo::UINT64_PER_128B_BLOCK
-                    + idxFromFifoEntry % MoeCommFieldInfo::UINT64_PER_128B_BLOCK;
+                int flagIndex = idxIn128Bytes * UINT64_PER_128B_BLOCK
+                    + idxFromFifoEntry % UINT64_PER_128B_BLOCK;
                 aligned128BytesShm[flagIndex] = tailValue;
             }
             tailOffsetIn128Bytes += 2;
@@ -147,7 +147,7 @@ public:
     }
 
     static __device__ __forceinline__ void rearm(
-        uint32_t* u32FifoPtr, uint64_t step, int countIn128Bytes, int fifoEntry128ByteIndexBase, int warpId, int laneId)
+        uint32_t* u32FifoPtr, uint64_t step, int countIn128Bytes, int fifoEntry128ByteIndexBase, int laneId)
     {
         // LL128 don't need rearm
     }

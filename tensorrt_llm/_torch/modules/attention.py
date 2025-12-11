@@ -119,7 +119,7 @@ def attn_custom_op_inplace(
                           attention_sinks=attention_sinks)
 
 
-class HelixAllToAll:
+class HelixAllToAllNative:
     """
     Manager for Helix All-to-All operations with MNNVL workspace management.
 
@@ -141,14 +141,14 @@ class HelixAllToAll:
             mapping: TensorRT-LLM mapping object containing cp_size and cp_rank
             is_fused: Whether to use fused all-to-all operation
         """
-        if MnnvlMemory.initialized and HelixAllToAll.workspace_tensor is not None:
+        if MnnvlMemory.initialized and HelixAllToAllNative.workspace_tensor is not None:
             return
         logger.info(
             f"Rank {mapping.cp_rank} initializing HelixCpMnnvlMemory for Helix, is_fused={is_fused}"
         )
         MnnvlMemory.initialize()
 
-        HelixAllToAll.mapping = mapping
+        HelixAllToAllNative.mapping = mapping
 
         # Get workspace size (in bytes)
         dummy = torch.empty(0, device="cuda")
@@ -160,18 +160,18 @@ class HelixAllToAll:
                 dummy, mapping.cp_size)
 
         # Allocate MNNVL memory using CP communicator for Helix
-        HelixAllToAll.workspace = HelixCpMnnvlMemory(mapping,
+        HelixAllToAllNative.workspace = HelixCpMnnvlMemory(mapping,
                                                      workspace_size_per_rank)
-        HelixAllToAll.workspace_tensor = (
-            HelixAllToAll.workspace.as_torch_strided_tensor(torch.uint64))
+        HelixAllToAllNative.workspace_tensor = (
+            HelixAllToAllNative.workspace.as_torch_strided_tensor(torch.uint64))
 
         torch.ops.trtllm.initializeHelixWorkspace(
-            HelixAllToAll.workspace_tensor, mapping.cp_rank, mapping.cp_size)
+            HelixAllToAllNative.workspace_tensor, mapping.cp_rank, mapping.cp_size)
         torch.cuda.synchronize()
         HelixCpMnnvlMemory.get_comm(mapping).barrier()
 
     @staticmethod
-    def alltoall(field0: torch.Tensor,
+    def alltoall_native(field0: torch.Tensor,
                  field1: torch.Tensor,
                  is_fused: bool = False):
         """
@@ -185,15 +185,15 @@ class HelixAllToAll:
         Returns:
             Tuple of (field0_out, field1_out) with same shapes as inputs, or single tensor for fused
         """
-        assert (HelixAllToAll.workspace_tensor
+        assert (HelixAllToAllNative.workspace_tensor
                 is not None), "Must call initialize() first"
 
         field0_out, field1_out = torch.ops.trtllm.helixAllToAllNative(
             field0,
             field1,
-            HelixAllToAll.workspace_tensor,
-            HelixAllToAll.mapping.cp_rank,
-            HelixAllToAll.mapping.cp_size,
+            HelixAllToAllNative.workspace_tensor,
+            HelixAllToAllNative.mapping.cp_rank,
+            HelixAllToAllNative.mapping.cp_size,
         )
 
         return field0_out, field1_out
@@ -1188,56 +1188,53 @@ class MLA(nn.Module):
             kv_lora_rank = partial_o.shape[-1] // self.num_heads_tp
             assert self.kv_lora_rank == kv_lora_rank
 
-            # Switch between FIFO-based (NCCL) and native all-to-all based on env variable
+            # Switch between NCCL-based and FIFO-based (MNNVL) all-to-all based on env variable.
             if os.getenv("TRTLLM_USE_NCCL_FOR_HELIX", "0") == "1":
-                # FIFO-based implementation using NCCL alltoall_helix
-                # this is the post-processing of helix parallel attention,
-                # similar to the post-processing of ring attention
-                # transpose the tensors to make the split across cp_size contiguous
-                # for both tensors, we need to split across the second dimension
+                # NCCL-based implementation using alltoall_helix.
+                # This is the post-processing of helix parallel attention,
+                # similar to the post-processing of ring attention.
+                # Transpose the tensors to make the split across cp_size contiguous
+                # For both tensors, we need to split across the second dimension.
                 chunks = []
                 for t in [partial_o, softmax_stats]:
                     t = t.transpose(1, 0).contiguous()
                     chunks.extend(
                         torch.split(t, t.shape[0] // self.mapping.cp_size))
                 gathered = alltoall_helix(chunks, self.mapping.cp_group)
-                # transpose the tensors back to ensure dimensions are ordered correctly
-                # note: an additional dimension was added at the first index for all-to-all,
-                # so the transpose dimensions are shifted by 1
+                # Transpose the tensors back to ensure dimensions are ordered correctly.
+                # Note: an additional dimension was added at the first index for all-to-all,
+                # so the transpose dimensions are shifted by 1.
                 gathered = [t.transpose(1, 2).contiguous() for t in gathered]
                 return torch.ops.trtllm.helix_post_process(
                     gathered[0], gathered[1], 1.0)
             else:
-                # Native all-to-all implementation using MNNVL workspace
-                # Initialize Helix All-to-All workspace if needed
-                HelixAllToAll.initialize(self.mapping)
+                # FIFO-based implementation using MNNVL workspace and LL128 Proto.
+                # Initialize Helix All-to-All workspace if needed.
+                HelixAllToAllNative.initialize(self.mapping)
 
-                # Get dimensions
+                # Get dimensions.
                 num_tokens = partial_o.shape[0]
                 cp_size = self.mapping.cp_size
+                assert cp_size > 1, f"cp_size must be greater than 1 for helix, but got {cp_size}."
 
-                # Reshape for native all-to-all:
-                # partial_o: [num_tokens, num_heads * kv_lora_rank] -> [num_tokens, cp_size, heads_per_rank, kv_lora_rank]
-                # softmax_stats: [num_tokens, num_heads, 2] -> [num_tokens, cp_size, heads_per_rank, 2]
-                assert self.num_heads_tp % cp_size == 0, f"num_heads ({self.num_heads_tp}) must be divisible by cp_size ({cp_size})"
-                heads_per_rank = self.num_heads_tp // cp_size
+                # Reshape for FIFO-based all-to-all.
+                # partial_o: [num_tokens, num_heads * kv_lora_rank] -> [num_tokens, cp_size, num_heads_tp_cp, kv_lora_rank]
+                # softmax_stats: [num_tokens, num_heads, 2] -> [num_tokens, cp_size, num_heads_tp_cp, 2]
 
-                # TODO: allToall currently expects the cp_size dimension to be the last-but-one dimension.
-                # Ideally, it must be last-but-two dimension.
-                field0 = partial_o.view(num_tokens, cp_size, heads_per_rank,
+                field0 = partial_o.view(num_tokens, cp_size, self.num_heads_tp_cp,
                                         kv_lora_rank).transpose(1,
                                                                 2).contiguous()
-                field1 = softmax_stats.view(num_tokens, cp_size, heads_per_rank,
+                field1 = softmax_stats.view(num_tokens, cp_size, self.num_heads_tp_cp,
                                             2).transpose(1, 2).contiguous()
 
-                # Call native helixAllToAll
-                field0_out, field1_out = HelixAllToAll.alltoall(field0, field1)
+                # Call FIFO-based helixAllToAll.
+                field0_out, field1_out = HelixAllToAllNative.alltoall_native(field0, field1)
 
-                # field0_out: [num_tokens, heads_per_rank, cp_size, kv_lora_rank]
-                # field1_out: [num_tokens, heads_per_rank, cp_size, 2]
+                # field0_out: [num_tokens, num_heads_tp_cp, cp_size, kv_lora_rank]
+                # field1_out: [num_tokens, num_heads_tp_cp, cp_size, 2]
                 # cp_dim = 2 (the dimension where cp_size is located)
 
-                # Call helixPostProcessNative with cp_dim=2
+                # Call helixPostProcessNative with cp_dim=2.
                 return torch.ops.trtllm.helixPostProcessNative(
                     field0_out, field1_out, 1.0, 2)
         else:

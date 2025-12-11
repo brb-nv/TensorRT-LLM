@@ -99,7 +99,7 @@ __device__ __forceinline__ int g2sAllFields(
     }
     else
     {
-        ldgsts<8>(reinterpret_cast<uint8_t*>(shmemBase) + totalSize, getPtr(fieldInfo[1], dataIndex), laneId == 0);
+        ldgsts<8>(reinterpret_cast<int*>(shmemBase + totalSize), reinterpret_cast<int const*>(getPtr(fieldInfo[1], dataIndex)), laneId == 0);
         cp_async_commit_group();
     }
 
