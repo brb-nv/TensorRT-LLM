@@ -393,6 +393,7 @@ void helixPostProcessNative(HelixPostProcParams<T> const& params, cudaStream_t s
     // Check that gathered_o is 16-byte aligned
     TLLM_CHECK_WITH_INFO(reinterpret_cast<uintptr_t>(params.gathered_o) % 16 == 0,
         "gathered_o must be 16-byte aligned for async memcpy");
+    // TODO: Figure why this constraint is specific to this implementation and not legacy one.
     TLLM_CHECK_WITH_INFO((params.kv_lora_rank * sizeof(T)) <= MAX_KV_LORA_BYTES,
         "kv_lora_rank * sizeof(T) must be <= ", MAX_KV_LORA_BYTES, " bytes");
     // Check that kv_lora_rank * sizeof(T) is a multiple of 16
