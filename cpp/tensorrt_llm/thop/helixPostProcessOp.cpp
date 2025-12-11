@@ -105,24 +105,28 @@ inline torch::Tensor helix_post_process_impl(
     CHECK_CONTIGUOUS(gathered_o);
     CHECK_TH_CUDA(gathered_stats);
     CHECK_CONTIGUOUS(gathered_stats);
-    auto tokens_dim = 1 - (cp_dim == 0 ? 0 : 1);
-    auto heads_dim = 2 - (cp_dim == 2 ? 1 : 0);
+
+    // Only cp_dim=2 is supported
+    TORCH_CHECK(cp_dim == 2, "cp_dim must be 2. Only cp_dim=2 layout is supported: "
+        "gathered_o: [num_tokens, num_heads, cp_size, kv_lora_rank], "
+        "gathered_stats: [num_tokens, num_heads, cp_size, 2]");
+
+    // For cp_dim=2: tokens_dim=0, heads_dim=1
+    auto tokens_dim = 0;
+    auto heads_dim = 1;
 
     TORCH_CHECK(gathered_o.dim() == 4,
-        "gathered_o must be 4D tensor [cp_size, "
-        "num_tokens, num_heads, kv_lora_rank] "
-        "where cp_size is at index cp_dim");
+        "gathered_o must be 4D tensor [num_tokens, num_heads, cp_size, kv_lora_rank]");
     TORCH_CHECK(gathered_stats.dim() == 4,
-        "gathered_stats must be 4D tensor [cp_size, num_tokens, num_heads, 2] "
-        "where cp_size is at index cp_dim");
+        "gathered_stats must be 4D tensor [num_tokens, num_heads, cp_size, 2]");
 
-    auto const cp_size = gathered_stats.sizes()[cp_dim];
     auto const num_tokens = gathered_stats.sizes()[tokens_dim];
     auto const num_heads = gathered_stats.sizes()[heads_dim];
+    auto const cp_size = gathered_stats.sizes()[2];
     auto const kv_lora_rank = gathered_o.sizes()[3];
 
     // check remaining input tensor dimensions
-    TORCH_CHECK(gathered_o.sizes()[cp_dim] == cp_size, "gathered_o cp_dim must match cp_size");
+    TORCH_CHECK(gathered_o.sizes()[2] == cp_size, "gathered_o cp_size dim must match");
     TORCH_CHECK(gathered_o.sizes()[tokens_dim] == num_tokens, "gathered_o tokens_dim must match num_tokens");
     TORCH_CHECK(gathered_o.sizes()[heads_dim] == num_heads, "gathered_o heads_dim must match num_heads");
 
@@ -152,7 +156,7 @@ inline torch::Tensor helix_post_process_impl(
     tensorrt_llm::kernels::HelixPostProcParams<T> params{reinterpret_cast<T*>(output.mutable_data_ptr()),
         reinterpret_cast<T const*>(gathered_o.data_ptr()), reinterpret_cast<float2 const*>(gathered_stats.data_ptr()),
         static_cast<int>(cp_size), static_cast<int>(num_tokens), static_cast<int>(num_heads),
-        static_cast<int>(kv_lora_rank), cp_dim};
+        static_cast<int>(kv_lora_rank)};
     fn(params, stream);
 
     if (scale != 1.0)
@@ -187,7 +191,7 @@ inline torch::Tensor helix_post_process_impl_version(
     }
     else if constexpr (version == 2)
     {
-        TORCH_CHECK(cp_dim >= 0 && cp_dim <= 2, "cp_dim must be 0, 1, or 2 for version 2");
+        TORCH_CHECK(cp_dim == 2, "cp_dim must be 2. Only cp_dim=2 layout is supported.");
         if (gathered_o.scalar_type() == at::ScalarType::Half)
         {
             return helix_post_process_impl<__half>(

@@ -244,17 +244,11 @@ static constexpr int MAX_KV_LORA_BYTES = (MAX_THREADS - WARP_SIZE) * BYTES_O_PER
 
 // Kernel: fused helix post-processing
 // output: [num_tokens, num_heads * kv_lora_rank] (half)
-// gathered_o: [cp_size, num_tokens, num_heads * kv_lora_rank] (half)
-// gathered_stats: [cp_size, num_tokens, num_heads, 2] (fp32)
-// note: the above is for CP_DIM == 0, for CP_DIM == 1, expected shapes are
-// gathered_o: [num_tokens, cp_size, num_heads * kv_lora_rank] (half)
-// gathered_stats: [num_tokens, cp_size, num_heads, 2] (fp32)
-// for CP_DIM == 2, expected shapes are
 // gathered_o: [num_tokens, num_heads, cp_size, kv_lora_rank] (half)
 // gathered_stats: [num_tokens, num_heads, cp_size, 2] (fp32)
 // note: we explicitly avoid using restrict here, to avoid getting ld.global.nc
 // which may have longer latency
-template <int CP_DIM = 0, typename T>
+template <typename T>
 __global__ void __launch_bounds__(MAX_THREADS) helix_postprocess_kernel_native(
     T* output, T const* gathered_o, float2 const* gathered_stats, int cp_size, int kv_lora_rank)
 {
@@ -280,60 +274,13 @@ __global__ void __launch_bounds__(MAX_THREADS) helix_postprocess_kernel_native(
     // all warps except first pre-load the gathered_o elements for the current
     // token/head
     T const* gathered_o_off;
-    if constexpr (CP_DIM == 0)
-    {
-        gathered_o_off = gathered_o + tok_idx * num_heads * kv_lora_rank + head_idx * kv_lora_rank;
-    }
-    else if constexpr (CP_DIM == 1)
-    {
-        gathered_o_off = gathered_o + tok_idx * cp_size * num_heads * kv_lora_rank + head_idx * kv_lora_rank;
-    }
-    else
-    {
-        gathered_o_off = gathered_o + tok_idx * num_heads * cp_size * kv_lora_rank + head_idx * cp_size * kv_lora_rank;
-    }
+    gathered_o_off = gathered_o + tok_idx * num_heads * cp_size * kv_lora_rank + head_idx * cp_size * kv_lora_rank;
     // we subtract WARP_SIZE because first warp is not participating in pre-load
     gathered_o_off += (threadIdx.x - WARP_SIZE) * NUM_O_PER_THREAD;
     float4 const* gathered_o_16b = reinterpret_cast<float4 const*>(gathered_o_off);
-    int gathered_16b_stride;
-    if constexpr (CP_DIM == 0)
-    {
-        gathered_16b_stride = (num_tokens * num_heads * kv_lora_rank) / NUM_O_PER_THREAD;
-    }
-    else if constexpr (CP_DIM == 1)
-    {
-        gathered_16b_stride = (num_heads * kv_lora_rank) / NUM_O_PER_THREAD;
-    }
-    else
-    {
-        gathered_16b_stride = (kv_lora_rank) / NUM_O_PER_THREAD;
-    }
-    int stats_offset;
-    if constexpr (CP_DIM == 0)
-    {
-        stats_offset = tok_idx * num_heads + head_idx;
-    }
-    else if constexpr (CP_DIM == 1)
-    {
-        stats_offset = tok_idx * cp_size * num_heads + head_idx;
-    }
-    else
-    {
-        stats_offset = tok_idx * num_heads * cp_size + head_idx * cp_size;
-    }
-    int stats_stride;
-    if constexpr (CP_DIM == 0)
-    {
-        stats_stride = num_tokens * num_heads;
-    }
-    else if constexpr (CP_DIM == 1)
-    {
-        stats_stride = num_heads;
-    }
-    else
-    {
-        stats_stride = 1;
-    }
+    int gathered_16b_stride = (kv_lora_rank) / NUM_O_PER_THREAD;
+    int stats_offset = tok_idx * num_heads * cp_size + head_idx * cp_size;
+    int stats_stride = 1;
 
     // here we have to wait for memory operations of the previous kernel to
     // complete
@@ -454,16 +401,7 @@ void helixPostProcessNative(HelixPostProcParams<T> const& params, cudaStream_t s
     // Check that cp_size is not larger than the max fallback CP size
     TLLM_CHECK_WITH_INFO(params.cp_size <= MAX_CP, "cp_size > fallback max CP size");
 
-    auto get_kernel = [](int cp_dim)
-    {
-        switch (cp_dim)
-        {
-        case 0: return helix_postprocess_kernel_native<0, T>;
-        case 1: return helix_postprocess_kernel_native<1, T>;
-        default: return helix_postprocess_kernel_native<2, T>;
-        }
-    };
-    auto kernel_instance = get_kernel(params.cp_dim);
+    auto kernel_instance = helix_postprocess_kernel_native<T>;
     cudaLaunchConfig_t config;
     config.gridDim = dim3(params.num_tokens, params.num_heads);
     config.blockDim = WARP_SIZE + params.kv_lora_rank * sizeof(T) / 16;
