@@ -1234,8 +1234,8 @@ class MLA(nn.Module):
                 # field1_out: [num_tokens, num_heads_tp_cp, cp_size, 2]
                 # cp_dim = 2 (the dimension where cp_size is located)
 
-                # Call helixPostProcessNative with cp_dim=2.
-                return torch.ops.trtllm.helixPostProcessNative(
+                # Call helix_post_process_native with cp_dim=2.
+                return torch.ops.trtllm.helix_post_process_native(
                     field0_out, field1_out, 1.0, 2)
         else:
             attn_output = attn_backend.forward(q, k, v, attn_metadata, **kwargs)

@@ -98,7 +98,7 @@ torch::Tensor helix_post_process(torch::Tensor const& gathered_o, torch::Tensor 
 }
 
 template <typename T, typename Fn>
-inline torch::Tensor helix_post_process_impl(
+inline torch::Tensor helix_post_process_native_impl(
     torch::Tensor const& gathered_o, torch::Tensor const& gathered_stats, double scale, int cp_dim, Fn fn)
 {
     CHECK_TH_CUDA(gathered_o);
@@ -107,8 +107,8 @@ inline torch::Tensor helix_post_process_impl(
     CHECK_CONTIGUOUS(gathered_stats);
 
     // Only cp_dim=2 is supported
-    TORCH_CHECK(cp_dim == 2, "cp_dim must be 2. Only cp_dim=2 layout is supported: "
-        "gathered_o: [num_tokens, num_heads, cp_size, kv_lora_rank], "
+    TORCH_CHECK(cp_dim == 2, "cp_dim must be 2. Expects tensor shapes to be: \n"
+        "gathered_o: [num_tokens, num_heads, cp_size, kv_lora_rank], \n"
         "gathered_stats: [num_tokens, num_heads, cp_size, 2]");
 
     // For cp_dim=2: tokens_dim=0, heads_dim=1
@@ -167,23 +167,23 @@ inline torch::Tensor helix_post_process_impl(
     return output;
 }
 
-inline torch::Tensor helixPostProcessNative(
+inline torch::Tensor helix_post_process_native(
     torch::Tensor const& gathered_o, torch::Tensor const& gathered_stats, double scale, int64_t cp_dim)
 {
     TORCH_CHECK(cp_dim == 2, "cp_dim must be 2. Only cp_dim=2 layout is supported.");
     if (gathered_o.scalar_type() == at::ScalarType::Half)
     {
-        return helix_post_process_impl<__half>(
+        return helix_post_process_native_impl<__half>(
             gathered_o, gathered_stats, scale, int(cp_dim), tensorrt_llm::kernels::helixPostProcessNative<__half>);
     }
     else if (gathered_o.scalar_type() == at::ScalarType::BFloat16)
     {
-        return helix_post_process_impl<__nv_bfloat16>(gathered_o, gathered_stats, scale, int(cp_dim),
+        return helix_post_process_native_impl<__nv_bfloat16>(gathered_o, gathered_stats, scale, int(cp_dim),
             tensorrt_llm::kernels::helixPostProcessNative<__nv_bfloat16>);
     }
     else
     {
-        TLLM_THROW("helixPostProcessNative only supports half and bfloat16 tensors.");
+        TLLM_THROW("helix_post_process_native only supports half and bfloat16 tensors.");
     }
 }
 
@@ -191,14 +191,14 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def("helix_post_process(Tensor gathered_o, Tensor gathered_stats, float scale) -> Tensor");
     m.def(
-        "helixPostProcessNative(Tensor gathered_o, Tensor gathered_stats, float "
+        "helix_post_process_native(Tensor gathered_o, Tensor gathered_stats, float "
         "scale, int cp_dim) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
     m.impl("helix_post_process", helix_post_process);
-    m.impl("helixPostProcessNative", &helixPostProcessNative);
+    m.impl("helix_post_process_native", &helix_post_process_native);
 }
 
 } // namespace torch_ext
