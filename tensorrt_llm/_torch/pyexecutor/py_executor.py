@@ -2024,6 +2024,8 @@ class PyExecutor:
             for req in new_gen_reqs:
                 req.state = LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
             return
+        else:
+            assert False, "TRTLLM_DISAGG_BENCHMARK_GEN_ONLY is not set."
 
         if os.getenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP") == "1":
             for req in new_gen_reqs:

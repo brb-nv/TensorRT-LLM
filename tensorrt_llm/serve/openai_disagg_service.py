@@ -190,6 +190,8 @@ class OpenAIDisaggregatedService(OpenAIService):
             )
             request.ignore_eos = True
             return True
+        else:
+            assert False, "TRTLLM_DISAGG_BENCHMARK_GEN_ONLY is not set."
         return False
 
     async def cluster_info(self) -> Dict[str, Any]:
@@ -252,6 +254,7 @@ class OpenAIDisaggregatedService(OpenAIService):
     async def _wait_for_all_servers_ready(self) -> None:
         # Skip context servers if TRTLLM_DISAGG_BENCHMARK_GEN_ONLY is set
         gen_only = os.getenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY") == "1"
+        assert gen_only, "TRTLLM_DISAGG_BENCHMARK_GEN_ONLY is not set."
 
         async def check_servers_ready():
             elapsed_time = 0
