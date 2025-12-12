@@ -112,6 +112,8 @@ echo "  server_env_var: ${server_env_var}"
 # Set TRTLLM_DISAGG_BENCHMARK_GEN_ONLY=1 for gen_only_no_context mode
 if [ "${benchmark_mode}" = "gen_only_no_context" ]; then
     export TRTLLM_DISAGG_BENCHMARK_GEN_ONLY=1
+    worker_env_var="${worker_env_var} TRTLLM_DISAGG_BENCHMARK_GEN_ONLY=1"
+    server_env_var="${server_env_var} TRTLLM_DISAGG_BENCHMARK_GEN_ONLY=1"
     echo "Setting TRTLLM_DISAGG_BENCHMARK_GEN_ONLY=1 for gen_only_no_context mode"
 fi
 
@@ -159,7 +161,7 @@ elif [ -d "${trtllm_repo}" ]; then
 
     if [ "${build_wheel}" = "true" ]; then
         echo "Building TensorRT-LLM wheel on one node..."
-        build_command="python3 ./scripts/build_wheel.py --trt_root /usr/local/tensorrt --benchmarks --use_ccache"
+        build_command="python3 ./scripts/build_wheel.py --trt_root /usr/local/tensorrt --benchmarks --use_ccache --clean"
         if [ -n "${cuda_architectures:-}" ]; then
             build_command="${build_command} --cuda_architectures \"${cuda_architectures}\""
         fi
