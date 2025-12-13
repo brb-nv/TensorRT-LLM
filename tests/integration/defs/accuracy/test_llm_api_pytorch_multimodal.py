@@ -219,7 +219,7 @@ class TestPhi4MMFusedVisionLora(LlmapiAccuracyTestHarness):
 class TestGemma3_27BInstruct(LlmapiAccuracyTestHarness):
     MODEL_NAME = "google/gemma-3-27b-it"
     MODEL_PATH = f"{llm_models_root()}/gemma/gemma-3-27b-it/"
-    MAX_NUM_TOKENS = 25600
+    MAX_NUM_TOKENS = 8704 * 4
 
     sampling_params = SamplingParams(
         max_tokens=MAX_NUM_TOKENS, truncate_prompt_tokens=MMMU.MAX_INPUT_LEN, stop="<end_of_turn>"
@@ -236,8 +236,9 @@ class TestGemma3_27BInstruct(LlmapiAccuracyTestHarness):
         # Gemma3 VLM needs FlashInfer attention backend for custom mask support
         with LLM(
             self.MODEL_PATH,
-            max_batch_size=32,
+            max_batch_size=4,
             max_num_tokens=self.MAX_NUM_TOKENS,
+            max_seq_len=8704,  # 8192 + 512.
             kv_cache_config=self.kv_cache_config,
             attn_backend="FLASHINFER",
             cuda_graph_config=None,

@@ -18,4 +18,4 @@ nvidia/NVIDIA-Nemotron-Nano-12B-v2-VL-BF16:
 microsoft/Phi-4-multimodal-instruct:
   - accuracy: 53.67
 google/gemma-3-27b-it:
-  - accuracy: 56.0
+  - accuracy: 53.0
