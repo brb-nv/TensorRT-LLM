@@ -7,6 +7,8 @@ from transformers import Gemma3TextConfig
 
 from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
     BaseWeightMapper
+from tensorrt_llm._torch.modules.multimodal_mask import \
+    generate_multimodal_attention_mask
 from tensorrt_llm._torch.modules.qk_norm_attention import QKNormRoPEAttention
 from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
 from tensorrt_llm.mapping import Mapping
@@ -377,16 +379,13 @@ class Gemma3ForCausalLM(DecoderModelForCausalLM[Gemma3TextModel,
         assert (cached_token_lens == 0).all(
         ), "cached_token_lens should be 0 for context requests since chunked prefill and kv cache reuse must be disabled."
 
-        # Create masks for context requests.
-        context_mask_list = []
-        for i in range(num_contexts):
-            mask_i = self.get_context_mask(
-                image_token_mask=image_token_mask[qo_indptr[i]:qo_indptr[i +
-                                                                         1]],
-                effective_sliding_window=effective_sliding_window,
-            )
-            context_mask_list.append(mask_i.flatten())
-        return torch.cat(context_mask_list, dim=0).contiguous()
+        # Use Triton kernel for efficient mask generation
+        return generate_multimodal_attention_mask(
+            image_token_mask=image_token_mask,
+            qo_indptr=qo_indptr,
+            num_contexts=num_contexts,
+            effective_sliding_window=effective_sliding_window,
+        )
 
     @torch.inference_mode()
     def forward(
