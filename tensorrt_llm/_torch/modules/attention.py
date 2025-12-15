@@ -908,13 +908,14 @@ class MLA(nn.Module):
             gpus_per_node=self.mapping.gpus_per_node,
             enable_attention_dp=self.mapping.enable_attention_dp,
         )
-        weight_name = None
+        # Compute override_tp_rank to swap tp_ranks 1 and 2 when using CP mapping
+        override_tp_rank = None
         if mapping_with_cp is not None:
-            print("[MLA::__init__] Found o_proj with CP mapping. Setting weight_name to o_proj_with_cp.")
-            weight_name = "o_proj_with_cp"
-        else:
-            print("[MLA::__init__] No CP mapping found. Setting weight_name to None.")
-            weight_name = None
+            original_tp_rank = mapping_o.tp_rank
+            if original_tp_rank == 1:
+                override_tp_rank = 2
+            elif original_tp_rank == 2:
+                override_tp_rank = 1
         self.o_proj = Linear(
             self.num_key_value_heads * self.v_head_dim,
             self.hidden_size,
@@ -927,7 +928,7 @@ class MLA(nn.Module):
             reduce_output=reduce_output,
             allreduce_strategy=config.allreduce_strategy,
             force_dynamic_quantization=config.force_dynamic_quantization,
-            weight_name=weight_name
+            override_tp_rank=override_tp_rank,
         )
 
         def yarn_get_mscale(scale=1, mscale=1):

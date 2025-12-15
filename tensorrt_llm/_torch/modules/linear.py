@@ -115,14 +115,6 @@ def load_weight_shard(
     if width == 1:
         return maybe_convert_to_torch_tensor(weight)
 
-    if weight_name is not None and tensor_parallel_rank == 1:
-        print(f"[load_weight_shard] SWAPPING O_PROJ RANK 1 TO 2.")
-        tensor_parallel_rank = 2
-        assert tensor_parallel_size == 4 and tensor_parallel_rank == 2
-    elif weight_name is not None and tensor_parallel_rank == 2:
-        print(f"[load_weight_shard] SWAPPING O_PROJ RANK 2 TO 1.")
-        tensor_parallel_rank = 1
-        assert tensor_parallel_size == 4 and tensor_parallel_rank == 1
     slice_width = math.ceil(width / tensor_parallel_size)
     slice_start = tensor_parallel_rank * slice_width
     slice_end = min((tensor_parallel_rank + 1) * slice_width, width)
@@ -162,9 +154,11 @@ def load_weights_vanilla_helper(module: Linear,
             assert "bias" in weights[0]
     device = torch.device('cuda')
 
+    # Use override_tp_rank if set, otherwise fall back to tp_rank
+    effective_tp_rank = module.override_tp_rank if module.override_tp_rank is not None else module.tp_rank
     weight = load_weight_shard(weights[0]['weight'], module.tp_size,
-                               module.tp_rank, module.tp_mode,
-                               device, weight_name=weight_name) if "weight" in weights[0] else None
+                               effective_tp_rank, module.tp_mode,
+                               device) if "weight" in weights[0] else None
 
     if weight is not None:
         if module.has_weight_only_quant:
@@ -180,8 +174,8 @@ def load_weights_vanilla_helper(module: Linear,
 
     if module.bias is not None:
         bias = load_weight_shard(weights[0]['bias'], module.tp_size,
-                                 module.tp_rank, module.tp_mode,
-                                 device, weight_name=weight_name) if "bias" in weights[0] else None
+                                 effective_tp_rank, module.tp_mode,
+                                 device) if "bias" in weights[0] else None
         if bias is not None:
             copy_weight(module.bias, bias_transform(bias))
 
@@ -2079,6 +2073,7 @@ class Linear(nn.Module):
         fused_weight_shard_indices_mapping: Optional[dict] = None,
         nvfp4_allowed_backends: Optional[List[str]] = None,
         weight_name: Optional[str] = None,
+        override_tp_rank: Optional[int] = None,
     ):
         """
         Args:
@@ -2125,6 +2120,7 @@ class Linear(nn.Module):
         else:
             self.weight_name = None
 
+        self.override_tp_rank = override_tp_rank
         local_in_features = in_features
         local_out_features = out_features
 
