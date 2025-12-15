@@ -68,10 +68,7 @@ def load_weight_shard(
     tensor_parallel_mode: Optional[TensorParallelMode] = None,
     device: torch.device = torch.device('cpu'),
     return_slice_indices: bool = False,
-    weight_name: Optional[str] = None,
 ) -> torch.Tensor:
-    if weight_name is not None:
-        print(f"[load_weight_shard] weight_name: {weight_name}")
     # Skip device transfers on integrated GPUs to conserve shared memory
     if weight.device.type != device.type and is_device_integrated():
         # For integrated GPU systems (e.g., DGX Spark), CPU and GPU share limited physical memory.
@@ -143,10 +140,7 @@ def load_weights_vanilla_helper(module: Linear,
                                 weights: List[Dict],
                                 weight_transform=lambda x: x,
                                 bias_transform=lambda x: x,
-                                allow_partial_loading: bool = False,
-                                weight_name: Optional[str] = None):
-    if weight_name is not None:
-        print(f"[load_weights_vanilla_helper] weight_name: {weight_name}")
+                                allow_partial_loading: bool = False):
     assert len(weights) == 1
     if not allow_partial_loading:
         assert "weight" in weights[0]
@@ -319,8 +313,7 @@ class LinearMethodBase(ABC):
                      module: Linear,
                      weights: List[Dict],
                      weight_mode: WeightMode,
-                     allow_partial_loading: bool = False,
-                     weight_name: Optional[str] = None):
+                     allow_partial_loading: bool = False):
         """
         Load weights from the checkpoint.
         """
@@ -328,7 +321,7 @@ class LinearMethodBase(ABC):
         if isinstance(self, UnquantizedLinearMethod):
             kargs['allow_partial_loading'] = allow_partial_loading
         if weight_mode == WeightMode.VANILLA:
-            self.load_weights_vanilla(module, weights, weight_name=weight_name, **kargs)
+            self.load_weights_vanilla(module, weights, **kargs)
         elif weight_mode == WeightMode.FUSED_QKV_LINEAR:
             self.load_weights_fused_qkv_linear(module, weights, **kargs)
         elif weight_mode == WeightMode.FUSED_GATE_UP_LINEAR:
@@ -348,8 +341,7 @@ class LinearMethodBase(ABC):
     def load_weights_vanilla(self,
                              module: Linear,
                              weights: List[Dict],
-                             allow_partial_loading: bool = False,
-                             weight_name: Optional[str] = None) -> None:
+                             allow_partial_loading: bool = False) -> None:
         """
         Load weights for the VANILLA weight mode.
         """
@@ -406,14 +398,10 @@ class UnquantizedLinearMethod(LinearMethodBase):
     def load_weights_vanilla(self,
                              module: Linear,
                              weights: List[Dict],
-                             allow_partial_loading: bool = False,
-                             weight_name: Optional[str] = None) -> None:
-        if weight_name is not None:
-            print(f"[UnquantizedLinearMethod::load_weights_vanilla] weight_name: {weight_name}")
+                             allow_partial_loading: bool = False) -> None:
         load_weights_vanilla_helper(module,
                                     weights,
-                                    allow_partial_loading=allow_partial_loading,
-                                    weight_name=weight_name)
+                                    allow_partial_loading=allow_partial_loading)
 
     def load_weights_fused_qkv_linear(
             self,
@@ -2072,7 +2060,6 @@ class Linear(nn.Module):
         disable_deep_gemm: bool = False,
         fused_weight_shard_indices_mapping: Optional[dict] = None,
         nvfp4_allowed_backends: Optional[List[str]] = None,
-        weight_name: Optional[str] = None,
         override_tp_rank: Optional[int] = None,
     ):
         """
@@ -2113,12 +2100,6 @@ class Linear(nn.Module):
         self.nvfp4_allowed_backends = nvfp4_allowed_backends or [
             'cutlass', 'cublaslt', 'cuda_core'
         ]
-
-        if weight_name is not None and "o_proj" in weight_name:
-            print("[Linear::__init__] Found o_proj with CP mapping. Setting weight_name to o_proj_with_cp.")
-            self.weight_name = "o_proj_with_cp"
-        else:
-            self.weight_name = None
 
         self.override_tp_rank = override_tp_rank
         local_in_features = in_features
@@ -2303,16 +2284,11 @@ class Linear(nn.Module):
         weight_mode = self.weights_loading_config.weight_mode
         if not isinstance(self.quant_method, UnquantizedLinearMethod):
             assert allow_partial_loading is False, "allow_partial_loading is only supported for non-unquantized linear methods now"
-        if self.weight_name is not None:
-            print("[Linear::load_weights] self.weight_name: ", self.weight_name, " uses quant method: ", self.quant_method)
-        else:
-            print("[Linear::load_weights] self.weight_name: None")
         self.quant_method.load_weights(
             self,
             weights,
             weight_mode,
-            allow_partial_loading=allow_partial_loading,
-            weight_name=self.weight_name)
+            allow_partial_loading=allow_partial_loading)
 
     def post_load_weights(self):
         self.quant_method.post_load_weights(self)
