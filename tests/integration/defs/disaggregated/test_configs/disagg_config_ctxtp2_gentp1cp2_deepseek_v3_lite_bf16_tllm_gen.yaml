@@ -4,7 +4,6 @@ model: DeepSeek-V3-Lite/bf16
 free_gpu_memory_fraction: 0.25
 backend: "pytorch"
 disable_overlap_scheduler: True
-cuda_graph_config: null
 context_servers:
   num_instances: 1
   enable_chunked_prefill: False
@@ -14,6 +13,8 @@ context_servers:
     tokens_per_block: 32
   tensor_parallel_size: 2
   pipeline_parallel_size: 1
+  # load_format: "dummy"
+  cuda_graph_config: null
   cache_transceiver_config:
     backend: "UCX"
   urls:
@@ -24,9 +25,13 @@ generation_servers:
   pipeline_parallel_size: 1
   context_parallel_size: 2
   enable_chunked_prefill: False
+  # load_format: "dummy"
   cp_config:
     cp_type: HELIX
     tokens_per_block: 32
+  cuda_graph_config:
+    enable_padding: True
+    batch_sizes: [4]
   kv_cache_config:
     enable_block_reuse: False
     enable_partial_reuse: False

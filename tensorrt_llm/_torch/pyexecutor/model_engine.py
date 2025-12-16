@@ -568,12 +568,13 @@ class PyTorchModelEngine(ModelEngine):
         # Reset the global cuda graph dummy request to None in warmup.
         self.cuda_graph_runner.padding_dummy_request = None
 
-        if self.mapping.cp_size > 1:
-            cp_type = self.mapping.cp_config.get("cp_type", None)
-            logger.info(
-                f"[ModelEngine::warmup] Skipping warmup for cp_type: {None if cp_type is None else cp_type.name}."
-            )
-            return
+        cp_type = self.mapping.cp_config.get('cp_type', None)
+        if cp_type is not None:
+            if cp_type in [CpType.ULYSSES, CpType.STAR, CpType.HELIX]:
+                logger.info(
+                    "[ModelEngine::warmup] Skipping warmup for cp_type: ",
+                    cp_type.name)
+                return
 
         self._run_torch_compile_warmup(resource_manager)
         self._run_autotuner_warmup(resource_manager)
@@ -843,6 +844,7 @@ class PyTorchModelEngine(ModelEngine):
             if num_left_over_tokens > 0:
                 ctx_token_nums.append(num_left_over_tokens)
 
+            print(f"[create_warmup_request] Call to add_dummy_requests under num_ctx_tokens > 0, num_ctx_tokens: {num_ctx_tokens}.")
             ctx_requests = kv_cache_manager.add_dummy_requests(
                 list(range(num_ctx_requests)),
                 token_nums=ctx_token_nums,
@@ -855,6 +857,7 @@ class PyTorchModelEngine(ModelEngine):
                     request_ids=list(range(num_ctx_requests)))
 
         if num_gen_tokens > 0:
+            print(f"[create_warmup_request] Call to add_dummy_requests under num_gen_tokens > 0, num_gen_tokens: {num_gen_tokens}.")
             gen_requests = kv_cache_manager.add_dummy_requests(
                 list(range(num_ctx_requests,
                            num_ctx_requests + num_gen_tokens)),
@@ -890,6 +893,7 @@ class PyTorchModelEngine(ModelEngine):
         num_extra_decoding_steps = self._get_num_extra_decoding_steps()
 
         # Add (batch_size - 1) dummy requests with seq_len=1.
+        print(f"[create_cuda_graph_warmup_request] Call to add_dummy_requests under batch_size - 1, batch_size: {batch_size - 1}.")
         requests = kv_cache_manager.add_dummy_requests(
             list(range(batch_size - 1)),
             is_gen=True,
@@ -913,6 +917,7 @@ class PyTorchModelEngine(ModelEngine):
         )
         token_num -= num_extra_decoding_steps
 
+        print(f"[create_cuda_graph_warmup_request] Call to add_dummy_requests under token_num, token_num: {token_num}.")
         max_seq_len_request = kv_cache_manager.add_dummy_requests(
             request_ids=[batch_size - 1],
             token_nums=[token_num],
@@ -1667,9 +1672,12 @@ class PyTorchModelEngine(ModelEngine):
 
                 position_id = past_seen_token_num
                 if self.mapping.has_cp_helix():
-                    # Warmup doesn't have `total_input_len_cp` set because merge_helix_requests is not called.
-                    if not self.is_warmup and not request.is_cuda_graph_dummy:
-                        position_id = request.total_input_len_cp + request.py_decoding_iter - 1
+                    assert not self.is_warmup, "Warmup is not called for helix parallelism."
+                    helix_is_inactive_rank_all_ranks = self.dist.cp_allgather(request.py_helix_is_inactive_rank)
+                    # print(f"[_prepare_tp_inputs][rank {self.dist.rank}][cp_rank {self.mapping.cp_rank}] helix_is_inactive_rank_all_ranks: {helix_is_inactive_rank_all_ranks}")
+                    helix_is_inactive_rank_all_ranks = torch.tensor(helix_is_inactive_rank_all_ranks, dtype=torch.long)
+                    assert torch.sum(helix_is_inactive_rank_all_ranks) == self.mapping.cp_size - 1, "There should be only one active rank in helix parallelism."
+                    position_id = request.total_input_len_cp + request.py_decoding_iter - 1
                     if request.py_helix_is_inactive_rank:
                         past_seen_token_num = request.seqlen_this_rank_cp
                     else:

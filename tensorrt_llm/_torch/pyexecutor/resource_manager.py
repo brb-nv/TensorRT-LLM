@@ -548,6 +548,13 @@ class KVCacheManager(BaseResourceManager):
                 for _ in range(num_extra_decoding_steps):
                     self.impl.add_token(req_id)
 
+            # When helix parallelism is active, mark only the last rank to be active.
+            if self.mapping.has_cp_helix():
+                if self.mapping.cp_size - 1 == self.mapping.cp_rank:
+                    req.py_helix_is_inactive_rank = False
+                else:
+                    req.py_helix_is_inactive_rank = True
+
             if is_gen:
                 req.state = LlmRequestState.GENERATION_IN_PROGRESS
                 req.prompt_len = token_num - 1
