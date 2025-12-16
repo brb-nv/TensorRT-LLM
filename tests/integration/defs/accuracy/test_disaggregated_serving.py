@@ -870,7 +870,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             "enable_chunked_prefill": False,
             "cuda_graph_config": {
                 "enable_padding": True,
-                "batch_sizes": [8]
+                "batch_sizes": [1, 2, 4, 8, 16]
             },
             "cache_transceiver_config": {
                 "backend": "UCX"
