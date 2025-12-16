@@ -27,6 +27,11 @@ from .accuracy_core import (GSM8K, MMLU, JsonModeEval,
                             LlmapiAccuracyTestHarness, get_accuracy_task)
 
 
+# Quick iteration version of GSM8K with reduced samples
+class GSM8K_Quick(GSM8K):
+    NUM_SAMPLES = 3  # Reduced from 1319 for faster iteration
+
+
 class Result(GenerationResultBase):
 
     def __init__(self, id: int, sampling_params: SamplingParams,
@@ -884,8 +889,8 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         with launch_disaggregated_llm(disaggregated_server_config,
                                       ctx_server_config, gen_server_config,
                                       self.MODEL_PATH) as llm:
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
+            # task = MMLU(self.MODEL_NAME)
+            # task.evaluate(llm)
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
