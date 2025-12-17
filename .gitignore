@@ -96,3 +96,6 @@ enroot/tensorrt_llm.devel.sqsh
 
 # MacOSX Files
 .DS_Store
+
+# Benchmark output directories (timestamped runs)
+examples/disaggregated/slurm/benchmark/202*/
