@@ -199,7 +199,11 @@ def submit_job(config, log_dir, dry_run):
     gen_world_size = gen_tp_size * gen_cp_size * gen_pp_size
     gen_nodes = calculate_nodes(gen_world_size, gen_num, gpus_per_node)
 
-    total_nodes = ctx_nodes + gen_nodes
+    mode = config['benchmark']['mode']
+    if mode == 'gen_only_no_context':
+        total_nodes = gen_nodes
+    else:
+        total_nodes = ctx_nodes + gen_nodes
     total_tasks = total_nodes * gpus_per_node
 
     # Generate log directory path based on configuration
@@ -209,10 +213,8 @@ def submit_job(config, log_dir, dry_run):
     gen_enable_attention_dp = worker_config['gen']['enable_attention_dp']
 
     if log_dir is None:
-        # Create base log directory path
-        date_prefix = datetime.now().strftime("%Y%m%d")
-        log_base = os.path.join(env_config['work_dir'],
-                                f"{date_prefix}/{isl}-{osl}")
+        # Create flat log directory path with timestamp including hours, minutes and seconds
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
         # Get eplb num_slots for gen worker
         load_balancer_config = worker_config['gen'].get('moe_config', {}).get(
@@ -222,19 +224,15 @@ def submit_job(config, log_dir, dry_run):
                 load_balancer_config = yaml.safe_load(f)
         eplb_num_slots = load_balancer_config.get('num_slots', 0)
 
-        # Get mtp_size from gen config's speculative_config
-        mtp_size = worker_config['gen'].get('speculative_config',
-                                            {}).get('num_nextn_predict_layers',
-                                                    0)
-
-        # Determine directory suffix based on attention_dp
+        # Determine config suffix based on attention_dp
         if gen_enable_attention_dp:
-            dir_suffix = f"disagg_ctx{ctx_num}_gen{gen_num}_dep{gen_tp_size}_batch{gen_batch_size}_eplb{eplb_num_slots}_mtp{mtp_size}"
+            config_suffix = f"ctx{ctx_num}_gen{gen_num}_dep{gen_tp_size}_cp{gen_cp_size}_batch{gen_batch_size}"
         else:
-            dir_suffix = f"disagg_ctx{ctx_num}_gen{gen_num}_tep{gen_tp_size}_batch{gen_batch_size}_eplb{eplb_num_slots}_mtp{mtp_size}"
+            config_suffix = f"ctx{ctx_num}_gen{gen_num}_tep{gen_tp_size}_cp{gen_cp_size}_batch{gen_batch_size}"
 
-        # Create full log directory path
-        log_dir = os.path.join(log_base, dir_suffix)
+        # Create full log directory path as a single flat directory
+        log_dir = os.path.join(env_config['work_dir'],
+                               f"{timestamp}_{isl}-{osl}_{config_suffix}")
 
     # Remove existing directory if it exists
     if os.path.exists(log_dir):
