@@ -1,42 +1,42 @@
 # SLURM Configuration
 slurm:
   script_file: "disaggr_torch.slurm"
-  partition: "<partition>"
-  account: "<account>"
+  partition: "gb300"
+  account: "coreai_comparch_trtllm"
   job_time: "02:00:00"
-  job_name: "<job_name>"
+  job_name: "coreai_comparch_trtllm-helix.benchmark"
   extra_args: "" # Cluster specific arguments, e.g. "--gres=gpu:4 --exclude=node1,node2"
   set_segment: true # Optional: whether to set the segment for the job
   numa_bind: true # Only enable for GB200/GB300 NVL72
 
 # Benchmark Mode
 benchmark:
-  mode: "e2e"  # Options: e2e, gen_only, gen_only_no_context
-  use_nv_sa_benchmark: false  # Whether to use NVIDIA SA benchmark script
-  multi_round: 8  # Number of benchmark rounds
-  benchmark_ratio: 0.8  # Benchmark ratio
+  mode: "gen_only_no_context"  # Options: e2e, gen_only, gen_only_no_context
+  use_nv_sa_benchmark: true  # Whether to use NVIDIA SA benchmark script
+  multi_round: 1  # Number of benchmark rounds
+  benchmark_ratio: 1.0  # Benchmark ratio
   streaming: true  # Enable streaming mode
-  concurrency_list: "16"
-  input_length: 1024  # Input sequence length
+  concurrency_list: "64"                        # @B: needs change. Make this batch size * 8.
+  input_length: 131072  # Input sequence length # @B: needs change.
   output_length: 1024  # Output sequence length
-  dataset_file: "<dataset_file>"
+  dataset_file: ""
 
 # Hardware Configuration
 hardware:
   gpus_per_node: 4  # Modify this with your hardware configuration
-  num_ctx_servers: 1  # Number of context servers
+  num_ctx_servers: 0  # Number of context servers (set to 0 for gen_only_no_context mode)
   num_gen_servers: 1  # Number of generation servers
 
 # Environment Configuration
 environment:
-  container_mount: "<container_mount>"  # Format: path1:path1,path2:path2
-  container_image: "<container_image>"
-  model_path: "<model_path>"
-  trtllm_repo: "<trtllm_repo>"
+  container_mount: "/lustre/fsw/coreai_comparch_trtllm:/lustre/fsw/coreai_comparch_trtllm"  # Format: path1:path1,path2:path2
+  container_image: "/lustre/fsw/coreai_comparch_trtllm/bbuddharaju/sqsh/tensorrt_llm_pytorch_25.10_py3_aarch64_ubuntu24.04_trt10.13.3.9_skip_tritondevel_202512151112_9977.sqsh"
+  model_path: "/lustre/fsw/coreai_comparch_trtllm/jiaganc/model/DeepSeek-R1/DeepSeek-R1-0528-FP4-v2/"
+  trtllm_repo: "/lustre/fsw/coreai_comparch_trtllm/bbuddharaju/TensorRT-LLM/"
   build_wheel: false  # Don't build the wheel when launching multiple jobs
-  cuda_architectures: ""  # Optional CUDA architectures to build for (e.g. "90-real;100-real"). If empty, builds for all architectures
-  trtllm_wheel_path: ""  # Path to pre-built TensorRT-LLM wheel. If provided, install from this wheel instead
-  work_dir: "<full_path_to_work_dir>"
+  cuda_architectures: "100-real"  # Optional CUDA architectures to build for (e.g. "90-real;100-real"). If empty, builds for all architectures
+  trtllm_wheel_path: "/lustre/fsw/coreai_comparch_trtllm/bbuddharaju/TensorRT-LLM/build/tensorrt_llm-1.2.0rc6-cp312-cp312-linux_aarch64.whl"  # Path to pre-built TensorRT-LLM wheel. If provided, install from this wheel instead
+  work_dir: "/lustre/fsw/coreai_comparch_trtllm/bbuddharaju/TensorRT-LLM/examples/disaggregated/slurm/benchmark"
   worker_env_var: "TLLM_LOG_LEVEL=INFO TRTLLM_SERVER_DISABLE_GC=1 TRTLLM_WORKER_DISABLE_GC=1 TRTLLM_ENABLE_PDL=1 ENROOT_ALLOW_DEV=yes"
   server_env_var: "TRTLLM_SERVER_DISABLE_GC=1"
 
@@ -55,36 +55,26 @@ accuracy:
 
 worker_config:
   gen:
-    tensor_parallel_size: 8
-    moe_expert_parallel_size: 8
-    enable_attention_dp: true
-    enable_lm_head_tp_in_adp: true
-    pipeline_parallel_size: 1
-    context_parallel_size: 1
+    tensor_parallel_size: 8                   # @B: needs change.
+    moe_expert_parallel_size: 8               # @B: needs change.
+    enable_attention_dp: false
+    enable_lm_head_tp_in_adp: false
+    pipeline_parallel_size: 1                 # @B: needs change.
+    context_parallel_size: 1                  # @B: needs change.
     # Uncomment this section to enable context parallelism.
     # cp_config:
     #   cp_type: "HELIX"
     #   tokens_per_block: 32  # must match kv_config.tokens_per_block.
-    max_batch_size: 256
-    max_num_tokens: 512
-    max_seq_len: 2251
+    max_batch_size: 4                         # @B: needs change.
+    max_num_tokens: 12                        # @B: needs change.
+    max_seq_len: 132096                       # @B: needs change.
     cuda_graph_config:
       enable_padding: true
-      batch_sizes:
+      batch_sizes:                            # @B: needs change. Make this [batch_size].
       - 1
       - 2
       - 4
       - 8
-      - 16
-      - 32
-      - 64
-      - 128
-      - 256
-      - 512
-      - 768
-      - 1024
-      - 2048
-      - 256
     print_iter_log: true
     trust_remote_code: true
     kv_cache_config:
@@ -94,17 +84,17 @@ worker_config:
       dtype: fp8
     moe_config:
       backend: CUTLASS
-      use_low_precision_moe_combine: true
-      load_balancer:
-        num_slots: 0
+      # use_low_precision_moe_combine: true
+      # load_balancer:
+      #   num_slots: 0
     cache_transceiver_config:
       max_tokens_in_buffer: 4608
-      backend: DEFAULT
+      backend: UCX
     stream_interval: 20
     num_postprocess_workers: 4
-    speculative_config: # when mtp_size is 0, remove this section.
-      decoding_type: MTP
-      num_nextn_predict_layers: 1
+    # speculative_config: # when mtp_size is 0, remove this section.
+    #   decoding_type: MTP
+    #   num_nextn_predict_layers: 1
   ctx:
     max_batch_size: 4
     max_num_tokens: 4608
@@ -124,7 +114,7 @@ worker_config:
       dtype: fp8
     cache_transceiver_config:
       max_tokens_in_buffer: 4608
-      backend: DEFAULT
-    speculative_config: # when mtp_size is 0, remove this section.
-      decoding_type: MTP
-      num_nextn_predict_layers: 1
+      backend: UCX
+    # speculative_config: # when mtp_size is 0, remove this section.
+    #   decoding_type: MTP
+    #   num_nextn_predict_layers: 1

@@ -168,7 +168,11 @@ def submit_job(config, log_dir):
     gen_world_size = gen_tp_size * gen_cp_size * gen_pp_size
     gen_nodes = calculate_nodes(gen_world_size, gen_num, gpus_per_node)
 
-    total_nodes = ctx_nodes + gen_nodes
+    mode = config['benchmark']['mode']
+    if mode == 'gen_only_no_context':
+        total_nodes = gen_nodes
+    else:
+        total_nodes = ctx_nodes + gen_nodes
     total_tasks = total_nodes * gpus_per_node
 
     # Generate log directory path based on configuration
@@ -234,6 +238,9 @@ def submit_job(config, log_dir):
             [str(device) for device in list(allocation["nodes"].values())[0]])
         worker_env_var = env_config[
             'worker_env_var'] + f" CUDA_VISIBLE_DEVICES={cuda_devices}"
+        # Add TRTLLM_DISAGG_BENCHMARK_GEN_ONLY=1 for gen_only_no_context mode
+        if mode == 'gen_only_no_context':
+            worker_env_var += " TRTLLM_DISAGG_BENCHMARK_GEN_ONLY=1"
         cmd = [
             "srun",
             "-l",
@@ -291,7 +298,7 @@ def submit_job(config, log_dir):
         *([] if not slurm_config['set_segment'] else [f'--segment={total_nodes}']),
         f'--output={log_dir}/slurm-%j.out',
         f'--error={log_dir}/slurm-%j.err',
-        f'--gpus-per-node={hw_config["gpus_per_node"]}',
+        # f'--gpus-per-node={hw_config["gpus_per_node"]}',
         *([arg for arg in slurm_config['extra_args'].split() if arg]),
         slurm_config['script_file'],
 
@@ -328,7 +335,7 @@ def submit_job(config, log_dir):
         '--model-args-extra', config['accuracy']['model_args_extra'],
 
         # Server environment variables
-        '--server-env-var', env_config['server_env_var']
+        '--server-env-var', env_config['server_env_var'],
     ]
     # yapf: enable
 
