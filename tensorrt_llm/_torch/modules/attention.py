@@ -1380,8 +1380,19 @@ class MLA(nn.Module):
                                                        self.qk_rope_head_dim)
         k = k.view(-1, self.num_heads_tp * self.qk_head_dim)
 
-        helix_position_offsets = position_ids if self.mapping.has_cp_helix(
-        ) else None
+        helix_position_offsets = None
+        if self.mapping.has_cp_helix():
+            # This path is being taken by unit testing.
+            # assert False, "Helix parallelism is not supported for context phase."
+            # Copy position_ids into static buffer for CUDA graph compatibility
+            if hasattr(attn_metadata, 'enable_helix') and attn_metadata.enable_helix:
+                attn_metadata.update_helix_param(
+                    helix_position_offsets=position_ids,
+                    helix_is_inactive_rank=None,
+                )
+                helix_position_offsets = attn_metadata.helix_position_offsets[:position_ids.shape[0]]
+            else:
+                helix_position_offsets = position_ids
 
         attn_output = self.mha.forward(
             q,
@@ -1763,8 +1774,19 @@ class MLA(nn.Module):
 
         helix_position_offsets, helix_is_inactive_rank = None, None
         if self.mapping.has_cp_helix():
-            helix_position_offsets = position_ids
-            helix_is_inactive_rank = attn_metadata.helix_is_inactive_rank
+            # Copy position_ids into static buffer for CUDA graph compatibility
+            if hasattr(attn_metadata, 'enable_helix') and attn_metadata.enable_helix:
+                # print("HAIDER [forward_absorption_generation] updating helix parameters with position_ids shape: ", position_ids.shape, " position_ids: ", position_ids)
+                attn_metadata.update_helix_param(
+                    helix_position_offsets=position_ids,
+                    helix_is_inactive_rank=None,
+                )
+                helix_position_offsets = attn_metadata.helix_position_offsets[:position_ids.shape[0]]
+                helix_is_inactive_rank = attn_metadata.helix_is_inactive_rank[:num_seqs]
+            else:
+                # assert False, "Helix must be enabled in attn_metadata for generation phase."
+                # This path is being taken by unit testing.
+                helix_position_offsets = position_ids
             assert helix_position_offsets is not None and helix_is_inactive_rank is not None, "helix_position_offsets and helix_is_inactive_rank must be provided for helix parallelism."
 
         rope_stream = self.aux_stream if not has_fp8_kv_cache else None

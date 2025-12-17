@@ -31,7 +31,7 @@ generation_servers:
     tokens_per_block: 32
   cuda_graph_config:
     enable_padding: True
-    batch_sizes: [4]
+    batch_sizes: [8]
   kv_cache_config:
     enable_block_reuse: False
     enable_partial_reuse: False

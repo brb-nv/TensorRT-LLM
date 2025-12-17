@@ -1020,6 +1020,7 @@ class PyTorchModelEngine(ModelEngine):
             cache_indirection=cache_indirection,
             sparse_attention_config=self.sparse_attention_config,
             num_heads_per_kv=num_heads_per_kv,
+            enable_helix=self.mapping.has_cp_helix() if self.mapping is not None else False,
         )
 
         return self.attn_metadata
@@ -2022,14 +2023,23 @@ class PyTorchModelEngine(ModelEngine):
 
         attn_metadata.request_ids = request_ids
         attn_metadata.prompt_lens = prompt_lengths
-        # print(f"[prepare_tp_inputs] BEFORE updating helix_is_inactive_rank: {helix_is_inactive_rank}")
+        # Update helix parameters by copying into static buffers for CUDA graph compatibility
         if helix_is_inactive_rank is not None and len(
                 helix_is_inactive_rank) > 0:
-            helix_is_inactive_rank = torch.tensor(helix_is_inactive_rank,
-                                                  dtype=torch.bool,
-                                                  device='cuda')
-        # print(f"[prepare_tp_inputs] AFTER updating helix_is_inactive_rank: {helix_is_inactive_rank}")
-        attn_metadata.helix_is_inactive_rank = helix_is_inactive_rank
+            helix_is_inactive_rank_tensor = torch.tensor(
+                helix_is_inactive_rank,
+                dtype=torch.bool,
+                pin_memory=True)
+            if attn_metadata.enable_helix:
+                # Copy into static buffer for CUDA graph compatibility
+                attn_metadata.update_helix_param(
+                    helix_position_offsets=None,
+                    helix_is_inactive_rank=helix_is_inactive_rank_tensor,
+                )
+            else:
+                # Fallback for non-CUDA graph mode
+                attn_metadata.helix_is_inactive_rank = helix_is_inactive_rank_tensor.to(
+                    device='cuda', non_blocking=True)
         attn_metadata.num_contexts = len(scheduled_requests.context_requests)
         # Use num_chunked_ctx_requests to record the number of extend context requests,
         # so that we can update the kv_lens_cuda correctly in _preprocess_inputs.

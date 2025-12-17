@@ -869,9 +869,10 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             "kv_cache_config": kv_cache_config,
             "enable_chunked_prefill": False,
             "cuda_graph_config": {
-                "enable_padding": True,
-                "batch_sizes": [1, 2, 4, 8, 16]
+                "enable_padding": False,
+                "batch_sizes": [1, 2, 4, 8, 16, 32, 64]
             },
+            # "cuda_graph_config": None,
             "cache_transceiver_config": {
                 "backend": "UCX"
             },
