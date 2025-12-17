@@ -11,20 +11,20 @@ slurm:
 
 # Benchmark Mode
 benchmark:
-  mode: "gen_only_no_context"  # Options: e2e, gen_only, gen_only_no_context
+  mode: "e2e"  # Options: e2e, gen_only, gen_only_no_context
   use_nv_sa_benchmark: true  # Whether to use NVIDIA SA benchmark script
   multi_round: 1  # Number of benchmark rounds
   benchmark_ratio: 1.0  # Benchmark ratio
   streaming: true  # Enable streaming mode
   concurrency_list: "64"                        # @B: needs change. Make this batch size * 8.
-  input_length: 131072  # Input sequence length # @B: needs change.
+  input_length: 128000  # Input sequence length # @B: needs change. (Leave room for chat template tokens)
   output_length: 1024  # Output sequence length
   dataset_file: ""
 
 # Hardware Configuration
 hardware:
   gpus_per_node: 4  # Modify this with your hardware configuration
-  num_ctx_servers: 0  # Number of context servers (set to 0 for gen_only_no_context mode)
+  num_ctx_servers: 1  # Number of context servers (set to 0 for gen_only_no_context mode)
   num_gen_servers: 1  # Number of generation servers
 
 # Environment Configuration
@@ -88,7 +88,7 @@ worker_config:
       # load_balancer:
       #   num_slots: 0
     cache_transceiver_config:
-      max_tokens_in_buffer: 4608
+      max_tokens_in_buffer: 131104
       backend: UCX
     stream_interval: 20
     num_postprocess_workers: 4
@@ -96,13 +96,13 @@ worker_config:
     #   decoding_type: MTP
     #   num_nextn_predict_layers: 1
   ctx:
-    max_batch_size: 4
-    max_num_tokens: 4608
-    max_seq_len: 1227
-    tensor_parallel_size: 4
+    max_batch_size: 1
+    max_num_tokens: 131104                       # @B: needs change. Must be >= input_length
+    max_seq_len: 131104                          # @B: needs change. Must be >= input_length + output_length
+    tensor_parallel_size: 8
     context_parallel_size: 1
-    moe_expert_parallel_size: 4
-    enable_attention_dp: true
+    moe_expert_parallel_size: 8
+    enable_attention_dp: false
     pipeline_parallel_size: 1
     print_iter_log: true
     trust_remote_code: true
@@ -113,7 +113,7 @@ worker_config:
       free_gpu_memory_fraction: 0.85
       dtype: fp8
     cache_transceiver_config:
-      max_tokens_in_buffer: 4608
+      max_tokens_in_buffer: 131104               # @B: needs change. Should match max_num_tokens
       backend: UCX
     # speculative_config: # when mtp_size is 0, remove this section.
     #   decoding_type: MTP
