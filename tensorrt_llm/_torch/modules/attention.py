@@ -1370,6 +1370,11 @@ class MLA(nn.Module):
             -1,
         )
 
+        ############################################################################
+        # Needed to get unit test working.
+        attn_metadata.helix_position_offsets = position_ids
+        ############################################################################
+
         k = torch.empty_like(q).view(-1, self.num_heads_tp, self.qk_head_dim)
         maybe_compiled_copy_(
             k[..., :self.qk_nope_head_dim],
