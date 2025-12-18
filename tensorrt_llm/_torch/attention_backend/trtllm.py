@@ -83,7 +83,8 @@ class TrtllmAttentionWrapper:
     spec_decoding_bl_tree_mask_offset: Optional[torch.Tensor]
     spec_decoding_bl_tree_mask: Optional[torch.Tensor]
     spec_bl_tree_first_sparse_mask_offset_kv: Optional[torch.Tensor]
-    # @B: Why are helix related parameters not in the base class?
+    helix_position_offsets: Optional[torch.Tensor]
+    helix_is_inactive_rank: Optional[torch.Tensor]
     kwargs: dict
 
     def __init__(
@@ -931,6 +932,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         if self.enable_flash_mla:
             self.prepare_flash_mla()
         # number of tokens needed in the kv cache for each sequence after the next pass
+        # @B: Remove this ugly len check and make sure self.helix_is_inactive_rank is
+        # already a tensor in .prepare() call.
         if self.helix_is_inactive_rank is not None and len(
                 self.helix_is_inactive_rank):
             # If helix is inactive, attend to the previously cached tokens only.
@@ -1547,6 +1550,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         mrope_config: Optional[dict] = None,
         attention_window_size: Optional[int] = None,
         softmax_stats_tensor: Optional[torch.Tensor] = None,
+        # @B: Avoid passing this here and use it from metadata.
         helix_position_offsets: Optional[torch.Tensor] = None,
         enable_attn_nvfp4_output: bool = True,
         output: Optional[torch.Tensor] = None,
@@ -1658,6 +1662,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             sparse_attn_indices_block_size=sparse_attn_indices_block_size,
             sparse_mla_topk=metadata.sparse_mla_topk if hasattr(
                 metadata, 'sparse_mla_topk') else 0,
+            # @B: We now have metadata.helix_position_offsets. Use it!
             helix_position_offsets=helix_position_offsets,
             helix_is_inactive_rank=metadata.helix_is_inactive_rank,
         )
