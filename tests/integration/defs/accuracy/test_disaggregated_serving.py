@@ -27,11 +27,6 @@ from .accuracy_core import (GSM8K, MMLU, JsonModeEval,
                             LlmapiAccuracyTestHarness, get_accuracy_task)
 
 
-# Quick iteration version of GSM8K with reduced samples
-class GSM8K_Quick(GSM8K):
-    NUM_SAMPLES = 3  # Reduced from 1319 for faster iteration
-
-
 class Result(GenerationResultBase):
 
     def __init__(self, id: int, sampling_params: SamplingParams,

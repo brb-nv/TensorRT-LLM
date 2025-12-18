@@ -332,16 +332,16 @@ def run_client_tests(example_dir,
                      use_ray=False):
     """Run client tests against the disaggregated server."""
     client_dir = f"{example_dir}/clients"
-    for _ in range(1):
+    for _ in range(num_iters):
         client_cmd = [
             'python3', f'{client_dir}/disagg_client.py', '-c', f'{config_file}',
             '-p', f'{client_dir}/{prompt_file}', '--ignore-eos',
             '--server-start-timeout',
             str(server_start_timeout)
         ]
-        # if prompt_file == "long_prompts.json":
-        #     # Use max_tokens 4 for long prompts to reduce test time
-        #     client_cmd.extend(['--max-tokens', '4'])
+        if prompt_file == "long_prompts.json":
+            # Use max_tokens 4 for long prompts to reduce test time
+            client_cmd.extend(['--max-tokens', '4'])
 
         # Prepare poll processes
         worker_processes = []
@@ -354,11 +354,11 @@ def run_client_tests(example_dir,
         poll_procs = worker_processes + [server_proc]
         check_call(client_cmd, env=env, poll_procs=poll_procs)
 
-        # # Streaming client run
-        # streaming_client_cmd = client_cmd + [
-        #     '--streaming', '-o', 'output_streaming.json'
-        # ]
-        # check_call(streaming_client_cmd, env=env, poll_procs=poll_procs)
+        # Streaming client run
+        streaming_client_cmd = client_cmd + [
+            '--streaming', '-o', 'output_streaming.json'
+        ]
+        check_call(streaming_client_cmd, env=env, poll_procs=poll_procs)
 
         # Run the chat completion endpoint test only for TinyLlama
         if test_desc == "overlap" or test_desc == "trtllm_sampler":
@@ -374,9 +374,9 @@ def run_client_tests(example_dir,
                        env=env,
                        poll_procs=poll_procs)
 
-        # # Skip output verification for long prompts test
-        # if prompt_file == "long_prompts.json":
-        #     continue
+        # Skip output verification for long prompts test
+        if prompt_file == "long_prompts.json":
+            continue
 
         if extra_endpoints_test is not None:
             extra_endpoints_test(server_url)
@@ -384,7 +384,7 @@ def run_client_tests(example_dir,
         # Verify outputs
         not_expected_strings = ["Berlin Berlin"]
 
-        output_files = ['output.json']
+        output_files = ['output.json', 'output_streaming.json']
         if test_desc == "overlap" or test_desc == "trtllm_sampler":
             # Disable streaming chat completion for overlap test
             # due to bug
@@ -396,29 +396,25 @@ def run_client_tests(example_dir,
         for output_file in output_files:
             with open(output_file, 'r') as f:
                 content = f.read()
-                print(f"[HAIDER] content: {content}")
-                continue
-
-                # Skip word matching for now.
-                # if "deepseek_v3_lite" in test_desc or output_file == "output_chat.json":
-                #     expected_strings = [
-                #         "Berlin", ["Asyncio is a", "Asyncio module in"]
-                #     ]
-                # else:
-                #     expected_strings = [
-                #         "The capital of Germany is Berlin",
-                #         "Asyncio is a Python library"
-                #     ]
-                # for expected_string in expected_strings:
-                #     if isinstance(expected_string, list):
-                #         # At least one of the strings in the list should be found in the content
-                #         assert any(
-                #             string in content for string in expected_string
-                #         ), f"None of the strings in {expected_string} found in {output_file}"
-                #     else:
-                #         assert expected_string in content, f"Expected string '{expected_string}' not found in {output_file}"
-                # for not_expected_string in not_expected_strings:
-                #     assert not_expected_string not in content, f"Unexpected string '{not_expected_string}' found in {output_file}"
+                if "deepseek_v3_lite" in test_desc or output_file == "output_chat.json":
+                    expected_strings = [
+                        "Berlin", ["Asyncio is a", "Asyncio module in"]
+                    ]
+                else:
+                    expected_strings = [
+                        "The capital of Germany is Berlin",
+                        "Asyncio is a Python library"
+                    ]
+                for expected_string in expected_strings:
+                    if isinstance(expected_string, list):
+                        # At least one of the strings in the list should be found in the content
+                        assert any(
+                            string in content for string in expected_string
+                        ), f"None of the strings in {expected_string} found in {output_file}"
+                    else:
+                        assert expected_string in content, f"Expected string '{expected_string}' not found in {output_file}"
+                for not_expected_string in not_expected_strings:
+                    assert not_expected_string not in content, f"Unexpected string '{not_expected_string}' found in {output_file}"
 
 
 # TODO: add test for disaggregated server prometheus metrics
