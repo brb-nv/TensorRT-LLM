@@ -2,7 +2,7 @@ import math
 import os
 import weakref
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Optional, Tuple, Union, List
 
 import torch
 
@@ -864,8 +864,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
 
     def update_helix_param(
         self,
-        helix_position_offsets: Optional[torch.Tensor],
-        helix_is_inactive_rank: Optional[torch.Tensor],
+        helix_position_offsets: List[int],
+        helix_is_inactive_rank: List[bool],
     ) -> None:
         """
         Update helix parameters by copying into static buffers for CUDA graph compatibility.
@@ -875,19 +875,18 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             helix_is_inactive_rank: Whether the current rank is inactive with shape (batch_size,).
         """
         if helix_position_offsets is not None and self.helix_position_offsets is not None:
-            # @B: This is ugly. Need to figure why position_ids is not always 1D.
-            # Flatten to 1D in case input has extra dimensions (e.g., [1, 1] -> [1])
-            helix_position_offsets = helix_position_offsets.view(-1)
-            num_tokens = helix_position_offsets.shape[0]
+            num_tokens = len(helix_position_offsets)
+            self.helix_position_offsets_cpu[:num_tokens].copy_(
+                torch.tensor(helix_position_offsets, dtype=torch.int))
             self.helix_position_offsets[:num_tokens].copy_(
-                helix_position_offsets, non_blocking=True)
+                self.helix_position_offsets_cpu[:num_tokens], non_blocking=True)
 
         if helix_is_inactive_rank is not None and self.helix_is_inactive_rank is not None:
-            # Flatten to 1D in case input has extra dimensions
-            helix_is_inactive_rank = helix_is_inactive_rank.view(-1)
-            batch_size = helix_is_inactive_rank.shape[0]
+            batch_size = len(helix_is_inactive_rank)
+            self.helix_is_inactive_rank_cpu[:batch_size].copy_(
+                torch.tensor(helix_is_inactive_rank, dtype=torch.bool))
             self.helix_is_inactive_rank[:batch_size].copy_(
-                helix_is_inactive_rank, non_blocking=True)
+                self.helix_is_inactive_rank_cpu[:batch_size], non_blocking=True)
 
     def prepare(self) -> None:
         extra_attrs = get_model_extra_attrs()
@@ -928,21 +927,13 @@ class TrtllmAttentionMetadata(AttentionMetadata):
 
         if self.enable_flash_mla:
             self.prepare_flash_mla()
-        # number of tokens needed in the kv cache for each sequence after the next pass
-        # @B: Remove this ugly len check and make sure self.helix_is_inactive_rank is
-        # already a tensor in .prepare() call.
-        if self.helix_is_inactive_rank is not None and len(
-                self.helix_is_inactive_rank):
+
+        # number of tokens needed in the kv cache for each sequence after the next pass.
+        if self.enable_helix:
             # If helix is inactive, attend to the previously cached tokens only.
             assert cached_token_lens is not None, "cached_token_lens should be set for helix"
-            kv_lens = cached_token_lens.clone()
-            helix_is_inactive_rank_cpu = torch.tensor(
-                self.helix_is_inactive_rank[:self.num_seqs],
-                dtype=torch.bool,
-                device='cpu',
-            )
-            active_rank = ~helix_is_inactive_rank_cpu
-            kv_lens[active_rank] += self.seq_lens_kv[active_rank]
+            active_rank = ~self.helix_is_inactive_rank_cpu[:self.num_seqs]
+            kv_lens = cached_token_lens[active_rank] + self.seq_lens_kv[active_rank]
         else:
             kv_lens = cached_token_lens + self.seq_lens_kv if cached_token_lens is not None else self.seq_lens_kv
 

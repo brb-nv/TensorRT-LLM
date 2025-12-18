@@ -2003,17 +2003,9 @@ class PyTorchModelEngine(ModelEngine):
                                                       num_first_draft]] += accepted_tokens
 
         if self.mapping.has_cp_helix():
-            helix_is_inactive_rank_tensor = torch.tensor(
-                helix_is_inactive_rank,
-                dtype=torch.bool,
-                pin_memory=True)
-            helix_position_offsets_tensor = torch.tensor(
-                helix_position_offsets,
-                dtype=torch.int,
-                pin_memory=True)
             attn_metadata.update_helix_param(
-                helix_position_offsets=helix_position_offsets_tensor,
-                helix_is_inactive_rank=helix_is_inactive_rank_tensor,
+                helix_position_offsets=helix_position_offsets,
+                helix_is_inactive_rank=helix_is_inactive_rank,
             )
 
         if not attn_metadata.is_cuda_graph:
