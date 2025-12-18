@@ -132,13 +132,13 @@ all_scenarios = [
 # limit the number of test scenarios to avoid taking too long
 test_scenarios = [
     all_scenarios[0],
-    # all_scenarios[1],
-    # all_scenarios[4],
-    # all_scenarios[7],
-    # all_scenarios[14],
-    # all_scenarios[17],
-    # all_scenarios[23],
-    # all_scenarios[24],
+    all_scenarios[1],
+    all_scenarios[4],
+    all_scenarios[7],
+    all_scenarios[14],
+    all_scenarios[17],
+    all_scenarios[23],
+    all_scenarios[24],
 ]
 
 
@@ -459,7 +459,7 @@ def _run_mla_distributed(
         layer_idx=0,
         dtype=scenario.dtype,
         config=config,
-        enable_unit_test=True,
+        enable_helix_test=True,
     ).cuda()
     # above should have the same config as the reference MLA except for the mapping
     # we update the weights accordingly and should be able to load them
@@ -697,7 +697,7 @@ def _full_test_multi_gpu(rank: int, world_size: int, scenario: Scenario, gen_ste
         pos_embd_params=pos_embd_params,
         layer_idx=0,
         dtype=scenario.dtype,
-        enable_unit_test=True,
+        enable_helix_test=True,
     ).cuda()
     _generate_random_weights(mla)
     weights = mla.state_dict()

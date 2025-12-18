@@ -700,7 +700,7 @@ class MLA(nn.Module):
         dtype: torch.dtype = None,
         dense_bias: Optional[bool] = None,
         config: Optional[ModelConfig] = None,
-        enable_unit_test: bool = False,
+        enable_helix_test: bool = False,
         mapping_with_cp: Optional[Mapping] = None,
         reduce_output: bool = True,
     ):
@@ -725,7 +725,7 @@ class MLA(nn.Module):
             dtype (torch.dtype): The data type.
             dense_bias (bool): Whether to use bias in the output projection layer.
             config (ModelConfig): The model configuration.
-            enable_unit_test (bool): Whether to enable unit test.
+            enable_helix_test (bool): Whether to enable unit test.
         """
         super().__init__()
         self.layer_idx = layer_idx
@@ -746,7 +746,7 @@ class MLA(nn.Module):
         self.max_position_embeddings = max_position_embeddings
         self.pos_embd_params = pos_embd_params
         self.dense_bias = dense_bias
-        self.enable_unit_test = enable_unit_test
+        self.enable_helix_test = enable_helix_test
         if dense_bias is None:
             self.dense_bias = bias
 
@@ -808,7 +808,7 @@ class MLA(nn.Module):
         self.num_key_value_heads_tp = (self.num_key_value_heads + tp_size -
                                        1) // tp_size
 
-        if self.enable_unit_test:
+        if self.enable_helix_test:
             rms_norm_eps = getattr(config.pretrained_config, "rms_norm_eps",
                                    1e-6)
         else:
@@ -1126,7 +1126,7 @@ class MLA(nn.Module):
     def create_output(self, hidden_states: torch.Tensor, num_contexts: int):
         num_tokens = hidden_states.shape[0]
         hidden_size = self.o_proj.in_features
-        if self.enable_unit_test and num_contexts > 0:
+        if self.enable_helix_test and num_contexts > 0:
             # note: for testing Helix parallelism, we ensure that the output is
             # large enough for the context phase, but we then cut it again in
             # `forward_context`
@@ -1370,10 +1370,11 @@ class MLA(nn.Module):
             -1,
         )
 
-        ############################################################################
-        # Needed to get unit test working.
-        attn_metadata.helix_position_offsets = position_ids
-        ############################################################################
+        if self.enable_helix_test:
+            # While helix parallelism is mainly meant for generation, we set the
+            # helix position offsets for the context phase to get the math right
+            # in test_mla_helix.py.
+            attn_metadata.helix_position_offsets = position_ids
 
         k = torch.empty_like(q).view(-1, self.num_heads_tp, self.qk_head_dim)
         maybe_compiled_copy_(
@@ -2164,7 +2165,7 @@ class MLA(nn.Module):
                               output=attn_output,
                               latent_cache_gen=latent_cache_gen)
 
-        if self.enable_unit_test and self.mapping.has_cp_helix():
+        if self.enable_helix_test and self.mapping.has_cp_helix():
             # note: for allowing testing Helix parallelism, we ensure that
             # the output is compatible with o_proj even in the context phase,
             # thus we cut it to num_heads_tp_cp * v_head_dim
