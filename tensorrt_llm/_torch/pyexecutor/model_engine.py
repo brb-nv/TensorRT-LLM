@@ -365,7 +365,6 @@ class PyTorchModelEngine(ModelEngine):
         self.previous_batch_indices_cuda = torch.empty((self.max_num_tokens, ),
                                                        dtype=torch.int,
                                                        device='cuda')
-        # @B: Why is this here and not a part of the attn_metadata?
         self.input_ids_cuda = torch.empty((self.max_num_tokens, ),
                                           dtype=torch.int,
                                           device='cuda')
@@ -1021,7 +1020,6 @@ class PyTorchModelEngine(ModelEngine):
             cache_indirection=cache_indirection,
             sparse_attention_config=self.sparse_attention_config,
             num_heads_per_kv=num_heads_per_kv,
-            # @B: See if we can lose this and could be set in the init of metadata.
             enable_helix=self.mapping.has_cp_helix() if self.mapping is not None else False,
         )
 
