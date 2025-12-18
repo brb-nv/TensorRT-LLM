@@ -933,7 +933,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             # If helix is inactive, attend to the previously cached tokens only.
             assert cached_token_lens is not None, "cached_token_lens should be set for helix"
             active_rank = ~self.helix_is_inactive_rank_cpu[:self.num_seqs]
-            kv_lens = cached_token_lens[active_rank] + self.seq_lens_kv[active_rank]
+            kv_lens = cached_token_lens.clone()
+            kv_lens[active_rank] += self.seq_lens_kv[active_rank]
         else:
             kv_lens = cached_token_lens + self.seq_lens_kv if cached_token_lens is not None else self.seq_lens_kv
 
