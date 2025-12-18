@@ -528,11 +528,14 @@ def _run_mla_distributed(
                     num_cached_tokens_per_seq=cached_tokens_per_seq,
                 ),
                 enable_context_mla_with_cached_kv=True,
-                helix_is_inactive_rank=torch.tensor(
-                    helix_is_inactive_rank, dtype=torch.bool, device="cuda"
-                ),
+                enable_helix=True,
+            )
+            attn_metadata.update_helix_param(
+                helix_is_inactive_rank=helix_is_inactive_rank,
+                helix_position_offsets=position_ids_gen,
             )
         else:
+            assert False, "Shouldn't take this codepath."
             attn_metadata.kv_cache_params = KVCacheParams(
                 use_cache=True,
                 num_cached_tokens_per_seq=cached_tokens_per_seq,
