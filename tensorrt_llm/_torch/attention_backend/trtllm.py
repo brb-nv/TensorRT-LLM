@@ -300,11 +300,6 @@ class TrtllmAttentionWrapper:
         self.sparse_mla_topk = sparse_mla_topk
         self.helix_position_offsets = helix_position_offsets
         self.helix_is_inactive_rank = helix_is_inactive_rank
-        # @B: Why is this being done here? Do we really need it?
-        if self.helix_is_inactive_rank is not None and not isinstance(
-                self.helix_is_inactive_rank, torch.Tensor):
-            self.helix_is_inactive_rank = torch.tensor(
-                self.helix_is_inactive_rank, dtype=torch.bool, pin_memory=True)
 
         if max_sequence_length > self.rope_params.max_positions:
             self.rope_params.max_positions = max_sequence_length
@@ -649,18 +644,20 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     spec_decoding_bl_tree_mask: Optional[torch.Tensor] = None
     spec_bl_tree_first_sparse_mask_offset_kv: Optional[torch.Tensor] = None
 
+    # Flag to enable helix parallelism.
+    enable_helix: bool = False
+
+    # Global position ids of tokens for each sequence in the batch. Given
+    # each helix rank has only a subset of tokens for a sequence, we compute
+    # a global position id for each token here.
+    helix_position_offsets: Optional[torch.Tensor] = None
+
     # Whether the current rank is inactive for helix parallelism.
     # In helix parallelism, only the active rank appends KV cache for the query token
     # and attends to the previously cached tokens as well as the query token. Inactive
     # ranks do not append KV cache for the query token and attend to the previously
     # cached tokens only.
     helix_is_inactive_rank: Optional[torch.Tensor] = None
-
-    # Flag to enable helix parallelism support with static buffers for CUDA graph
-    enable_helix: bool = False
-
-    # Static buffer for helix position offsets (allocated in _post_init_with_buffers)
-    helix_position_offsets: Optional[torch.Tensor] = None
 
     @property
     def max_seq_len(self) -> int:
@@ -1550,8 +1547,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         mrope_config: Optional[dict] = None,
         attention_window_size: Optional[int] = None,
         softmax_stats_tensor: Optional[torch.Tensor] = None,
-        # @B: Avoid passing this here and use it from metadata.
-        helix_position_offsets: Optional[torch.Tensor] = None,
         enable_attn_nvfp4_output: bool = True,
         output: Optional[torch.Tensor] = None,
         output_sf: Optional[torch.Tensor] = None,
@@ -1570,6 +1565,12 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             TrtllmAttentionMetadata,
         )
         assert not metadata.is_cross, "TRT-LLM Attention does not support cross attention yet."
+
+        #####################################################################################
+        # Assert kwargs does not have helix_position_offsets and helix_is_inactive_rank.
+        assert 'helix_position_offsets' not in kwargs, "helix_position_offsets should be passed in metadata."
+        assert 'helix_is_inactive_rank' not in kwargs, "helix_is_inactive_rank should be passed in metadata."
+        #####################################################################################
 
         use_paged_context_fmha = (
             metadata.runtime_features.chunked_prefill
@@ -1662,8 +1663,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             sparse_attn_indices_block_size=sparse_attn_indices_block_size,
             sparse_mla_topk=metadata.sparse_mla_topk if hasattr(
                 metadata, 'sparse_mla_topk') else 0,
-            # @B: We now have metadata.helix_position_offsets. Use it!
-            helix_position_offsets=helix_position_offsets,
+            helix_position_offsets=metadata.helix_position_offsets,
             helix_is_inactive_rank=metadata.helix_is_inactive_rank,
         )
         out_dtype = None
@@ -1923,8 +1923,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         mla_bmm1_scale: torch.Tensor,
         mla_bmm2_scale: torch.Tensor,
         quant_q_buffer: torch.Tensor,
-        helix_position_offsets: Optional[torch.Tensor] = None,
-        helix_is_inactive_rank: Optional[torch.Tensor] = None,
         out_scale: Optional[torch.Tensor] = None,
     ) -> None:
         """
@@ -1945,15 +1943,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         assert metadata.kv_cache_manager is not None
         sink_token_length = 0
 
-        # Ensure helix_is_inactive_rank is on the same device as other tensors.
-        # print(f"[mla_rope_generation] helix_is_inactive_rank: {helix_is_inactive_rank}")
-        # print(f"[mla_rope_generation] helix_position_offsets: {helix_position_offsets}")
-        if helix_is_inactive_rank is not None:
-            assert helix_is_inactive_rank.device == helix_position_offsets.device, \
-                f"helix_is_inactive_rank must be on the same device as helix_position_offsets, " \
-                f"got {helix_is_inactive_rank.device} vs {helix_position_offsets.device}"
-
-        mla_tensor_params = [helix_position_offsets, helix_is_inactive_rank]
+        mla_tensor_params = [metadata.helix_position_offsets, metadata.helix_is_inactive_rank]
 
         torch.ops.trtllm.mla_rope_generation(
             fused_q,

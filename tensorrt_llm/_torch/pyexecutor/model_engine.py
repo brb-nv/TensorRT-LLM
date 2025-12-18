@@ -1639,7 +1639,7 @@ class PyTorchModelEngine(ModelEngine):
             # update batch index
             request.py_batch_idx = request.py_seq_slot
 
-        helix_is_inactive_rank = [] if self.mapping.has_cp_helix() else None
+        helix_is_inactive_rank, helix_position_offsets = [], []
         for request in generation_requests:
             request_ids.append(request.py_request_id)
             beam_width = request.sampling_config.beam_width
@@ -1675,11 +1675,15 @@ class PyTorchModelEngine(ModelEngine):
 
                 position_id = past_seen_token_num
                 if self.mapping.has_cp_helix():
+                    #####################################################################################
                     assert not self.is_warmup, "Warmup is not called for helix parallelism."
                     helix_is_inactive_rank_all_ranks = self.dist.cp_allgather(request.py_helix_is_inactive_rank)
                     # print(f"[_prepare_tp_inputs][rank {self.dist.rank}][cp_rank {self.mapping.cp_rank}] helix_is_inactive_rank_all_ranks: {helix_is_inactive_rank_all_ranks}")
                     helix_is_inactive_rank_all_ranks = torch.tensor(helix_is_inactive_rank_all_ranks, dtype=torch.long)
                     assert torch.sum(helix_is_inactive_rank_all_ranks) == self.mapping.cp_size - 1, "There should be only one active rank in helix parallelism."
+                    #####################################################################################
+                    # We compute a global position_id because each helix rank has only a subset of
+                    # tokens for a sequence.
                     position_id = request.total_input_len_cp + request.py_decoding_iter - 1
                     if request.py_helix_is_inactive_rank:
                         past_seen_token_num = request.seqlen_this_rank_cp
@@ -1688,13 +1692,14 @@ class PyTorchModelEngine(ModelEngine):
                         # been previously seen.
                         past_seen_token_num = request.seqlen_this_rank_cp - 1
 
+                    # Update helix-specific parameters.
+                    helix_is_inactive_rank.append(request.py_helix_is_inactive_rank)
+                    helix_position_offsets.append(position_id)
+
                 position_ids.append(position_id)
                 num_cached_tokens_per_seq.append(past_seen_token_num)
                 request.cached_tokens = num_cached_tokens_per_seq[-1]
                 prompt_lengths.append(request.py_prompt_len)
-                if self.mapping.has_cp_helix():
-                    helix_is_inactive_rank.append(
-                        request.py_helix_is_inactive_rank)
                 draft_lens.append(0)
                 sequence_lengths.append(1)
                 num_accepted_draft_tokens.append(0)
@@ -1997,6 +2002,20 @@ class PyTorchModelEngine(ModelEngine):
                     draft_request_indices_buffer_cuda[:
                                                       num_first_draft]] += accepted_tokens
 
+        if self.mapping.has_cp_helix():
+            helix_is_inactive_rank_tensor = torch.tensor(
+                helix_is_inactive_rank,
+                dtype=torch.bool,
+                pin_memory=True)
+            helix_position_offsets_tensor = torch.tensor(
+                helix_position_offsets,
+                dtype=torch.int,
+                pin_memory=True)
+            attn_metadata.update_helix_param(
+                helix_position_offsets=helix_position_offsets_tensor,
+                helix_is_inactive_rank=helix_is_inactive_rank_tensor,
+            )
+
         if not attn_metadata.is_cuda_graph:
             # Assumes seq lens do not change between CUDA graph invocations. This applies
             # to draft sequences too. This means that all draft sequences must be padded.
@@ -2025,24 +2044,6 @@ class PyTorchModelEngine(ModelEngine):
 
         attn_metadata.request_ids = request_ids
         attn_metadata.prompt_lens = prompt_lengths
-        # Update helix parameters by copying into static buffers for CUDA graph compatibility
-        if helix_is_inactive_rank is not None and len(
-                helix_is_inactive_rank) > 0:
-            helix_is_inactive_rank_tensor = torch.tensor(
-                helix_is_inactive_rank,
-                dtype=torch.bool,
-                pin_memory=True)
-            if attn_metadata.enable_helix:
-                # Copy into static buffer for CUDA graph compatibility
-                attn_metadata.update_helix_param(
-                    helix_position_offsets=None,
-                    helix_is_inactive_rank=helix_is_inactive_rank_tensor,
-                )
-            else:
-                # @B: Why do we need this fallback? Unify the code path.
-                # Fallback for non-CUDA graph mode
-                attn_metadata.helix_is_inactive_rank = helix_is_inactive_rank_tensor.to(
-                    device='cuda', non_blocking=True)
         attn_metadata.num_contexts = len(scheduled_requests.context_requests)
         # Use num_chunked_ctx_requests to record the number of extend context requests,
         # so that we can update the kv_lens_cuda correctly in _preprocess_inputs.
