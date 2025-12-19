@@ -80,7 +80,7 @@ class Scenario:
     rope_original_max_position_embeddings: int = 4096
     rope_type: str = "yarn"
     model_type: str = "deepseek_v3"
-    kv_cache_tokens_per_block: int = 64
+    kv_cache_tokens_per_block: int = 32
     # TODO only 1 is supported for now here
     predicted_tokens_per_seq: int = 1
     bias: bool = False
@@ -459,7 +459,7 @@ def _run_mla_distributed(
         layer_idx=0,
         dtype=scenario.dtype,
         config=config,
-        enable_unit_test=True,
+        enable_helix_test=True,
     ).cuda()
     # above should have the same config as the reference MLA except for the mapping
     # we update the weights accordingly and should be able to load them
@@ -528,9 +528,11 @@ def _run_mla_distributed(
                     num_cached_tokens_per_seq=cached_tokens_per_seq,
                 ),
                 enable_context_mla_with_cached_kv=True,
-                helix_is_inactive_rank=torch.tensor(
-                    helix_is_inactive_rank, dtype=torch.bool, device="cuda"
-                ),
+                enable_helix=True,
+            )
+            attn_metadata.update_helix_param(
+                helix_is_inactive_rank=helix_is_inactive_rank,
+                helix_position_offsets=position_ids_gen,
             )
         else:
             attn_metadata.kv_cache_params = KVCacheParams(
@@ -694,7 +696,7 @@ def _full_test_multi_gpu(rank: int, world_size: int, scenario: Scenario, gen_ste
         pos_embd_params=pos_embd_params,
         layer_idx=0,
         dtype=scenario.dtype,
-        enable_unit_test=True,
+        enable_helix_test=True,
     ).cuda()
     _generate_random_weights(mla)
     weights = mla.state_dict()
