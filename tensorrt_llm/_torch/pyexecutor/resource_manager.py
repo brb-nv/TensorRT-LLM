@@ -1132,6 +1132,14 @@ class KVCacheManager(BaseResourceManager):
             f"secondary_pool_memory_bytes is set to {self._secondary_pool_memory_bytes/1024**3}GB"
         )
 
+        # HAIDER: Log KV cache pool allocation details
+        logger.info(f"HAIDER: --- KV Cache Pool Allocation ---")
+        logger.info(f"HAIDER: free_mem before KV cache: {free_mem / (1024**3):.2f} GiB")
+        logger.info(f"HAIDER: total_mem: {total_mem / (1024**3):.2f} GiB")
+        logger.info(f"HAIDER: free_gpu_memory_fraction: {free_gpu_memory_fraction}")
+        logger.info(f"HAIDER: primary_pool_memory_bytes: {self._primary_pool_memory_bytes / (1024**3):.2f} GiB")
+        logger.info(f"HAIDER: secondary_pool_memory_bytes (host): {self._secondary_pool_memory_bytes / (1024**3):.2f} GiB")
+
         # Adjust the window sizes to fit the memory if even a single sequence
         # cannot fit in the memory.
         window_size_to_layers, max_attention_window_vec = self.adjust_window_sizes_for_vswa(

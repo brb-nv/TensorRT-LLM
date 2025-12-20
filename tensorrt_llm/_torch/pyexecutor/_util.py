@@ -168,6 +168,7 @@ class KvCacheCreator:
                                          end_id=-1)
                 request.py_multimodal_data = multimodal_data
             else:
+                assert False, "Dummy multimodal data must be available for this model."
                 # Fall back to text-only prompt when we could not find the small image size.
                 prompt_token_ids = torch.randint(
                     low=0, high=vocab_size, size=(input_seq_len, )).tolist()
@@ -202,6 +203,8 @@ class KvCacheCreator:
                    "original_arch") and MODEL_CLASS_VISION_ENCODER_MAPPING.get(
                        self._model_engine.model.original_arch, None):
             requests = self._create_dummy_mm_context_request(input_seq_len)
+        else:
+            assert False, "Dummy multimodal data must be available for this model."
         # if succeed profiling with multimodal requests then return, otherwise profile
         # with default case
         if requests:
@@ -356,6 +359,51 @@ class KvCacheCreator:
         logger.info(
             f"Memory used outside torch (e.g., NCCL and CUDA graphs) in memory usage profiling: {extra_cost / (GB):.2f} GiB"
         )
+
+        # HAIDER: Detailed memory breakdown for debugging
+        logger.info(f"HAIDER: ======= DETAILED MEMORY BREAKDOWN =======")
+        logger.info(f"HAIDER: total_gpu_memory: {total_gpu_memory / (GB):.2f} GiB")
+        logger.info(f"HAIDER: free_gpu_memory (end): {end / (GB):.2f} GiB")
+        logger.info(f"HAIDER: total_used_bytes (GPU - free): {total_used_bytes / (GB):.2f} GiB")
+        logger.info(f"HAIDER: torch_used_bytes (PyTorch tracked): {torch_used_bytes / (GB):.2f} GiB")
+        logger.info(f"HAIDER: torch_peak_memory: {torch_peak_memory / (GB):.2f} GiB")
+        logger.info(f"HAIDER: model_bytes (weights): {model_bytes / (GB):.2f} GiB")
+        logger.info(f"HAIDER: activation_bytes (peak - model): {activation_bytes / (GB):.2f} GiB")
+        logger.info(f"HAIDER: extra_cost (outside torch): {extra_cost / (GB):.2f} GiB")
+        logger.info(f"HAIDER: peak_memory (torch_peak + extra): {peak_memory / (GB):.2f} GiB")
+
+        # HAIDER: PyTorch memory stats breakdown
+        try:
+            mem_stats = torch.cuda.memory_stats()
+            logger.info(f"HAIDER: --- PyTorch Memory Stats ---")
+            logger.info(f"HAIDER: allocated_bytes.all.current: {mem_stats.get('allocated_bytes.all.current', 0) / (GB):.2f} GiB")
+            logger.info(f"HAIDER: allocated_bytes.all.peak: {mem_stats.get('allocated_bytes.all.peak', 0) / (GB):.2f} GiB")
+            logger.info(f"HAIDER: reserved_bytes.all.current: {mem_stats.get('reserved_bytes.all.current', 0) / (GB):.2f} GiB")
+            logger.info(f"HAIDER: reserved_bytes.all.peak: {mem_stats.get('reserved_bytes.all.peak', 0) / (GB):.2f} GiB")
+            logger.info(f"HAIDER: inactive_split_bytes.all.current: {mem_stats.get('inactive_split_bytes.all.current', 0) / (GB):.2f} GiB")
+            logger.info(f"HAIDER: num_alloc_retries: {mem_stats.get('num_alloc_retries', 0)}")
+        except Exception as e:
+            logger.info(f"HAIDER: Failed to get PyTorch memory stats: {e}")
+
+        # HAIDER: Mapping info for NCCL/UB estimation
+        logger.info(f"HAIDER: --- Parallelism Config ---")
+        logger.info(f"HAIDER: tp_size: {mapping.tp_size}")
+        logger.info(f"HAIDER: pp_size: {mapping.pp_size}")
+        logger.info(f"HAIDER: cp_size: {mapping.cp_size}")
+        logger.info(f"HAIDER: world_size: {mapping.world_size}")
+        logger.info(f"HAIDER: rank: {mapping.rank}")
+
+        # HAIDER: KV cache info
+        try:
+            kv_mgr = py_executor.resource_manager.resource_managers.get(ResourceManagerType.KV_CACHE_MANAGER)
+            if kv_mgr is not None:
+                kv_stats_debug = kv_mgr.get_kv_cache_stats()
+                logger.info(f"HAIDER: --- KV Cache Stats ---")
+                logger.info(f"HAIDER: kv_cache allocated_bytes: {kv_stats_debug.allocated_bytes / (GB):.2f} GiB")
+        except Exception as e:
+            logger.info(f"HAIDER: Failed to get KV cache stats: {e}")
+
+        logger.info(f"HAIDER: ======= END MEMORY BREAKDOWN =======")
 
         # get kv cache stats for both model and draft model
         kv_stats = py_executor.resource_manager.resource_managers.get(

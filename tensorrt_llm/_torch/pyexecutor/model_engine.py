@@ -3380,23 +3380,34 @@ class PyTorchModelEngine(ModelEngine):
         return {'mm_embeddings': mm_embeddings, 'logits': None}
 
     def _init_userbuffers(self, hidden_size):
+        # HAIDER: Log UB initialization attempt
+        logger.info(f"HAIDER: _init_userbuffers called with hidden_size={hidden_size}, max_num_tokens={self.max_num_tokens}")
+        logger.info(f"HAIDER: tp_size={self.mapping.tp_size}, pp_size={self.mapping.pp_size}")
+
         if self.mapping.tp_size <= 1 or self.mapping.pp_size > 1:
+            logger.info(f"HAIDER: Skipping UB init (tp_size<=1 or pp_size>1)")
             return False
 
         # Disable UB for unsupported platforms
         if not ub.ub_supported():
+            logger.info(f"HAIDER: Skipping UB init (ub not supported)")
             return False
         # NCCL_SYMMETRIC strategy no longer requires UserBuffer allocator initialization.
         # It uses NCCLWindowAllocator from ncclUtils directly.
         if self.llm_args.allreduce_strategy == "NCCL_SYMMETRIC":
             # Skip UB initialization for NCCL_SYMMETRIC - it uses NCCLWindowAllocator directly
+            logger.info(f"HAIDER: Skipping UB init (NCCL_SYMMETRIC strategy)")
             return False
+
+        ub_buffer_size = hidden_size * self.max_num_tokens * 2
+        logger.info(f"HAIDER: Initializing UserBuffers with size: {ub_buffer_size / (1024**3):.2f} GiB")
+
         ub.initialize_userbuffers_manager(self.mapping.tp_size,
                                           self.mapping.pp_size,
                                           self.mapping.cp_size,
                                           self.mapping.rank,
                                           self.mapping.gpus_per_node,
-                                          hidden_size * self.max_num_tokens * 2)
+                                          ub_buffer_size)
 
         return True
 

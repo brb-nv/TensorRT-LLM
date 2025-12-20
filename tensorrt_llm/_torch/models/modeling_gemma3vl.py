@@ -25,7 +25,8 @@ from ..modules.rms_norm import RMSNorm
 from .modeling_gemma3 import Gemma3ForCausalLM
 from .modeling_multimodal_utils import fuse_input_embeds
 from .modeling_siglip import SiglipVisionModel
-from .modeling_utils import ModelConfig, filter_weights, register_auto_model
+from .modeling_utils import (ModelConfig, filter_weights, register_auto_model,
+                             register_vision_encoder)
 
 _MULTIMODAL_ENV_NAME = "TLLM_MULTIMODAL_DISAGGREGATED"
 
@@ -173,6 +174,7 @@ class Gemma3MultiModalProjector(torch.nn.Module):
         return projected_vision_outputs.type_as(vision_outputs)
 
 
+@register_vision_encoder(SiglipVisionModel)
 @register_auto_model("Gemma3ForConditionalGeneration")
 @register_input_processor(
     Gemma3InputProcessor,
@@ -189,6 +191,10 @@ class Gemma3VLM(PreTrainedModel):
                 "Gemma3VLM does not support disaggregated inference yet. Please unset "
                 f"the {_MULTIMODAL_ENV_NAME} environment variable, or set it to '0'."
             )
+
+        # This helps with memory profiling to use dummy multimodal data for profiling.
+        # Without this, memory profiling would include text-only data.
+        self.original_arch = model_config.pretrained_config.architectures[0]
 
         config = model_config.pretrained_config
         super().__init__(config)
