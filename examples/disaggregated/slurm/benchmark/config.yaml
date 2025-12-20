@@ -17,7 +17,7 @@ benchmark:
   benchmark_ratio: 1.0  # Benchmark ratio
   streaming: true  # Enable streaming mode
   concurrency_list: "64"                        # @B: needs change. Make this batch size * 8.
-  input_length: 200000  # Input sequence length # @B: needs change. (Leave room for chat template tokens)
+  input_length: 32768  # Input sequence length # @B: needs change. (Leave room for chat template tokens)
   output_length: 1024  # Output sequence length
   dataset_file: ""
 
@@ -55,18 +55,18 @@ accuracy:
 
 worker_config:
   gen:
-    tensor_parallel_size: 8                   # @B: needs change.
+    tensor_parallel_size: 1                   # @B: needs change.
     moe_expert_parallel_size: 8               # @B: needs change.
     enable_attention_dp: false
     enable_lm_head_tp_in_adp: false
     pipeline_parallel_size: 1                 # @B: needs change.
-    context_parallel_size: 1                  # @B: needs change.
+    context_parallel_size: 8                  # @B: needs change.
     cp_config:
       cp_type: "HELIX"
       tokens_per_block: 32  # must match kv_config.tokens_per_block.
-    max_batch_size: 4                         # @B: needs change.
-    max_num_tokens: 12                        # @B: needs change.
-    max_seq_len: 204000                       # @B: needs change.
+    max_batch_size: 1                         # @B: needs change.
+    max_num_tokens: 32                        # @B: needs change.
+    max_seq_len: 35328                       # @B: needs change.
     cuda_graph_config:
       enable_padding: true
       batch_sizes:                            # @B: needs change. Make this [batch_size].
@@ -86,7 +86,7 @@ worker_config:
       # load_balancer:
       #   num_slots: 0
     cache_transceiver_config:
-      max_tokens_in_buffer: 4068
+      max_tokens_in_buffer: 4096
       backend: UCX
     stream_interval: 20
     num_postprocess_workers: 4
@@ -108,5 +108,5 @@ worker_config:
       free_gpu_memory_fraction: 0.85
       dtype: fp8
     cache_transceiver_config:
-      max_tokens_in_buffer: 4068               # @B: needs change. Should match max_num_tokens
+      max_tokens_in_buffer: 4096               # @B: needs change. Should match max_num_tokens
       backend: UCX

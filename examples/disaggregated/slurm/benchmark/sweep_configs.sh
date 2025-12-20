@@ -8,30 +8,39 @@ set -e
 # Working directory
 WORK_DIR="/lustre/fsw/coreai_comparch_trtllm/bbuddharaju/TensorRT-LLM/examples/disaggregated/slurm/benchmark"
 CONFIG_FILE="${WORK_DIR}/config.yaml"
-CONFIG_BACKUP="${WORK_DIR}/config.yaml.backup"
+
+# Directory to save configs for review
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+CONFIGS_DIR="${WORK_DIR}/saved_configs/${TIMESTAMP}"
 
 # =============================================================================
 # DEFINE SWEEP PARAMETERS - Modify these arrays as needed
 # =============================================================================
 NUM_GPUS=8                       # Total number of GPUs (TP = NUM_GPUS / CP)
-CP_VALUES=(1 2 4 8)                    # Context Parallel sizes
-ISL_VALUES=(2**15 2**16 2**17 2**18 2**19 2**20)              # Input Sequence Lengths
-BATCH_SIZE_VALUES=(1 2 4 8)          # Batch sizes
+CP_VALUES=(1 8)                    # Context Parallel sizes
+ISL_VALUES=(32768)              # Input Sequence Lengths
+BATCH_SIZE_VALUES=(1)          # Batch sizes
 
 # =============================================================================
 # Helper functions
 # =============================================================================
 
-backup_config() {
-    cp "$CONFIG_FILE" "$CONFIG_BACKUP"
-    echo "Backed up config to $CONFIG_BACKUP"
-}
+save_config() {
+    local tp=$1
+    local cp=$2
+    local ep=$3
+    local isl=$4
+    local batch_size=$5
 
-restore_config() {
-    if [ -f "$CONFIG_BACKUP" ]; then
-        cp "$CONFIG_BACKUP" "$CONFIG_FILE"
-        echo "Restored config from backup"
-    fi
+    # Create configs directory if it doesn't exist
+    mkdir -p "$CONFIGS_DIR"
+
+    # Generate descriptive filename
+    local config_name="tp${tp}_cp${cp}_ep${ep}_isl${isl}_bs${batch_size}.yaml"
+    local save_path="${CONFIGS_DIR}/${config_name}"
+
+    cp "$CONFIG_FILE" "$save_path"
+    echo "Saved config to: $save_path"
 }
 
 # Function to update config.yaml using yq
@@ -43,12 +52,12 @@ update_config() {
     local batch_size=$5
 
     # Calculate derived values
-    local concurrency=$(( batch_size * 4 < 64 ? batch_size * 4 : 64 ))
+    local concurrency=$(( batch_size * 8 < 64 ? batch_size * 8 : 64 ))
     local max_seq_len=$((isl + 2560))  # osl is 1024.
 
     echo "=========================================="
     echo "Updating config with:"
-    echo "  NUM_GPUS=$NUM_GPUS, TP=$tp (NUM_GPUS/CP), CP=$cp, EP=$ep"
+    echo "  NUM_GPUS=$NUM_GPUS, TP=$tp, CP=$cp, EP=$ep"
     echo "  ISL=$isl, batch_size=$batch_size"
     echo "  concurrency=$concurrency, max_seq_len=$max_seq_len"
     echo "=========================================="
@@ -83,8 +92,9 @@ update_config() {
             s/moe_expert_parallel_size: [0-9]*/moe_expert_parallel_size: $ep/
             s/context_parallel_size: [0-9]*/context_parallel_size: $cp/
             s/max_batch_size: [0-9]*/max_batch_size: $batch_size/
-            s/max_num_tokens: [0-9]*/max_num_tokens: $((batch_size * 3))/
+            s/max_num_tokens: [0-9]*/max_num_tokens: $((batch_size * 32))/
             s/max_seq_len: [0-9]*/max_seq_len: $max_seq_len/
+            s/batch_sizes: \[[0-9, ]*\]/batch_sizes: [$batch_size]/
         }" "$CONFIG_FILE"
     fi
 
@@ -102,14 +112,8 @@ submit_job() {
 # Main execution
 # =============================================================================
 
-# Trap to restore config on exit/error
-trap restore_config EXIT
-
 # Navigate to work directory
 cd "$WORK_DIR"
-
-# Backup original config
-backup_config
 
 # Counter for tracking progress
 total_combinations=$((${#CP_VALUES[@]} * ${#ISL_VALUES[@]} * ${#BATCH_SIZE_VALUES[@]}))
@@ -135,17 +139,17 @@ for batch_size in "${BATCH_SIZE_VALUES[@]}"; do
             echo "Processing combination $current/$total_combinations"
             echo "============================================"
 
-            # Restore original config before each update
-            restore_config
-
             # Update config with current parameters
             update_config "$tp" "$cp" "$ep" "$isl" "$batch_size"
+
+            # Save config for later review
+            save_config "$tp" "$cp" "$ep" "$isl" "$batch_size"
 
             # Submit the job
             submit_job
 
             # Optional: Add delay between submissions to avoid overwhelming the scheduler
-            sleep 2
+            sleep 5
         done
     done
 done
@@ -153,5 +157,5 @@ done
 echo ""
 echo "============================================"
 echo "Sweep complete! Submitted $total_combinations jobs"
+echo "Configs saved to: $CONFIGS_DIR"
 echo "============================================"
-
