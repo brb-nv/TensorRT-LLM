@@ -218,7 +218,7 @@ class TestPhi4MMFusedVisionLora(LlmapiAccuracyTestHarness):
 
 class TestGemma3_27BInstruct(LlmapiAccuracyTestHarness):
     MODEL_NAME = "google/gemma-3-27b-it"
-    MODEL_PATH = f"{llm_models_root()}/gemma/gemma-3-27b-it-fp8/"
+    MODEL_PATH = f"{llm_models_root()}/gemma/gemma-3-27b-it/"
     MAX_NUM_TOKENS = 12800
 
     sampling_params = SamplingParams(
@@ -230,7 +230,7 @@ class TestGemma3_27BInstruct(LlmapiAccuracyTestHarness):
         kv_cache_config = KvCacheConfig(
                 enable_block_reuse=False,
                 enable_partial_reuse=False,
-                free_gpu_memory_fraction=0.6,
+                free_gpu_memory_fraction=0.4,
             )
         with LLM(
             self.MODEL_PATH,

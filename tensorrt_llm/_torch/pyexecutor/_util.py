@@ -168,7 +168,6 @@ class KvCacheCreator:
                                          end_id=-1)
                 request.py_multimodal_data = multimodal_data
             else:
-                assert False, "Dummy multimodal data must be available for this model."
                 # Fall back to text-only prompt when we could not find the small image size.
                 prompt_token_ids = torch.randint(
                     low=0, high=vocab_size, size=(input_seq_len, )).tolist()
@@ -203,8 +202,6 @@ class KvCacheCreator:
                    "original_arch") and MODEL_CLASS_VISION_ENCODER_MAPPING.get(
                        self._model_engine.model.original_arch, None):
             requests = self._create_dummy_mm_context_request(input_seq_len)
-        else:
-            assert False, "Dummy multimodal data must be available for this model."
         # if succeed profiling with multimodal requests then return, otherwise profile
         # with default case
         if requests:
