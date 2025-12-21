@@ -1147,16 +1147,17 @@ class MLA(nn.Module):
                 # partial_o: [num_tokens, num_heads * kv_lora_rank] -> [num_tokens, cp_size, num_heads_tp_cp, kv_lora_rank]
                 # softmax_stats: [num_tokens, num_heads, 2] -> [num_tokens, cp_size, num_heads_tp_cp, 2]
 
-                partial_o = partial_o.view(num_tokens, cp_size,
-                                        self.num_heads_tp_cp,
-                                        kv_lora_rank).transpose(1,
-                                                                2).contiguous()
+                partial_o = partial_o.view(
+                    num_tokens, cp_size, self.num_heads_tp_cp,
+                    kv_lora_rank).transpose(1, 2).contiguous()
                 softmax_stats = softmax_stats.view(num_tokens, cp_size,
-                                            self.num_heads_tp_cp,
-                                            2).transpose(1, 2).contiguous()
+                                                   self.num_heads_tp_cp,
+                                                   2).transpose(1,
+                                                                2).contiguous()
 
                 # Call FIFO-based helixAllToAll.
-                partial_o_out, softmax_stats_out = helix.alltoall_native(partial_o, softmax_stats)
+                partial_o_out, softmax_stats_out = helix.alltoall_native(
+                    partial_o, softmax_stats)
 
                 # partial_o_out: [num_tokens, num_heads_tp_cp, cp_size, kv_lora_rank]
                 # softmax_stats_out: [num_tokens, num_heads_tp_cp, cp_size, 2]

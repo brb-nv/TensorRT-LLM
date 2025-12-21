@@ -147,21 +147,22 @@ std::tuple<torch::Tensor, torch::Tensor> alltoall_helix_native(
     // Shape validation
     TORCH_CHECK(partial_o.dim() >= 2, "partial_o must have at least 2 dimensions");
     TORCH_CHECK(softmax_stats.dim() >= 2, "softmax_stats must have at least 2 dimensions");
-    TORCH_CHECK(partial_o.dim() == softmax_stats.dim(), "partial_o and softmax_stats must have same number of dimensions");
+    TORCH_CHECK(
+        partial_o.dim() == softmax_stats.dim(), "partial_o and softmax_stats must have same number of dimensions");
 
     // Get dimensions
     int kv_lora_rank = partial_o.size(-1);
     TORCH_CHECK(partial_o.size(-2) == cp_size && softmax_stats.size(-2) == cp_size,
         "partial_o/softmax_stats second-to-last dimension must equal cp_size");
-    TORCH_CHECK(
-        softmax_stats.size(-1) % 2 == 0 && softmax_stats.size(-1) >= 2, "softmax_stats last dimension must be divisible by 2 (float2)");
+    TORCH_CHECK(softmax_stats.size(-1) % 2 == 0 && softmax_stats.size(-1) >= 2,
+        "softmax_stats last dimension must be divisible by 2 (float2)");
     bool allowVariableField1 = softmax_stats.size(-1) > 2;
 
     // Check that leading dimensions match
     for (int i = 0; i < partial_o.dim() - 2; i++)
     {
-        TORCH_CHECK(
-            partial_o.size(i) == softmax_stats.size(i), "partial_o and softmax_stats must have matching dimensions except last two");
+        TORCH_CHECK(partial_o.size(i) == softmax_stats.size(i),
+            "partial_o and softmax_stats must have matching dimensions except last two");
     }
     TORCH_CHECK(partial_o.size(-1) * partial_o.element_size() % 16 == 0, "partial_o must be aligned to 16 bytes");
 
