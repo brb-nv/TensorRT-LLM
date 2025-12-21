@@ -838,20 +838,20 @@ def _run_single_rank(func, *args, **kwargs):
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 GPUs to run this test")
 @pytest.mark.parametrize("scenario", test_scenarios, ids=lambda x: f"scenario: {x}")
-@pytest.mark.parametrize("use_nccl_for_helix", ["0", "1"], ids=["fifo", "nccl"])
+@pytest.mark.parametrize("use_nccl_for_helix", [False, True], ids=["fifo", "nccl"])
 def test_mla_helix_distributed(
     scenario: Scenario,
-    use_nccl_for_helix: str,
+    use_nccl_for_helix: bool,
     gen_steps: Optional[int] = None,
     max_mismatch_ratio: float = 0.02,
     mismatch_ratios: Optional[List[float]] = None,
 ):
     # Set environment variable to control which codepath is used
     old_env_value = os.environ.get("TRTLLM_USE_NCCL_FOR_HELIX")
-    os.environ["TRTLLM_USE_NCCL_FOR_HELIX"] = use_nccl_for_helix
+    os.environ["TRTLLM_USE_NCCL_FOR_HELIX"] = "1" if use_nccl_for_helix else "0"
 
     world_size = 2
-    print(f"Testing with TRTLLM_USE_NCCL_FOR_HELIX={use_nccl_for_helix}.")
+    print(f"Testing with TRTLLM_USE_NCCL_FOR_HELIX={'1' if use_nccl_for_helix else '0'}.")
     gen_steps = scenario.ref_steps if gen_steps is None else gen_steps
     try:
         with MPIPoolExecutor(max_workers=world_size) as executor:
@@ -873,10 +873,10 @@ def test_mla_helix_distributed(
 
 
 if __name__ == "__main__":
-    for use_nccl in ["0", "1"]:
-        nccl_mode = "NCCL" if use_nccl == "1" else "FIFO"
+    for use_nccl in [False, True]:
+        nccl_mode = "NCCL" if use_nccl else "FIFO"
         print(f"\n{'=' * 60}")
-        print(f"Testing with TRTLLM_USE_NCCL_FOR_HELIX={use_nccl} ({nccl_mode} mode)")
+        print(f"Testing with TRTLLM_USE_NCCL_FOR_HELIX={'1' if use_nccl else '0'} ({nccl_mode} mode)")
         print(f"{'=' * 60}\n")
         for scenario in all_scenarios[:11]:
             timing_steps = 256
