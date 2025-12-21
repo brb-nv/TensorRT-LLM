@@ -76,15 +76,15 @@ class MnnvlMemory:
     def __init__(self, mapping: Mapping, size: int):
         self.mapping = mapping
         self.segment_size = size
-        self.ptr, self.rank_stride = MnnvlMemory.open_mnnvl_memory(self.mapping, size)
+        self.ptr, self.rank_stride = type(self).open_mnnvl_memory(self.mapping, size)
 
     def __del__(self):
         if not sys.is_finalizing():
             if hasattr(self, "ptr"):
-                MnnvlMemory.close_mnnvl_memory(self.ptr)
+                type(self).close_mnnvl_memory(self.ptr)
 
     def as_torch_strided_tensor(self, dtype):
-        num_segments = MnnvlMemory.comm.Get_size()
+        num_segments = type(self).comm.Get_size()
         return pack_strided_memory(
             self.ptr, self.segment_size, self.rank_stride, num_segments, dtype, MnnvlMemory.dev_id
         )
@@ -101,17 +101,17 @@ class MnnvlMemory:
                 pynvml.nvmlInit()
             MnnvlMemory.initialized = True
 
-    @staticmethod
-    def get_comm(mapping: Mapping):
+    @classmethod
+    def get_comm(cls, mapping: Mapping):
         """Get TP-based communicator (ranks grouped by PP+CP+MOE_TP, ordered by TP rank)."""
-        if MnnvlMemory.comm is not None:
-            return MnnvlMemory.comm
+        if cls.comm is not None:
+            return cls.comm
         comm = mpi_comm().Split(
             (mapping.pp_rank * mapping.cp_size + mapping.cp_rank) * mapping.moe_tp_size
             + mapping.moe_tp_rank,
             mapping.tp_rank,
         )
-        MnnvlMemory.comm = comm
+        cls.comm = comm
         return comm
 
     @staticmethod
@@ -151,23 +151,26 @@ class MnnvlMemory:
         MnnvlMemory.allocation_granularity = granularity
         return MnnvlMemory.allocation_granularity
 
-    @staticmethod
-    def new_mnnvl_memory_address(mapping: Mapping, size: int):
+    @classmethod
+    def new_mnnvl_memory_address(cls, mapping: Mapping, size: int):
         page_count = (size + MnnvlMemory.fabric_page_size - 1) // MnnvlMemory.fabric_page_size
         current_rank_stride = page_count * MnnvlMemory.fabric_page_size
-        logger.info(f"[MnnvlMemory] creating address with stride={current_rank_stride}")
-        comm = MnnvlMemory.get_comm(mapping)
+        logger.info(f"[{cls.__name__}] creating address with stride={current_rank_stride}")
+        comm = cls.get_comm(mapping)
         comm_size = comm.Get_size()
         address_size = current_rank_stride * comm_size
         ptr = _check_cu_result(
             cuda.cuMemAddressReserve(address_size, MnnvlMemory.fabric_page_size, 0, 0)
         )
-        MnnvlMemory.current_start_address = int(ptr)
-        MnnvlMemory.current_rank_stride = current_rank_stride
-        MnnvlMemory.current_mem_offset = 0
+        cls.current_start_address = int(ptr)
+        cls.current_rank_stride = current_rank_stride
+        cls.current_mem_offset = 0
 
-    @staticmethod
-    def open_mnnvl_memory(mapping: Mapping, size: int):
+    @classmethod
+    def open_mnnvl_memory(cls, mapping: Mapping, size: int):
+        # Ensure MnnvlMemory is initialized (for dev_id and allocation_granularity)
+        MnnvlMemory.initialize()
+
         dev = _check_cu_result(cuda.cuCtxGetDevice())
         dev_id = int(dev)
         if MnnvlMemory.dev_id is None:
@@ -175,7 +178,7 @@ class MnnvlMemory:
         assert dev_id == MnnvlMemory.dev_id, (
             f"Different dev_id found dev_id={dev_id} but MnnvlMemory.dev_id={MnnvlMemory.dev_id}"
         )
-        comm = MnnvlMemory.get_comm(mapping)
+        comm = cls.get_comm(mapping)
         comm_rank = comm.Get_rank()
         comm_size = comm.Get_size()
         all_rank_allocate_sizes = comm.allgather(size)
@@ -184,10 +187,10 @@ class MnnvlMemory:
         granularity = MnnvlMemory.get_allocation_granularity(dev_id)
         aligned_size = (size + granularity - 1) // granularity * granularity
 
-        if MnnvlMemory.current_mem_offset + aligned_size > MnnvlMemory.current_rank_stride:
-            MnnvlMemory.new_mnnvl_memory_address(mapping, aligned_size)
+        if cls.current_mem_offset + aligned_size > cls.current_rank_stride:
+            cls.new_mnnvl_memory_address(mapping, aligned_size)
 
-        assert MnnvlMemory.current_mem_offset + aligned_size <= MnnvlMemory.current_rank_stride
+        assert cls.current_mem_offset + aligned_size <= cls.current_rank_stride
 
         allocation_prop = MnnvlMemory.get_allocation_prop(dev_id)
         allocated_mem_handle = _check_cu_result(
@@ -248,9 +251,9 @@ class MnnvlMemory:
 
         for i, remote_handle_data in enumerate(all_handles_data):
             rank_ptr = (
-                MnnvlMemory.current_start_address
-                + MnnvlMemory.current_rank_stride * i
-                + MnnvlMemory.current_mem_offset
+                cls.current_start_address
+                + cls.current_rank_stride * i
+                + cls.current_mem_offset
             )
             if i == comm_rank:
                 # Local memory mapping
@@ -268,44 +271,44 @@ class MnnvlMemory:
 
             _check_cu_result(cuda.cuMemSetAccess(rank_ptr, aligned_size, [madesc], 1))
 
-        ptr = MnnvlMemory.current_start_address + MnnvlMemory.current_mem_offset
-        stride = MnnvlMemory.current_rank_stride
-        MnnvlMemory.allocated_map[ptr] = (
+        ptr = cls.current_start_address + cls.current_mem_offset
+        stride = cls.current_rank_stride
+        cls.allocated_map[ptr] = (
             mapping,
             aligned_size,
             mem_handles,
-            MnnvlMemory.current_start_address,
-            MnnvlMemory.current_rank_stride,
-            MnnvlMemory.current_mem_offset,
+            cls.current_start_address,
+            cls.current_rank_stride,
+            cls.current_mem_offset,
         )
-        MnnvlMemory.address_refcnt[MnnvlMemory.current_start_address] = (
-            MnnvlMemory.address_refcnt.get(MnnvlMemory.current_start_address, 0) + 1
+        cls.address_refcnt[cls.current_start_address] = (
+            cls.address_refcnt.get(cls.current_start_address, 0) + 1
         )
 
-        MnnvlMemory.current_mem_offset += aligned_size
+        cls.current_mem_offset += aligned_size
         return ptr, stride
 
-    @staticmethod
-    def close_mnnvl_memory(ptr: int):
+    @classmethod
+    def close_mnnvl_memory(cls, ptr: int):
         mapping, aligned_size, mem_handles, start_address, rank_stride, address_offset = (
-            MnnvlMemory.allocated_map.pop(ptr)
+            cls.allocated_map.pop(ptr)
         )
-        comm = MnnvlMemory.get_comm(mapping)
+        comm = cls.get_comm(mapping)
         comm_size = comm.Get_size()
         for i in range(comm_size):
             rank_ptr = start_address + i * rank_stride + address_offset
             _check_cu_result(cuda.cuMemUnmap(rank_ptr, aligned_size))
             _check_cu_result(cuda.cuMemRelease(mem_handles[i]))
-        MnnvlMemory.address_refcnt[start_address] -= 1
+        cls.address_refcnt[start_address] -= 1
 
-        if MnnvlMemory.address_refcnt[start_address] == 0:
-            MnnvlMemory.address_refcnt.pop(start_address)
+        if cls.address_refcnt[start_address] == 0:
+            cls.address_refcnt.pop(start_address)
             device_ptr = cuda.CUdeviceptr(start_address)
             _check_cu_result(cuda.cuMemAddressFree(device_ptr, comm_size * rank_stride))
-            if start_address == MnnvlMemory.current_start_address:
-                MnnvlMemory.current_start_address = 0
-                MnnvlMemory.current_rank_stride = 0
-                MnnvlMemory.current_mem_offset = 0
+            if start_address == cls.current_start_address:
+                cls.current_start_address = 0
+                cls.current_rank_stride = 0
+                cls.current_mem_offset = 0
 
     @staticmethod
     def support_nvlink(need_all_up: bool = True):
@@ -341,7 +344,7 @@ class MnnvlMemory:
         return support_nvlink_and_all_up
 
 
-class HelixCpMnnvlMemory:
+class HelixCpMnnvlMemory(MnnvlMemory):
     """MNNVL memory management for Helix context parallel (CP) operations."""
 
     current_mem_offset: int = 0
@@ -354,200 +357,19 @@ class HelixCpMnnvlMemory:
     allocated_map = {}
     address_refcnt = {}
 
-    def __init__(self, mapping: Mapping, size: int):
-        self.mapping = mapping
-        self.segment_size = size
-        self.ptr, self.rank_stride = HelixCpMnnvlMemory.open_mnnvl_memory(self.mapping, size)
-
-    def __del__(self):
-        if not sys.is_finalizing():
-            if hasattr(self, "ptr"):
-                HelixCpMnnvlMemory.close_mnnvl_memory(self.ptr)
-
-    def as_torch_strided_tensor(self, dtype):
-        num_segments = HelixCpMnnvlMemory.comm.Get_size()
-        return pack_strided_memory(
-            self.ptr, self.segment_size, self.rank_stride, num_segments, dtype, MnnvlMemory.dev_id
-        )
-
-    @staticmethod
-    def get_comm(mapping: Mapping):
+    @classmethod
+    def get_comm(cls, mapping: Mapping):
         """Get CP-based communicator (ranks grouped by PP+TP+MOE_TP, ordered by CP rank)."""
-        if HelixCpMnnvlMemory.comm is not None:
-            return HelixCpMnnvlMemory.comm
+        if cls.comm is not None:
+            return cls.comm
         comm = mpi_comm().Split(
             mapping.pp_rank * mapping.tp_size * mapping.moe_tp_size
             + mapping.tp_rank * mapping.moe_tp_size
             + mapping.moe_tp_rank,
             mapping.cp_rank,
         )
-        HelixCpMnnvlMemory.comm = comm
+        cls.comm = comm
         return comm
-
-    @staticmethod
-    def new_mnnvl_memory_address(mapping: Mapping, size: int):
-        page_count = (size + MnnvlMemory.fabric_page_size - 1) // MnnvlMemory.fabric_page_size
-        current_rank_stride = page_count * MnnvlMemory.fabric_page_size
-        logger.info(f"[HelixCpMnnvlMemory] creating address with stride={current_rank_stride}")
-        comm = HelixCpMnnvlMemory.get_comm(mapping)
-        comm_size = comm.Get_size()
-        address_size = current_rank_stride * comm_size
-        ptr = _check_cu_result(
-            cuda.cuMemAddressReserve(address_size, MnnvlMemory.fabric_page_size, 0, 0)
-        )
-        HelixCpMnnvlMemory.current_start_address = int(ptr)
-        HelixCpMnnvlMemory.current_rank_stride = current_rank_stride
-        HelixCpMnnvlMemory.current_mem_offset = 0
-
-    @staticmethod
-    def open_mnnvl_memory(mapping: Mapping, size: int):
-        # Ensure MnnvlMemory is initialized (for dev_id and allocation_granularity)
-        MnnvlMemory.initialize()
-
-        dev = _check_cu_result(cuda.cuCtxGetDevice())
-        dev_id = int(dev)
-        if MnnvlMemory.dev_id is None:
-            MnnvlMemory.dev_id = dev_id
-        assert dev_id == MnnvlMemory.dev_id, (
-            f"Different dev_id found dev_id={dev_id} but MnnvlMemory.dev_id={MnnvlMemory.dev_id}"
-        )
-        comm = HelixCpMnnvlMemory.get_comm(mapping)
-        comm_rank = comm.Get_rank()
-        comm_size = comm.Get_size()
-        all_rank_allocate_sizes = comm.allgather(size)
-        assert len(all_rank_allocate_sizes) == comm_size
-        assert all(x == size for x in all_rank_allocate_sizes), "Not all rank allocating same size."
-        granularity = MnnvlMemory.get_allocation_granularity(dev_id)
-        aligned_size = (size + granularity - 1) // granularity * granularity
-
-        if (
-            HelixCpMnnvlMemory.current_mem_offset + aligned_size
-            > HelixCpMnnvlMemory.current_rank_stride
-        ):
-            HelixCpMnnvlMemory.new_mnnvl_memory_address(mapping, aligned_size)
-
-        assert (
-            HelixCpMnnvlMemory.current_mem_offset + aligned_size
-            <= HelixCpMnnvlMemory.current_rank_stride
-        )
-
-        allocation_prop = MnnvlMemory.get_allocation_prop(dev_id)
-        allocated_mem_handle = _check_cu_result(
-            cuda.cuMemCreate(aligned_size, allocation_prop, flags=0)
-        )
-        exported_fabric_handle = _check_cu_result(
-            cuda.cuMemExportToShareableHandle(
-                allocated_mem_handle, allocation_prop.requestedHandleTypes, 0
-            )
-        )
-        if (
-            allocation_prop.requestedHandleTypes
-            == cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
-        ):
-            all_handles_data = comm.allgather(exported_fabric_handle.data)
-        else:
-            all_handles_data = comm.allgather(exported_fabric_handle)
-            all_pids = comm.allgather(os.getpid())
-            libc = ctypes.CDLL(None, use_errno=True)
-            syscall = libc.syscall
-            SYS_pidfd_open = 434
-            SYS_pidfd_getfd = 438
-            pidfds = []
-            for i, pid in enumerate(all_pids):
-                pidfd = syscall(SYS_pidfd_open, pid, 0)
-                if pidfd < 0:
-                    err = ctypes.get_errno()
-                    raise RuntimeError(
-                        f"pidfd_open({pid}) failed with errno {err}: {os.strerror(err)}"
-                    )
-                pidfds.append(pidfd)
-
-            remote_fds = []
-            for i, (pidfd, fd) in enumerate(zip(pidfds, all_handles_data)):
-                remote_fd = syscall(SYS_pidfd_getfd, pidfd, fd, 0)
-                if remote_fd < 0:
-                    err = ctypes.get_errno()
-                    error_msg = f"pidfd_getfd(pidfd={pidfd}, fd={fd}) failed with errno {err}: {os.strerror(err)}."
-                    if err == 1:  # EPERM
-                        error_msg += (
-                            " Permission denied. If running in a container, try adding --cap-add=SYS_PTRACE "
-                            "to your docker run command."
-                        )
-                    else:
-                        error_msg += " This may be due to kernel version (requires Linux 5.6+)."
-                    raise RuntimeError(error_msg)
-                remote_fds.append(remote_fd)
-
-            all_handles_data = remote_fds
-        # all_handles_data like b'\x00\x00\x00 \x00\x00\x00\x00\x8f\xec\x02\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\t\x00\x00\x00\x00\x00\x1d\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'  # noqa: E501
-        # can use buf = memoryview(data) to import if using plain buffer for data.
-
-        madesc = cuda.CUmemAccessDesc()
-        madesc.location = allocation_prop.location
-        madesc.flags = cuda.CUmemAccess_flags.CU_MEM_ACCESS_FLAGS_PROT_READWRITE
-
-        mem_handles = [None] * comm_size
-
-        for i, remote_handle_data in enumerate(all_handles_data):
-            rank_ptr = (
-                HelixCpMnnvlMemory.current_start_address
-                + HelixCpMnnvlMemory.current_rank_stride * i
-                + HelixCpMnnvlMemory.current_mem_offset
-            )
-            if i == comm_rank:
-                # Local memory mapping
-                mem_handles[i] = allocated_mem_handle
-                _check_cu_result(cuda.cuMemMap(rank_ptr, aligned_size, 0, allocated_mem_handle, 0))
-            else:
-                # Fabric memory mapping
-                imported_mem_handle = _check_cu_result(
-                    cuda.cuMemImportFromShareableHandle(
-                        remote_handle_data, allocation_prop.requestedHandleTypes
-                    )
-                )
-                mem_handles[i] = imported_mem_handle
-                _check_cu_result(cuda.cuMemMap(rank_ptr, aligned_size, 0, imported_mem_handle, 0))
-
-            _check_cu_result(cuda.cuMemSetAccess(rank_ptr, aligned_size, [madesc], 1))
-
-        ptr = HelixCpMnnvlMemory.current_start_address + HelixCpMnnvlMemory.current_mem_offset
-        stride = HelixCpMnnvlMemory.current_rank_stride
-        HelixCpMnnvlMemory.allocated_map[ptr] = (
-            mapping,
-            aligned_size,
-            mem_handles,
-            HelixCpMnnvlMemory.current_start_address,
-            HelixCpMnnvlMemory.current_rank_stride,
-            HelixCpMnnvlMemory.current_mem_offset,
-        )
-        HelixCpMnnvlMemory.address_refcnt[HelixCpMnnvlMemory.current_start_address] = (
-            HelixCpMnnvlMemory.address_refcnt.get(HelixCpMnnvlMemory.current_start_address, 0) + 1
-        )
-
-        HelixCpMnnvlMemory.current_mem_offset += aligned_size
-        return ptr, stride
-
-    @staticmethod
-    def close_mnnvl_memory(ptr: int):
-        mapping, aligned_size, mem_handles, start_address, rank_stride, address_offset = (
-            HelixCpMnnvlMemory.allocated_map.pop(ptr)
-        )
-        comm = HelixCpMnnvlMemory.get_comm(mapping)
-        comm_size = comm.Get_size()
-        for i in range(comm_size):
-            rank_ptr = start_address + i * rank_stride + address_offset
-            _check_cu_result(cuda.cuMemUnmap(rank_ptr, aligned_size))
-            _check_cu_result(cuda.cuMemRelease(mem_handles[i]))
-        HelixCpMnnvlMemory.address_refcnt[start_address] -= 1
-
-        if HelixCpMnnvlMemory.address_refcnt[start_address] == 0:
-            HelixCpMnnvlMemory.address_refcnt.pop(start_address)
-            device_ptr = cuda.CUdeviceptr(start_address)
-            _check_cu_result(cuda.cuMemAddressFree(device_ptr, comm_size * rank_stride))
-            if start_address == HelixCpMnnvlMemory.current_start_address:
-                HelixCpMnnvlMemory.current_start_address = 0
-                HelixCpMnnvlMemory.current_rank_stride = 0
-                HelixCpMnnvlMemory.current_mem_offset = 0
 
 
 @dataclass

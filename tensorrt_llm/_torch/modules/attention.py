@@ -1,7 +1,7 @@
 import math
 import os
 import weakref
-from typing import Optional, Union, cast
+from typing import Dict, Optional, Union, cast
 
 import torch
 from torch import nn
@@ -129,73 +129,70 @@ class HelixAllToAllNative:
     - Field 1: [..., cp_size, 2] float32
     """
 
-    workspace: HelixCpMnnvlMemory = None
-    workspace_tensor: torch.Tensor = None
-    mapping: Mapping = None
+    # Global cache: mapping -> instance
+    _cache: Dict[Mapping, "HelixAllToAllNative"] = {}
+
+    def __init__(self, mapping: Mapping, workspace: HelixCpMnnvlMemory,
+                 workspace_tensor: torch.Tensor):
+        """Private constructor - use get() instead."""
+        self.mapping = mapping
+        self.workspace = workspace
+        self.workspace_tensor = workspace_tensor
 
     @staticmethod
-    def initialize(mapping: Mapping, is_fused: bool = False):
+    def get(mapping: Mapping) -> "HelixAllToAllNative":
         """
-        Initialize the Helix All-to-All workspace using MNNVL memory.
+        Get or create a HelixAllToAllNative instance for the given configuration.
 
         Args:
             mapping: TensorRT-LLM mapping object containing cp_size and cp_rank
-            is_fused: Whether to use fused all-to-all operation
+
+        Returns:
+            Cached or newly-created HelixAllToAllNative instance
         """
-        if MnnvlMemory.initialized and HelixAllToAllNative.workspace_tensor is not None:
-            return
-        logger.info(
-            f"Rank {mapping.cp_rank} initializing HelixCpMnnvlMemory for Helix, is_fused={is_fused}"
-        )
-        MnnvlMemory.initialize()
+        if mapping not in HelixAllToAllNative._cache:
+            logger.info(
+                f"Rank {mapping.cp_rank} initializing HelixCpMnnvlMemory for Helix"
+            )
+            MnnvlMemory.initialize()
 
-        HelixAllToAllNative.mapping = mapping
-
-        # Get workspace size (in bytes)
-        dummy = torch.empty(0, device="cuda")
-        if is_fused:
-            workspace_size_per_rank = torch.ops.trtllm.getHelixFusedWorkspaceSizePerRank(
-                dummy, mapping.cp_size)
-        else:
+            # Get workspace size (in bytes)
+            dummy = torch.empty(0, device="cuda")
             workspace_size_per_rank = torch.ops.trtllm.get_helix_workspace_size_per_rank(
                 dummy, mapping.cp_size)
 
-        # Allocate MNNVL memory using CP communicator for Helix
-        HelixAllToAllNative.workspace = HelixCpMnnvlMemory(
-            mapping, workspace_size_per_rank)
-        HelixAllToAllNative.workspace_tensor = (
-            HelixAllToAllNative.workspace.as_torch_strided_tensor(torch.uint64))
+            # Allocate MNNVL memory using CP communicator for Helix
+            workspace = HelixCpMnnvlMemory(mapping, workspace_size_per_rank)
+            workspace_tensor = workspace.as_torch_strided_tensor(torch.uint64)
 
-        torch.ops.trtllm.initialize_helix_workspace(
-            HelixAllToAllNative.workspace_tensor, mapping.cp_rank,
-            mapping.cp_size)
-        torch.cuda.synchronize()
-        HelixCpMnnvlMemory.get_comm(mapping).barrier()
+            torch.ops.trtllm.initialize_helix_workspace(workspace_tensor,
+                                                        mapping.cp_rank,
+                                                        mapping.cp_size)
+            torch.cuda.synchronize()
+            HelixCpMnnvlMemory.get_comm(mapping).barrier()
 
-    @staticmethod
-    def alltoall_native(field0: torch.Tensor,
-                        field1: torch.Tensor,
-                        is_fused: bool = False):
+            HelixAllToAllNative._cache[mapping] = HelixAllToAllNative(
+                mapping, workspace, workspace_tensor)
+
+        return HelixAllToAllNative._cache[mapping]
+
+    def alltoall_native(self, field0: torch.Tensor, field1: torch.Tensor):
         """
         Perform all-to-all data exchange.
 
         Args:
             field0: Field 0 tensor, shape [..., cp_size, kv_lora_rank], dtype half
             field1: Field 1 tensor, shape [..., cp_size, 2], dtype float32
-            is_fused: Whether to use fused all-to-all operation
 
         Returns:
-            Tuple of (field0_out, field1_out) with same shapes as inputs, or single tensor for fused
+            Tuple of (field0_out, field1_out) with same shapes as inputs
         """
-        assert (HelixAllToAllNative.workspace_tensor
-                is not None), "Must call initialize() first"
-
         field0_out, field1_out = torch.ops.trtllm.alltoall_helix_native(
             field0,
             field1,
-            HelixAllToAllNative.workspace_tensor,
-            HelixAllToAllNative.mapping.cp_rank,
-            HelixAllToAllNative.mapping.cp_size,
+            self.workspace_tensor,
+            self.mapping.cp_rank,
+            self.mapping.cp_size,
         )
 
         return field0_out, field1_out
@@ -1218,8 +1215,8 @@ class MLA(nn.Module):
                     gathered[0], gathered[1], 1.0)
             else:
                 # FIFO-based implementation using MNNVL workspace and LL128 Proto.
-                # Initialize Helix All-to-All workspace if needed.
-                HelixAllToAllNative.initialize(self.mapping)
+                # Get or create Helix All-to-All instance.
+                helix = HelixAllToAllNative.get(self.mapping)
 
                 # Get dimensions.
                 num_tokens = partial_o.shape[0]
@@ -1238,8 +1235,7 @@ class MLA(nn.Module):
                                             2).transpose(1, 2).contiguous()
 
                 # Call FIFO-based helixAllToAll.
-                field0_out, field1_out = HelixAllToAllNative.alltoall_native(
-                    field0, field1)
+                field0_out, field1_out = helix.alltoall_native(field0, field1)
 
                 # field0_out: [num_tokens, num_heads_tp_cp, cp_size, kv_lora_rank]
                 # field1_out: [num_tokens, num_heads_tp_cp, cp_size, 2]

@@ -840,7 +840,7 @@ def _run_single_rank(func, *args, **kwargs):
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 GPUs to run this test")
 @pytest.mark.parametrize("scenario", test_scenarios, ids=lambda x: f"scenario: {x}")
-@pytest.mark.parametrize("use_nccl_for_helix", [False, True], ids=["fifo", "nccl"])
+@pytest.mark.parametrize("use_nccl_for_helix", [True, False], ids=["nccl", "fifo"])
 def test_mla_helix_distributed(
     scenario: Scenario,
     use_nccl_for_helix: bool,
