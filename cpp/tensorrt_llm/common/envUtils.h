@@ -161,9 +161,6 @@ bool getEnvKVCacheTransferAllBlocksForWindow();
 
 bool getEnvEplbForceGdrcopy();
 
-// Whether to use NCCL-based all-to-all for Helix parallelism.
-bool getEnvUseNcclForHelix();
-
 } // namespace common
 
 TRTLLM_NAMESPACE_END

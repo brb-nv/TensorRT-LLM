@@ -1115,8 +1115,8 @@ class MLA(nn.Module):
             kv_lora_rank = partial_o.shape[-1] // self.num_heads_tp
             assert self.kv_lora_rank == kv_lora_rank
 
-            # Switch between NCCL-based and FIFO-based (MNNVL) all-to-all based on env variable.
-            if os.getenv("TRTLLM_USE_NCCL_FOR_HELIX", "0") == "1":
+            # Switch between NCCL-based and FIFO-based (MNNVL) all-to-all based on cp_config.
+            if self.mapping.cp_config.get("use_nccl_for_alltoall", True):
                 # NCCL-based implementation using alltoall_helix.
                 # This is the post-processing of helix parallel attention,
                 # similar to the post-processing of ring attention.

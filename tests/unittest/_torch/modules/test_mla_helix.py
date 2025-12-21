@@ -635,7 +635,7 @@ def _run_mla_distributed(
 
 
 @torch.inference_mode
-def _full_test_multi_gpu(rank: int, world_size: int, scenario: Scenario, gen_steps: int):
+def _full_test_multi_gpu(rank: int, world_size: int, scenario: Scenario, gen_steps: int, use_nccl_for_alltoall: bool = False):
     if scenario.rope_scaling:
         rope_scaling = {
             "beta_fast": scenario.rope_beta_fast,
@@ -805,7 +805,7 @@ def _full_test_multi_gpu(rank: int, world_size: int, scenario: Scenario, gen_ste
 
     # Distributed mapping for helix
     mapping = Mapping(
-        world_size=world_size, rank=rank, cp_size=world_size, cp_config={"cp_type": CpType.HELIX}
+        world_size=world_size, rank=rank, cp_size=world_size, cp_config={"cp_type": CpType.HELIX, "use_nccl_for_alltoall": use_nccl_for_alltoall}
     )
     # we use cp_allgather here because there is no broadcast op across CP group
     ref_output_all = cp_allgather(ref_output, mapping=mapping, dim=0)
@@ -848,30 +848,20 @@ def test_mla_helix_distributed(
     max_mismatch_ratio: float = 0.02,
     mismatch_ratios: Optional[List[float]] = None,
 ):
-    # Set environment variable to control which codepath is used
-    old_env_value = os.environ.get("TRTLLM_USE_NCCL_FOR_HELIX")
-    os.environ["TRTLLM_USE_NCCL_FOR_HELIX"] = "1" if use_nccl_for_helix else "0"
-
     world_size = 2
-    print(f"Testing with TRTLLM_USE_NCCL_FOR_HELIX={'1' if use_nccl_for_helix else '0'}.")
+    nccl_mode = "NCCL" if use_nccl_for_helix else "FIFO"
+    print(f"Testing with use_nccl_for_alltoall={use_nccl_for_helix} ({nccl_mode} mode).")
     gen_steps = scenario.ref_steps if gen_steps is None else gen_steps
-    try:
-        with MPIPoolExecutor(max_workers=world_size) as executor:
-            results = executor.map(
-                _run_single_rank,
-                *zip(*[(_full_test_multi_gpu, world_size, scenario, gen_steps)] * world_size),
-            )
-            if mismatch_ratios is None:
-                for ratio_mismatch in results:
-                    assert ratio_mismatch <= max_mismatch_ratio
-            else:
-                mismatch_ratios.extend(results)
-    finally:
-        # Restore the original environment variable value
-        if old_env_value is None:
-            os.environ.pop("TRTLLM_USE_NCCL_FOR_HELIX", None)
+    with MPIPoolExecutor(max_workers=world_size) as executor:
+        results = executor.map(
+            _run_single_rank,
+            *zip(*[(_full_test_multi_gpu, world_size, scenario, gen_steps, use_nccl_for_helix)] * world_size),
+        )
+        if mismatch_ratios is None:
+            for ratio_mismatch in results:
+                assert ratio_mismatch <= max_mismatch_ratio
         else:
-            os.environ["TRTLLM_USE_NCCL_FOR_HELIX"] = old_env_value
+            mismatch_ratios.extend(results)
 
 
 if __name__ == "__main__":
@@ -879,7 +869,7 @@ if __name__ == "__main__":
         nccl_mode = "NCCL" if use_nccl else "FIFO"
         print(f"\n{'=' * 60}")
         print(
-            f"Testing with TRTLLM_USE_NCCL_FOR_HELIX={'1' if use_nccl else '0'} ({nccl_mode} mode)"
+            f"Testing with use_nccl_for_alltoall={use_nccl} ({nccl_mode} mode)"
         )
         print(f"{'=' * 60}\n")
         for scenario in all_scenarios[:11]:
