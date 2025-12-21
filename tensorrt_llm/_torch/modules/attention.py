@@ -1,5 +1,4 @@
 import math
-import os
 import weakref
 from typing import Optional, Union, cast
 

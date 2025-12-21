@@ -13,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
 import pickle
 import sys
 import time
@@ -635,7 +634,13 @@ def _run_mla_distributed(
 
 
 @torch.inference_mode
-def _full_test_multi_gpu(rank: int, world_size: int, scenario: Scenario, gen_steps: int, use_nccl_for_alltoall: bool = False):
+def _full_test_multi_gpu(
+    rank: int,
+    world_size: int,
+    scenario: Scenario,
+    gen_steps: int,
+    use_nccl_for_alltoall: bool = False,
+):
     if scenario.rope_scaling:
         rope_scaling = {
             "beta_fast": scenario.rope_beta_fast,
@@ -805,7 +810,10 @@ def _full_test_multi_gpu(rank: int, world_size: int, scenario: Scenario, gen_ste
 
     # Distributed mapping for helix
     mapping = Mapping(
-        world_size=world_size, rank=rank, cp_size=world_size, cp_config={"cp_type": CpType.HELIX, "use_nccl_for_alltoall": use_nccl_for_alltoall}
+        world_size=world_size,
+        rank=rank,
+        cp_size=world_size,
+        cp_config={"cp_type": CpType.HELIX, "use_nccl_for_alltoall": use_nccl_for_alltoall},
     )
     # we use cp_allgather here because there is no broadcast op across CP group
     ref_output_all = cp_allgather(ref_output, mapping=mapping, dim=0)
@@ -840,22 +848,25 @@ def _run_single_rank(func, *args, **kwargs):
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 GPUs to run this test")
 @pytest.mark.parametrize("scenario", test_scenarios, ids=lambda x: f"scenario: {x}")
-@pytest.mark.parametrize("use_nccl_for_helix", [True, False], ids=["nccl", "fifo"])
+@pytest.mark.parametrize("use_nccl_for_alltoall", [True, False], ids=["nccl", "fifo"])
 def test_mla_helix_distributed(
     scenario: Scenario,
-    use_nccl_for_helix: bool,
+    use_nccl_for_alltoall: bool,
     gen_steps: Optional[int] = None,
     max_mismatch_ratio: float = 0.02,
     mismatch_ratios: Optional[List[float]] = None,
 ):
     world_size = 2
-    nccl_mode = "NCCL" if use_nccl_for_helix else "FIFO"
-    print(f"Testing with use_nccl_for_alltoall={use_nccl_for_helix} ({nccl_mode} mode).")
+    nccl_mode = "NCCL" if use_nccl_for_alltoall else "FIFO"
+    print(f"Testing with use_nccl_for_alltoall={use_nccl_for_alltoall} ({nccl_mode} mode).")
     gen_steps = scenario.ref_steps if gen_steps is None else gen_steps
     with MPIPoolExecutor(max_workers=world_size) as executor:
         results = executor.map(
             _run_single_rank,
-            *zip(*[(_full_test_multi_gpu, world_size, scenario, gen_steps, use_nccl_for_helix)] * world_size),
+            *zip(
+                *[(_full_test_multi_gpu, world_size, scenario, gen_steps, use_nccl_for_alltoall)]
+                * world_size
+            ),
         )
         if mismatch_ratios is None:
             for ratio_mismatch in results:
@@ -868,9 +879,7 @@ if __name__ == "__main__":
     for use_nccl in [False, True]:
         nccl_mode = "NCCL" if use_nccl else "FIFO"
         print(f"\n{'=' * 60}")
-        print(
-            f"Testing with use_nccl_for_alltoall={use_nccl} ({nccl_mode} mode)"
-        )
+        print(f"Testing with use_nccl_for_alltoall={use_nccl} ({nccl_mode} mode)")
         print(f"{'=' * 60}\n")
         for scenario in all_scenarios[:11]:
             timing_steps = 256
@@ -879,7 +888,7 @@ if __name__ == "__main__":
             mismatch_ratios = []
             test_mla_helix_distributed(
                 scenario,
-                use_nccl_for_helix=use_nccl,
+                use_nccl_for_alltoall=use_nccl,
                 gen_steps=gen_steps,
                 mismatch_ratios=mismatch_ratios,
             )
