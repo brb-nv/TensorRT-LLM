@@ -18,6 +18,11 @@
 file(GLOB_RECURSE SRC_CPP *.cpp)
 file(GLOB_RECURSE SRC_CU *.cu)
 
+# Explicitly add newly added kernel files to ensure they're included
+# (GLOB only runs at configure time, not build time)
+list(APPEND SRC_CU ${CMAKE_CURRENT_SOURCE_DIR}/helixAllToAll.cu)
+list(REMOVE_DUPLICATES SRC_CU)
+
 # Exclude files in the cutlass_kernels, decoderMaskedMultiheadAttention and
 # selectiveScan trtllmGenKernels folder
 list(FILTER SRC_CPP EXCLUDE REGEX "cutlass_kernels/.*")

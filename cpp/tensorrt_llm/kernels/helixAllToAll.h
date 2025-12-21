@@ -15,35 +15,17 @@
  */
 #pragma once
 
-#include "tensorrt_llm/common/cudaUtils.h"
-#include "tensorrt_llm/kernels/moeCommKernelsCommon.h"
+#include "tensorrt_llm/common/config.h"
 
 #include <cuda_runtime.h>
 
-#include <algorithm>
+#include <cstddef>
 #include <cstdint>
-#include <cstdlib>
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
-
-// Backward compatibility aliases (reference common constants from moeCommKernelsCommon.h)
-// WARP_SIZE, WARP_MASK, BYTES_PER_128B_BLOCK, UINT64_PER_128B_BLOCK, MAX_GROUP_COUNT_PER_BLOCK
-// are now defined in moeCommKernelsCommon.h
-
-// ============================================================================
-// Structure declarations and definitions
-// ============================================================================
-
-// ALIGN_256 is defined in moeCommKernelsCommon.h
-
-struct ALIGN_256 HelixFifoInfo
-{
-    volatile int64_t head;
-    volatile int64_t tail;
-};
 
 struct HelixFieldInfo
 {
@@ -66,11 +48,6 @@ struct HelixAllToAllParams
     int channelCount; // use 0 to auto-compute
     int maxChannelCount;
 };
-
-// ============================================================================
-// Utility Functions
-// ceil_div and align_up are now defined in moeCommKernelsCommon.h
-// ============================================================================
 
 // ============================================================================
 // Workspace Management Functions
@@ -113,4 +90,5 @@ void initializeHelixWorkspace(uint64_t* workspace, int cpSize, cudaStream_t stre
 void launchHelixAllToAll(HelixAllToAllParams const& params, bool allowVariableField1, cudaStream_t stream);
 
 } // namespace kernels
-} // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END

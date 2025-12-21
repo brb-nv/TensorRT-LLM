@@ -20,25 +20,32 @@
 #include "tensorrt_llm/kernels/cudaAsyncOps.cuh"
 #include "tensorrt_llm/kernels/helixAllToAll.h"
 #include "tensorrt_llm/kernels/ll128Proto.cuh"
+#include "tensorrt_llm/kernels/moeCommKernelsCommon.h"
 
-#include <cstdint>
-#include <cstdio>
+#include <algorithm>
+#include <tuple>
 #include <unordered_map>
 
-#include <cooperative_groups.h>
-#include <cuda_bf16.h>
-#include <cuda_fp16.h>
-#include <cuda_runtime.h>
+TRTLLM_NAMESPACE_BEGIN
 
-namespace cg = cooperative_groups;
-
-namespace tensorrt_llm
-{
 namespace kernels
 {
 
 namespace
 {
+
+// ============================================================================
+// Structure declarations and definitions
+// ============================================================================
+
+// ALIGN_256 is defined in moeCommKernelsCommon.h
+
+struct ALIGN_256 HelixFifoInfo
+{
+    volatile int64_t head;
+    volatile int64_t tail;
+};
+
 // ============================================================================
 // Helix-specific FIFO constants
 // Note: Helix uses 128KB FIFO entries vs 256KB in FusedMoe
@@ -671,4 +678,5 @@ void initializeHelixWorkspace(uint64_t* local_workspace_ptr, int cpSize, cudaStr
 }
 
 } // namespace kernels
-} // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END

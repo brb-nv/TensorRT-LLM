@@ -15,31 +15,13 @@
  * limitations under the License.
  */
 
-//  #include "tensorrt_llm/kernels/fusedMoeCommKernels.h"
- 
-//  #include <c10/cuda/CUDAStream.h>
-//  #include <torch/extension.h>
-//  #include <vector>
- 
-
-
-#include "tensorrt_llm/kernels/helixAllToAll.h"
-#include "tensorrt_llm/kernels/fusedMoeCommKernels.h"
 #include "tensorrt_llm/common/opUtils.h"
+#include "tensorrt_llm/kernels/helixAllToAll.h"
 #include "tensorrt_llm/runtime/torchUtils.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include "tensorrt_llm/thop/thUtils.h"
 
-#include <NvInferRuntime.h>
-#include <c10/cuda/CUDAStream.h>
-#include <cassert>
-#include <set>
-#include <string>
-#include <torch/extension.h>
 #include <vector>
-#if ENABLE_MULTI_DEVICE
-#include <nccl.h>
-#endif // ENABLE_MULTI_DEVICE
 
 TRTLLM_NAMESPACE_BEGIN
 
@@ -145,7 +127,7 @@ std::vector<torch::Tensor> alltoall_helix(
  * @param cp_size Total number of context parallel ranks
  * @return tuple of (field0_out, field1_out) with same shapes as inputs
  */
-std::tuple<torch::Tensor, torch::Tensor> helixAllToAllNative(
+std::tuple<torch::Tensor, torch::Tensor> alltoall_helix_native(
     torch::Tensor field0, torch::Tensor field1, torch::Tensor workspace, int64_t cp_rank, int64_t cp_size)
 {
 
@@ -252,7 +234,7 @@ std::tuple<torch::Tensor, torch::Tensor> helixAllToAllNative(
  * Get workspace size per rank in bytes.
  * Use dummy tensor argument to allow using torch.ops
  */
-int64_t getHelixWorkspaceSizePerRank(torch::Tensor __dummy__, int64_t cp_size)
+int64_t get_helix_workspace_size_per_rank(torch::Tensor __dummy__, int64_t cp_size)
 {
     return tensorrt_llm::kernels::computeHelixWorkspaceSizePerRank(cp_size);
 }
@@ -260,7 +242,7 @@ int64_t getHelixWorkspaceSizePerRank(torch::Tensor __dummy__, int64_t cp_size)
 /**
  * Initialize workspace for helix all-to-all
  */
-void initializeHelixWorkspace(torch::Tensor workspace, int64_t cp_rank, int64_t cp_size)
+void initialize_helix_workspace(torch::Tensor workspace, int64_t cp_rank, int64_t cp_size)
 {
     CHECK_TH_CUDA(workspace);
     CHECK_TYPE(workspace, at::ScalarType::UInt64);
@@ -285,18 +267,18 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def("alltoall_helix(Tensor[] input_list, int[] group, int? num_lists) -> Tensor[]");
     m.def(
-        "helixAllToAllNative(Tensor field0, Tensor field1, Tensor workspace, int "
+        "alltoall_helix_native(Tensor field0, Tensor field1, Tensor workspace, int "
         "cp_rank, int cp_size) -> (Tensor, Tensor)");
-    m.def("getHelixWorkspaceSizePerRank(Tensor __dummy__, int cp_size) -> int");
+    m.def("get_helix_workspace_size_per_rank(Tensor __dummy__, int cp_size) -> int");
     m.def(
-        "initializeHelixWorkspace(Tensor workspace, int cp_rank, int cp_size) "
+        "initialize_helix_workspace(Tensor workspace, int cp_rank, int cp_size) "
         "-> ()");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
     m.impl("alltoall_helix", &tensorrt_llm::torch_ext::alltoall_helix);
-    m.impl("helixAllToAllNative", &tensorrt_llm::torch_ext::helixAllToAllNative);
-    m.impl("getHelixWorkspaceSizePerRank", &tensorrt_llm::torch_ext::getHelixWorkspaceSizePerRank);
-    m.impl("initializeHelixWorkspace", &tensorrt_llm::torch_ext::initializeHelixWorkspace);
+    m.impl("alltoall_helix_native", &tensorrt_llm::torch_ext::alltoall_helix_native);
+    m.impl("get_helix_workspace_size_per_rank", &tensorrt_llm::torch_ext::get_helix_workspace_size_per_rank);
+    m.impl("initialize_helix_workspace", &tensorrt_llm::torch_ext::initialize_helix_workspace);
 }

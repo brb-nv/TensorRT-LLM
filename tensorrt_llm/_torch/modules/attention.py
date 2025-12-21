@@ -157,7 +157,7 @@ class HelixAllToAllNative:
             workspace_size_per_rank = torch.ops.trtllm.getHelixFusedWorkspaceSizePerRank(
                 dummy, mapping.cp_size)
         else:
-            workspace_size_per_rank = torch.ops.trtllm.getHelixWorkspaceSizePerRank(
+            workspace_size_per_rank = torch.ops.trtllm.get_helix_workspace_size_per_rank(
                 dummy, mapping.cp_size)
 
         # Allocate MNNVL memory using CP communicator for Helix
@@ -166,7 +166,7 @@ class HelixAllToAllNative:
         HelixAllToAllNative.workspace_tensor = (
             HelixAllToAllNative.workspace.as_torch_strided_tensor(torch.uint64))
 
-        torch.ops.trtllm.initializeHelixWorkspace(
+        torch.ops.trtllm.initialize_helix_workspace(
             HelixAllToAllNative.workspace_tensor, mapping.cp_rank,
             mapping.cp_size)
         torch.cuda.synchronize()
@@ -190,7 +190,7 @@ class HelixAllToAllNative:
         assert (HelixAllToAllNative.workspace_tensor
                 is not None), "Must call initialize() first"
 
-        field0_out, field1_out = torch.ops.trtllm.helixAllToAllNative(
+        field0_out, field1_out = torch.ops.trtllm.alltoall_helix_native(
             field0,
             field1,
             HelixAllToAllNative.workspace_tensor,
@@ -1224,7 +1224,6 @@ class MLA(nn.Module):
                 # Get dimensions.
                 num_tokens = partial_o.shape[0]
                 cp_size = self.mapping.cp_size
-                assert cp_size > 1, f"cp_size must be greater than 1 for helix, but got {cp_size}."
 
                 # Reshape for FIFO-based all-to-all.
                 # partial_o: [num_tokens, num_heads * kv_lora_rank] -> [num_tokens, cp_size, num_heads_tp_cp, kv_lora_rank]
