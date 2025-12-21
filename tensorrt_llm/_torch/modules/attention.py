@@ -1147,24 +1147,24 @@ class MLA(nn.Module):
                 # partial_o: [num_tokens, num_heads * kv_lora_rank] -> [num_tokens, cp_size, num_heads_tp_cp, kv_lora_rank]
                 # softmax_stats: [num_tokens, num_heads, 2] -> [num_tokens, cp_size, num_heads_tp_cp, 2]
 
-                field0 = partial_o.view(num_tokens, cp_size,
+                partial_o = partial_o.view(num_tokens, cp_size,
                                         self.num_heads_tp_cp,
                                         kv_lora_rank).transpose(1,
                                                                 2).contiguous()
-                field1 = softmax_stats.view(num_tokens, cp_size,
+                softmax_stats = softmax_stats.view(num_tokens, cp_size,
                                             self.num_heads_tp_cp,
                                             2).transpose(1, 2).contiguous()
 
                 # Call FIFO-based helixAllToAll.
-                field0_out, field1_out = helix.alltoall_native(field0, field1)
+                partial_o_out, softmax_stats_out = helix.alltoall_native(partial_o, softmax_stats)
 
-                # field0_out: [num_tokens, num_heads_tp_cp, cp_size, kv_lora_rank]
-                # field1_out: [num_tokens, num_heads_tp_cp, cp_size, 2]
+                # partial_o_out: [num_tokens, num_heads_tp_cp, cp_size, kv_lora_rank]
+                # softmax_stats_out: [num_tokens, num_heads_tp_cp, cp_size, 2]
                 # cp_dim = 2 (the dimension where cp_size is located)
 
                 # Call helix_post_process_native with cp_dim=2.
                 return torch.ops.trtllm.helix_post_process_native(
-                    field0_out, field1_out, 1.0, 2)
+                    partial_o_out, softmax_stats_out, 1.0, 2)
         else:
             attn_output = attn_backend.forward(q, k, v, attn_metadata, **kwargs)
             return attn_output
