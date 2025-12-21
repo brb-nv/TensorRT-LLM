@@ -22,7 +22,7 @@ from ..attention_backend.interface import (AttentionBackend, AttentionMask,
 from ..attention_backend.sparse.dsa import (
     DSAtrtllmAttentionMetadata, transform_local_topk_and_prepare_pool_view)
 from ..attention_backend.utils import create_attention, get_attention_backend
-from ..distributed import AllReduceParams, alltoall_helix
+from ..distributed import AllReduceParams, HelixAllToAllNative, alltoall_helix
 from ..model_config import ModelConfig
 from ..peft.lora.layer import LoraLayer, LoraModuleType
 from ..utils import (Fp4QuantizedTensor, get_model_extra_attrs,
@@ -118,84 +118,6 @@ def attn_custom_op_inplace(
                           enable_attn_nvfp4_output=False,
                           output=output,
                           attention_sinks=attention_sinks)
-
-
-class HelixAllToAllNative:
-    """
-    Manager for Helix All-to-All operations with MNNVL workspace management.
-
-    Exchanges data along the cp_size dimension:
-    - Field 0: [..., cp_size, kv_lora_rank] half-precision
-    - Field 1: [..., cp_size, 2] float32
-    """
-
-    # Global cache: mapping -> instance
-    _cache: Dict[Mapping, "HelixAllToAllNative"] = {}
-
-    def __init__(self, mapping: Mapping, workspace: HelixCpMnnvlMemory,
-                 workspace_tensor: torch.Tensor):
-        """Private constructor - use get() instead."""
-        self.mapping = mapping
-        self.workspace = workspace
-        self.workspace_tensor = workspace_tensor
-
-    @staticmethod
-    def get(mapping: Mapping) -> "HelixAllToAllNative":
-        """
-        Get or create a HelixAllToAllNative instance for the given configuration.
-
-        Args:
-            mapping: TensorRT-LLM mapping object containing cp_size and cp_rank
-
-        Returns:
-            Cached or newly-created HelixAllToAllNative instance
-        """
-        if mapping not in HelixAllToAllNative._cache:
-            logger.info(
-                f"Rank {mapping.cp_rank} initializing HelixCpMnnvlMemory for Helix"
-            )
-            MnnvlMemory.initialize()
-
-            # Get workspace size (in bytes)
-            dummy = torch.empty(0, device="cuda")
-            workspace_size_per_rank = torch.ops.trtllm.get_helix_workspace_size_per_rank(
-                dummy, mapping.cp_size)
-
-            # Allocate MNNVL memory using CP communicator for Helix
-            workspace = HelixCpMnnvlMemory(mapping, workspace_size_per_rank)
-            workspace_tensor = workspace.as_torch_strided_tensor(torch.uint64)
-
-            torch.ops.trtllm.initialize_helix_workspace(workspace_tensor,
-                                                        mapping.cp_rank,
-                                                        mapping.cp_size)
-            torch.cuda.synchronize()
-            HelixCpMnnvlMemory.get_comm(mapping).barrier()
-
-            HelixAllToAllNative._cache[mapping] = HelixAllToAllNative(
-                mapping, workspace, workspace_tensor)
-
-        return HelixAllToAllNative._cache[mapping]
-
-    def alltoall_native(self, field0: torch.Tensor, field1: torch.Tensor):
-        """
-        Perform all-to-all data exchange.
-
-        Args:
-            field0: Field 0 tensor, shape [..., cp_size, kv_lora_rank], dtype half
-            field1: Field 1 tensor, shape [..., cp_size, 2], dtype float32
-
-        Returns:
-            Tuple of (field0_out, field1_out) with same shapes as inputs
-        """
-        field0_out, field1_out = torch.ops.trtllm.alltoall_helix_native(
-            field0,
-            field1,
-            self.workspace_tensor,
-            self.mapping.cp_rank,
-            self.mapping.cp_size,
-        )
-
-        return field0_out, field1_out
 
 
 class Attention(nn.Module):
