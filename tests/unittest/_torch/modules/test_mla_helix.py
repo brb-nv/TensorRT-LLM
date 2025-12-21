@@ -133,6 +133,8 @@ all_scenarios = [
 # limit the number of test scenarios to avoid taking too long
 test_scenarios = [
     all_scenarios[0],
+    all_scenarios[1],
+    all_scenarios[4],
     all_scenarios[7],
     all_scenarios[14],
     all_scenarios[17],
