@@ -15,11 +15,20 @@
  * limitations under the License.
  */
 
-#include "alltoallOp.h"
+//  #include "tensorrt_llm/kernels/fusedMoeCommKernels.h"
+ 
+//  #include <c10/cuda/CUDAStream.h>
+//  #include <torch/extension.h>
+//  #include <vector>
+ 
+
+
+#include "tensorrt_llm/kernels/helixAllToAll.h"
+#include "tensorrt_llm/kernels/fusedMoeCommKernels.h"
 #include "tensorrt_llm/common/opUtils.h"
 #include "tensorrt_llm/runtime/torchUtils.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
-#include "thUtils.h"
+#include "tensorrt_llm/thop/thUtils.h"
 
 #include <NvInferRuntime.h>
 #include <c10/cuda/CUDAStream.h>

@@ -29,17 +29,6 @@ namespace tensorrt_llm
 namespace kernels
 {
 
-// ============================================================================
-// Helix-specific FIFO constants
-// Note: Helix uses 128KB FIFO entries vs 256KB in FusedMoe
-// ============================================================================
-
-constexpr int HELIX_FIFO_DEPTH = 4;
-constexpr int HELIX_FIFO_ENTRY_BYTES = 128 * 1024;
-constexpr int HELIX_FIFO_ENTRY_128B_COUNT = HELIX_FIFO_ENTRY_BYTES / BYTES_PER_128B_BLOCK;
-constexpr int HELIX_FIFO_TOTAL_BYTES = HELIX_FIFO_ENTRY_BYTES * HELIX_FIFO_DEPTH;
-constexpr int HELIX_FIFO_TOTAL_U64 = HELIX_FIFO_TOTAL_BYTES / sizeof(uint64_t);
-
 // Backward compatibility aliases (reference common constants from moeCommKernelsCommon.h)
 // WARP_SIZE, WARP_MASK, BYTES_PER_128B_BLOCK, UINT64_PER_128B_BLOCK, MAX_GROUP_COUNT_PER_BLOCK
 // are now defined in moeCommKernelsCommon.h
@@ -48,17 +37,9 @@ constexpr int HELIX_FIFO_TOTAL_U64 = HELIX_FIFO_TOTAL_BYTES / sizeof(uint64_t);
 // Structure declarations and definitions
 // ============================================================================
 
-struct HelixPairInfo
-{
-    int senderRank;
-    int receiverRank;
-    int channel;
-    int runChannelCount;
-};
-
 // ALIGN_256 is defined in moeCommKernelsCommon.h
 
-struct ALIGN_256 FifoInfo
+struct ALIGN_256 HelixFifoInfo
 {
     volatile int64_t head;
     volatile int64_t tail;
@@ -102,21 +83,7 @@ struct HelixAllToAllParams
  * @param smCount Number of SMs available (0 = auto-detect)
  * @return Number of channels to use
  */
-inline int computeHelixMaxChannelCount(int cpSize, int smCount = 0)
-{
-    if (smCount == 0)
-    {
-        int deviceId = 0;
-        TLLM_CUDA_CHECK(cudaGetDevice(&deviceId));
-        TLLM_CUDA_CHECK(cudaDeviceGetAttribute(&smCount, cudaDevAttrMultiProcessorCount, deviceId));
-    }
-
-    int blockCountPerChannel = ceil_div(cpSize, MAX_GROUP_COUNT_PER_BLOCK);
-    blockCountPerChannel *= 2; // for send and recv
-
-    int preferredChannel = smCount / blockCountPerChannel;
-    return std::max(preferredChannel, 1); // at least one channel
-}
+int computeHelixMaxChannelCount(int cpSize, int smCount = 0);
 
 /**
  * Compute the workspace size required per rank for the all-to-all operation.
@@ -124,23 +91,7 @@ inline int computeHelixMaxChannelCount(int cpSize, int smCount = 0)
  * @param cpSize Number of context parallel ranks
  * @return Size in bytes
  */
-inline size_t computeHelixWorkspaceSizePerRank(int cpSize)
-{
-    static int maxChannelCount = 0;
-    if (maxChannelCount == 0)
-    {
-        maxChannelCount = computeHelixMaxChannelCount(cpSize);
-    }
-
-    // FIFO buffers: cpSize * channelCount pairs
-    size_t fifoSize = static_cast<size_t>(HELIX_FIFO_TOTAL_BYTES) * cpSize * maxChannelCount;
-
-    // Sender and receiver FIFO info structures
-    size_t senderInfoSize = sizeof(FifoInfo) * cpSize * maxChannelCount;
-    size_t receiverInfoSize = sizeof(FifoInfo) * cpSize * maxChannelCount;
-
-    return fifoSize + senderInfoSize + receiverInfoSize;
-}
+size_t computeHelixWorkspaceSizePerRank(int cpSize);
 
 /**
  * Initialize workspace memory for a given rank.

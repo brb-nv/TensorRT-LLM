@@ -36,6 +36,32 @@ namespace tensorrt_llm
 {
 namespace kernels
 {
+
+namespace
+{
+// ============================================================================
+// Helix-specific FIFO constants
+// Note: Helix uses 128KB FIFO entries vs 256KB in FusedMoe
+// ============================================================================
+
+constexpr int HELIX_FIFO_DEPTH = 4;
+constexpr int HELIX_FIFO_ENTRY_BYTES = 128 * 1024;
+constexpr int HELIX_FIFO_TOTAL_BYTES = HELIX_FIFO_ENTRY_BYTES * HELIX_FIFO_DEPTH;
+constexpr int HELIX_FIFO_ENTRY_128B_COUNT = HELIX_FIFO_ENTRY_BYTES / BYTES_PER_128B_BLOCK;
+constexpr int HELIX_FIFO_TOTAL_U64 = HELIX_FIFO_TOTAL_BYTES / sizeof(uint64_t);
+
+// ============================================================================
+// Implementation-only structures
+// ============================================================================
+
+struct HelixPairInfo
+{
+    int senderRank;
+    int receiverRank;
+    int channel;
+    int runChannelCount;
+};
+
 // WARP_SIZE, WARP_MASK, and other constants are defined in moeCommKernelsCommon.h
 
 // ============================================================================
@@ -170,36 +196,36 @@ __device__ __forceinline__ uint64_t* getFifoBasePtr(HelixAllToAllParams const& p
     return mappedMemory + fifoOffset;
 }
 
-__device__ __forceinline__ FifoInfo* getSenderFifoInfo(HelixAllToAllParams const& params, HelixPairInfo const& pairInfo)
+__device__ __forceinline__ HelixFifoInfo* getSenderHelixFifoInfo(HelixAllToAllParams const& params, HelixPairInfo const& pairInfo)
 {
-    // SenderSideFifoInfo is physically located at sender rank
+    // SenderSideHelixFifoInfo is physically located at sender rank
     int mappedMemoryRank = pairInfo.senderRank;
     int rankInsideMappedMemory = pairInfo.receiverRank;
 
     auto* mappedMemory = reinterpret_cast<uint8_t*>(params.workspace + mappedMemoryRank * params.workspaceStrideInU64);
     size_t fieldOffset = static_cast<size_t>(HELIX_FIFO_TOTAL_BYTES) * params.cpSize * params.maxChannelCount;
     mappedMemory += fieldOffset;
-    mappedMemory += rankInsideMappedMemory * params.maxChannelCount * sizeof(FifoInfo);
-    mappedMemory += pairInfo.channel * sizeof(FifoInfo);
+    mappedMemory += rankInsideMappedMemory * params.maxChannelCount * sizeof(HelixFifoInfo);
+    mappedMemory += pairInfo.channel * sizeof(HelixFifoInfo);
 
-    return reinterpret_cast<FifoInfo*>(mappedMemory);
+    return reinterpret_cast<HelixFifoInfo*>(mappedMemory);
 }
 
-__device__ __forceinline__ FifoInfo* getReceiverFifoInfo(
+__device__ __forceinline__ HelixFifoInfo* getReceiverHelixFifoInfo(
     HelixAllToAllParams const& params, HelixPairInfo const& pairInfo)
 {
-    // ReceiverSideFifoInfo is physically located at receiver rank
+    // ReceiverSideHelixFifoInfo is physically located at receiver rank
     int mappedMemoryRank = pairInfo.receiverRank;
     int rankInsideMappedMemory = pairInfo.senderRank;
 
     auto* mappedMemory = reinterpret_cast<uint8_t*>(params.workspace + mappedMemoryRank * params.workspaceStrideInU64);
     size_t fieldOffset = static_cast<size_t>(HELIX_FIFO_TOTAL_BYTES) * params.cpSize * params.maxChannelCount;
-    fieldOffset += sizeof(FifoInfo) * params.cpSize * params.maxChannelCount;
+    fieldOffset += sizeof(HelixFifoInfo) * params.cpSize * params.maxChannelCount;
     mappedMemory += fieldOffset;
-    mappedMemory += rankInsideMappedMemory * params.maxChannelCount * sizeof(FifoInfo);
-    mappedMemory += pairInfo.channel * sizeof(FifoInfo);
+    mappedMemory += rankInsideMappedMemory * params.maxChannelCount * sizeof(HelixFifoInfo);
+    mappedMemory += pairInfo.channel * sizeof(HelixFifoInfo);
 
-    return reinterpret_cast<FifoInfo*>(mappedMemory);
+    return reinterpret_cast<HelixFifoInfo*>(mappedMemory);
 }
 
 __device__ __forceinline__ void startWorkspaceS2G(
@@ -315,8 +341,8 @@ __global__ void helixAllToAllKernel(HelixAllToAllParams params)
 
     // Get FIFO pointers
     uint64_t* fifoBase = getFifoBasePtr(params, pairInfo);
-    FifoInfo* senderFifo = getSenderFifoInfo(params, pairInfo);
-    FifoInfo* receiverFifo = getReceiverFifoInfo(params, pairInfo);
+    HelixFifoInfo* senderFifo = getSenderHelixFifoInfo(params, pairInfo);
+    HelixFifoInfo* receiverFifo = getReceiverHelixFifoInfo(params, pairInfo);
 
     int fifoEntry128ByteIndexBase = HELIX_FIFO_ENTRY_128B_COUNT;
     int fifoEntryIndex = -1;
@@ -572,6 +598,46 @@ void launchHelixAllToAllImpl(HelixAllToAllParams const& params, cudaStream_t str
     TLLM_CUDA_CHECK(cudaLaunchKernelEx(&config, kernel_instance, params));
 }
 
+} // anonymous namespace
+
+// ============================================================================
+// Public API Functions
+// ============================================================================
+
+int computeHelixMaxChannelCount(int cpSize, int smCount)
+{
+    if (smCount == 0)
+    {
+        int deviceId = 0;
+        TLLM_CUDA_CHECK(cudaGetDevice(&deviceId));
+        TLLM_CUDA_CHECK(cudaDeviceGetAttribute(&smCount, cudaDevAttrMultiProcessorCount, deviceId));
+    }
+
+    int blockCountPerChannel = ceil_div(cpSize, MAX_GROUP_COUNT_PER_BLOCK);
+    blockCountPerChannel *= 2; // for send and recv
+
+    int preferredChannel = smCount / blockCountPerChannel;
+    return std::max(preferredChannel, 1); // at least one channel
+}
+
+size_t computeHelixWorkspaceSizePerRank(int cpSize)
+{
+    static int maxChannelCount = 0;
+    if (maxChannelCount == 0)
+    {
+        maxChannelCount = computeHelixMaxChannelCount(cpSize);
+    }
+
+    // FIFO buffers: cpSize * channelCount pairs
+    size_t fifoSize = static_cast<size_t>(HELIX_FIFO_TOTAL_BYTES) * cpSize * maxChannelCount;
+
+    // Sender and receiver FIFO info structures
+    size_t senderInfoSize = sizeof(HelixFifoInfo) * cpSize * maxChannelCount;
+    size_t receiverInfoSize = sizeof(HelixFifoInfo) * cpSize * maxChannelCount;
+
+    return fifoSize + senderInfoSize + receiverInfoSize;
+}
+
 void launchHelixAllToAll(HelixAllToAllParams const& params, bool allowVariableField1, cudaStream_t stream)
 {
     if (allowVariableField1)
@@ -593,8 +659,8 @@ void initializeHelixWorkspace(uint64_t* local_workspace_ptr, int cpSize, cudaStr
     int maxChannelCount = computeHelixMaxChannelCount(cpSize);
     // Calculate sizes with channel dimension
     size_t fifoSize = static_cast<size_t>(HELIX_FIFO_TOTAL_BYTES) * cpSize * maxChannelCount;
-    size_t senderInfoSize = sizeof(FifoInfo) * cpSize * maxChannelCount;
-    size_t receiverInfoSize = sizeof(FifoInfo) * cpSize * maxChannelCount;
+    size_t senderInfoSize = sizeof(HelixFifoInfo) * cpSize * maxChannelCount;
+    size_t receiverInfoSize = sizeof(HelixFifoInfo) * cpSize * maxChannelCount;
 
     // Initialize FIFO buffers to 0xFFFFFFFF (-1 for signed integer types)
     TLLM_CUDA_CHECK(cudaMemsetAsync(local_workspace_ptr, 0xFF, fifoSize, stream));
