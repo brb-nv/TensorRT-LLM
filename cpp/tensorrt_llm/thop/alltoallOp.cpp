@@ -232,15 +232,6 @@ std::tuple<torch::Tensor, torch::Tensor> alltoall_helix_native(
 }
 
 /**
- * Get workspace size per rank in bytes.
- * Use dummy tensor argument to allow using torch.ops
- */
-int64_t get_helix_workspace_size_per_rank(torch::Tensor __dummy__, int64_t cp_size)
-{
-    return tensorrt_llm::kernels::computeHelixWorkspaceSizePerRank(cp_size);
-}
-
-/**
  * Initialize workspace for helix all-to-all
  */
 void initialize_helix_workspace(torch::Tensor workspace, int64_t cp_rank, int64_t cp_size)
@@ -270,7 +261,6 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
     m.def(
         "alltoall_helix_native(Tensor partial_o, Tensor softmax_stats, Tensor workspace, int "
         "cp_rank, int cp_size) -> (Tensor, Tensor)");
-    m.def("get_helix_workspace_size_per_rank(Tensor __dummy__, int cp_size) -> int");
     m.def(
         "initialize_helix_workspace(Tensor workspace, int cp_rank, int cp_size) "
         "-> ()");
@@ -280,6 +270,5 @@ TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
     m.impl("alltoall_helix", &tensorrt_llm::torch_ext::alltoall_helix);
     m.impl("alltoall_helix_native", &tensorrt_llm::torch_ext::alltoall_helix_native);
-    m.impl("get_helix_workspace_size_per_rank", &tensorrt_llm::torch_ext::get_helix_workspace_size_per_rank);
     m.impl("initialize_helix_workspace", &tensorrt_llm::torch_ext::initialize_helix_workspace);
 }

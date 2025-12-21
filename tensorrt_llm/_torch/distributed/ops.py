@@ -11,6 +11,7 @@ from tensorrt_llm._mnnvl_utils import HelixCpMnnvlMemory, MnnvlMemory
 from tensorrt_llm._torch.distributed.symm_mem_allreduce import \
     SymmetricMemoryAllReduce
 from tensorrt_llm._utils import mpi_comm, mpi_disabled
+from tensorrt_llm.bindings import internal as _tllm_internal
 from tensorrt_llm.bindings.internal.runtime import McastGPUBuffer
 from tensorrt_llm.functional import (AllReduceFusionOp, AllReduceParams,
                                      AllReduceStrategy, MoEAllReduceParams)
@@ -401,9 +402,8 @@ class HelixAllToAllNative:
             MnnvlMemory.initialize()
 
             # Get workspace size (in bytes)
-            dummy = torch.empty(0, device="cuda")
-            workspace_size_per_rank = torch.ops.trtllm.get_helix_workspace_size_per_rank(
-                dummy, mapping.cp_size)
+            workspace_size_per_rank = _tllm_internal.thop.get_helix_workspace_size_per_rank(
+                mapping.cp_size)
 
             # Allocate MNNVL memory using CP communicator for Helix
             workspace = HelixCpMnnvlMemory(mapping, workspace_size_per_rank)
