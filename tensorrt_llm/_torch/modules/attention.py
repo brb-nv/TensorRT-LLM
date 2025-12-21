@@ -1,13 +1,12 @@
 import math
 import os
 import weakref
-from typing import Dict, Optional, Union, cast
+from typing import Optional, Union, cast
 
 import torch
 from torch import nn
 
 import tensorrt_llm.quantization.utils.fp8_utils as fp8_utils
-from tensorrt_llm._mnnvl_utils import HelixCpMnnvlMemory, MnnvlMemory
 from tensorrt_llm._utils import (get_sm_version, is_sm_100f, nvtx_range,
                                  nvtx_range_debug)
 from tensorrt_llm.logger import logger

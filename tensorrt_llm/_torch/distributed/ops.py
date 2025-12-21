@@ -7,6 +7,7 @@ from typing import Dict, List, Optional, Tuple, Union
 import torch
 from torch import nn
 
+from tensorrt_llm._mnnvl_utils import HelixCpMnnvlMemory, MnnvlMemory
 from tensorrt_llm._torch.distributed.symm_mem_allreduce import \
     SymmetricMemoryAllReduce
 from tensorrt_llm._utils import mpi_comm, mpi_disabled
@@ -15,7 +16,6 @@ from tensorrt_llm.functional import (AllReduceFusionOp, AllReduceParams,
                                      AllReduceStrategy, MoEAllReduceParams)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm._mnnvl_utils import HelixCpMnnvlMemory, MnnvlMemory
 from tensorrt_llm.plugin.plugin import CustomAllReduceHelper
 
 _thread_local = threading.local()
@@ -440,7 +440,6 @@ class HelixAllToAllNative:
         )
 
         return field0_out, field1_out
-
 
 
 def reducescatter(

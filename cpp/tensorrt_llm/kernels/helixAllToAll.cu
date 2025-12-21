@@ -203,7 +203,8 @@ __device__ __forceinline__ uint64_t* getFifoBasePtr(HelixAllToAllParams const& p
     return mappedMemory + fifoOffset;
 }
 
-__device__ __forceinline__ HelixFifoInfo* getSenderHelixFifoInfo(HelixAllToAllParams const& params, HelixPairInfo const& pairInfo)
+__device__ __forceinline__ HelixFifoInfo* getSenderHelixFifoInfo(
+    HelixAllToAllParams const& params, HelixPairInfo const& pairInfo)
 {
     // SenderSideHelixFifoInfo is physically located at sender rank
     int mappedMemoryRank = pairInfo.senderRank;

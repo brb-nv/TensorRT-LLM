@@ -878,7 +878,9 @@ if __name__ == "__main__":
     for use_nccl in [False, True]:
         nccl_mode = "NCCL" if use_nccl else "FIFO"
         print(f"\n{'=' * 60}")
-        print(f"Testing with TRTLLM_USE_NCCL_FOR_HELIX={'1' if use_nccl else '0'} ({nccl_mode} mode)")
+        print(
+            f"Testing with TRTLLM_USE_NCCL_FOR_HELIX={'1' if use_nccl else '0'} ({nccl_mode} mode)"
+        )
         print(f"{'=' * 60}\n")
         for scenario in all_scenarios[:11]:
             timing_steps = 256

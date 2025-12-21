@@ -251,9 +251,7 @@ class MnnvlMemory:
 
         for i, remote_handle_data in enumerate(all_handles_data):
             rank_ptr = (
-                cls.current_start_address
-                + cls.current_rank_stride * i
-                + cls.current_mem_offset
+                cls.current_start_address + cls.current_rank_stride * i + cls.current_mem_offset
             )
             if i == comm_rank:
                 # Local memory mapping
