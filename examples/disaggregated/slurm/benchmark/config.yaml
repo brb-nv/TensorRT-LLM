@@ -16,8 +16,8 @@ benchmark:
   multi_round: 1  # Number of benchmark rounds
   benchmark_ratio: 1.0  # Benchmark ratio
   streaming: true  # Enable streaming mode
-  concurrency_list: "64"                        # @B: needs change. Make this batch size * 8.
-  input_length: 32768  # Input sequence length # @B: needs change. (Leave room for chat template tokens)
+  concurrency_list: "128"
+  input_length: 524288  # Input sequence length
   output_length: 1024  # Output sequence length
   dataset_file: ""
 
@@ -33,9 +33,10 @@ environment:
   container_image: "/lustre/fsw/coreai_comparch_trtllm/bbuddharaju/sqsh/tensorrt_llm_pytorch_25.10_py3_aarch64_ubuntu24.04_trt10.13.3.9_skip_tritondevel_202512151112_9977.sqsh"
   model_path: "/lustre/fsw/coreai_comparch_trtllm/jiaganc/model/DeepSeek-R1/DeepSeek-R1-0528-FP4-v2/"
   trtllm_repo: "/lustre/fsw/coreai_comparch_trtllm/bbuddharaju/TensorRT-LLM/"
-  build_wheel: false  # Don't build the wheel when launching multiple jobs
+  build_wheel: true  # Don't build the wheel when launching multiple jobs
   cuda_architectures: "100-real"  # Optional CUDA architectures to build for (e.g. "90-real;100-real"). If empty, builds for all architectures
-  trtllm_wheel_path: "/lustre/fsw/coreai_comparch_trtllm/bbuddharaju/TensorRT-LLM/build/tensorrt_llm-1.2.0rc6-cp312-cp312-linux_aarch64.whl"  # Path to pre-built TensorRT-LLM wheel. If provided, install from this wheel instead
+  # trtllm_wheel_path: "/lustre/fsw/coreai_comparch_trtllm/bbuddharaju/TensorRT-LLM/build/tensorrt_llm-1.2.0rc6-cp312-cp312-linux_aarch64.whl"  # Path to pre-built TensorRT-LLM wheel. If provided, install from this wheel instead
+  trtllm_wheel_path: ""
   work_dir: "/lustre/fsw/coreai_comparch_trtllm/bbuddharaju/TensorRT-LLM/examples/disaggregated/slurm/benchmark/"
   worker_env_var: "TLLM_LOG_LEVEL=INFO TRTLLM_SERVER_DISABLE_GC=1 TRTLLM_WORKER_DISABLE_GC=1 TRTLLM_ENABLE_PDL=1 ENROOT_ALLOW_DEV=yes"
   server_env_var: "TRTLLM_SERVER_DISABLE_GC=1"
@@ -55,24 +56,22 @@ accuracy:
 
 worker_config:
   gen:
-    tensor_parallel_size: 1                   # @B: needs change.
-    moe_expert_parallel_size: 8               # @B: needs change.
+    tensor_parallel_size: 1
+    moe_expert_parallel_size: 8
     enable_attention_dp: false
     enable_lm_head_tp_in_adp: false
-    pipeline_parallel_size: 1                 # @B: needs change.
-    context_parallel_size: 8                  # @B: needs change.
+    pipeline_parallel_size: 1
+    context_parallel_size: 16
     cp_config:
       cp_type: "HELIX"
-      tokens_per_block: 32  # must match kv_config.tokens_per_block.
-    max_batch_size: 1                         # @B: needs change.
-    max_num_tokens: 32                        # @B: needs change.
-    max_seq_len: 35328                       # @B: needs change.
+      tokens_per_block: 32
+    max_batch_size: 64
+    max_num_tokens: 128
+    max_seq_len: 525312
     cuda_graph_config:
       enable_padding: true
-      batch_sizes:                            # @B: needs change. Make this [batch_size].
-      - 1
-      - 2
-      - 4
+      batch_sizes:
+      - 64
     print_iter_log: true
     trust_remote_code: true
     kv_cache_config:
@@ -92,8 +91,8 @@ worker_config:
     num_postprocess_workers: 4
   ctx:
     max_batch_size: 1
-    max_num_tokens: 131104                       # @B: needs change. Must be >= input_length
-    max_seq_len: 131104                          # @B: needs change. Must be >= input_length + output_length
+    max_num_tokens: 131104
+    max_seq_len: 131104
     tensor_parallel_size: 8
     context_parallel_size: 1
     moe_expert_parallel_size: 8
@@ -108,5 +107,5 @@ worker_config:
       free_gpu_memory_fraction: 0.85
       dtype: fp8
     cache_transceiver_config:
-      max_tokens_in_buffer: 4096               # @B: needs change. Should match max_num_tokens
+      max_tokens_in_buffer: 4096
       backend: UCX
