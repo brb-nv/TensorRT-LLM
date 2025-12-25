@@ -17,9 +17,9 @@ CONFIGS_DIR="${WORK_DIR}/saved_configs/${TIMESTAMP}"
 # DEFINE SWEEP PARAMETERS - Modify these arrays as needed
 # =============================================================================
 NUM_GPUS=8                       # Total number of GPUs (TP = NUM_GPUS / CP)
-CP_VALUES=(1 8)                    # Context Parallel sizes
-ISL_VALUES=(32768)              # Input Sequence Lengths
-BATCH_SIZE_VALUES=(1)          # Batch sizes
+CP_VALUES=(8)                    # Context Parallel sizes
+ISL_VALUES=(65536 131072 262144 524288 1048576)              # Input Sequence Lengths
+BATCH_SIZE_VALUES=(8)          # Batch sizes
 
 # =============================================================================
 # Helper functions
@@ -43,7 +43,7 @@ save_config() {
     echo "Saved config to: $save_path"
 }
 
-# Function to update config.yaml using yq
+# Function to update config.yaml using sed
 update_config() {
     local tp=$1
     local cp=$2
@@ -53,50 +53,33 @@ update_config() {
 
     # Calculate derived values
     local concurrency=$(( batch_size * 8 < 64 ? batch_size * 8 : 64 ))
-    local max_seq_len=$((isl + 2560))  # osl is 1024.
+    local max_seq_len=$((isl / cp + 2560))  # osl is 1024.
 
     echo "=========================================="
     echo "Updating config with:"
     echo "  NUM_GPUS=$NUM_GPUS, TP=$tp, CP=$cp, EP=$ep"
-    echo "  ISL=$isl, batch_size=$batch_size"
+    echo "  ISL=$isl, OSL=1024, batch_size=$batch_size"
     echo "  concurrency=$concurrency, max_seq_len=$max_seq_len"
     echo "=========================================="
 
-    # Check if yq is available
-    if command -v yq &> /dev/null; then
-        # Use yq for YAML manipulation
-        yq -i ".benchmark.input_length = $isl" "$CONFIG_FILE"
-        yq -i ".benchmark.concurrency_list = \"$concurrency\"" "$CONFIG_FILE"
+    # Update benchmark section
+    sed -i "s/input_length: [0-9]*/input_length: $isl/" "$CONFIG_FILE"
+    sed -i "s/concurrency_list: \"[0-9]*\"/concurrency_list: \"$concurrency\"/" "$CONFIG_FILE"
 
-        yq -i ".worker_config.gen.tensor_parallel_size = $tp" "$CONFIG_FILE"
-        yq -i ".worker_config.gen.context_parallel_size = $cp" "$CONFIG_FILE"
-        yq -i ".worker_config.gen.moe_expert_parallel_size = $ep" "$CONFIG_FILE"
-        yq -i ".worker_config.gen.max_batch_size = $batch_size" "$CONFIG_FILE"
-        yq -i ".worker_config.gen.max_num_tokens = $((batch_size * 3))" "$CONFIG_FILE"
-        yq -i ".worker_config.gen.max_seq_len = $max_seq_len" "$CONFIG_FILE"
+    # Update gen worker config
+    sed -i "/worker_config:/,/ctx:/ {
+        s/tensor_parallel_size: [0-9]*/tensor_parallel_size: $tp/
+        s/moe_expert_parallel_size: [0-9]*/moe_expert_parallel_size: $ep/
+        s/context_parallel_size: [0-9]*/context_parallel_size: $cp/
+        s/max_batch_size: [0-9]*/max_batch_size: $batch_size/
+        s/max_num_tokens: [0-9]*/max_num_tokens: $((batch_size * 32))/
+        s/max_seq_len: [0-9]*/max_seq_len: $max_seq_len/
+    }" "$CONFIG_FILE"
 
-        # Update cuda_graph_config.batch_sizes to include sizes from 1 to batch_size
-        yq -i ".worker_config.gen.cuda_graph_config.batch_sizes = [$batch_size]" "$CONFIG_FILE"
-
-    else
-        # Fallback to sed-based approach
-        echo "Warning: yq not found, using sed-based approach"
-        
-        # Update benchmark section
-        sed -i "s/input_length: [0-9]*/input_length: $isl/" "$CONFIG_FILE"
-        sed -i "s/concurrency_list: \"[0-9]*\"/concurrency_list: \"$concurrency\"/" "$CONFIG_FILE"
-
-        # Update gen worker config
-        sed -i "/worker_config:/,/ctx:/ {
-            s/tensor_parallel_size: [0-9]*/tensor_parallel_size: $tp/
-            s/moe_expert_parallel_size: [0-9]*/moe_expert_parallel_size: $ep/
-            s/context_parallel_size: [0-9]*/context_parallel_size: $cp/
-            s/max_batch_size: [0-9]*/max_batch_size: $batch_size/
-            s/max_num_tokens: [0-9]*/max_num_tokens: $((batch_size * 32))/
-            s/max_seq_len: [0-9]*/max_seq_len: $max_seq_len/
-            s/batch_sizes: \[[0-9, ]*\]/batch_sizes: [$batch_size]/
-        }" "$CONFIG_FILE"
-    fi
+    # Update cuda_graph_config.batch_sizes (multi-line YAML list format)
+    sed -i "/batch_sizes:$/,/^[^-]/ {
+        s/^\( *- \)[0-9][0-9]*/\1$batch_size/
+    }" "$CONFIG_FILE"
 
     echo "Config updated successfully"
 }
