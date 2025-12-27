@@ -908,7 +908,8 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             "enable_chunked_prefill": False,
             "cuda_graph_config": None,
             "cache_transceiver_config": {
-                "backend": "UCX"
+                "backend": "UCX",
+                "max_tokens_in_buffer": 8192,
             },
         }
         gen_server_config = {
@@ -926,7 +927,8 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             "enable_chunked_prefill": False,
             "cuda_graph_config": cuda_graph_config,
             "cache_transceiver_config": {
-                "backend": "UCX"
+                "backend": "UCX",
+                "max_tokens_in_buffer": 8192,
             },
         }
         disaggregated_server_config = {
