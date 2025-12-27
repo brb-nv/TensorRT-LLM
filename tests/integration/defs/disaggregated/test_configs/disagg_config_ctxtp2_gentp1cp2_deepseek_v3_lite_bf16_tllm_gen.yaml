@@ -16,12 +16,13 @@ context_servers:
   pipeline_parallel_size: 1
   cache_transceiver_config:
     backend: "UCX"
+    max_tokens_in_buffer: 8192
   urls:
       - "localhost:8001"
 generation_servers:
   num_instances: 1
   tensor_parallel_size: 1
-  pipeline_parallel_size: 1
+  pipeline_parallel_size: 2
   context_parallel_size: 2
   enable_chunked_prefill: False
   cp_config:
@@ -33,5 +34,6 @@ generation_servers:
     tokens_per_block: 32
   cache_transceiver_config:
     backend: "UCX"
+    max_tokens_in_buffer: 8192
   urls:
       - "localhost:8002"

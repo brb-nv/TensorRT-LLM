@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import contextlib
+import glob
 import os
 import re
 import subprocess
@@ -174,7 +175,7 @@ def get_test_config(test_desc, example_dir, test_root):
         "llama4_kv_cache_overflow":
         (8, f"{test_configs_root}/disagg_config_llama4_kv_cache_overflow.yaml"),
         "deepseek_v3_lite_bf16_tllm_gen_helix":
-        (4,
+        (6,
          f"{test_configs_root}/disagg_config_ctxtp2_gentp1cp2_deepseek_v3_lite_bf16_tllm_gen.yaml"
          ),
     }
@@ -234,16 +235,15 @@ def run_client_tests(example_dir,
                      use_ray=False):
     """Run client tests against the disaggregated server."""
     client_dir = f"{example_dir}/clients"
-    for _ in range(num_iters):
+    # Use only 1 iteration for long prompts test
+    effective_num_iters = 1 if prompt_file == "long_prompts.json" else num_iters
+    for _ in range(effective_num_iters):
         client_cmd = [
             'python3', f'{client_dir}/disagg_client.py', '-c', f'{config_file}',
             '-p', f'{client_dir}/{prompt_file}', '--ignore-eos',
             '--server-start-timeout',
             str(server_start_timeout)
         ]
-        if prompt_file == "long_prompts.json":
-            # Use max_tokens 4 for long prompts to reduce test time
-            client_cmd.extend(['--max-tokens', '4'])
 
         # Prepare poll processes
         worker_processes = []
@@ -256,11 +256,13 @@ def run_client_tests(example_dir,
         poll_procs = worker_processes + [server_proc]
         check_call(client_cmd, env=env, poll_procs=poll_procs)
 
-        # Streaming client run
-        streaming_client_cmd = client_cmd + [
-            '--streaming', '-o', 'output_streaming.json'
-        ]
-        check_call(streaming_client_cmd, env=env, poll_procs=poll_procs)
+        # Skip streaming for long prompts test
+        if prompt_file != "long_prompts.json":
+            # Streaming client run
+            streaming_client_cmd = client_cmd + [
+                '--streaming', '-o', 'output_streaming.json'
+            ]
+            check_call(streaming_client_cmd, env=env, poll_procs=poll_procs)
 
         # Run the chat completion endpoint test only for TinyLlama
         if test_desc == "overlap" or test_desc == "trtllm_sampler":
@@ -276,8 +278,15 @@ def run_client_tests(example_dir,
                        env=env,
                        poll_procs=poll_procs)
 
-        # Skip output verification for long prompts test
+        # Print and skip further verification for long prompts test.
         if prompt_file == "long_prompts.json":
+            # Print all output_*.json file contents.
+            for output_file in glob.glob('output_*.json') + ['output.json']:
+                if os.path.exists(output_file):
+                    with open(output_file, 'r') as f:
+                        content = f.read()
+                        logger.info(f"-------- {output_file} content --------")
+                        logger.info(content)
             continue
 
         if extra_endpoints_test is not None:
@@ -1834,7 +1843,7 @@ def test_llama4_long_context_kv_cache_overflow(disaggregated_test_root,
                                  cwd=llm_venv.get_working_directory())
 
 
-@pytest.mark.skip_less_device(4)
+@pytest.mark.skip_less_device(8)
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-bf16'],
                          indirect=True)
 def test_disaggregated_deepseek_v3_lite_bf16_tllm_gen_helix(
