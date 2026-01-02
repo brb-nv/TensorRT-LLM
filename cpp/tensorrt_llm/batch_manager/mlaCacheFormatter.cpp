@@ -37,17 +37,23 @@
 namespace tensorrt_llm::batch_manager::kv_cache_manager
 {
 
-// some context rank in connection
+// Pick which context connections to receive from (called by gen side).
+// Context always has CP=1, so mDomainCPSize should be 1.
 std::vector<size_t> MLACacheFormatter::pickRecvConnections(
     size_t numConnections, CacheState const& selfConfig, SizeType32 selfIdx, CacheState const& destConfig) const
 {
 
     auto targetInfo = executor::kv_cache::targetIRanks(destConfig, selfConfig, selfIdx);
-    // This function is called only by gen side and we only support CPSize=1 on context size.
+    // Context side always has CP=1, so domain CP size from gen's perspective is 1.
     TLLM_CHECK(targetInfo.mDomainCPSize == 1);
     TLLM_CHECK(numConnections == targetInfo.mIRanks.size());
     std::vector<size_t> ret;
-    // targetInfo , mRanks [tpranks, ppranks]
+    // targetInfo.mIRanks contains [CP ranks, TP ranks, PP ranks] from context side.
+    // Since context CP=1, we only need to consider TP and PP dimensions.
+
+    // Get gen's DP rank - this determines which context TP rank to receive from.
+    // When gen has both CP and attention DP, different gen CP ranks at the same TP rank
+    // receive from the same context rank (but different blocks).
     int dpRank = selfConfig.getParallelConfig().mEnableAttentionDP ? selfConfig.getParallelConfig().mDPrank : 0;
 
     for (int i = 0; i < targetInfo.mDomainPPSize; i++)
@@ -661,10 +667,13 @@ void MLACacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& s
         TLLM_LOG_WARNING("MLACacheFormatter::inquireSupport: TP size must be divisible by DP size");
         return false;
     }
+    // When gen (dest) has attention DP without CP, TP must equal DP size.
+    // When gen has both CP and attention DP, this constraint is relaxed.
     if ((destConfig.getParallelConfig().mEnableAttentionDP)
+        && (destConfig.getParallelConfig().mContextParallelism == 1)
         && (destConfig.getParallelConfig().mTensorParallelism != destConfig.getParallelConfig().mDPsize))
     {
-        TLLM_LOG_WARNING("MLACacheFormatter::inquireSupport: TP size must be equal to DP size");
+        TLLM_LOG_WARNING("MLACacheFormatter::inquireSupport: TP size must be equal to DP size when CP=1");
         return false;
     }
 

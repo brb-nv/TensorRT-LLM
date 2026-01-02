@@ -891,8 +891,10 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                                  "cudagraph:with_padding"
                              ])
     @pytest.mark.parametrize("comms_medium", ["fifo", "nccl"])
-    def test_auto_dtype_with_helix(self, comms_medium, cuda_graph_config,
-                                   gen_pp, gen_tp, gen_cp):
+    @pytest.mark.parametrize("enable_attention_dp", [False, True],
+                             ids=["adp_off", "adp_on"])
+    def test_auto_dtype_with_helix(self, enable_attention_dp, comms_medium,
+                                   cuda_graph_config, gen_pp, gen_tp, gen_cp):
         use_nccl_for_alltoall = comms_medium == "nccl"
         gen_ep = gen_tp * gen_cp
         kv_cache_config = {
@@ -932,6 +934,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                 "backend": "UCX",
                 "max_tokens_in_buffer": 8192,
             },
+            "enable_attention_dp": enable_attention_dp,
         }
         disaggregated_server_config = {
             "hostname": "localhost",

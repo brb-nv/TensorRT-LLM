@@ -2386,3 +2386,187 @@ TEST(targetTest, CacheStateContextDP)
     verfiyGeneration(
         /*contextRank*/ 1, /*generationRank*/ 0, /*expectRanks*/ {1}, /*expectPPDomain*/ 1, /*expectTPDomain*/ 1);
 }
+
+// Test case for gen-side CP > 1 with attention DP enabled.
+// Context server always has CP = 1, gen server can have CP > 1 with attention DP.
+TEST(targetTest, CacheStateGenCPWithDP)
+{
+    int const numLayers = 16;
+    int const numHeads = 2;
+    int const sizePerHead = 64;
+    int const tokensPerBlock = 64;
+    auto const dataType = nvinfer1::DataType::kFLOAT;
+    bool const isMLA = true;
+    int const kvFactor = 2;
+
+    // Context side configuration (always CP = 1).
+    int contextPP = 1;
+    int contextTP = 4;
+    int contextCP = 1;
+    bool contextEnableDP = true;
+
+    // Gen side configuration (CP > 1 with attention DP).
+    int genPP = 1;
+    int genTP = 4;
+    int genCP = 2;
+    bool genEnableDP = true;
+
+    std::vector<SizeType32> contextAttentionLayerNumPerPP(contextPP, numLayers / contextPP);
+    std::vector<SizeType32> genAttentionLayerNumPerPP(genPP, numLayers / genPP);
+
+    // Verify context-to-gen direction: context rank sends to gen ranks.
+    auto const verifyContextToGen = [&](int contextRank, int generationRank, std::vector<int> const& expectRanks,
+                                        int expectPPDomain, int expectTPDomain, int expectCPDomain, bool expectNeedSend)
+    {
+        int contextDPRank = contextRank % contextTP;
+        int generationDPRank = (generationRank % (genTP * genCP)) / genCP;
+        auto attentionType = isMLA ? texec::kv_cache::CacheState::AttentionType::kMLA
+                                   : texec::kv_cache::CacheState::AttentionType::kDEFAULT;
+
+        auto const contextCache = tensorrt_llm::executor::kv_cache::CacheState{numLayers, numHeads, sizePerHead,
+            tokensPerBlock, contextTP, contextPP, contextCP, contextAttentionLayerNumPerPP, dataType, attentionType,
+            kvFactor, contextEnableDP, contextDPRank, contextTP};
+
+        auto const genCache = tensorrt_llm::executor::kv_cache::CacheState{numLayers, numHeads, sizePerHead,
+            tokensPerBlock, genTP, genPP, genCP, genAttentionLayerNumPerPP, dataType, attentionType, kvFactor,
+            genEnableDP, generationDPRank, genTP};
+
+        auto const contextTargetInfo
+            = tensorrt_llm::executor::kv_cache::TargetRanksInfoForDP(genCache, contextCache, contextRank);
+
+        EXPECT_EQ(expectRanks, contextTargetInfo.mIRanks);
+        EXPECT_EQ(expectPPDomain, contextTargetInfo.mDomainPPSize);
+        EXPECT_EQ(expectTPDomain, contextTargetInfo.mDomainTPSize);
+        EXPECT_EQ(expectCPDomain, contextTargetInfo.mDomainCPSize);
+        EXPECT_EQ(expectNeedSend, MLACacheFormatter::needSendCache(contextCache, genCache, contextRank));
+    };
+
+    // Verify gen-to-context direction: gen rank receives from context ranks.
+    auto const verifyGenToContext = [&](int generationRank, std::vector<int> const& expectRanks, int expectPPDomain,
+                                        int expectTPDomain, int expectCPDomain)
+    {
+        int generationDPRank = (generationRank % (genTP * genCP)) / genCP;
+        auto attentionType = isMLA ? texec::kv_cache::CacheState::AttentionType::kMLA
+                                   : texec::kv_cache::CacheState::AttentionType::kDEFAULT;
+
+        auto const contextCache = tensorrt_llm::executor::kv_cache::CacheState{numLayers, numHeads, sizePerHead,
+            tokensPerBlock, contextTP, contextPP, contextCP, contextAttentionLayerNumPerPP, dataType, attentionType,
+            kvFactor, contextEnableDP, /*contextDPRank*/ 0, contextTP};
+
+        auto const genCache = tensorrt_llm::executor::kv_cache::CacheState{numLayers, numHeads, sizePerHead,
+            tokensPerBlock, genTP, genPP, genCP, genAttentionLayerNumPerPP, dataType, attentionType, kvFactor,
+            genEnableDP, generationDPRank, genTP};
+
+        auto const genTargetInfo
+            = tensorrt_llm::executor::kv_cache::TargetRanksInfoForDP(contextCache, genCache, generationRank);
+
+        EXPECT_EQ(expectRanks, genTargetInfo.mIRanks);
+        EXPECT_EQ(expectPPDomain, genTargetInfo.mDomainPPSize);
+        EXPECT_EQ(expectTPDomain, genTargetInfo.mDomainTPSize);
+        EXPECT_EQ(expectCPDomain, genTargetInfo.mDomainCPSize);
+    };
+
+    // Test case 1: contextTP=4 (with DP), genTP=4, genCP=2 (with DP).
+    // Gen ranks: ppRank * (tpNum * cpNum) + tpRank * cpNum + cpRank.
+    // With genTP=4, genCP=2: rank 0 = (tp=0,cp=0), rank 1 = (tp=0,cp=1), rank 2 = (tp=1,cp=0), etc.
+    {
+        // Context rank 0 sends to gen ranks with matching DP group.
+        // Since both have DP with TP=4, each context rank maps to 1 gen TP rank.
+        // But gen has CP=2, so context rank 0 sends to gen ranks 0,1 (tp=0, cp=0,1).
+        verifyContextToGen(
+            /*contextRank*/ 0, /*generationRank*/ 0, /*expectRanks*/ {0, 1}, /*expectPPDomain*/ 1,
+            /*expectTPDomain*/ 1, /*expectCPDomain*/ 2, /*expectNeedSend*/ true);
+        verifyContextToGen(
+            /*contextRank*/ 1, /*generationRank*/ 0, /*expectRanks*/ {2, 3}, /*expectPPDomain*/ 1,
+            /*expectTPDomain*/ 1, /*expectCPDomain*/ 2, /*expectNeedSend*/ true);
+        verifyContextToGen(
+            /*contextRank*/ 2, /*generationRank*/ 0, /*expectRanks*/ {4, 5}, /*expectPPDomain*/ 1,
+            /*expectTPDomain*/ 1, /*expectCPDomain*/ 2, /*expectNeedSend*/ true);
+        verifyContextToGen(
+            /*contextRank*/ 3, /*generationRank*/ 0, /*expectRanks*/ {6, 7}, /*expectPPDomain*/ 1,
+            /*expectTPDomain*/ 1, /*expectCPDomain*/ 2, /*expectNeedSend*/ true);
+
+        // Gen rank 0 (tp=0, cp=0) receives from context rank 0.
+        verifyGenToContext(
+            /*generationRank*/ 0, /*expectRanks*/ {0}, /*expectPPDomain*/ 1, /*expectTPDomain*/ 1,
+            /*expectCPDomain*/ 1);
+        // Gen rank 1 (tp=0, cp=1) receives from context rank 0.
+        verifyGenToContext(
+            /*generationRank*/ 1, /*expectRanks*/ {0}, /*expectPPDomain*/ 1, /*expectTPDomain*/ 1,
+            /*expectCPDomain*/ 1);
+        // Gen rank 2 (tp=1, cp=0) receives from context rank 1.
+        verifyGenToContext(
+            /*generationRank*/ 2, /*expectRanks*/ {1}, /*expectPPDomain*/ 1, /*expectTPDomain*/ 1,
+            /*expectCPDomain*/ 1);
+        // Gen rank 3 (tp=1, cp=1) receives from context rank 1.
+        verifyGenToContext(
+            /*generationRank*/ 3, /*expectRanks*/ {1}, /*expectPPDomain*/ 1, /*expectTPDomain*/ 1,
+            /*expectCPDomain*/ 1);
+    }
+
+    // Test case 2: contextTP=2, genTP=4, genCP=2 (gen TP grows with CP).
+    contextTP = 2;
+    genTP = 4;
+    genCP = 2;
+    contextAttentionLayerNumPerPP = std::vector<SizeType32>(contextPP, numLayers / contextPP);
+    genAttentionLayerNumPerPP = std::vector<SizeType32>(genPP, numLayers / genPP);
+    {
+        // Context rank 0 sends to gen ranks 0,1,2,3 (tp=0,1 with cp=0,1).
+        verifyContextToGen(
+            /*contextRank*/ 0, /*generationRank*/ 0, /*expectRanks*/ {0, 2, 1, 3}, /*expectPPDomain*/ 1,
+            /*expectTPDomain*/ 2, /*expectCPDomain*/ 2, /*expectNeedSend*/ true);
+        verifyContextToGen(
+            /*contextRank*/ 1, /*generationRank*/ 0, /*expectRanks*/ {4, 6, 5, 7}, /*expectPPDomain*/ 1,
+            /*expectTPDomain*/ 2, /*expectCPDomain*/ 2, /*expectNeedSend*/ true);
+    }
+
+    // Test case 3: contextTP=4 (no DP), genTP=2, genCP=2 (with DP).
+    // Context has more TP than gen, so duplicate heads scenario.
+    contextTP = 4;
+    genTP = 2;
+    genCP = 2;
+    contextEnableDP = false;
+    genEnableDP = true;
+    contextAttentionLayerNumPerPP = std::vector<SizeType32>(contextPP, numLayers / contextPP);
+    genAttentionLayerNumPerPP = std::vector<SizeType32>(genPP, numLayers / genPP);
+    {
+        // Context rank 0 sends to gen ranks 0,1 (tp=0, cp=0,1).
+        verifyContextToGen(
+            /*contextRank*/ 0, /*generationRank*/ 0, /*expectRanks*/ {0, 1}, /*expectPPDomain*/ 1,
+            /*expectTPDomain*/ 1, /*expectCPDomain*/ 2, /*expectNeedSend*/ true);
+        // Context rank 1 has duplicate heads, should not send.
+        verifyContextToGen(
+            /*contextRank*/ 1, /*generationRank*/ 0, /*expectRanks*/ {0, 1}, /*expectPPDomain*/ 1,
+            /*expectTPDomain*/ 1, /*expectCPDomain*/ 2, /*expectNeedSend*/ false);
+        // Context rank 2 sends to gen ranks 2,3 (tp=1, cp=0,1).
+        verifyContextToGen(
+            /*contextRank*/ 2, /*generationRank*/ 0, /*expectRanks*/ {2, 3}, /*expectPPDomain*/ 1,
+            /*expectTPDomain*/ 1, /*expectCPDomain*/ 2, /*expectNeedSend*/ true);
+        // Context rank 3 has duplicate heads, should not send.
+        verifyContextToGen(
+            /*contextRank*/ 3, /*generationRank*/ 0, /*expectRanks*/ {2, 3}, /*expectPPDomain*/ 1,
+            /*expectTPDomain*/ 1, /*expectCPDomain*/ 2, /*expectNeedSend*/ false);
+    }
+
+    // Test case 4: With PP > 1 on gen side.
+    contextPP = 1;
+    contextTP = 2;
+    genPP = 2;
+    genTP = 2;
+    genCP = 2;
+    contextEnableDP = true;
+    genEnableDP = true;
+    contextAttentionLayerNumPerPP = std::vector<SizeType32>(contextPP, numLayers / contextPP);
+    genAttentionLayerNumPerPP = std::vector<SizeType32>(genPP, numLayers / genPP);
+    {
+        // Context rank 0 sends to gen pp0 and pp1 ranks.
+        // Gen rank formula: ppRank * (tpNum * cpNum) + tpRank * cpNum + cpRank.
+        // pp0: ranks 0-3, pp1: ranks 4-7.
+        verifyContextToGen(
+            /*contextRank*/ 0, /*generationRank*/ 0, /*expectRanks*/ {0, 4, 1, 5}, /*expectPPDomain*/ 2,
+            /*expectTPDomain*/ 1, /*expectCPDomain*/ 2, /*expectNeedSend*/ true);
+        verifyContextToGen(
+            /*contextRank*/ 1, /*generationRank*/ 0, /*expectRanks*/ {2, 6, 3, 7}, /*expectPPDomain*/ 2,
+            /*expectTPDomain*/ 1, /*expectCPDomain*/ 2, /*expectNeedSend*/ true);
+    }
+}
