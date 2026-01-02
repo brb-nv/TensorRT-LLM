@@ -887,7 +887,16 @@ protected:
     auto makeLlmRequestWithDP(SizeType32 length, LlmRequest::RequestIdType requestId, int contextDpRank)
     {
         constexpr SizeType32 maxNewTokens{1};
-        texec::Request request{VecTokens(length), maxNewTokens};
+        auto const tokensPerBlock = mContextCacheState->getModelConfig().mTokensPerBlock;
+
+        std::optional<CPMetaData> cpMetaData;
+        int seqLen = length;
+        if (mCpSize > 1)
+        {
+            cpMetaData.emplace(length, tokensPerBlock, mCpRank, mCpSize);
+            seqLen = cpMetaData.value().mSeqLenOnThisCPRank;
+        }
+        texec::Request request{VecTokens(seqLen, seqLen), maxNewTokens};
 
         auto state = std::make_unique<texec::DataTransceiverState>();
         state->setCommState(texec::kv_cache::CommState{*mContextCommState});
@@ -905,7 +914,6 @@ protected:
         request.setContextPhaseParams(std::move(stats));
         auto llmRequestPtr = std::make_unique<LlmRequest>(requestId, std::move(request));
 
-        std::optional<CPMetaData> cpMetaData;
         return std::make_unique<WrappedLlmRequest>(std::move(llmRequestPtr), cpMetaData);
     }
 
@@ -1428,6 +1436,27 @@ TEST_P(AsymmetricalCacheTestWithDP, TestCase)
     {
         GTEST_SKIP() << "Temporarily skipping cache transceiver tests with NIXL and MOONCAKE backend for CP.";
     }
+    // Filter request lengths based on CP requirements.
+    // Each request must have at least one block per CP rank to be valid for CP tests.
+    std::vector<int> lenList = {60, 30, 60, 10};
+    if (genCp > 1)
+    {
+        std::vector<int> updatedLenList;
+        for (auto len : lenList)
+        {
+            if (len > tokensPerBlock * (genCp - 1))
+            {
+                updatedLenList.push_back(len);
+            }
+        }
+        if (updatedLenList.empty())
+        {
+            GTEST_SKIP() << "Skipping test because not even one request has one block per genCP rank. tokensPerBlock="
+                         << tokensPerBlock << ", genCp=" << genCp;
+        }
+        lenList = updatedLenList;
+    }
+
     setUpCommunicator(contextTp, contextPp, contextCp, genTp, genPp, genCp, isMLA, contextDP, generationDP);
 
     if (mIsContext || mIsGeneration)
@@ -1438,7 +1467,7 @@ TEST_P(AsymmetricalCacheTestWithDP, TestCase)
         setUpCacheTransceiver();
         std::vector<std::shared_ptr<WrappedLlmRequest>> requests;
         int requestId = 0;
-        for (auto len : {60, 30, 60, 10})
+        for (auto len : lenList)
         {
             requests.emplace_back(makeLlmRequestWithDP(len, requestId, requestId % contextTp));
             requestId++;
@@ -1812,6 +1841,83 @@ INSTANTIATE_TEST_CASE_P(AsymmetricCaseTest1WithCPForMLA, AsymmetricalCacheTest,
         /*isMLA*/ testing::Values(true),
         /*contextDP*/ testing::Values(false),
         /*generationDP*/ testing::Values(false),
+        /*isWindow*/ testing::Values(false), testing::Values(false), testing::Values(0), testing::Values(128)));
+
+// Tests cases where gen has both CP > 1 and attention DP enabled.
+// Gen TP must be >= DP size, and TP must be divisible by DP size.
+INSTANTIATE_TEST_CASE_P(AsymmetricCaseTestWithCPAndDPForMLA0, AsymmetricalCacheTestWithDP,
+    testing::Combine(/*contextTp*/ testing::Values(1, 2),
+        /*contextPp*/ testing::Values(1),
+        /*contextCp*/ testing::Values(1),
+        /*genTp*/ testing::Values(2),
+        /*genPp*/ testing::Values(1),
+        /*genCp*/ testing::Values(2),
+        /*numLayers*/ testing::Values(4),
+        /*numHeads*/ testing::Values(1),
+        /*sizePerHead*/ testing::Values(4),
+        /*tokensPerBlock*/ testing::Values(8),
+        /*dataType*/ testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT8),
+        /*kvFactor*/ testing::Values(1),
+        /*isMLA*/ testing::Values(true),
+        /*contextDP*/ testing::Values(false),
+        /*generationDP*/ testing::Values(true),
+        /*isWindow*/ testing::Values(false), testing::Values(false), testing::Values(0), testing::Values(128)));
+
+// Tests cases where gen has CP > 1, PP > 1, and attention DP enabled.
+INSTANTIATE_TEST_CASE_P(AsymmetricCaseTestWithCPAndDPForMLA1, AsymmetricalCacheTestWithDP,
+    testing::Combine(/*contextTp*/ testing::Values(1, 2),
+        /*contextPp*/ testing::Values(1, 2),
+        /*contextCp*/ testing::Values(1),
+        /*genTp*/ testing::Values(2),
+        /*genPp*/ testing::Values(2),
+        /*genCp*/ testing::Values(2),
+        /*numLayers*/ testing::Values(4),
+        /*numHeads*/ testing::Values(1),
+        /*sizePerHead*/ testing::Values(4),
+        /*tokensPerBlock*/ testing::Values(8),
+        /*dataType*/ testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT8),
+        /*kvFactor*/ testing::Values(1),
+        /*isMLA*/ testing::Values(true),
+        /*contextDP*/ testing::Values(false),
+        /*generationDP*/ testing::Values(true),
+        /*isWindow*/ testing::Values(false), testing::Values(false), testing::Values(0), testing::Values(128)));
+
+// Tests cases where context has DP and gen has both CP > 1 and DP.
+INSTANTIATE_TEST_CASE_P(AsymmetricCaseTestWithCPAndDPForMLA2, AsymmetricalCacheTestWithDP,
+    testing::Combine(/*contextTp*/ testing::Values(2),
+        /*contextPp*/ testing::Values(1),
+        /*contextCp*/ testing::Values(1),
+        /*genTp*/ testing::Values(2),
+        /*genPp*/ testing::Values(1),
+        /*genCp*/ testing::Values(2),
+        /*numLayers*/ testing::Values(4),
+        /*numHeads*/ testing::Values(1),
+        /*sizePerHead*/ testing::Values(4),
+        /*tokensPerBlock*/ testing::Values(8),
+        /*dataType*/ testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT8),
+        /*kvFactor*/ testing::Values(1),
+        /*isMLA*/ testing::Values(true),
+        /*contextDP*/ testing::Values(true),
+        /*generationDP*/ testing::Values(true),
+        /*isWindow*/ testing::Values(false), testing::Values(false), testing::Values(0), testing::Values(128)));
+
+// Tests cases where gen has higher TP (4) with CP and DP.
+INSTANTIATE_TEST_CASE_P(AsymmetricCaseTestWithCPAndDPForMLA3, AsymmetricalCacheTestWithDP,
+    testing::Combine(/*contextTp*/ testing::Values(2, 4),
+        /*contextPp*/ testing::Values(1),
+        /*contextCp*/ testing::Values(1),
+        /*genTp*/ testing::Values(4),
+        /*genPp*/ testing::Values(1),
+        /*genCp*/ testing::Values(2),
+        /*numLayers*/ testing::Values(4),
+        /*numHeads*/ testing::Values(1),
+        /*sizePerHead*/ testing::Values(4),
+        /*tokensPerBlock*/ testing::Values(8),
+        /*dataType*/ testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT8),
+        /*kvFactor*/ testing::Values(1),
+        /*isMLA*/ testing::Values(true),
+        /*contextDP*/ testing::Values(false),
+        /*generationDP*/ testing::Values(true),
         /*isWindow*/ testing::Values(false), testing::Values(false), testing::Values(0), testing::Values(128)));
 
 INSTANTIATE_TEST_CASE_P(AsymmetricCaseTestWithDPForMLA1, AsymmetricalCacheTestWithDP,
