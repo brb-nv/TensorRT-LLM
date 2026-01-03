@@ -359,7 +359,10 @@ class ExecutorRequestQueue:
     def _fetch_new_requests_attention_dp(
             self, activate_requests: List[LlmRequest]) -> List[LlmRequest]:
         """Handle attention DP request fetching with load balancing."""
-        # Get active request counts across all ranks
+        # Get active request counts across all DP ranks.
+        # With attention DP, the effective DP size is tp_size (each tp_rank is a DP rank).
+        # When CP is enabled, ranks within a CP group share the same DP rank (same tp_rank)
+        # and should receive the same set of requests.
         all_ranks_num_active_requests = []
         all_ranks_num_active_tokens = []
         num_active_tokens = sum(
@@ -369,6 +372,16 @@ class ExecutorRequestQueue:
         for num_active_requests, num_active_tokens in responses_list:
             all_ranks_num_active_requests.append(num_active_requests)
             all_ranks_num_active_tokens.append(num_active_tokens)
+
+        # When CP is enabled, tp_allgather only communicates within a tp_group.
+        # Each tp_group contains one rank per DP rank with the same cp_rank.
+        # Ranks with different cp_ranks are in different tp_groups and may have
+        # different gathered data. Synchronize across CP ranks to ensure consistency.
+        if self.dist.cp_size > 1:
+            all_ranks_num_active_requests, all_ranks_num_active_tokens = \
+                self.dist.cp_broadcast(
+                    (all_ranks_num_active_requests, all_ranks_num_active_tokens),
+                    root=0)
 
         total_num_active_requests = sum(all_ranks_num_active_requests)
         total_max_num_active_requests = self.dist.tp_size * self.max_num_active_requests

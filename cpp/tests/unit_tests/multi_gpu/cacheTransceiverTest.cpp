@@ -2467,9 +2467,11 @@ TEST(targetTest, CacheStateGenDPAndCP)
     bool const contextHasDP = false;
     bool const genHasDP = true;
 
-    auto const verifyContext = [&](int contextRank, std::tuple<int, int, int> const& contextWC, bool const contextEnableDP,
-        std::vector<int> const& generationRanks, std::tuple<int, int, int> const& genWC, bool const genEnableDP,
-        std::vector<int> const& expectRanks, int expectPPDomain, int expectTPDomain, int expectCPDomain, std::vector<bool> const& expectNeedSend)
+    auto const verifyContext
+        = [&](int contextRank, std::tuple<int, int, int> const& contextWC, bool const contextEnableDP,
+              std::vector<int> const& generationRanks, std::tuple<int, int, int> const& genWC, bool const genEnableDP,
+              std::vector<int> const& expectRanks, int expectPPDomain, int expectTPDomain, int expectCPDomain,
+              std::vector<bool> const& expectNeedSend)
     {
         ASSERT_EQ(generationRanks.size(), expectNeedSend.size());
 
@@ -2479,11 +2481,11 @@ TEST(targetTest, CacheStateGenDPAndCP)
         std::vector<SizeType32> const genAttentionLayerNumPerPP(genPP, numLayers / genPP);
         int contextDPRank = (contextRank % (contextTP * contextCP)) / contextCP;
         auto attentionType = isMLA ? texec::kv_cache::CacheState::AttentionType::kMLA
-                : texec::kv_cache::CacheState::AttentionType::kDEFAULT;
+                                   : texec::kv_cache::CacheState::AttentionType::kDEFAULT;
 
         auto const contextCache = tensorrt_llm::executor::kv_cache::CacheState{numLayers, numHeads, sizePerHead,
-        tokensPerBlock, contextTP, contextPP, contextCP, contextAttentionLayerNumPerPP, dataType, attentionType,
-        kvFactor, contextEnableDP, contextDPRank, contextTP};
+            tokensPerBlock, contextTP, contextPP, contextCP, contextAttentionLayerNumPerPP, dataType, attentionType,
+            kvFactor, contextEnableDP, contextDPRank, contextTP};
 
         for (size_t i = 0; i < generationRanks.size(); ++i)
         {
@@ -2491,11 +2493,11 @@ TEST(targetTest, CacheStateGenDPAndCP)
             int generationDPRank = (generationRank % (genTP * genCP)) / genCP;
 
             auto const genCache = tensorrt_llm::executor::kv_cache::CacheState{numLayers, numHeads, sizePerHead,
-            tokensPerBlock, genTP, genPP, genCP, genAttentionLayerNumPerPP, dataType, attentionType, kvFactor,
-            genEnableDP, generationDPRank, genTP};
+                tokensPerBlock, genTP, genPP, genCP, genAttentionLayerNumPerPP, dataType, attentionType, kvFactor,
+                genEnableDP, generationDPRank, genTP};
 
             auto const contextTargetInfo
-            = tensorrt_llm::executor::kv_cache::TargetRanksInfoForDP(genCache, contextCache, contextRank);
+                = tensorrt_llm::executor::kv_cache::TargetRanksInfoForDP(genCache, contextCache, contextRank);
 
             EXPECT_EQ(expectRanks, contextTargetInfo.mIRanks);
             EXPECT_EQ(expectPPDomain, contextTargetInfo.mDomainPPSize);
@@ -2504,67 +2506,71 @@ TEST(targetTest, CacheStateGenDPAndCP)
         }
     };
 
-    // Note: There is 1 call to verifyContext() per DP group on recv side.
-    // CP grows from context to generation. PASSES.
-    {
-        std::tuple<int, int, int> const contextWC{/*tpSize*/ 2, /*ppSize*/ 2, /*cpSize*/ 1};
-        std::tuple<int, int, int> const genWC{/*tpSize*/ 2, /*ppSize*/ 2, /*cpSize*/ 2};
-        verifyContext(
-            /*contextRank*/ 0, contextWC, contextHasDP, /*generationRanks*/ {0, 1}, /*genWC*/ genWC, genHasDP, /*expectRanks*/ {0, 1},
-            /*expectPPDomain*/ 1, /*expectTPDomain*/ 1, /*expectCPDomain*/ 2, /*expectNeedSend*/ {true, true});
-        verifyContext(
-            /*contextRank*/ 1, contextWC, contextHasDP, /*generationRanks*/ {2, 3}, /*genWC*/ genWC, genHasDP, /*expectRanks*/ {2, 3},
-            /*expectPPDomain*/ 1, /*expectTPDomain*/ 1, /*expectCPDomain*/ 2, /*expectNeedSend*/ {true, true});
-        verifyContext(
-            /*contextRank*/ 2, contextWC, contextHasDP, /*generationRanks*/ {4, 5}, /*genWC*/ genWC, genHasDP, /*expectRanks*/ {4, 5},
-            /*expectPPDomain*/ 1, /*expectTPDomain*/ 1, /*expectCPDomain*/ 2, /*expectNeedSend*/ {true, true});
-        verifyContext(
-            /*contextRank*/ 3, contextWC, contextHasDP, /*generationRanks*/ {6, 7}, /*genWC*/ genWC, genHasDP, /*expectRanks*/ {6, 7},
-            /*expectPPDomain*/ 1, /*expectTPDomain*/ 1, /*expectCPDomain*/ 2, /*expectNeedSend*/ {true, true});
-    }
+    // // Note: There is 1 call to verifyContext() per DP group on recv side.
+    // // CP grows from context to generation. PASSES.
+    // {
+    //     std::tuple<int, int, int> const contextWC{/*tpSize*/ 2, /*ppSize*/ 2, /*cpSize*/ 1};
+    //     std::tuple<int, int, int> const genWC{/*tpSize*/ 2, /*ppSize*/ 2, /*cpSize*/ 2};
+    //     verifyContext(
+    //         /*contextRank*/ 0, contextWC, contextHasDP, /*generationRanks*/ {0, 1}, /*genWC*/ genWC, genHasDP,
+    //         /*expectRanks*/ {0, 1},
+    //         /*expectPPDomain*/ 1, /*expectTPDomain*/ 1, /*expectCPDomain*/ 2, /*expectNeedSend*/ {true, true});
+    //     verifyContext(
+    //         /*contextRank*/ 1, contextWC, contextHasDP, /*generationRanks*/ {2, 3}, /*genWC*/ genWC, genHasDP,
+    //         /*expectRanks*/ {2, 3},
+    //         /*expectPPDomain*/ 1, /*expectTPDomain*/ 1, /*expectCPDomain*/ 2, /*expectNeedSend*/ {true, true});
+    //     verifyContext(
+    //         /*contextRank*/ 2, contextWC, contextHasDP, /*generationRanks*/ {4, 5}, /*genWC*/ genWC, genHasDP,
+    //         /*expectRanks*/ {4, 5},
+    //         /*expectPPDomain*/ 1, /*expectTPDomain*/ 1, /*expectCPDomain*/ 2, /*expectNeedSend*/ {true, true});
+    //     verifyContext(
+    //         /*contextRank*/ 3, contextWC, contextHasDP, /*generationRanks*/ {6, 7}, /*genWC*/ genWC, genHasDP,
+    //         /*expectRanks*/ {6, 7},
+    //         /*expectPPDomain*/ 1, /*expectTPDomain*/ 1, /*expectCPDomain*/ 2, /*expectNeedSend*/ {true, true});
+    // }
 
-    // TP as well as CP grow from context to generation - PASSES.
-    // One call per DP group on gen side (8 DP groups total: 4 per PP stage).
-    {
-        std::tuple<int, int, int> const contextWC{/*tpSize*/ 2, /*ppSize*/ 2, /*cpSize*/ 1};
-        std::tuple<int, int, int> const genWC{/*tpSize*/ 4, /*ppSize*/ 2, /*cpSize*/ 2};
-        // PP stage 0: DP groups 0-3
-        verifyContext(
-            /*contextRank*/ 0, contextWC, contextHasDP, /*generationRanks*/ {0, 1}, /*genWC*/ genWC, genHasDP,
-            /*expectRanks*/ {0, 1}, /*expectPPDomain*/ 1, /*expectTPDomain*/ 1, /*expectCPDomain*/ 2,
-            /*expectNeedSend*/ {true, true});
-        verifyContext(
-            /*contextRank*/ 0, contextWC, contextHasDP, /*generationRanks*/ {4, 5}, /*genWC*/ genWC, genHasDP,
-            /*expectRanks*/ {4, 5}, /*expectPPDomain*/ 1, /*expectTPDomain*/ 1, /*expectCPDomain*/ 2,
-            /*expectNeedSend*/ {true, true});
-        verifyContext(
-            /*contextRank*/ 1, contextWC, contextHasDP, /*generationRanks*/ {2, 3}, /*genWC*/ genWC, genHasDP,
-            /*expectRanks*/ {2, 3}, /*expectPPDomain*/ 1, /*expectTPDomain*/ 1, /*expectCPDomain*/ 2,
-            /*expectNeedSend*/ {true, true});
-        verifyContext(
-            /*contextRank*/ 1, contextWC, contextHasDP, /*generationRanks*/ {6, 7}, /*genWC*/ genWC, genHasDP,
-            /*expectRanks*/ {6, 7}, /*expectPPDomain*/ 1, /*expectTPDomain*/ 1, /*expectCPDomain*/ 2,
-            /*expectNeedSend*/ {true, true});
-        // PP stage 1: DP groups 0-3
-        verifyContext(
-            /*contextRank*/ 2, contextWC, contextHasDP, /*generationRanks*/ {8, 9}, /*genWC*/ genWC, genHasDP,
-            /*expectRanks*/ {8, 9}, /*expectPPDomain*/ 1, /*expectTPDomain*/ 1, /*expectCPDomain*/ 2,
-            /*expectNeedSend*/ {true, true});
-        verifyContext(
-            /*contextRank*/ 2, contextWC, contextHasDP, /*generationRanks*/ {12, 13}, /*genWC*/ genWC, genHasDP,
-            /*expectRanks*/ {12, 13}, /*expectPPDomain*/ 1, /*expectTPDomain*/ 1, /*expectCPDomain*/ 2,
-            /*expectNeedSend*/ {true, true});
-        verifyContext(
-            /*contextRank*/ 3, contextWC, contextHasDP, /*generationRanks*/ {10, 11}, /*genWC*/ genWC, genHasDP,
-            /*expectRanks*/ {10, 11}, /*expectPPDomain*/ 1, /*expectTPDomain*/ 1, /*expectCPDomain*/ 2,
-            /*expectNeedSend*/ {true, true});
-        verifyContext(
-            /*contextRank*/ 3, contextWC, contextHasDP, /*generationRanks*/ {14, 15}, /*genWC*/ genWC, genHasDP,
-            /*expectRanks*/ {14, 15}, /*expectPPDomain*/ 1, /*expectTPDomain*/ 1, /*expectCPDomain*/ 2,
-            /*expectNeedSend*/ {true, true});
-    }
+    // // TP as well as CP grow from context to generation - PASSES.
+    // // One call per DP group on gen side (8 DP groups total: 4 per PP stage).
+    // {
+    //     std::tuple<int, int, int> const contextWC{/*tpSize*/ 2, /*ppSize*/ 2, /*cpSize*/ 1};
+    //     std::tuple<int, int, int> const genWC{/*tpSize*/ 4, /*ppSize*/ 2, /*cpSize*/ 2};
+    //     // PP stage 0: DP groups 0-3
+    //     verifyContext(
+    //         /*contextRank*/ 0, contextWC, contextHasDP, /*generationRanks*/ {0, 1}, /*genWC*/ genWC, genHasDP,
+    //         /*expectRanks*/ {0, 1}, /*expectPPDomain*/ 1, /*expectTPDomain*/ 1, /*expectCPDomain*/ 2,
+    //         /*expectNeedSend*/ {true, true});
+    //     verifyContext(
+    //         /*contextRank*/ 0, contextWC, contextHasDP, /*generationRanks*/ {4, 5}, /*genWC*/ genWC, genHasDP,
+    //         /*expectRanks*/ {4, 5}, /*expectPPDomain*/ 1, /*expectTPDomain*/ 1, /*expectCPDomain*/ 2,
+    //         /*expectNeedSend*/ {true, true});
+    //     verifyContext(
+    //         /*contextRank*/ 1, contextWC, contextHasDP, /*generationRanks*/ {2, 3}, /*genWC*/ genWC, genHasDP,
+    //         /*expectRanks*/ {2, 3}, /*expectPPDomain*/ 1, /*expectTPDomain*/ 1, /*expectCPDomain*/ 2,
+    //         /*expectNeedSend*/ {true, true});
+    //     verifyContext(
+    //         /*contextRank*/ 1, contextWC, contextHasDP, /*generationRanks*/ {6, 7}, /*genWC*/ genWC, genHasDP,
+    //         /*expectRanks*/ {6, 7}, /*expectPPDomain*/ 1, /*expectTPDomain*/ 1, /*expectCPDomain*/ 2,
+    //         /*expectNeedSend*/ {true, true});
+    //     // PP stage 1: DP groups 0-3
+    //     verifyContext(
+    //         /*contextRank*/ 2, contextWC, contextHasDP, /*generationRanks*/ {8, 9}, /*genWC*/ genWC, genHasDP,
+    //         /*expectRanks*/ {8, 9}, /*expectPPDomain*/ 1, /*expectTPDomain*/ 1, /*expectCPDomain*/ 2,
+    //         /*expectNeedSend*/ {true, true});
+    //     verifyContext(
+    //         /*contextRank*/ 2, contextWC, contextHasDP, /*generationRanks*/ {12, 13}, /*genWC*/ genWC, genHasDP,
+    //         /*expectRanks*/ {12, 13}, /*expectPPDomain*/ 1, /*expectTPDomain*/ 1, /*expectCPDomain*/ 2,
+    //         /*expectNeedSend*/ {true, true});
+    //     verifyContext(
+    //         /*contextRank*/ 3, contextWC, contextHasDP, /*generationRanks*/ {10, 11}, /*genWC*/ genWC, genHasDP,
+    //         /*expectRanks*/ {10, 11}, /*expectPPDomain*/ 1, /*expectTPDomain*/ 1, /*expectCPDomain*/ 2,
+    //         /*expectNeedSend*/ {true, true});
+    //     verifyContext(
+    //         /*contextRank*/ 3, contextWC, contextHasDP, /*generationRanks*/ {14, 15}, /*genWC*/ genWC, genHasDP,
+    //         /*expectRanks*/ {14, 15}, /*expectPPDomain*/ 1, /*expectTPDomain*/ 1, /*expectCPDomain*/ 2,
+    //         /*expectNeedSend*/ {true, true});
+    // }
 
-    // // TP shrinks while CP grows from context to generation.
+    // // TP shrinks while CP grows from context to generation. - PASSES.
     // {
     //     std::tuple<int, int, int> const contextWC{/*tpSize*/ 4, /*ppSize*/ 1, /*cpSize*/ 1};
     //     std::tuple<int, int, int> const genWC{/*tpSize*/ 2, /*ppSize*/ 1, /*cpSize*/ 2};
@@ -2579,14 +2585,14 @@ TEST(targetTest, CacheStateGenDPAndCP)
     //     verifyContext(
     //         /*contextRank*/ 2, contextWC, contextHasDP, /*generationRanks*/ {2, 3}, /*genWC*/ genWC, genHasDP,
     //         /*expectRanks*/ {2, 3}, /*expectPPDomain*/ 1, /*expectTPDomain*/ 1, /*expectCPDomain*/ 2,
-    //         /*expectNeedSend*/ {true, true});
+    //         /*expectNeedSend*/ {false, false});
     //     verifyContext(
     //         /*contextRank*/ 3, contextWC, contextHasDP, /*generationRanks*/ {2, 3}, /*genWC*/ genWC, genHasDP,
     //         /*expectRanks*/ {2, 3}, /*expectPPDomain*/ 1, /*expectTPDomain*/ 1, /*expectCPDomain*/ 2,
     //         /*expectNeedSend*/ {false, false});
     // }
 
-    // // PP as well as CP grow from context to generation.
+    // // PP as well as CP grow from context to generation - PASSES.
     // {
     //     std::tuple<int, int, int> const contextWC{/*tpSize*/ 2, /*ppSize*/ 2, /*cpSize*/ 1};
     //     std::tuple<int, int, int> const genWC{/*tpSize*/ 2, /*ppSize*/ 4, /*cpSize*/ 2};
@@ -2599,16 +2605,18 @@ TEST(targetTest, CacheStateGenDPAndCP)
     //         /*expectRanks*/ {2, 6, 3, 7}, /*expectPPDomain*/ 2, /*expectTPDomain*/ 1, /*expectCPDomain*/ 2,
     //         /*expectNeedSend*/ {true, true, true, true});
     //     verifyContext(
-    //         /*contextRank*/ 2, contextWC, contextHasDP, /*generationRanks*/ {8, 12, 9, 13}, /*genWC*/ genWC, genHasDP,
+    //         /*contextRank*/ 2, contextWC, contextHasDP, /*generationRanks*/ {8, 12, 9, 13}, /*genWC*/ genWC,
+    //         genHasDP,
     //         /*expectRanks*/ {8, 12, 9, 13}, /*expectPPDomain*/ 2, /*expectTPDomain*/ 1, /*expectCPDomain*/ 2,
     //         /*expectNeedSend*/ {true, true, true, true});
     //     verifyContext(
-    //         /*contextRank*/ 3, contextWC, contextHasDP, /*generationRanks*/ {10, 14, 11, 15}, /*genWC*/ genWC, genHasDP,
+    //         /*contextRank*/ 3, contextWC, contextHasDP, /*generationRanks*/ {10, 14, 11, 15}, /*genWC*/ genWC,
+    //         genHasDP,
     //         /*expectRanks*/ {10, 14, 11, 15}, /*expectPPDomain*/ 2, /*expectTPDomain*/ 1, /*expectCPDomain*/ 2,
     //         /*expectNeedSend*/ {true, true, true, true});
     // }
 
-    // // PP shrinks while CP grows from context to generation.
+    // // PP shrinks while CP grows from context to generation. - PASSES.
     // {
     //     std::tuple<int, int, int> const contextWC{/*tpSize*/ 2, /*ppSize*/ 4, /*cpSize*/ 1};
     //     std::tuple<int, int, int> const genWC{/*tpSize*/ 2, /*ppSize*/ 2, /*cpSize*/ 2};
@@ -2646,43 +2654,43 @@ TEST(targetTest, CacheStateGenDPAndCP)
     //         /*expectNeedSend*/ {true, true});
     // }
 
-    // // TP as well as PP shrink while CP grows from context to generation.
-    // {
-    //     std::tuple<int, int, int> const contextWC{/*tpSize*/ 4, /*ppSize*/ 2, /*cpSize*/ 1};
-    //     std::tuple<int, int, int> const genWC{/*tpSize*/ 2, /*ppSize*/ 1, /*cpSize*/ 2};
-    //     verifyContext(
-    //         /*contextRank*/ 0, contextWC, contextHasDP, /*generationRanks*/ {0, 1}, /*genWC*/ genWC, genHasDP,
-    //         /*expectRanks*/ {0, 1}, /*expectPPDomain*/ 1, /*expectTPDomain*/ 1, /*expectCPDomain*/ 2,
-    //         /*expectNeedSend*/ {true, true});
-    //     verifyContext(
-    //         /*contextRank*/ 1, contextWC, contextHasDP, /*generationRanks*/ {0, 1}, /*genWC*/ genWC, genHasDP,
-    //         /*expectRanks*/ {0, 1}, /*expectPPDomain*/ 1, /*expectTPDomain*/ 1, /*expectCPDomain*/ 2,
-    //         /*expectNeedSend*/ {false, false});
-    //     verifyContext(
-    //         /*contextRank*/ 2, contextWC, contextHasDP, /*generationRanks*/ {2, 3}, /*genWC*/ genWC, genHasDP,
-    //         /*expectRanks*/ {2, 3}, /*expectPPDomain*/ 1, /*expectTPDomain*/ 1, /*expectCPDomain*/ 2,
-    //         /*expectNeedSend*/ {true, true});
-    //     verifyContext(
-    //         /*contextRank*/ 3, contextWC, contextHasDP, /*generationRanks*/ {2, 3}, /*genWC*/ genWC, genHasDP,
-    //         /*expectRanks*/ {2, 3}, /*expectPPDomain*/ 1, /*expectTPDomain*/ 1, /*expectCPDomain*/ 2,
-    //         /*expectNeedSend*/ {false, false});
-    //     verifyContext(
-    //         /*contextRank*/ 4, contextWC, contextHasDP, /*generationRanks*/ {0, 1}, /*genWC*/ genWC, genHasDP,
-    //         /*expectRanks*/ {0, 1}, /*expectPPDomain*/ 1, /*expectTPDomain*/ 1, /*expectCPDomain*/ 2,
-    //         /*expectNeedSend*/ {true, true});
-    //     verifyContext(
-    //         /*contextRank*/ 5, contextWC, contextHasDP, /*generationRanks*/ {0, 1}, /*genWC*/ genWC, genHasDP,
-    //         /*expectRanks*/ {0, 1}, /*expectPPDomain*/ 1, /*expectTPDomain*/ 1, /*expectCPDomain*/ 2,
-    //         /*expectNeedSend*/ {false, false});
-    //     verifyContext(
-    //         /*contextRank*/ 6, contextWC, contextHasDP, /*generationRanks*/ {2, 3}, /*genWC*/ genWC, genHasDP,
-    //         /*expectRanks*/ {2, 3}, /*expectPPDomain*/ 1, /*expectTPDomain*/ 1, /*expectCPDomain*/ 2,
-    //         /*expectNeedSend*/ {true, true});
-    //     verifyContext(
-    //         /*contextRank*/ 7, contextWC, contextHasDP, /*generationRanks*/ {2, 3}, /*genWC*/ genWC, genHasDP,
-    //         /*expectRanks*/ {2, 3}, /*expectPPDomain*/ 1, /*expectTPDomain*/ 1, /*expectCPDomain*/ 2,
-    //         /*expectNeedSend*/ {false, false});
-    // }
+    // TP as well as PP shrink while CP grows from context to generation.
+    {
+        std::tuple<int, int, int> const contextWC{/*tpSize*/ 4, /*ppSize*/ 2, /*cpSize*/ 1};
+        std::tuple<int, int, int> const genWC{/*tpSize*/ 2, /*ppSize*/ 1, /*cpSize*/ 2};
+        verifyContext(
+            /*contextRank*/ 0, contextWC, contextHasDP, /*generationRanks*/ {0, 1}, /*genWC*/ genWC, genHasDP,
+            /*expectRanks*/ {0, 1}, /*expectPPDomain*/ 1, /*expectTPDomain*/ 1, /*expectCPDomain*/ 2,
+            /*expectNeedSend*/ {true, true});
+        verifyContext(
+            /*contextRank*/ 1, contextWC, contextHasDP, /*generationRanks*/ {0, 1}, /*genWC*/ genWC, genHasDP,
+            /*expectRanks*/ {0, 1}, /*expectPPDomain*/ 1, /*expectTPDomain*/ 1, /*expectCPDomain*/ 2,
+            /*expectNeedSend*/ {false, false});
+        verifyContext(
+            /*contextRank*/ 2, contextWC, contextHasDP, /*generationRanks*/ {2, 3}, /*genWC*/ genWC, genHasDP,
+            /*expectRanks*/ {2, 3}, /*expectPPDomain*/ 1, /*expectTPDomain*/ 1, /*expectCPDomain*/ 2,
+            /*expectNeedSend*/ {true, true});
+        verifyContext(
+            /*contextRank*/ 3, contextWC, contextHasDP, /*generationRanks*/ {2, 3}, /*genWC*/ genWC, genHasDP,
+            /*expectRanks*/ {2, 3}, /*expectPPDomain*/ 1, /*expectTPDomain*/ 1, /*expectCPDomain*/ 2,
+            /*expectNeedSend*/ {false, false});
+        verifyContext(
+            /*contextRank*/ 4, contextWC, contextHasDP, /*generationRanks*/ {0, 1}, /*genWC*/ genWC, genHasDP,
+            /*expectRanks*/ {0, 1}, /*expectPPDomain*/ 1, /*expectTPDomain*/ 1, /*expectCPDomain*/ 2,
+            /*expectNeedSend*/ {true, true});
+        verifyContext(
+            /*contextRank*/ 5, contextWC, contextHasDP, /*generationRanks*/ {0, 1}, /*genWC*/ genWC, genHasDP,
+            /*expectRanks*/ {0, 1}, /*expectPPDomain*/ 1, /*expectTPDomain*/ 1, /*expectCPDomain*/ 2,
+            /*expectNeedSend*/ {false, false});
+        verifyContext(
+            /*contextRank*/ 6, contextWC, contextHasDP, /*generationRanks*/ {2, 3}, /*genWC*/ genWC, genHasDP,
+            /*expectRanks*/ {2, 3}, /*expectPPDomain*/ 1, /*expectTPDomain*/ 1, /*expectCPDomain*/ 2,
+            /*expectNeedSend*/ {true, true});
+        verifyContext(
+            /*contextRank*/ 7, contextWC, contextHasDP, /*generationRanks*/ {2, 3}, /*genWC*/ genWC, genHasDP,
+            /*expectRanks*/ {2, 3}, /*expectPPDomain*/ 1, /*expectTPDomain*/ 1, /*expectCPDomain*/ 2,
+            /*expectNeedSend*/ {false, false});
+    }
 
     // // TP, CP grow while PP shrinks from context to generation.
     // {

@@ -1364,3 +1364,307 @@ def test_balance_requests_across_ranks_token_count_sorting(attention_dp_queue):
     assert result[0][0] == req2
     assert result[1][0] == req3
     assert result[2][0] == req1
+
+
+# ============================================================================
+# Tests for Attention DP with Context Parallelism (CP)
+# ============================================================================
+# When DP and CP are both enabled:
+# - The effective DP size is tp_size (number of DP groups).
+# - Each DP group consists of cp_size ranks that share the same tp_rank.
+# - Ranks within a CP group share the same set of requests.
+# For example, with tp_size=2, cp_size=2:
+# - World ranks 0,1 have tp_rank=0 (DP rank 0) and share requests.
+# - World ranks 2,3 have tp_rank=1 (DP rank 1) and share requests.
+
+
+@pytest.fixture
+def mock_dist_attention_dp_with_cp():
+    """Create a mock Distributed instance for attention DP with CP testing."""
+    mock_dist = Mock()
+    mock_dist.rank = 0
+    mock_dist.tp_size = 2  # 2 DP groups
+    mock_dist.pp_size = 1
+    mock_dist.has_pp = False
+    mock_dist.tp_rank = 0  # DP rank 0
+    mock_dist.cp_rank = 0  # First rank in CP group
+    mock_dist.cp_size = 2  # 2 ranks per DP group
+    mock_dist.cp_config = {}
+    mock_dist.is_first_pp_rank = True
+    mock_dist.is_last_pp_rank = True
+    mock_dist.next_pp_rank = 1
+    mock_dist.prev_pp_rank = 0
+    mock_dist.broadcast = Mock(return_value=([], None))
+    # Mock cp_broadcast to return the input (simulating successful broadcast).
+    mock_dist.cp_broadcast = Mock(side_effect=lambda x, root=0: x)
+    return mock_dist
+
+
+@pytest.fixture
+def attention_dp_cp_queue(mock_dist_attention_dp_with_cp):
+    """Create an ExecutorRequestQueue instance for attention DP+CP testing."""
+    queue = ExecutorRequestQueue(dist=mock_dist_attention_dp_with_cp,
+                                 enable_attention_dp=True,
+                                 max_batch_size=4,
+                                 max_beam_width=2,
+                                 max_num_active_requests=8,
+                                 enable_iter_perf_stats=True,
+                                 batch_wait_timeout_ms=0.0)
+    return queue
+
+
+def test_attention_dp_with_cp_schedule_to_dp_ranks(attention_dp_cp_queue):
+    """Test that DP+CP schedules requests to DP ranks (tp_size groups)."""
+    # With tp_size=2, we should have 2 DP groups.
+    # Requests should be distributed across these 2 groups.
+    req1 = RequestQueueItem(
+        1, create_mock_request_with_py_schedule_params(attention_dp_rank=None))
+    req1.request.input_token_ids = [1, 2, 3]
+
+    req2 = RequestQueueItem(
+        2, create_mock_request_with_py_schedule_params(attention_dp_rank=None))
+    req2.request.input_token_ids = [1, 2, 3, 4]
+
+    new_requests = [req1, req2]
+
+    # 2 DP ranks (tp_size=2), not 4 ranks.
+    all_ranks_num_active_requests = [0, 0]  # 2 DP ranks.
+    all_ranks_num_active_tokens = [0, 0]  # 2 DP ranks.
+
+    all_ranks_new_requests = attention_dp_cp_queue._schedule_attention_dp_requests(
+        new_requests, all_ranks_num_active_requests,
+        all_ranks_num_active_tokens)
+
+    # Should have 2 DP ranks in the result (not 4).
+    assert len(all_ranks_new_requests) == 2
+
+    # Both requests should be scheduled.
+    total_scheduled = sum(len(reqs) for reqs in all_ranks_new_requests.values())
+    assert total_scheduled == 2
+
+
+def test_attention_dp_with_cp_target_dp_rank(attention_dp_cp_queue):
+    """Test that requests targeting a specific DP rank are scheduled correctly."""
+    # Request targeting DP rank 1.
+    req1 = RequestQueueItem(
+        1,
+        create_mock_request_with_py_schedule_params(attention_dp_rank=1,
+                                                    attention_dp_relax=False))
+    req1.request.input_token_ids = [1, 2, 3]
+
+    # Request targeting DP rank 0.
+    req2 = RequestQueueItem(
+        2,
+        create_mock_request_with_py_schedule_params(attention_dp_rank=0,
+                                                    attention_dp_relax=False))
+    req2.request.input_token_ids = [1, 2, 3, 4]
+
+    new_requests = [req1, req2]
+
+    all_ranks_num_active_requests = [0, 0]  # 2 DP ranks.
+    all_ranks_num_active_tokens = [0, 0]  # 2 DP ranks.
+
+    all_ranks_new_requests = attention_dp_cp_queue._schedule_attention_dp_requests(
+        new_requests, all_ranks_num_active_requests,
+        all_ranks_num_active_tokens)
+
+    # req1 should go to DP rank 1.
+    assert req1 in all_ranks_new_requests[1]
+    # req2 should go to DP rank 0.
+    assert req2 in all_ranks_new_requests[0]
+
+
+def test_attention_dp_with_cp_balanced_distribution(attention_dp_cp_queue):
+    """Test that relaxed requests are balanced across DP ranks."""
+    requests = []
+    for i in range(4):
+        req = RequestQueueItem(
+            i,
+            create_mock_request_with_py_schedule_params(
+                attention_dp_rank=None, attention_dp_relax=True))
+        req.request.input_token_ids = [1] * (i + 1)
+        requests.append(req)
+
+    all_ranks_num_active_requests = [0, 0]  # 2 DP ranks, both empty.
+    all_ranks_num_active_tokens = [0, 0]
+
+    all_ranks_new_requests = attention_dp_cp_queue._schedule_attention_dp_requests(
+        requests, all_ranks_num_active_requests, all_ranks_num_active_tokens)
+
+    # Requests should be distributed evenly across 2 DP ranks.
+    assert len(all_ranks_new_requests[0]) == 2
+    assert len(all_ranks_new_requests[1]) == 2
+
+
+def test_attention_dp_with_cp_respects_expected_capacity(attention_dp_cp_queue):
+    """Test that scheduling respects expected_num_active_requests per DP rank.
+
+    Note: The _schedule_attention_dp_requests function uses expected_num_active_requests
+    (a calculated target for load balancing), not max_num_active_requests. The actual
+    max_num_active_requests enforcement happens earlier in _get_from_waiting_queue.
+    """
+    attention_dp_cp_queue.max_num_active_requests = 4
+
+    requests = []
+    for i in range(4):
+        req = RequestQueueItem(
+            i,
+            create_mock_request_with_py_schedule_params(
+                attention_dp_rank=None, attention_dp_relax=True))
+        req.request.input_token_ids = [1]
+        requests.append(req)
+
+    # DP rank 0 has 3 active, DP rank 1 has 1 active.
+    # expected_num_active_requests = max((3+1+4+2-1)//2, max(3,1)) = max(4, 3) = 4.
+    all_ranks_num_active_requests = [3, 1]
+    all_ranks_num_active_tokens = [30, 10]
+
+    all_ranks_new_requests = attention_dp_cp_queue._schedule_attention_dp_requests(
+        requests, all_ranks_num_active_requests, all_ranks_num_active_tokens)
+
+    # DP rank 0 has 3 active, can take 1 more (up to expected 4).
+    assert len(all_ranks_new_requests[0]) == 1
+    # DP rank 1 has 1 active, can take 3 more (up to expected 4).
+    assert len(all_ranks_new_requests[1]) == 3
+    # Total scheduled should equal total requests.
+    assert len(all_ranks_new_requests[0]) + len(all_ranks_new_requests[1]) == 4
+
+
+def test_attention_dp_with_cp_cp_broadcast_called(
+        mock_dist_attention_dp_with_cp):
+    """Test that cp_broadcast is called when cp_size > 1 during fetch."""
+    queue = ExecutorRequestQueue(dist=mock_dist_attention_dp_with_cp,
+                                 enable_attention_dp=True,
+                                 max_batch_size=4,
+                                 max_beam_width=2,
+                                 max_num_active_requests=8,
+                                 enable_iter_perf_stats=False,
+                                 batch_wait_timeout_ms=0.0)
+
+    # Set up mock for tp_allgather to return consistent data.
+    mock_dist_attention_dp_with_cp.tp_allgather = Mock(
+        return_value=[[0, 0], [0, 0]])
+
+    # Mock the other methods to avoid side effects.
+    with patch.object(queue, '_fetch_and_process_requests', return_value=[]):
+        with patch.object(queue,
+                          '_schedule_attention_dp_requests',
+                          return_value={
+                              0: [],
+                              1: []
+                          }):
+            with patch.object(queue, '_merge_requests', return_value=[]):
+                # Call the method.
+                queue._fetch_new_requests_attention_dp([])
+
+    # Verify cp_broadcast was called since cp_size > 1.
+    mock_dist_attention_dp_with_cp.cp_broadcast.assert_called_once()
+
+
+def test_attention_dp_with_cp_no_cp_broadcast_when_cp_size_1():
+    """Test that cp_broadcast is NOT called when cp_size = 1."""
+    mock_dist = Mock()
+    mock_dist.rank = 0
+    mock_dist.tp_size = 4
+    mock_dist.pp_size = 1
+    mock_dist.has_pp = False
+    mock_dist.tp_rank = 0
+    mock_dist.cp_rank = 0
+    mock_dist.cp_size = 1  # No CP.
+    mock_dist.cp_config = {}
+    mock_dist.is_first_pp_rank = True
+    mock_dist.is_last_pp_rank = True
+    mock_dist.broadcast = Mock(return_value=([], None))
+    mock_dist.cp_broadcast = Mock()
+    mock_dist.tp_allgather = Mock(return_value=[[0, 0], [0, 0], [0, 0], [0, 0]])
+
+    queue = ExecutorRequestQueue(dist=mock_dist,
+                                 enable_attention_dp=True,
+                                 max_batch_size=4,
+                                 max_beam_width=2,
+                                 max_num_active_requests=8,
+                                 enable_iter_perf_stats=False,
+                                 batch_wait_timeout_ms=0.0)
+
+    with patch.object(queue, '_fetch_and_process_requests', return_value=[]):
+        with patch.object(queue,
+                          '_schedule_attention_dp_requests',
+                          return_value={
+                              0: [],
+                              1: [],
+                              2: [],
+                              3: []
+                          }):
+            with patch.object(queue, '_merge_requests', return_value=[]):
+                queue._fetch_new_requests_attention_dp([])
+
+    # cp_broadcast should NOT be called when cp_size = 1.
+    mock_dist.cp_broadcast.assert_not_called()
+
+
+@pytest.mark.parametrize("cp_rank", [0, 1])
+def test_attention_dp_with_cp_same_requests_per_cp_group(cp_rank):
+    """Test that all CP ranks within a DP group get the same requests."""
+    # Simulate two different CP ranks in the same DP group (tp_rank=0).
+    mock_dist = Mock()
+    mock_dist.rank = cp_rank  # 0 or 1.
+    mock_dist.tp_size = 2
+    mock_dist.pp_size = 1
+    mock_dist.has_pp = False
+    mock_dist.tp_rank = 0  # Same DP rank for both.
+    mock_dist.cp_rank = cp_rank
+    mock_dist.cp_size = 2
+    mock_dist.cp_config = {}
+    mock_dist.is_first_pp_rank = True
+    mock_dist.is_last_pp_rank = True
+    mock_dist.broadcast = Mock(return_value=([], None))
+    # cp_broadcast synchronizes data from cp_rank=0.
+    mock_dist.cp_broadcast = Mock(side_effect=lambda x, root=0: x)
+
+    queue = ExecutorRequestQueue(dist=mock_dist,
+                                 enable_attention_dp=True,
+                                 max_batch_size=4,
+                                 max_beam_width=2,
+                                 max_num_active_requests=8,
+                                 enable_iter_perf_stats=False,
+                                 batch_wait_timeout_ms=0.0)
+
+    req = RequestQueueItem(
+        1,
+        create_mock_request_with_py_schedule_params(attention_dp_rank=0,
+                                                    attention_dp_relax=False))
+    req.request.input_token_ids = [1, 2, 3]
+
+    all_ranks_num_active_requests = [0, 0]
+    all_ranks_num_active_tokens = [0, 0]
+
+    all_ranks_new_requests = queue._schedule_attention_dp_requests(
+        [req], all_ranks_num_active_requests, all_ranks_num_active_tokens)
+
+    # Request targets DP rank 0, so it should be assigned to DP rank 0
+    # regardless of which CP rank is running this code.
+    assert req in all_ranks_new_requests[0]
+    # The current rank (tp_rank=0) should get this request.
+    assert all_ranks_new_requests[queue.dist.tp_rank] == [req]
+
+
+def test_attention_dp_with_cp_balance_across_dp_groups(attention_dp_cp_queue):
+    """Test load balancing with existing load on DP groups."""
+    requests = []
+    for i in range(3):
+        req = RequestQueueItem(
+            i,
+            create_mock_request_with_py_schedule_params(
+                attention_dp_rank=None, attention_dp_relax=True))
+        req.request.input_token_ids = [1, 2, 3]
+        requests.append(req)
+
+    # DP rank 0 has more load, DP rank 1 has less.
+    all_ranks_num_active_requests = [3, 1]
+    all_ranks_num_active_tokens = [30, 10]
+
+    all_ranks_new_requests = attention_dp_cp_queue._schedule_attention_dp_requests(
+        requests, all_ranks_num_active_requests, all_ranks_num_active_tokens)
+
+    # DP rank 1 should get more requests since it has less load.
+    assert len(all_ranks_new_requests[1]) >= len(all_ranks_new_requests[0])

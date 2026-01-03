@@ -231,13 +231,15 @@ TargetRanksInfo TargetRanksInfoForDP(
             = (peerNbHeadsPerLayer * peerTPSizePerDPGroup) / (selfNbHeadsPerLayer * selfTPSizePerDPGroup);
     }
 
-    TLLM_LOG_INFO(mpi::MpiComm::world().getRank(),
-        "mDomainPPSize:%d, mDomainTPSize:%d, mDomainCPSize:%d, mDupHeadFactor:%d, mPeerDupHeadFactor:%d, selfPPRank:%d, selfPPNum:%d, "
-        "peerPPNum:%d, selfTPRank:%d, selfTPNum:%d, peerTPNum:%d, selfCPRank:%d, selfCPNum:%d, peerCPNum:%d, selfTPSizePerDPGroup:%d, peerTPSizePerDPGroup:%d, "
+    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
+        "mDomainPPSize:%d, mDomainTPSize:%d, mDomainCPSize:%d, mDupHeadFactor:%d, mPeerDupHeadFactor:%d, "
+        "selfPPRank:%d, selfPPNum:%d, "
+        "peerPPNum:%d, selfTPRank:%d, selfTPNum:%d, peerTPNum:%d, selfCPRank:%d, selfCPNum:%d, peerCPNum:%d, "
+        "selfTPSizePerDPGroup:%d, peerTPSizePerDPGroup:%d, "
         "selfNbHeadsPerLayer:%d, peerNbHeadsPerLayer:%d, selfTPrankInDPGroup:%d, peerDpRank:%d, selfRank:%d",
-        mDomainPPSize, mDomainTPSize, mDomainCPSize, mDupHeadFactor, mPeerDupHeadFactor, selfPPRank, selfPPNum, peerPPNum, selfTPRank, selfTPNum,
-        peerTPNum, selfCPRank, selfCPNum, peerCPNum, selfTPSizePerDPGroup, peerTPSizePerDPGroup, selfNbHeadsPerLayer, peerNbHeadsPerLayer,
-        selfTPrankInDPGroup, peerDpRank, selfRank);
+        mDomainPPSize, mDomainTPSize, mDomainCPSize, mDupHeadFactor, mPeerDupHeadFactor, selfPPRank, selfPPNum,
+        peerPPNum, selfTPRank, selfTPNum, peerTPNum, selfCPRank, selfCPNum, peerCPNum, selfTPSizePerDPGroup,
+        peerTPSizePerDPGroup, selfNbHeadsPerLayer, peerNbHeadsPerLayer, selfTPrankInDPGroup, peerDpRank, selfRank);
 
     auto vector_to_string = [](std::vector<int> const& vec)
     {
@@ -248,7 +250,7 @@ TargetRanksInfo TargetRanksInfoForDP(
         }
         return ss.str();
     };
-    TLLM_LOG_INFO(mpi::MpiComm::world().getRank(), "retRanks:%s , targetPeerPPLayerNum:%s",
+    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), "retRanks:%s , targetPeerPPLayerNum:%s",
         vector_to_string(retRanks).c_str(), vector_to_string(targetPeerPPLayerNum).c_str());
     return {mDomainPPSize, mDomainTPSize, mDomainCPSize, std::move(retRanks), mDupHeadFactor, mPeerDupHeadFactor,
         std::move(targetPeerPPLayerNum)};
