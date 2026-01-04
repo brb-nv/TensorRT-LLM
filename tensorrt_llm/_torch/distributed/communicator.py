@@ -436,9 +436,13 @@ class MPIDist(Distributed):
         return safe_broadcast(comm, obj, root=root, chunk_size=chunk_size)
 
     def tp_allgather(self, obj):
+        if self.cp_size > 1:
+            print(f"[MPIDist::tp_allgather] FUNCTION CALLED. RANK: {self.rank}, CP_SIZE: {self.cp_size}")
         return self.tp_comm.allgather(obj)
 
     def tp_gather(self, obj, root=0, chunk_size: int = 4 * 1024 * 1024):
+        if self.cp_size > 1:
+            print(f"[MPIDist::tp_gather] FUNCTION CALLED. RANK: {self.rank}, CP_SIZE: {self.cp_size}")
         comm = self.tp_comm
         return safe_gather(comm, obj, root=root, chunk_size=chunk_size)
 
@@ -447,6 +451,8 @@ class MPIDist(Distributed):
                      root=0,
                      chunk_size: int = 4 * 1024 * 1024,
                      **kwargs):
+        if self.cp_size > 1:
+            print(f"[MPIDist::tp_broadcast] FUNCTION CALLED. RANK: {self.rank}, CP_SIZE: {self.cp_size}")
         comm = self.tp_comm
         return safe_broadcast(comm, obj, root=root, chunk_size=chunk_size)
 
@@ -688,6 +694,8 @@ class TorchDist(Distributed):
 
     @log_op
     def tp_allgather(self, obj):
+        if self.cp_size > 1:
+            print(f"[TorchDist::tp_allgather] FUNCTION CALLED. RANK: {self.rank}, CP_SIZE: {self.cp_size}")
         if isinstance(obj, torch.Tensor):
             output_list = [
                 torch.empty_like(obj)
@@ -704,6 +712,8 @@ class TorchDist(Distributed):
 
     @log_op
     def tp_gather(self, obj, dst=0):
+        if self.cp_size > 1:
+            print(f"[TorchDist::tp_gather] FUNCTION CALLED. RANK: {self.rank}, CP_SIZE: {self.cp_size}")
         global_rank = torch.distributed.get_rank()
         if isinstance(obj, torch.Tensor):
             if global_rank == dst:
@@ -732,6 +742,8 @@ class TorchDist(Distributed):
 
     @log_op
     def tp_broadcast(self, obj, root=0, **kwargs):
+        if self.cp_size > 1:
+            print(f"[TorchDist::tp_broadcast] FUNCTION CALLED. RANK: {self.rank}, CP_SIZE: {self.cp_size}")
         if isinstance(obj, torch.Tensor):
             dist.broadcast(obj, src=root, group=self.mapping.tp_group_pg)
             return obj

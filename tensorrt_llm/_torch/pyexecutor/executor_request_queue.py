@@ -359,45 +359,118 @@ class ExecutorRequestQueue:
     def _fetch_new_requests_attention_dp(
             self, activate_requests: List[LlmRequest]) -> List[LlmRequest]:
         """Handle attention DP request fetching with load balancing."""
-        # Get active request counts across all DP ranks.
-        # With attention DP, the effective DP size is tp_size (each tp_rank is a DP rank).
-        # When CP is enabled, ranks within a CP group share the same DP rank (same tp_rank)
-        # and should receive the same set of requests.
+        # Logging for gen server with CP enabled
+        if self.dist.cp_size > 1:
+            print(f"[ExecutorRequestQueue::_fetch_new_requests_attention_dp] FUNCTION CALLED. "
+                  f"RANK: {self.dist.rank}, TP_RANK: {self.dist.tp_rank}, CP_SIZE: {self.dist.cp_size}, "
+                  f"TP_SIZE: {self.dist.tp_size}")
+            print(f"[ExecutorRequestQueue::_fetch_new_requests_attention_dp] INPUT: "
+                  f"num_activate_requests={len(activate_requests)}, "
+                  f"activate_request_ids={[req.py_request_id for req in activate_requests]}")
+
+        # Get active request counts across all ranks.
         all_ranks_num_active_requests = []
         all_ranks_num_active_tokens = []
         num_active_tokens = sum(
             [req.py_orig_prompt_len for req in activate_requests])
+
+        if self.dist.cp_size > 1:
+            print(f"[ExecutorRequestQueue::_fetch_new_requests_attention_dp] "
+                  f"RANK: {self.dist.rank}, local_num_active_tokens={num_active_tokens}, "
+                  f"local_num_active_requests={len(activate_requests)}")
+            print(f"[ExecutorRequestQueue::_fetch_new_requests_attention_dp] "
+                  f"RANK: {self.dist.rank}, CALLING tp_allgather with "
+                  f"[{len(activate_requests)}, {num_active_tokens}]")
+
         responses_list = self.dist.tp_allgather(
             [len(activate_requests), num_active_tokens])
+
+        if self.dist.cp_size > 1:
+            print(f"[ExecutorRequestQueue::_fetch_new_requests_attention_dp] "
+                  f"RANK: {self.dist.rank}, tp_allgather RETURNED (raw): {responses_list}")
+            # When CP is enabled, tp_allgather returns one entry per rank, but CP ranks
+            # within the same DP group (same tp_rank) handle the same requests with
+            # different token portions (sequence is split across CP ranks).
+            # Verify that CP ranks within the same DP group have the same number of requests,
+            # and aggregate by summing the token counts.
+            aggregated_responses = []
+            for dp_group_idx in range(self.dist.tp_size):
+                # Get all entries for this DP group (cp_size entries per group)
+                group_start = dp_group_idx * self.dist.cp_size
+                group_entries = responses_list[group_start:group_start + self.dist.cp_size]
+                # Number of requests (first element) should be identical across CP ranks
+                for i, entry in enumerate(group_entries[1:], start=1):
+                    assert entry[0] == group_entries[0][0], (
+                        f"CP ranks within DP group {dp_group_idx} have mismatched request counts: "
+                        f"cp_rank=0 has {group_entries[0][0]} requests, cp_rank={i} has {entry[0]} requests. "
+                        f"Full responses_list: {responses_list}"
+                    )
+                # Sum the token counts across CP ranks (sequence is split)
+                total_tokens = sum(entry[1] for entry in group_entries)
+                aggregated_responses.append([group_entries[0][0], total_tokens])
+            responses_list = aggregated_responses
+            print(f"[ExecutorRequestQueue::_fetch_new_requests_attention_dp] "
+                  f"RANK: {self.dist.rank}, tp_allgather RETURNED (aggregated): {responses_list}")
+
         for num_active_requests, num_active_tokens in responses_list:
             all_ranks_num_active_requests.append(num_active_requests)
             all_ranks_num_active_tokens.append(num_active_tokens)
 
-        # When CP is enabled, tp_allgather only communicates within a tp_group.
-        # Each tp_group contains one rank per DP rank with the same cp_rank.
-        # Ranks with different cp_ranks are in different tp_groups and may have
-        # different gathered data. Synchronize across CP ranks to ensure consistency.
         if self.dist.cp_size > 1:
-            all_ranks_num_active_requests, all_ranks_num_active_tokens = \
-                self.dist.cp_broadcast(
-                    (all_ranks_num_active_requests, all_ranks_num_active_tokens),
-                    root=0)
+            print(f"[ExecutorRequestQueue::_fetch_new_requests_attention_dp] "
+                  f"RANK: {self.dist.rank}, all_ranks_num_active_requests={all_ranks_num_active_requests}, "
+                  f"all_ranks_num_active_tokens={all_ranks_num_active_tokens}")
 
         total_num_active_requests = sum(all_ranks_num_active_requests)
         total_max_num_active_requests = self.dist.tp_size * self.max_num_active_requests
 
+        if self.dist.cp_size > 1:
+            print(f"[ExecutorRequestQueue::_fetch_new_requests_attention_dp] "
+                  f"RANK: {self.dist.rank}, total_num_active_requests={total_num_active_requests}, "
+                  f"total_max_num_active_requests={total_max_num_active_requests}, "
+                  f"max_num_active_requests_per_rank={self.max_num_active_requests}")
+
         # fetch and process requests into waiting queue
+        if self.dist.cp_size > 1:
+            print(f"[ExecutorRequestQueue::_fetch_new_requests_attention_dp] "
+                  f"RANK: {self.dist.rank}, CALLING _fetch_and_process_requests")
+
         new_requests = self._fetch_and_process_requests(
             total_num_active_requests,
             total_max_num_active_requests,
             enable_attention_dp=True,
             all_ranks_num_active_requests=all_ranks_num_active_requests)
 
+        if self.dist.cp_size > 1:
+            print(f"[ExecutorRequestQueue::_fetch_new_requests_attention_dp] "
+                  f"RANK: {self.dist.rank}, _fetch_and_process_requests RETURNED: "
+                  f"num_new_requests={len(new_requests)}, "
+                  f"new_request_ids={[req.id for req in new_requests]}")
+
         # Schedule attention dp requests
+        if self.dist.cp_size > 1:
+            print(f"[ExecutorRequestQueue::_fetch_new_requests_attention_dp] "
+                  f"RANK: {self.dist.rank}, CALLING _schedule_attention_dp_requests")
+
         all_ranks_new_requests = self._schedule_attention_dp_requests(
             new_requests, all_ranks_num_active_requests,
             all_ranks_num_active_tokens)
+
+        if self.dist.cp_size > 1:
+            print(f"[ExecutorRequestQueue::_fetch_new_requests_attention_dp] "
+                  f"RANK: {self.dist.rank}, _schedule_attention_dp_requests RETURNED")
+            for tp_rank, reqs in all_ranks_new_requests.items():
+                print(f"[ExecutorRequestQueue::_fetch_new_requests_attention_dp] "
+                      f"RANK: {self.dist.rank}, TP_RANK {tp_rank} assigned {len(reqs)} requests: "
+                      f"ids={[req.id for req in reqs]}")
+
         new_requests_cur_rank = all_ranks_new_requests[self.dist.tp_rank]
+
+        if self.dist.cp_size > 1:
+            print(f"[ExecutorRequestQueue::_fetch_new_requests_attention_dp] "
+                  f"RANK: {self.dist.rank}, current_tp_rank={self.dist.tp_rank}, "
+                  f"new_requests_cur_rank_count={len(new_requests_cur_rank)}, "
+                  f"new_requests_cur_rank_ids={[req.id for req in new_requests_cur_rank]}")
 
         # Update performance metrics
         if self.enable_iter_perf_stats and self.start_times:
@@ -408,8 +481,26 @@ class ExecutorRequestQueue:
         self.num_fetch_requests += len(new_requests)
         self.num_fetch_requests_cur_rank += len(new_requests_cur_rank)
 
+        if self.dist.cp_size > 1:
+            print(f"[ExecutorRequestQueue::_fetch_new_requests_attention_dp] "
+                  f"RANK: {self.dist.rank}, UPDATED COUNTERS: "
+                  f"num_fetch_requests={self.num_fetch_requests}, "
+                  f"num_fetch_requests_cur_rank={self.num_fetch_requests_cur_rank}")
+
         # Merge requests and add to active list
+        if self.dist.cp_size > 1:
+            print(f"[ExecutorRequestQueue::_fetch_new_requests_attention_dp] "
+                  f"RANK: {self.dist.rank}, CALLING _merge_requests with "
+                  f"{len(new_requests_cur_rank)} requests")
+
         new_requests_cur_rank = self._merge_requests(new_requests_cur_rank)
+
+        if self.dist.cp_size > 1:
+            print(f"[ExecutorRequestQueue::_fetch_new_requests_attention_dp] "
+                  f"RANK: {self.dist.rank}, FUNCTION RETURNING: "
+                  f"num_requests={len(new_requests_cur_rank)}, "
+                  f"request_ids={[req.py_request_id if hasattr(req, 'py_request_id') else 'N/A' for req in new_requests_cur_rank]}")
+
         return new_requests_cur_rank
 
     def _schedule_attention_dp_requests(
@@ -698,6 +789,7 @@ class ExecutorRequestQueue:
                 input_ids_this_rank = input_ids_this_rank[:-padding_len]
                 position_ids_this_rank = position_ids_this_rank[:-padding_len]
 
+            print(f"[ExecutorRequestQueue::_merge_helix_requests] rank:{self.dist.rank}, cp_rank:{curr_cp_rank}, req_item.id:{req_item.id}, input_ids_this_rank:{input_ids_this_rank}, position_ids_this_rank:{position_ids_this_rank}")
             req = executor_request_to_llm_request(
                 req_id=req_item.id,
                 executor_request=req_item.request,

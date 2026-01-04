@@ -852,6 +852,8 @@ class PyExecutor:
         batch_state: BatchState,
         micro_batch_id: int = 0,
     ):
+        if self.dist.cp_size > 1:
+            print(f"[PyExecutor::_process_iter_stats] FUNCTION CALLED. RANK: {self.dist.rank}, CP_SIZE: {self.dist.cp_size}")
         iter_end_time = time.time()
         iter_latency_ms = (iter_end_time - batch_state.iter_start_time) * 1e3
         if batch_state.iter_stats is None:
@@ -1205,6 +1207,8 @@ class PyExecutor:
             self.send_handles[microbatch_id] = None
 
     def _can_queue(self, scheduled_batch):
+        if self.dist.cp_size > 1:
+            print(f"[PyExecutor::_can_queue] FUNCTION CALLED. RANK: {self.dist.rank}, CP_SIZE: {self.dist.cp_size}")
 
         if self.enable_attention_dp:
             tp_batch_sizes = self.dist.tp_allgather(scheduled_batch.batch_size)
@@ -1215,6 +1219,8 @@ class PyExecutor:
         return can_queue
 
     def _prepare_and_schedule_batch(self):
+        if self.dist.cp_size > 1:
+            print(f"[PyExecutor::_prepare_and_schedule_batch] FUNCTION CALLED. RANK: {self.dist.rank}, CP_SIZE: {self.dist.cp_size}")
         new_requests = self._fetch_and_activate_new_requests()
         if self.should_stop_processing:
             return None, None
@@ -1299,6 +1305,8 @@ class PyExecutor:
         return scheduled_batch, iter_stats
 
     def _kv_connector_start_batch(self, scheduled_batch):
+        if self.dist.cp_size > 1:
+            print(f"[PyExecutor::_kv_connector_start_batch] FUNCTION CALLED. RANK: {self.dist.rank}, CP_SIZE: {self.dist.cp_size}")
         if self.kv_connector_manager:
             self.kv_connector_manager.take_scheduled_requests_pending_load(
                 scheduled_batch)
@@ -1307,6 +1315,8 @@ class PyExecutor:
                 torch.cuda.current_stream())
 
     def _kv_connector_terminate_requests(self):
+        if self.dist.cp_size > 1:
+            print(f"[PyExecutor::_kv_connector_terminate_requests] FUNCTION CALLED. RANK: {self.dist.rank}, CP_SIZE: {self.dist.cp_size}")
         if self.kv_connector_manager:
             reqs_to_terminate = self.kv_connector_manager.get_finished()
             for req in reqs_to_terminate:
@@ -1485,6 +1495,8 @@ class PyExecutor:
             self._handle_errors(error_msg)
 
     def _handle_control_request(self):
+        if self.dist.cp_size > 1:
+            print(f"[PyExecutor::_handle_control_request] FUNCTION CALLED. RANK: {self.dist.rank}, CP_SIZE: {self.dist.cp_size}")
         if len(self.active_requests) == 0 and \
             self.executor_request_queue.get_waiting_queue_size() == 0 and \
             len(self.executor_request_queue.control_requests) > 0:
@@ -2034,6 +2046,8 @@ class PyExecutor:
 
     @nvtx_range("_check_kv_transfer_timeout")
     def _check_kv_transfer_timeout(self):
+        if self.dist.cp_size > 1:
+            print(f"[PyExecutor::_check_kv_transfer_timeout] FUNCTION CALLED. RANK: {self.dist.rank}, CP_SIZE: {self.dist.cp_size}")
         if not self.kv_cache_transceiver:
             return
         timeout_ms = self.kv_cache_transceiver.kv_transfer_timeout_ms
@@ -2116,6 +2130,8 @@ class PyExecutor:
 
     @nvtx_range("_prepare_disagg_gen_transmission_complete")
     def _prepare_disagg_gen_transmission_complete(self, scheduled_batch):
+        if self.dist.cp_size > 1:
+            print(f"[PyExecutor::_prepare_disagg_gen_transmission_complete] FUNCTION CALLED. RANK: {self.dist.rank}, CP_SIZE: {self.dist.cp_size}")
         cache_trans_complete_requests = []
         for req in scheduled_batch.generation_requests:
             if req.is_disagg_generation_transmission_complete:
@@ -2173,6 +2189,8 @@ class PyExecutor:
 
     @nvtx_range("_send_disagg_ctx_cache")
     def _send_disagg_ctx_cache(self, scheduled_ctx_requests):
+        if self.dist.cp_size > 1:
+            print(f"[PyExecutor::_send_disagg_ctx_cache] FUNCTION CALLED. RANK: {self.dist.rank}, CP_SIZE: {self.dist.cp_size}")
         if (scheduled_ctx_requests is None or len(scheduled_ctx_requests) == 0):
             return []
         for req in scheduled_ctx_requests:
@@ -2230,6 +2248,8 @@ class PyExecutor:
             scheduled_requests,
             new_tensors_device: Optional[SampleStateTensors] = None,
             num_accepted_tokens_device: Optional[torch.Tensor] = None):
+        if self.dist.cp_size > 1:
+            print(f"[PyExecutor::_forward_step] FUNCTION CALLED. RANK: {self.dist.rank}, CP_SIZE: {self.dist.cp_size}")
         ExpertStatistic.set_iter(self.iter_counter)
 
         @nvtx_range(
@@ -2320,6 +2340,8 @@ class PyExecutor:
 
     @nvtx_range("_update_request_states")
     def _update_request_states(self, scheduled_requests: ScheduledRequests):
+        if self.dist.cp_size > 1:
+            print(f"[PyExecutor::_update_request_states] FUNCTION CALLED. RANK: {self.dist.rank}, CP_SIZE: {self.dist.cp_size}")
         cp_config = self.dist.cp_config
         if 'cp_type' in cp_config:
             cp_type = cp_config['cp_type']
@@ -2336,6 +2358,8 @@ class PyExecutor:
     @nvtx_range("_sample_async")
     def _sample_async(self, scheduled_batch,
                       batch_outputs) -> SampleState | None:
+        if self.dist.cp_size > 1:
+            print(f"[PyExecutor::_sample_async] FUNCTION CALLED. RANK: {self.dist.rank}, CP_SIZE: {self.dist.cp_size}")
         try:
             if batch_outputs is not None:
                 num_context_logits_prefix_sum = [0]
@@ -2383,6 +2407,8 @@ class PyExecutor:
     def _update_requests(self,
                          sample_state: SampleState,
                          resource_manager: Optional[ResourceManager] = None):
+        if self.dist.cp_size > 1:
+            print(f"[PyExecutor::_update_requests] FUNCTION CALLED. RANK: {self.dist.rank}, CP_SIZE: {self.dist.cp_size}")
         try:
             self.sampler.update_requests(sample_state, resource_manager)
         except Exception as e:
@@ -2469,6 +2495,8 @@ class PyExecutor:
 
     @nvtx_range("_handle_canceled_requests")
     def _handle_canceled_requests(self):
+        if self.dist.cp_size > 1:
+            print(f"[PyExecutor::_handle_canceled_requests] FUNCTION CALLED. RANK: {self.dist.rank}, CP_SIZE: {self.dist.cp_size}")
         if self.executor_request_queue.get_canceled_req_ids_size() == 0:
             return
 
@@ -2501,7 +2529,16 @@ class PyExecutor:
 
     @nvtx_range("_enqueue_responses")
     def _enqueue_responses(self, responses: Iterable[Tuple[int, LlmResponse]]):
-        if 0 not in self.dist.mapping.tp_group and not self.gather_all_responses:
+        # When CP is enabled, CP ranks are included in the tp_comm and all ranks
+        # must participate in collective operations. Skip the early return check
+        # in this case to prevent deadlocks where some ranks call tp_gather
+        # while others proceed to different collective operations.
+        if self.dist.cp_size > 1:
+            print(f"[PyExecutor::_enqueue_responses] RANK: {self.dist.rank}, CP_SIZE: {self.dist.cp_size}, "
+                  f"tp_group: {self.dist.mapping.tp_group}, 0_in_tp_group: {0 in self.dist.mapping.tp_group}, "
+                  f"skipping early return check due to CP > 1, gather_all_responses: {self.gather_all_responses}")
+
+        if self.dist.cp_size <= 1 and 0 not in self.dist.mapping.tp_group and not self.gather_all_responses:
             return
 
         if self.enable_attention_dp and self.dist.world_size != 1:
@@ -2512,6 +2549,15 @@ class PyExecutor:
             if self.dist.rank == 0 or self.gather_all_responses:
                 gather_responses = []
                 if responses_list is not None:
+                    # When CP is enabled, tp_gather returns data from all ranks
+                    # including CP ranks. CP ranks with the same tp_rank have identical
+                    # data, so we need to deduplicate by striding by cp_size.
+                    if self.dist.cp_size > 1:
+                        raw_len = len(responses_list)
+                        responses_list = responses_list[::self.dist.cp_size]
+                        print(f"[PyExecutor::_enqueue_responses] RANK: {self.dist.rank}, "
+                              f"deduplicating responses_list: raw_len={raw_len}, "
+                              f"deduplicated_len={len(responses_list)}, cp_size={self.dist.cp_size}")
                     for resp in responses_list:
                         if resp is not None:
                             gather_responses.extend(resp)
@@ -2537,6 +2583,8 @@ class PyExecutor:
 
     @nvtx_range("_handle_first_token_response")
     def _handle_first_token_response(self, scheduled_batch):
+        if self.dist.cp_size > 1:
+            print(f"[PyExecutor::_handle_first_token_response] FUNCTION CALLED. RANK: {self.dist.rank}, CP_SIZE: {self.dist.cp_size}")
         new_responses = []
         for req in scheduled_batch.generation_requests:
             if req.py_decoding_iter == 1:
@@ -2550,6 +2598,8 @@ class PyExecutor:
 
     @nvtx_range("_handle_responses")
     def _handle_responses(self):
+        if self.dist.cp_size > 1:
+            print(f"[PyExecutor::_handle_responses] FUNCTION CALLED. RANK: {self.dist.rank}, CP_SIZE: {self.dist.cp_size}")
         new_responses = []
         requests_to_terminate = []
         new_active_requests = []
@@ -2647,6 +2697,8 @@ class PyExecutor:
 
     @nvtx_range("_terminate_disagg_ctx_finished_requests")
     def _terminate_disagg_ctx_finished_requests(self):
+        if self.dist.cp_size > 1:
+            print(f"[PyExecutor::_terminate_disagg_ctx_finished_requests] FUNCTION CALLED. RANK: {self.dist.rank}, CP_SIZE: {self.dist.cp_size}")
         # make a copy of the keys, since we are modifying the dictionary in the loop
         in_transmission_requests_id = list(
             self.ctx_in_transmission_requests.keys())
@@ -2740,6 +2792,8 @@ class PyExecutor:
             return response
 
     def _pause_requests(self, requests_to_pause):
+        if self.dist.cp_size > 1:
+            print(f"[PyExecutor::_pause_requests] FUNCTION CALLED. RANK: {self.dist.rank}, CP_SIZE: {self.dist.cp_size}")
         # todo: support work with self.inflight_req_ids.
         #       Currently, self.inflight_req_ids is not.
         max_input_len = self.max_input_len
@@ -2822,6 +2876,8 @@ class PyExecutor:
             failed_requests: List of (request_id, error_message) tuples for failed requests,
                            or None if no failures occurred
         """
+        if self.dist.cp_size > 1:
+            print(f"[PyExecutor::_handle_guided_decoder_errors] FUNCTION CALLED. RANK: {self.dist.rank}, CP_SIZE: {self.dist.cp_size}")
         if not failed_requests:
             return
 
