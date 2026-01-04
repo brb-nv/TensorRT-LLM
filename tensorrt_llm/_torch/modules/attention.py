@@ -2224,6 +2224,10 @@ class MLA(nn.Module):
         all_reduce_params: Optional[AllReduceParams] = None,
         latent_cache_gen: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        _debug_cp = self.mapping.cp_size > 1
+        _debug_cp_rank = self.mapping.cp_rank if _debug_cp else -1
+        if _debug_cp:
+            print(f"[DEBUG][cp_rank={_debug_cp_rank}][layer={self.layer_idx}] >>> ENTER MLA.forward (is_dsa={self.is_dsa}, register_to_config={self.register_to_config})", flush=True)
 
         attn_output = self.create_output(hidden_states,
                                          attn_metadata.num_contexts)
@@ -2233,16 +2237,24 @@ class MLA(nn.Module):
                                        attn_metadata,
                                        output=attn_output)
         elif self.register_to_config:
+            if _debug_cp:
+                print(f"[DEBUG][cp_rank={_debug_cp_rank}][layer={self.layer_idx}] MLA: before mla_custom_op_inplace", flush=True)
             torch.ops.trtllm.mla_custom_op_inplace(hidden_states, position_ids,
                                                    self.layer_idx_str,
                                                    attn_output,
                                                    latent_cache_gen)
+            if _debug_cp:
+                print(f"[DEBUG][cp_rank={_debug_cp_rank}][layer={self.layer_idx}] MLA: after mla_custom_op_inplace", flush=True)
         else:
+            if _debug_cp:
+                print(f"[DEBUG][cp_rank={_debug_cp_rank}][layer={self.layer_idx}] MLA: before forward_impl", flush=True)
             self.forward_impl(position_ids,
                               hidden_states,
                               attn_metadata,
                               output=attn_output,
                               latent_cache_gen=latent_cache_gen)
+            if _debug_cp:
+                print(f"[DEBUG][cp_rank={_debug_cp_rank}][layer={self.layer_idx}] MLA: after forward_impl", flush=True)
 
         if self.enable_helix_test and self.mapping.has_cp_helix():
             # note: for allowing testing Helix parallelism, we ensure that
@@ -2251,8 +2263,12 @@ class MLA(nn.Module):
             attn_output = attn_output[:, :self.num_heads_tp_cp *
                                       self.v_head_dim].contiguous()
 
+        if _debug_cp:
+            print(f"[DEBUG][cp_rank={_debug_cp_rank}][layer={self.layer_idx}] MLA: before o_proj", flush=True)
         attn_output = self.o_proj(attn_output,
                                   all_reduce_params=all_reduce_params)
+        if _debug_cp:
+            print(f"[DEBUG][cp_rank={_debug_cp_rank}][layer={self.layer_idx}] MLA: after o_proj <<< EXIT MLA.forward", flush=True)
         return attn_output
 
     def resmooth_parameters(self,

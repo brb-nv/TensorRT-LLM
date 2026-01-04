@@ -1887,6 +1887,10 @@ class PyTorchModelEngine(ModelEngine):
         """
         Prepare inputs for Pytorch Model.
         """
+        _debug_cp = self.mapping is not None and self.mapping.cp_size > 1
+        _debug_cp_rank = self.mapping.cp_rank if _debug_cp else -1
+        if _debug_cp:
+            print(f"[DEBUG][cp_rank={_debug_cp_rank}] >>> ENTER _prepare_tp_inputs", flush=True)
 
         new_tokens_device, new_tokens_lens_device, next_draft_tokens_device = None, None, None
         if new_tensors_device is not None:
@@ -2618,13 +2622,21 @@ class PyTorchModelEngine(ModelEngine):
             num_cached_tokens_per_seq=num_cached_tokens_per_seq,
             num_extra_kv_tokens=get_num_extra_kv_tokens(spec_config))
         attn_metadata.kv_cache_manager = kv_cache_manager
+        if _debug_cp:
+            print(f"[DEBUG][cp_rank={_debug_cp_rank}] _prepare_tp_inputs: before attn_metadata.prepare()", flush=True)
 
         attn_metadata.prepare()
+        if _debug_cp:
+            print(f"[DEBUG][cp_rank={_debug_cp_rank}] _prepare_tp_inputs: after attn_metadata.prepare()", flush=True)
 
         lora_params = self._get_lora_params_from_requests(
             scheduled_requests, attn_metadata)
+        if _debug_cp:
+            print(f"[DEBUG][cp_rank={_debug_cp_rank}][global_rank={self.mapping.rank}][tp_rank={self.mapping.tp_rank}] _prepare_tp_inputs: before _get_all_rank_num_tokens (num_tokens={attn_metadata.num_tokens}, enable_attention_dp={self.enable_attention_dp})", flush=True)
 
         attn_all_rank_num_tokens = self._get_all_rank_num_tokens(attn_metadata)
+        if _debug_cp:
+            print(f"[DEBUG][cp_rank={_debug_cp_rank}][global_rank={self.mapping.rank}] _prepare_tp_inputs: after _get_all_rank_num_tokens (result={attn_all_rank_num_tokens})", flush=True)
         padded_num_tokens, can_run_piecewise_cuda_graph, attn_all_rank_num_tokens = self._get_padding_params(
             total_num_tokens, num_ctx_requests, attn_all_rank_num_tokens)
         set_per_request_piecewise_cuda_graph_flag(can_run_piecewise_cuda_graph)
@@ -2678,13 +2690,21 @@ class PyTorchModelEngine(ModelEngine):
             if isinstance(spec_metadata, Eagle3OneModelSpecMetadata):
                 spec_metadata.populate_sampling_params_for_one_model(
                     scheduled_requests.all_requests())
+            if _debug_cp:
+                print(f"[DEBUG][cp_rank={_debug_cp_rank}] _prepare_tp_inputs: before spec_metadata.prepare()", flush=True)
             spec_metadata.prepare()
+            if _debug_cp:
+                print(f"[DEBUG][cp_rank={_debug_cp_rank}] _prepare_tp_inputs: after spec_metadata.prepare()", flush=True)
             inputs['spec_metadata'] = spec_metadata
 
             if self.enable_attention_dp:
+                if _debug_cp:
+                    print(f"[DEBUG][cp_rank={_debug_cp_rank}] _prepare_tp_inputs: before tp_allgather", flush=True)
                 all_rank_num_tokens = self.dist.tp_allgather(
                     [spec_metadata.num_tokens,
                      len(sequence_lengths)])
+                if _debug_cp:
+                    print(f"[DEBUG][cp_rank={_debug_cp_rank}] _prepare_tp_inputs: after tp_allgather", flush=True)
 
                 spec_all_rank_num_tokens = [
                     item[0] for item in all_rank_num_tokens
@@ -2714,6 +2734,8 @@ class PyTorchModelEngine(ModelEngine):
             ]
             self.has_previous_device_draft = next_draft_tokens_device is not None
 
+        if _debug_cp:
+            print(f"[DEBUG][cp_rank={_debug_cp_rank}] <<< EXIT _prepare_tp_inputs", flush=True)
         return inputs, self.gather_ids_cuda[:len(
             gather_ids)] if self.enable_spec_decode else None
 
@@ -3224,8 +3246,14 @@ class PyTorchModelEngine(ModelEngine):
                 spec_decoding_tensor: Optional[SpecDecodingTensor] = None,
                 num_accepted_tokens_device: Optional[torch.Tensor] = None,
                 req_id_to_old_request: Optional[Dict[int, LlmRequest]] = None):
+        _debug_cp = hasattr(self, 'mapping') and self.mapping.cp_size > 1
+        _debug_cp_rank = self.mapping.cp_rank if _debug_cp else -1
+        if _debug_cp:
+            print(f"[DEBUG][cp_rank={_debug_cp_rank}] >>> ENTER ModelEngine.forward", flush=True)
         kv_cache_manager = resource_manager.get_resource_manager(
             self.kv_cache_manager_key)
+        if _debug_cp:
+            print(f"[DEBUG][cp_rank={_debug_cp_rank}] ModelEngine: before _set_up_attn_metadata", flush=True)
 
         attn_metadata = self._set_up_attn_metadata(kv_cache_manager)
         if self.enable_spec_decode:
@@ -3255,6 +3283,8 @@ class PyTorchModelEngine(ModelEngine):
         else:
             spec_resource_manager = None
             spec_metadata = None
+        if _debug_cp:
+            print(f"[DEBUG][cp_rank={_debug_cp_rank}] ModelEngine: after spec setup", flush=True)
 
         moe_load_balancer: MoeLoadBalancer = getattr(self, 'moe_load_balancer',
                                                      None)
@@ -3271,9 +3301,13 @@ class PyTorchModelEngine(ModelEngine):
                 else:
                     return self._forward_step(inputs, gather_ids,
                                               gather_context_logits)
+        if _debug_cp:
+            print(f"[DEBUG][cp_rank={_debug_cp_rank}] ModelEngine: before cuda_graph_runner.pad_batch", flush=True)
         with self.cuda_graph_runner.pad_batch(
                 scheduled_requests, resource_manager,
                 self.runtime_draft_len) as padded_requests:
+            if _debug_cp:
+                print(f"[DEBUG][cp_rank={_debug_cp_rank}] ModelEngine: inside pad_batch context, before maybe_get_cuda_graph", flush=True)
 
             maybe_attn_metadata, maybe_spec_metadata, key = self.cuda_graph_runner.maybe_get_cuda_graph(
                 padded_requests,
@@ -3296,18 +3330,26 @@ class PyTorchModelEngine(ModelEngine):
                 else:
                     spec_metadata = None
 
+            if _debug_cp:
+                print(f"[DEBUG][cp_rank={_debug_cp_rank}] ModelEngine: before _prepare_inputs", flush=True)
             inputs, gather_ids = self._prepare_inputs(
                 padded_requests, kv_cache_manager, attn_metadata, spec_metadata,
                 new_tensors_device, cache_indirection_buffer,
                 num_accepted_tokens_device, req_id_to_old_request,
                 resource_manager)
+            if _debug_cp:
+                print(f"[DEBUG][cp_rank={_debug_cp_rank}] ModelEngine: after _prepare_inputs", flush=True)
 
             with with_shared_pool(self.cuda_graph_runner.get_graph_pool()):
                 if not can_run_graph:
                     # Fallback to eager execution if graph was not used
+                    if _debug_cp:
+                        print(f"[DEBUG][cp_rank={_debug_cp_rank}] ModelEngine: before _forward_step (eager)", flush=True)
                     with MoeLoadBalancerIterContext(moe_load_balancer):
                         outputs = self._forward_step(inputs, gather_ids,
                                                      gather_context_logits)
+                    if _debug_cp:
+                        print(f"[DEBUG][cp_rank={_debug_cp_rank}] ModelEngine: after _forward_step (eager)", flush=True)
                 else:
                     if self.cuda_graph_runner.needs_capture(key):
 
@@ -3365,17 +3407,27 @@ class PyTorchModelEngine(ModelEngine):
                       inputs: Dict[str, Any],
                       gather_ids: Optional[torch.Tensor],
                       gather_context_logits: bool = False) -> Dict[str, Any]:
+        _debug_cp = hasattr(self, 'mapping') and self.mapping.cp_size > 1
+        _debug_cp_rank = self.mapping.cp_rank if _debug_cp else -1
+        if _debug_cp:
+            print(f"[DEBUG][cp_rank={_debug_cp_rank}] >>> ENTER _forward_step (inner)", flush=True)
         inputs = self._preprocess_inputs(inputs)
+        if _debug_cp:
+            print(f"[DEBUG][cp_rank={_debug_cp_rank}] _forward_step: after _preprocess_inputs", flush=True)
         if inputs.get('spec_metadata', None):
             gather_ids = inputs['spec_metadata'].gather_ids
 
         # For simplicity, just return all the the logits if we have special gather_ids
         # from speculative decoding.
+        if _debug_cp:
+            print(f"[DEBUG][cp_rank={_debug_cp_rank}] _forward_step: before model_forward", flush=True)
         outputs = self.model_forward(
             **inputs,
             return_context_logits=gather_ids is not None
             or gather_context_logits,
         )
+        if _debug_cp:
+            print(f"[DEBUG][cp_rank={_debug_cp_rank}] _forward_step: after model_forward", flush=True)
 
         if self.without_logits:
             return outputs

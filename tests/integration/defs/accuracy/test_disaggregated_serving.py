@@ -915,6 +915,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                 "backend": "UCX",
                 "max_tokens_in_buffer": 8192,
             },
+            "print_iter_log": True,
         }
         gen_server_config = {
             "tensor_parallel_size": gen_tp,
@@ -935,6 +936,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                 "max_tokens_in_buffer": 8192,
             },
             "enable_attention_dp": enable_attention_dp,
+            "print_iter_log": True,
         }
         disaggregated_server_config = {
             "hostname": "localhost",

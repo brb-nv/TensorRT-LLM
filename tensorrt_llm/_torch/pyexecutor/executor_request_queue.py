@@ -1,6 +1,7 @@
 import dataclasses
 import datetime
 import heapq
+import logging
 import queue
 import threading
 import time
@@ -12,6 +13,8 @@ import torch
 
 from tensorrt_llm._utils import mpi_disabled, nvtx_range
 from tensorrt_llm.mapping import CpType
+
+logger = logging.getLogger(__name__)
 
 from ..distributed import Distributed
 from .llm_request import (ExecutorRequest, LlmRequest,
@@ -367,24 +370,90 @@ class ExecutorRequestQueue:
         all_ranks_num_active_tokens = []
         num_active_tokens = sum(
             [req.py_orig_prompt_len for req in activate_requests])
+
+        # DEBUG: Log distributed configuration.
+        logger.info(
+            f"[DP+CP DEBUG] rank={self.dist.rank}, tp_rank={self.dist.tp_rank}, "
+            f"cp_rank={self.dist.cp_rank}, tp_size={self.dist.tp_size}, "
+            f"cp_size={self.dist.cp_size}, "
+            f"num_activate_requests={len(activate_requests)}, "
+            f"num_active_tokens={num_active_tokens}"
+        )
+
         responses_list = self.dist.tp_allgather(
             [len(activate_requests), num_active_tokens])
+
+        # DEBUG: Log tp_allgather results.
+        logger.info(
+            f"[DP+CP DEBUG] rank={self.dist.rank}: tp_allgather returned "
+            f"{len(responses_list)} entries: {responses_list}"
+        )
+
         for num_active_requests, num_active_tokens in responses_list:
             all_ranks_num_active_requests.append(num_active_requests)
             all_ranks_num_active_tokens.append(num_active_tokens)
 
-        # When CP is enabled, tp_allgather only communicates within a tp_group.
+        # The actual number of DP ranks is tp_size (from the mapping).
+        # With Helix CP, the tp_comm may include more ranks (tp_size * cp_size) because
+        # CP ranks are repurposed to TP during communicator creation. In this case,
+        # tp_allgather returns more entries than there are DP ranks.
+        # We need to aggregate the data to match the actual DP structure.
+        num_dp_ranks = self.dist.tp_size
+        gathered_count = len(all_ranks_num_active_requests)
+
+        logger.info(
+            f"[DP+CP DEBUG] rank={self.dist.rank}: gathered_count={gathered_count}, "
+            f"num_dp_ranks={num_dp_ranks}, tp_size={self.dist.tp_size}, "
+            f"cp_size={self.dist.cp_size}"
+        )
+
+        if gathered_count > num_dp_ranks:
+            # With Helix CP, tp_allgather returns data from all world ranks in the tp_comm.
+            # The tp_comm contains tp_size * cp_size ranks (since CP is repurposed to TP).
+            # Ranks are ordered such that every cp_size-th rank has the same tp_rank (DP rank).
+            # Since all CP ranks in a DP group process the same requests, we take one
+            # representative entry per DP rank by sampling every cp_size-th entry.
+            step = self.dist.cp_size if self.dist.cp_size > 1 else 1
+            logger.info(
+                f"[DP+CP DEBUG] rank={self.dist.rank}: Aggregating data with step={step}. "
+                f"Before: all_ranks_num_active_requests={all_ranks_num_active_requests}"
+            )
+            all_ranks_num_active_requests = all_ranks_num_active_requests[::step][:num_dp_ranks]
+            all_ranks_num_active_tokens = all_ranks_num_active_tokens[::step][:num_dp_ranks]
+            logger.info(
+                f"[DP+CP DEBUG] rank={self.dist.rank}: After aggregation: "
+                f"all_ranks_num_active_requests={all_ranks_num_active_requests}"
+            )
+
+        # When CP is enabled (non-Helix), tp_allgather only communicates within a tp_group.
         # Each tp_group contains one rank per DP rank with the same cp_rank.
         # Ranks with different cp_ranks are in different tp_groups and may have
         # different gathered data. Synchronize across CP ranks to ensure consistency.
-        if self.dist.cp_size > 1:
+        # Note: For Helix CP, all ranks are in the same tp_group, so this is not needed.
+        if self.dist.cp_size > 1 and gathered_count == num_dp_ranks:
+            logger.info(
+                f"[DP+CP DEBUG] rank={self.dist.rank}: cp_size={self.dist.cp_size} > 1, "
+                f"broadcasting data across CP group. Before broadcast: "
+                f"all_ranks_num_active_requests={all_ranks_num_active_requests}"
+            )
             all_ranks_num_active_requests, all_ranks_num_active_tokens = \
                 self.dist.cp_broadcast(
                     (all_ranks_num_active_requests, all_ranks_num_active_tokens),
                     root=0)
+            logger.info(
+                f"[DP+CP DEBUG] rank={self.dist.rank}: After cp_broadcast: "
+                f"all_ranks_num_active_requests={all_ranks_num_active_requests}"
+            )
+
+        # DEBUG: Log computed values.
+        logger.info(
+            f"[DP+CP DEBUG] rank={self.dist.rank}: final num_dp_ranks={num_dp_ranks}, "
+            f"all_ranks_num_active_requests={all_ranks_num_active_requests}, "
+            f"all_ranks_num_active_tokens={all_ranks_num_active_tokens}"
+        )
 
         total_num_active_requests = sum(all_ranks_num_active_requests)
-        total_max_num_active_requests = self.dist.tp_size * self.max_num_active_requests
+        total_max_num_active_requests = num_dp_ranks * self.max_num_active_requests
 
         # fetch and process requests into waiting queue
         new_requests = self._fetch_and_process_requests(
@@ -393,11 +462,28 @@ class ExecutorRequestQueue:
             enable_attention_dp=True,
             all_ranks_num_active_requests=all_ranks_num_active_requests)
 
-        # Schedule attention dp requests
+        logger.info(
+            f"[DP+CP DEBUG] rank={self.dist.rank}: Fetched {len(new_requests)} new requests"
+        )
+
+        # Schedule attention dp requests.
         all_ranks_new_requests = self._schedule_attention_dp_requests(
             new_requests, all_ranks_num_active_requests,
-            all_ranks_num_active_tokens)
+            all_ranks_num_active_tokens, num_dp_ranks)
+
+        # DEBUG: Log scheduling results.
+        scheduled_counts = {k: len(v) for k, v in all_ranks_new_requests.items()}
+        logger.info(
+            f"[DP+CP DEBUG] rank={self.dist.rank}: Scheduled requests per DP rank: "
+            f"{scheduled_counts}"
+        )
+
         new_requests_cur_rank = all_ranks_new_requests[self.dist.tp_rank]
+
+        logger.info(
+            f"[DP+CP DEBUG] rank={self.dist.rank}: tp_rank={self.dist.tp_rank}, "
+            f"new_requests_cur_rank has {len(new_requests_cur_rank)} requests"
+        )
 
         # Update performance metrics
         if self.enable_iter_perf_stats and self.start_times:
@@ -415,16 +501,45 @@ class ExecutorRequestQueue:
     def _schedule_attention_dp_requests(
             self, new_requests: List[RequestQueueItem],
             all_ranks_num_active_requests: List[int],
-            all_ranks_num_active_tokens: List[int]) -> List[RequestQueueItem]:
-        """Schedule attention dp requests."""
+            all_ranks_num_active_tokens: List[int],
+            num_dp_ranks: Optional[int] = None) -> Dict[int, List[RequestQueueItem]]:
+        """Schedule attention dp requests.
 
-        # Map from ranks to new requests
+        Args:
+            new_requests: List of new requests to schedule.
+            all_ranks_num_active_requests: Number of active requests per DP rank.
+            all_ranks_num_active_tokens: Number of active tokens per DP rank.
+            num_dp_ranks: Number of DP ranks. If None, uses len(all_ranks_num_active_requests).
+
+        Returns:
+            Dictionary mapping DP rank to list of scheduled requests.
+        """
+        # Use provided num_dp_ranks or infer from the data.
+        if num_dp_ranks is None:
+            num_dp_ranks = len(all_ranks_num_active_requests)
+
+        # DEBUG: Log scheduling parameters.
+        logger.info(
+            f"[DP+CP DEBUG] _schedule_attention_dp_requests: "
+            f"num_dp_ranks={num_dp_ranks}, "
+            f"len(all_ranks_num_active_requests)={len(all_ranks_num_active_requests)}, "
+            f"len(all_ranks_num_active_tokens)={len(all_ranks_num_active_tokens)}, "
+            f"len(new_requests)={len(new_requests)}, "
+            f"tp_size={self.dist.tp_size}"
+        )
+
+        # Map from ranks to new requests.
         all_ranks_new_requests = {
-            tp_rank: []
-            for tp_rank in range(self.dist.tp_size)
+            dp_rank: []
+            for dp_rank in range(num_dp_ranks)
         }
 
-        # Prioritize the requests that are not in relax mode
+        logger.info(
+            f"[DP+CP DEBUG] Created all_ranks_new_requests with keys: "
+            f"{list(all_ranks_new_requests.keys())}"
+        )
+
+        # Prioritize the requests that are not in relax mode.
         def get_relax_value(req_item):
             scheduling_params = getattr(req_item.request,
                                         'py_scheduling_params', None)
@@ -434,7 +549,7 @@ class ExecutorRequestQueue:
 
         new_requests = sorted(new_requests, key=get_relax_value, reverse=True)
 
-        # Try to put the requests to the target dp rank until the max_num_active_requests is reached
+        # Try to put the requests to the target dp rank until the max_num_active_requests is reached.
         remaining_unscheduled = []
         for req_item in new_requests:
             scheduled = False
@@ -442,8 +557,8 @@ class ExecutorRequestQueue:
                                         'py_scheduling_params', None)
             if scheduling_params is not None:
                 target_dp_rank = scheduling_params.attention_dp_rank
-                if target_dp_rank is not None and all_ranks_num_active_requests[
-                        target_dp_rank] < self.max_num_active_requests:
+                if target_dp_rank is not None and target_dp_rank < num_dp_ranks and \
+                        all_ranks_num_active_requests[target_dp_rank] < self.max_num_active_requests:
                     all_ranks_num_active_requests[target_dp_rank] += 1
                     scheduled = True
                     all_ranks_new_requests[target_dp_rank].append(req_item)
@@ -451,12 +566,12 @@ class ExecutorRequestQueue:
             if not scheduled:
                 remaining_unscheduled.append(req_item)
 
-        # Balance the remaining unscheduled requests across ranks
+        # Balance the remaining unscheduled requests across ranks.
         num_new_requests_all_ranks = len(remaining_unscheduled)
         total_num_active_requests = sum(all_ranks_num_active_requests)
         self.expected_num_active_requests = max(
             (total_num_active_requests + num_new_requests_all_ranks +
-             self.dist.tp_size - 1) // self.dist.tp_size,
+             num_dp_ranks - 1) // num_dp_ranks,
             max(all_ranks_num_active_requests),
         )
 
@@ -520,8 +635,18 @@ class ExecutorRequestQueue:
             self, new_requests: List[RequestQueueItem],
             all_ranks_new_requests: Dict[int, List[RequestQueueItem]],
             all_ranks_num_active_requests: List[int],
-            all_ranks_num_active_tokens: List[int]) -> List[RequestQueueItem]:
+            all_ranks_num_active_tokens: List[int]) -> Dict[int, List[RequestQueueItem]]:
         """Balance requests across ranks for attention DP."""
+        # DEBUG: Log input parameters.
+        logger.info(
+            f"[DP+CP DEBUG] _balance_requests_across_ranks: "
+            f"len(new_requests)={len(new_requests)}, "
+            f"all_ranks_new_requests.keys()={list(all_ranks_new_requests.keys())}, "
+            f"len(all_ranks_num_active_requests)={len(all_ranks_num_active_requests)}, "
+            f"len(all_ranks_num_active_tokens)={len(all_ranks_num_active_tokens)}, "
+            f"expected_num_active_requests={self.expected_num_active_requests}"
+        )
+
         if new_requests:
             # Balance context tokens across ranks using heap
             HeapVal = namedtuple(
@@ -533,15 +658,33 @@ class ExecutorRequestQueue:
                 for tp_rank, val in enumerate(all_ranks_num_active_requests)
             ]
 
+            # DEBUG: Log heap before filtering.
+            logger.info(
+                f"[DP+CP DEBUG] Heap before filtering: "
+                f"ranks in heap: {[v.rank for v in all_ranks_new_requests_heap]}"
+            )
+
             all_ranks_new_requests_heap = [
                 val for val in all_ranks_new_requests_heap
                 if val.num_requests < self.expected_num_active_requests
             ]
 
+            # DEBUG: Log heap after filtering.
+            logger.info(
+                f"[DP+CP DEBUG] Heap after filtering: "
+                f"ranks in heap: {[v.rank for v in all_ranks_new_requests_heap]}"
+            )
+
             all_ranks_new_scheduled_requests = {
                 val.rank: val.request_list
                 for val in all_ranks_new_requests_heap
             }
+
+            # DEBUG: Log scheduled requests dict keys.
+            logger.info(
+                f"[DP+CP DEBUG] all_ranks_new_scheduled_requests.keys()="
+                f"{list(all_ranks_new_scheduled_requests.keys())}"
+            )
 
             heapq.heapify(all_ranks_new_requests_heap)
 
@@ -571,7 +714,18 @@ class ExecutorRequestQueue:
                     heapq.heappush(all_ranks_new_requests_heap, val)
 
             # Extend all_ranks_new_requests with the new requests that have been scheduled
+            # DEBUG: Log before extending.
+            logger.info(
+                f"[DP+CP DEBUG] About to extend all_ranks_new_requests. "
+                f"all_ranks_new_requests.keys()={list(all_ranks_new_requests.keys())}, "
+                f"all_ranks_new_scheduled_requests.keys()={list(all_ranks_new_scheduled_requests.keys())}"
+            )
             for rank, reqs in all_ranks_new_scheduled_requests.items():
+                if rank not in all_ranks_new_requests:
+                    logger.error(
+                        f"[DP+CP DEBUG] ERROR: rank {rank} not in all_ranks_new_requests! "
+                        f"all_ranks_new_requests.keys()={list(all_ranks_new_requests.keys())}"
+                    )
                 all_ranks_new_requests[rank].extend(reqs)
 
         return all_ranks_new_requests
@@ -650,6 +804,9 @@ class ExecutorRequestQueue:
     # during initialization of a new request.
     def _merge_helix_requests(self, new_requests: list[RequestQueueItem],
                               tokens_per_block: int):
+        logger.info(
+            f"_merge_helix_requests called on gen side with {len(new_requests)} requests, tokens_per_block={tokens_per_block}"
+        )
         req_with_children = []
         num_cp_ranks = self.dist.cp_size
         curr_cp_rank = self.dist.cp_rank
@@ -697,6 +854,13 @@ class ExecutorRequestQueue:
             if curr_cp_rank == num_cp_ranks - 1 and padding_len > 0:
                 input_ids_this_rank = input_ids_this_rank[:-padding_len]
                 position_ids_this_rank = position_ids_this_rank[:-padding_len]
+
+            logger.info(
+                f"_merge_helix_requests: req_id={req_item.id}, cp_rank={curr_cp_rank}/{num_cp_ranks}, "
+                f"total_input_len={input_len}, num_total_blocks={num_total_blocks}, padding_len={padding_len}, "
+                f"input_ids_this_rank_len={len(input_ids_this_rank)}, position_ids_this_rank_len={len(position_ids_this_rank)}, "
+                f"input_ids_this_rank={input_ids_this_rank}, position_ids_this_rank={position_ids_this_rank}"
+            )
 
             req = executor_request_to_llm_request(
                 req_id=req_item.id,

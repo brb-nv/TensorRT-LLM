@@ -1265,10 +1265,16 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         spec_metadata: Optional[SpecMetadata] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        _debug_cp = hasattr(self.mapping, 'cp_size') and self.mapping.cp_size > 1
+        _debug_cp_rank = getattr(self.mapping, 'cp_rank', -1) if _debug_cp else -1
+        if _debug_cp:
+            print(f"[DEBUG][cp_rank={_debug_cp_rank}][layer={self.layer_idx}] >>> ENTER DeepseekV3DecoderLayer.forward", flush=True)
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
         # Self Attention
+        if _debug_cp:
+            print(f"[DEBUG][cp_rank={_debug_cp_rank}][layer={self.layer_idx}] before self_attn", flush=True)
         hidden_states = self.self_attn(
             position_ids=position_ids,
             hidden_states=hidden_states,
@@ -1277,6 +1283,8 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                 enable_allreduce=not (self.disable_attn_allreduce)),
             **kwargs,
         )
+        if _debug_cp:
+            print(f"[DEBUG][cp_rank={_debug_cp_rank}][layer={self.layer_idx}] after self_attn", flush=True)
         if isinstance(self.mlp, Deepseekv3MoE):
             if spec_metadata is not None and spec_metadata.is_layer_capture(
                     self.layer_idx):
@@ -1305,6 +1313,10 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         residual: torch.Tensor,
         spec_metadata: Optional[SpecMetadata] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        _debug_cp = hasattr(self.mapping, 'cp_size') and self.mapping.cp_size > 1
+        _debug_cp_rank = getattr(self.mapping, 'cp_rank', -1) if _debug_cp else -1
+        if _debug_cp:
+            print(f"[DEBUG][cp_rank={_debug_cp_rank}][layer={self.layer_idx}] >>> ENTER forward_MoE", flush=True)
 
         def _run_MoE(hidden_states, hidden_states_fp4, do_finalize):
             return self.mlp(
@@ -1393,6 +1405,10 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         residual: torch.Tensor,
         spec_metadata: Optional[SpecMetadata] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        _debug_cp = hasattr(self.mapping, 'cp_size') and self.mapping.cp_size > 1
+        _debug_cp_rank = getattr(self.mapping, 'cp_rank', -1) if _debug_cp else -1
+        if _debug_cp:
+            print(f"[DEBUG][cp_rank={_debug_cp_rank}][layer={self.layer_idx}] >>> ENTER forward_mlp", flush=True)
 
         if self.fusion_config.PRE_MLP_FUSION:
             act_fp4, act_sf, residual = self.allreduce(

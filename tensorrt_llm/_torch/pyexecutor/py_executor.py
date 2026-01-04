@@ -1205,18 +1205,39 @@ class PyExecutor:
             self.send_handles[microbatch_id] = None
 
     def _can_queue(self, scheduled_batch):
+        if self.dist.cp_size > 1:
+            print(f"[DEBUG][cp_rank={self.dist.cp_rank}][iter={self.iter_counter}] >>> ENTER _can_queue", flush=True)
 
         if self.enable_attention_dp:
             tp_batch_sizes = self.dist.tp_allgather(scheduled_batch.batch_size)
-            can_queue = 0 not in tp_batch_sizes
+
+            # With Helix CP, tp_allgather returns tp_size * cp_size entries.
+            # Aggregate to get one entry per DP rank (tp_size entries).
+            num_dp_ranks = self.dist.tp_size
+            gathered_count = len(tp_batch_sizes)
+            if gathered_count > num_dp_ranks and self.dist.cp_size > 1:
+                # Sample every cp_size-th entry to get one per DP rank.
+                step = self.dist.cp_size
+                tp_batch_sizes = tp_batch_sizes[::step][:num_dp_ranks]
+
+            # With attention DP, different DP ranks may have different batch sizes
+            # due to load balancing. Allow processing if ANY DP rank has requests.
+            # All ranks still participate in forward pass collectives.
+            can_queue = any(bs > 0 for bs in tp_batch_sizes)
         else:
             can_queue = scheduled_batch.batch_size > 0
 
+        if self.dist.cp_size > 1:
+            print(f"[DEBUG][cp_rank={self.dist.cp_rank}][iter={self.iter_counter}] <<< EXIT _can_queue (can_queue={can_queue})", flush=True)
         return can_queue
 
     def _prepare_and_schedule_batch(self):
+        if self.dist.cp_size > 1:
+            print(f"[DEBUG][cp_rank={self.dist.cp_rank}][iter={self.iter_counter}] >>> ENTER _prepare_and_schedule_batch", flush=True)
         new_requests = self._fetch_and_activate_new_requests()
         if self.should_stop_processing:
+            if self.dist.cp_size > 1:
+                print(f"[DEBUG][cp_rank={self.dist.cp_rank}][iter={self.iter_counter}] <<< EXIT _prepare_and_schedule_batch (should_stop)", flush=True)
             return None, None
 
         if self.kv_cache_transceiver:
@@ -1296,17 +1317,25 @@ class PyExecutor:
             f'has {len(self.active_requests)} active_requests, '
             f'scheduled {len(scheduled_batch.context_requests)} context requests and '
             f'{len(scheduled_batch.generation_requests)} generation requests')
+        if self.dist.cp_size > 1:
+            print(f"[DEBUG][cp_rank={self.dist.cp_rank}][iter={self.iter_counter}] <<< EXIT _prepare_and_schedule_batch (ctx={len(scheduled_batch.context_requests)}, gen={len(scheduled_batch.generation_requests)})", flush=True)
         return scheduled_batch, iter_stats
 
     def _kv_connector_start_batch(self, scheduled_batch):
+        if self.dist.cp_size > 1:
+            print(f"[DEBUG][cp_rank={self.dist.cp_rank}][iter={self.iter_counter}] >>> ENTER _kv_connector_start_batch", flush=True)
         if self.kv_connector_manager:
             self.kv_connector_manager.take_scheduled_requests_pending_load(
                 scheduled_batch)
             self.kv_connector_manager.handle_metadata()
             self.kv_connector_manager.worker.start_load_kv(
                 torch.cuda.current_stream())
+        if self.dist.cp_size > 1:
+            print(f"[DEBUG][cp_rank={self.dist.cp_rank}][iter={self.iter_counter}] <<< EXIT _kv_connector_start_batch", flush=True)
 
     def _kv_connector_terminate_requests(self):
+        if self.dist.cp_size > 1:
+            print(f"[DEBUG][cp_rank={self.dist.cp_rank}][iter={self.iter_counter}] >>> ENTER _kv_connector_terminate_requests", flush=True)
         if self.kv_connector_manager:
             reqs_to_terminate = self.kv_connector_manager.get_finished()
             for req in reqs_to_terminate:
@@ -1318,6 +1347,8 @@ class PyExecutor:
                     else:
                         self.ctx_in_transmission_requests[req.py_request_id] = (
                             request, block_id, counter - 1)
+        if self.dist.cp_size > 1:
+            print(f"[DEBUG][cp_rank={self.dist.cp_rank}][iter={self.iter_counter}] <<< EXIT _kv_connector_terminate_requests", flush=True)
 
     def _kv_connector_wait_for_save(self):
         if self.kv_connector_manager is not None:
@@ -1485,6 +1516,8 @@ class PyExecutor:
             self._handle_errors(error_msg)
 
     def _handle_control_request(self):
+        if self.dist.cp_size > 1:
+            print(f"[DEBUG][cp_rank={self.dist.cp_rank}][iter={self.iter_counter}] >>> ENTER _handle_control_request", flush=True)
         if len(self.active_requests) == 0 and \
             self.executor_request_queue.get_waiting_queue_size() == 0 and \
             len(self.executor_request_queue.control_requests) > 0:
@@ -1497,6 +1530,8 @@ class PyExecutor:
             self.control_request_barrier.set()
             self.control_action_done.wait()
             self.control_action_done.clear()
+        if self.dist.cp_size > 1:
+            print(f"[DEBUG][cp_rank={self.dist.cp_rank}][iter={self.iter_counter}] <<< EXIT _handle_control_request", flush=True)
 
     @contextmanager
     def control_action(self):
@@ -1879,6 +1914,8 @@ class PyExecutor:
                 raise ValueError("Token ID out of range")
 
     def _fetch_and_activate_new_requests(self) -> List[LlmRequest]:
+        if self.dist.cp_size > 1:
+            print(f"[DEBUG][cp_rank={self.dist.cp_rank}][iter={self.iter_counter}] >>> ENTER _fetch_and_activate_new_requests", flush=True)
 
         def _respond_if_invalid(request: LlmRequest) -> bool:
             """Immediately fail invalid request.
@@ -1905,6 +1942,8 @@ class PyExecutor:
         ]
 
         self.active_requests.extend(validated_requests)
+        if self.dist.cp_size > 1:
+            print(f"[DEBUG][cp_rank={self.dist.cp_rank}][iter={self.iter_counter}] <<< EXIT _fetch_and_activate_new_requests (new_reqs={len(validated_requests)})", flush=True)
         return validated_requests
 
     def _add_kv_cache_events(self):
@@ -1928,6 +1967,15 @@ class PyExecutor:
             num_scheduled_context_requests, num_scheduled_generation_requests,
             num_scheduled_tokens
         ])
+
+        # With Helix CP, tp_allgather returns tp_size * cp_size entries.
+        # Aggregate to get one entry per DP rank (tp_size entries).
+        num_dp_ranks = self.dist.tp_size
+        gathered_count = len(responses_list)
+        if gathered_count > num_dp_ranks and self.dist.cp_size > 1:
+            step = self.dist.cp_size
+            responses_list = responses_list[::step][:num_dp_ranks]
+
         all_ranks_num_scheduled_context_requests = [
             response[0] for response in responses_list
         ]
@@ -1991,6 +2039,8 @@ class PyExecutor:
 
     @nvtx_range("_schedule")
     def _schedule(self):
+        if self.dist.cp_size > 1:
+            print(f"[DEBUG][cp_rank={self.dist.cp_rank}][iter={self.iter_counter}] >>> ENTER _schedule", flush=True)
         scheduler_output = self.scheduler.schedule_request(
             self.active_requests, self.inflight_req_ids)
         scheduled_context_requests = scheduler_output.context_requests
@@ -2012,10 +2062,14 @@ class PyExecutor:
         scheduled_requests.context_requests = scheduled_context_requests
         scheduled_requests.generation_requests = scheduler_output.generation_requests
         scheduled_requests.paused_requests = scheduler_output.paused_requests
+        if self.dist.cp_size > 1:
+            print(f"[DEBUG][cp_rank={self.dist.cp_rank}][iter={self.iter_counter}] <<< EXIT _schedule (ctx={len(scheduled_context_requests)}, gen={len(scheduler_output.generation_requests)})", flush=True)
         return scheduled_requests, scheduler_output.fitting_disagg_gen_init_requests, scheduler_output.num_fitting_requests
 
     @nvtx_range("_check_disagg_gen_transfer_status")
     def _check_disagg_gen_transfer_status(self):
+        if self.dist.cp_size > 1:
+            print(f"[DEBUG][cp_rank={self.dist.cp_rank}][iter={self.iter_counter}] >>> ENTER _check_disagg_gen_transfer_status", flush=True)
 
         need_check = any([
             req.is_disagg_generation_transmission_in_progress
@@ -2030,14 +2084,22 @@ class PyExecutor:
             at_least_num = 1 if need_check_one else 0
             self._check_disagg_gen_cache_transfer_status(at_least_num)
 
+        if self.dist.cp_size > 1:
+            print(f"[DEBUG][cp_rank={self.dist.cp_rank}][iter={self.iter_counter}] <<< EXIT _check_disagg_gen_transfer_status", flush=True)
         return
 
     @nvtx_range("_check_kv_transfer_timeout")
     def _check_kv_transfer_timeout(self):
+        if self.dist.cp_size > 1:
+            print(f"[DEBUG][cp_rank={self.dist.cp_rank}][iter={self.iter_counter}] >>> ENTER _check_kv_transfer_timeout", flush=True)
         if not self.kv_cache_transceiver:
+            if self.dist.cp_size > 1:
+                print(f"[DEBUG][cp_rank={self.dist.cp_rank}][iter={self.iter_counter}] <<< EXIT _check_kv_transfer_timeout (no transceiver)", flush=True)
             return
         timeout_ms = self.kv_cache_transceiver.kv_transfer_timeout_ms
         if timeout_ms is None:
+            if self.dist.cp_size > 1:
+                print(f"[DEBUG][cp_rank={self.dist.cp_rank}][iter={self.iter_counter}] <<< EXIT _check_kv_transfer_timeout (no timeout)", flush=True)
             return
 
         def flag_if_kv_transfer_timed_out(req: LlmRequest, type: str) -> None:
@@ -2058,14 +2120,24 @@ class PyExecutor:
             if req.is_disagg_generation_transmission_in_progress:
                 flag_if_kv_transfer_timed_out(req, "generation")
 
+        if self.dist.cp_size > 1:
+            print(f"[DEBUG][cp_rank={self.dist.cp_rank}][iter={self.iter_counter}] <<< EXIT _check_kv_transfer_timeout", flush=True)
         return
 
     @nvtx_range("_pad_attention_dp_dummy_request")
     def _pad_attention_dp_dummy_request(self):
         """
         Pad with a generation dummy request, if required, to ensure every attention_dp rank has at least one active request.
+
+        When CP (context parallelism) is enabled, all CP ranks within a DP group must make
+        the same decision about whether to add a dummy request. This ensures consistency
+        across CP ranks that share the same set of requests.
         """
+        if self.dist.cp_size > 1:
+            print(f"[DEBUG][cp_rank={self.dist.cp_rank}][iter={self.iter_counter}] >>> ENTER _pad_attention_dp_dummy_request", flush=True)
         if not self.enable_attention_dp:
+            if self.dist.cp_size > 1:
+                print(f"[DEBUG][cp_rank={self.dist.cp_rank}][iter={self.iter_counter}] <<< EXIT _pad_attention_dp_dummy_request (no attention_dp)", flush=True)
             return
 
         assert self.expected_num_active_requests >= len(self.active_requests)
@@ -2078,7 +2150,14 @@ class PyExecutor:
                 for req in self.active_requests
             ])
 
-        if self.expected_num_active_requests - num_active_request > 0 and num_active_request == 0:
+        should_add_dummy = self.expected_num_active_requests - num_active_request > 0 and num_active_request == 0
+
+        # Synchronize decision across CP ranks to ensure consistency.
+        # All CP ranks in a DP group should agree - take the decision from cp_rank=0.
+        if self.dist.cp_size > 1:
+            should_add_dummy = self.dist.cp_broadcast(should_add_dummy, root=0)
+
+        if should_add_dummy:
             llm_request = self.kv_cache_manager.add_dummy_requests(
                 request_ids=[0],
                 is_gen=True,
@@ -2091,6 +2170,8 @@ class PyExecutor:
             if spec_resource_manager is not None:
                 spec_resource_manager.add_dummy_requests([0])
             self.active_requests.append(llm_request)
+        if self.dist.cp_size > 1:
+            print(f"[DEBUG][cp_rank={self.dist.cp_rank}][iter={self.iter_counter}] <<< EXIT _pad_attention_dp_dummy_request", flush=True)
 
     @nvtx_range("_prepare_disagg_gen_init")
     def _prepare_disagg_gen_init(self, fitting_disagg_gen_init_requests):
@@ -2116,6 +2197,8 @@ class PyExecutor:
 
     @nvtx_range("_prepare_disagg_gen_transmission_complete")
     def _prepare_disagg_gen_transmission_complete(self, scheduled_batch):
+        if self.dist.cp_size > 1:
+            print(f"[DEBUG][cp_rank={self.dist.cp_rank}][iter={self.iter_counter}] >>> ENTER _prepare_disagg_gen_transmission_complete", flush=True)
         cache_trans_complete_requests = []
         for req in scheduled_batch.generation_requests:
             if req.is_disagg_generation_transmission_complete:
@@ -2141,6 +2224,8 @@ class PyExecutor:
                 beam_width = req.sampling_config.beam_width
                 for beam in range(0, beam_width):
                     req.add_new_token(first_gen_tokens[beam], beam)
+        if self.dist.cp_size > 1:
+            print(f"[DEBUG][cp_rank={self.dist.cp_rank}][iter={self.iter_counter}] <<< EXIT _prepare_disagg_gen_transmission_complete", flush=True)
 
     @nvtx_range("_recv_disagg_gen_cache")
     def _recv_disagg_gen_cache(self, new_gen_reqs):
@@ -2173,7 +2258,11 @@ class PyExecutor:
 
     @nvtx_range("_send_disagg_ctx_cache")
     def _send_disagg_ctx_cache(self, scheduled_ctx_requests):
+        if self.dist.cp_size > 1:
+            print(f"[DEBUG][cp_rank={self.dist.cp_rank}][iter={self.iter_counter}] >>> ENTER _send_disagg_ctx_cache", flush=True)
         if (scheduled_ctx_requests is None or len(scheduled_ctx_requests) == 0):
+            if self.dist.cp_size > 1:
+                print(f"[DEBUG][cp_rank={self.dist.cp_rank}][iter={self.iter_counter}] <<< EXIT _send_disagg_ctx_cache (no requests)", flush=True)
             return []
         for req in scheduled_ctx_requests:
             if req.is_context_only_request and (req.is_context_finished or
@@ -2199,6 +2288,8 @@ class PyExecutor:
             for req in ctx_transmission_reqs:
                 req.py_kv_transfer_start_time = time.time()
 
+        if self.dist.cp_size > 1:
+            print(f"[DEBUG][cp_rank={self.dist.cp_rank}][iter={self.iter_counter}] <<< EXIT _send_disagg_ctx_cache (ctx_transmission_reqs={len(ctx_transmission_reqs)})", flush=True)
         return ctx_transmission_reqs
 
     def _get_disagg_reqs_in_error_state(self):
@@ -2230,6 +2321,8 @@ class PyExecutor:
             scheduled_requests,
             new_tensors_device: Optional[SampleStateTensors] = None,
             num_accepted_tokens_device: Optional[torch.Tensor] = None):
+        if self.dist.cp_size > 1:
+            print(f"[DEBUG][cp_rank={self.dist.cp_rank}][iter={self.iter_counter}] >>> ENTER _forward_step", flush=True)
         ExpertStatistic.set_iter(self.iter_counter)
 
         @nvtx_range(
@@ -2247,26 +2340,40 @@ class PyExecutor:
                 num_accepted_tokens_device=num_accepted_tokens_device)
 
         try:
+            if self.dist.cp_size > 1:
+                print(f"[DEBUG][cp_rank={self.dist.cp_rank}][iter={self.iter_counter}] _forward_step: gathering context logits...", flush=True)
             gather_context_logits = any(
                 a.py_return_context_logits
                 for a in scheduled_requests.context_requests)
             cache_indirection_buffer = self.sampler.get_cache_indirection()
 
+            if self.dist.cp_size > 1:
+                print(f"[DEBUG][cp_rank={self.dist.cp_rank}][iter={self.iter_counter}] _forward_step: before execution_stream.wait_stream", flush=True)
             # Run model forward on the execution stream for proper synchronization
             # with KVCacheTransferManager's onboard/offload operations.
             self.execution_stream.wait_stream(torch.cuda.current_stream())
+            if self.dist.cp_size > 1:
+                print(f"[DEBUG][cp_rank={self.dist.cp_rank}][iter={self.iter_counter}] _forward_step: before model_engine.forward (ctx={len(scheduled_requests.context_requests)}, gen={len(scheduled_requests.generation_requests)})", flush=True)
             with torch.cuda.stream(self.execution_stream):
                 outputs = forward(scheduled_requests, self.resource_manager,
                                   new_tensors_device, gather_context_logits,
                                   cache_indirection_buffer,
                                   num_accepted_tokens_device)
+            if self.dist.cp_size > 1:
+                print(f"[DEBUG][cp_rank={self.dist.cp_rank}][iter={self.iter_counter}] _forward_step: after model_engine.forward", flush=True)
 
             # Ensure the default stream waits for execution_stream to complete
             # before downstream operations use the outputs.
+            if self.dist.cp_size > 1:
+                print(f"[DEBUG][cp_rank={self.dist.cp_rank}][iter={self.iter_counter}] _forward_step: before current_stream.wait_stream", flush=True)
             torch.cuda.current_stream().wait_stream(self.execution_stream)
+            if self.dist.cp_size > 1:
+                print(f"[DEBUG][cp_rank={self.dist.cp_rank}][iter={self.iter_counter}] _forward_step: after current_stream.wait_stream", flush=True)
 
             self._kv_connector_wait_for_save()
 
+            if self.dist.cp_size > 1:
+                print(f"[DEBUG][cp_rank={self.dist.cp_rank}][iter={self.iter_counter}] <<< EXIT _forward_step (success)", flush=True)
             return outputs
         except Exception as e:
             traceback.print_exc()
@@ -2320,6 +2427,8 @@ class PyExecutor:
 
     @nvtx_range("_update_request_states")
     def _update_request_states(self, scheduled_requests: ScheduledRequests):
+        if self.dist.cp_size > 1:
+            print(f"[DEBUG][cp_rank={self.dist.cp_rank}][iter={self.iter_counter}] >>> ENTER _update_request_states", flush=True)
         cp_config = self.dist.cp_config
         if 'cp_type' in cp_config:
             cp_type = cp_config['cp_type']
@@ -2332,10 +2441,14 @@ class PyExecutor:
                 raise NotImplementedError(
                     f'Unsupported cp type {cp_type.name}.')
         self._update_request_states_tp(scheduled_requests)
+        if self.dist.cp_size > 1:
+            print(f"[DEBUG][cp_rank={self.dist.cp_rank}][iter={self.iter_counter}] <<< EXIT _update_request_states", flush=True)
 
     @nvtx_range("_sample_async")
     def _sample_async(self, scheduled_batch,
                       batch_outputs) -> SampleState | None:
+        if self.dist.cp_size > 1:
+            print(f"[DEBUG][cp_rank={self.dist.cp_rank}][iter={self.iter_counter}] >>> ENTER _sample_async", flush=True)
         try:
             if batch_outputs is not None:
                 num_context_logits_prefix_sum = [0]
@@ -2361,8 +2474,11 @@ class PyExecutor:
                                           batch_outputs, beam_width,
                                           num_context_tokens)
 
-                return self.sampler.sample_async(scheduled_batch, batch_outputs,
+                result = self.sampler.sample_async(scheduled_batch, batch_outputs,
                                                  num_context_logits_prefix_sum)
+                if self.dist.cp_size > 1:
+                    print(f"[DEBUG][cp_rank={self.dist.cp_rank}][iter={self.iter_counter}] <<< EXIT _sample_async (success)", flush=True)
+                return result
         except Exception as e:
             traceback.print_exc()
             error_msg = str(e)
@@ -2383,8 +2499,12 @@ class PyExecutor:
     def _update_requests(self,
                          sample_state: SampleState,
                          resource_manager: Optional[ResourceManager] = None):
+        if self.dist.cp_size > 1:
+            print(f"[DEBUG][cp_rank={self.dist.cp_rank}][iter={self.iter_counter}] >>> ENTER _update_requests", flush=True)
         try:
             self.sampler.update_requests(sample_state, resource_manager)
+            if self.dist.cp_size > 1:
+                print(f"[DEBUG][cp_rank={self.dist.cp_rank}][iter={self.iter_counter}] <<< EXIT _update_requests", flush=True)
         except Exception as e:
             traceback.print_exc()
             error_msg = str(e)
@@ -2469,7 +2589,11 @@ class PyExecutor:
 
     @nvtx_range("_handle_canceled_requests")
     def _handle_canceled_requests(self):
+        if self.dist.cp_size > 1:
+            print(f"[DEBUG][cp_rank={self.dist.cp_rank}][iter={self.iter_counter}] >>> ENTER _handle_canceled_requests", flush=True)
         if self.executor_request_queue.get_canceled_req_ids_size() == 0:
+            if self.dist.cp_size > 1:
+                print(f"[DEBUG][cp_rank={self.dist.cp_rank}][iter={self.iter_counter}] <<< EXIT _handle_canceled_requests (no canceled)", flush=True)
             return
 
         # Remove cancel request in the waiting queue
@@ -2498,11 +2622,16 @@ class PyExecutor:
         self.executor_request_queue.canceled_req_ids.clear()
         self.executor_request_queue.canceled_req_ids.extend(
             still_pending_canceled_ids)
+        if self.dist.cp_size > 1:
+            print(f"[DEBUG][cp_rank={self.dist.cp_rank}][iter={self.iter_counter}] <<< EXIT _handle_canceled_requests", flush=True)
 
     @nvtx_range("_enqueue_responses")
     def _enqueue_responses(self, responses: Iterable[Tuple[int, LlmResponse]]):
-        if 0 not in self.dist.mapping.tp_group and not self.gather_all_responses:
-            return
+        # With attention DP, all ranks must participate in the collective.
+        # Skip early return when attention DP is enabled to avoid collective mismatch.
+        if not self.enable_attention_dp:
+            if 0 not in self.dist.mapping.tp_group and not self.gather_all_responses:
+                return
 
         if self.enable_attention_dp and self.dist.world_size != 1:
             if not self.gather_all_responses:
@@ -2550,6 +2679,8 @@ class PyExecutor:
 
     @nvtx_range("_handle_responses")
     def _handle_responses(self):
+        if self.dist.cp_size > 1:
+            print(f"[DEBUG][cp_rank={self.dist.cp_rank}][iter={self.iter_counter}] >>> ENTER _handle_responses", flush=True)
         new_responses = []
         requests_to_terminate = []
         new_active_requests = []
@@ -2643,10 +2774,14 @@ class PyExecutor:
         self._enqueue_responses(new_responses)
         for request in requests_to_terminate:
             self._terminate_request(request)
+        if self.dist.cp_size > 1:
+            print(f"[DEBUG][cp_rank={self.dist.cp_rank}][iter={self.iter_counter}] <<< EXIT _handle_responses (finished={len(requests_to_terminate)})", flush=True)
         return requests_to_terminate
 
     @nvtx_range("_terminate_disagg_ctx_finished_requests")
     def _terminate_disagg_ctx_finished_requests(self):
+        if self.dist.cp_size > 1:
+            print(f"[DEBUG][cp_rank={self.dist.cp_rank}][iter={self.iter_counter}] >>> ENTER _terminate_disagg_ctx_finished_requests", flush=True)
         # make a copy of the keys, since we are modifying the dictionary in the loop
         in_transmission_requests_id = list(
             self.ctx_in_transmission_requests.keys())
@@ -2673,6 +2808,8 @@ class PyExecutor:
                                                                       block_id,
                                                                       counter -
                                                                       1))
+        if self.dist.cp_size > 1:
+            print(f"[DEBUG][cp_rank={self.dist.cp_rank}][iter={self.iter_counter}] <<< EXIT _terminate_disagg_ctx_finished_requests", flush=True)
 
     def _handle_logits_communication(self, previous_batch, prev_microbatch_id):
         """Handle logits communication between pipeline parallel ranks.
@@ -2740,12 +2877,16 @@ class PyExecutor:
             return response
 
     def _pause_requests(self, requests_to_pause):
+        if self.dist.cp_size > 1:
+            print(f"[DEBUG][cp_rank={self.dist.cp_rank}][iter={self.iter_counter}] >>> ENTER _pause_requests (count={len(requests_to_pause)})", flush=True)
         # todo: support work with self.inflight_req_ids.
         #       Currently, self.inflight_req_ids is not.
         max_input_len = self.max_input_len
         for req in requests_to_pause:
             req.pause(max_input_len)
             self._terminate_request(req)
+        if self.dist.cp_size > 1:
+            print(f"[DEBUG][cp_rank={self.dist.cp_rank}][iter={self.iter_counter}] <<< EXIT _pause_requests", flush=True)
 
     def _add_inflight_ids(self, scheduled_requests):
         """Add request IDs of current requests to self.inflight_req_ids.
@@ -2822,7 +2963,11 @@ class PyExecutor:
             failed_requests: List of (request_id, error_message) tuples for failed requests,
                            or None if no failures occurred
         """
+        if self.dist.cp_size > 1:
+            print(f"[DEBUG][cp_rank={self.dist.cp_rank}][iter={self.iter_counter}] >>> ENTER _handle_guided_decoder_errors", flush=True)
         if not failed_requests:
+            if self.dist.cp_size > 1:
+                print(f"[DEBUG][cp_rank={self.dist.cp_rank}][iter={self.iter_counter}] <<< EXIT _handle_guided_decoder_errors (no failures)", flush=True)
             return
 
         failed_req_id_to_err = {req_id: err for req_id, err in failed_requests}
@@ -2832,6 +2977,8 @@ class PyExecutor:
                 continue
             error_msg = failed_req_id_to_err[request.py_request_id]
             self._handle_errors(error_msg, requests=[request])
+        if self.dist.cp_size > 1:
+            print(f"[DEBUG][cp_rank={self.dist.cp_rank}][iter={self.iter_counter}] <<< EXIT _handle_guided_decoder_errors", flush=True)
 
 
 class DisaggPPTerminationHandler:
