@@ -360,13 +360,13 @@ class ExecutorRequestQueue:
             self, activate_requests: List[LlmRequest]) -> List[LlmRequest]:
         """Handle attention DP request fetching with load balancing."""
         # Logging for gen server with CP enabled
-        if self.dist.cp_size > 1:
-            print(f"[ExecutorRequestQueue::_fetch_new_requests_attention_dp] FUNCTION CALLED. "
-                  f"RANK: {self.dist.rank}, TP_RANK: {self.dist.tp_rank}, CP_SIZE: {self.dist.cp_size}, "
-                  f"TP_SIZE: {self.dist.tp_size}")
-            print(f"[ExecutorRequestQueue::_fetch_new_requests_attention_dp] INPUT: "
-                  f"num_activate_requests={len(activate_requests)}, "
-                  f"activate_request_ids={[req.py_request_id for req in activate_requests]}")
+        # if self.dist.cp_size > 1:
+        #     print(f"[ExecutorRequestQueue::_fetch_new_requests_attention_dp] FUNCTION CALLED. "
+        #           f"RANK: {self.dist.rank}, TP_RANK: {self.dist.tp_rank}, CP_SIZE: {self.dist.cp_size}, "
+        #           f"TP_SIZE: {self.dist.tp_size}")
+        #     print(f"[ExecutorRequestQueue::_fetch_new_requests_attention_dp] INPUT: "
+        #           f"num_activate_requests={len(activate_requests)}, "
+        #           f"activate_request_ids={[req.py_request_id for req in activate_requests]}")
 
         # Get active request counts across all ranks.
         all_ranks_num_active_requests = []
@@ -374,20 +374,20 @@ class ExecutorRequestQueue:
         num_active_tokens = sum(
             [req.py_orig_prompt_len for req in activate_requests])
 
-        if self.dist.cp_size > 1:
-            print(f"[ExecutorRequestQueue::_fetch_new_requests_attention_dp] "
-                  f"RANK: {self.dist.rank}, local_num_active_tokens={num_active_tokens}, "
-                  f"local_num_active_requests={len(activate_requests)}")
-            print(f"[ExecutorRequestQueue::_fetch_new_requests_attention_dp] "
-                  f"RANK: {self.dist.rank}, CALLING tp_allgather with "
-                  f"[{len(activate_requests)}, {num_active_tokens}]")
+        # if self.dist.cp_size > 1:
+        #     print(f"[ExecutorRequestQueue::_fetch_new_requests_attention_dp] "
+        #           f"RANK: {self.dist.rank}, local_num_active_tokens={num_active_tokens}, "
+        #           f"local_num_active_requests={len(activate_requests)}")
+        #     print(f"[ExecutorRequestQueue::_fetch_new_requests_attention_dp] "
+        #           f"RANK: {self.dist.rank}, CALLING tp_allgather with "
+        #           f"[{len(activate_requests)}, {num_active_tokens}]")
 
         responses_list = self.dist.tp_allgather(
             [len(activate_requests), num_active_tokens])
 
         if self.dist.cp_size > 1:
-            print(f"[ExecutorRequestQueue::_fetch_new_requests_attention_dp] "
-                  f"RANK: {self.dist.rank}, tp_allgather RETURNED (raw): {responses_list}")
+        #     print(f"[ExecutorRequestQueue::_fetch_new_requests_attention_dp] "
+        #           f"RANK: {self.dist.rank}, tp_allgather RETURNED (raw): {responses_list}")
             # When CP is enabled, tp_allgather returns one entry per rank, but CP ranks
             # within the same DP group (same tp_rank) handle the same requests with
             # different token portions (sequence is split across CP ranks).
@@ -409,31 +409,31 @@ class ExecutorRequestQueue:
                 total_tokens = sum(entry[1] for entry in group_entries)
                 aggregated_responses.append([group_entries[0][0], total_tokens])
             responses_list = aggregated_responses
-            print(f"[ExecutorRequestQueue::_fetch_new_requests_attention_dp] "
-                  f"RANK: {self.dist.rank}, tp_allgather RETURNED (aggregated): {responses_list}")
+            # print(f"[ExecutorRequestQueue::_fetch_new_requests_attention_dp] "
+            #       f"RANK: {self.dist.rank}, tp_allgather RETURNED (aggregated): {responses_list}")
 
         for num_active_requests, num_active_tokens in responses_list:
             all_ranks_num_active_requests.append(num_active_requests)
             all_ranks_num_active_tokens.append(num_active_tokens)
 
-        if self.dist.cp_size > 1:
-            print(f"[ExecutorRequestQueue::_fetch_new_requests_attention_dp] "
-                  f"RANK: {self.dist.rank}, all_ranks_num_active_requests={all_ranks_num_active_requests}, "
-                  f"all_ranks_num_active_tokens={all_ranks_num_active_tokens}")
+        # if self.dist.cp_size > 1:
+        #     print(f"[ExecutorRequestQueue::_fetch_new_requests_attention_dp] "
+        #           f"RANK: {self.dist.rank}, all_ranks_num_active_requests={all_ranks_num_active_requests}, "
+        #           f"all_ranks_num_active_tokens={all_ranks_num_active_tokens}")
 
         total_num_active_requests = sum(all_ranks_num_active_requests)
         total_max_num_active_requests = self.dist.tp_size * self.max_num_active_requests
 
-        if self.dist.cp_size > 1:
-            print(f"[ExecutorRequestQueue::_fetch_new_requests_attention_dp] "
-                  f"RANK: {self.dist.rank}, total_num_active_requests={total_num_active_requests}, "
-                  f"total_max_num_active_requests={total_max_num_active_requests}, "
-                  f"max_num_active_requests_per_rank={self.max_num_active_requests}")
+        # if self.dist.cp_size > 1:
+        #     print(f"[ExecutorRequestQueue::_fetch_new_requests_attention_dp] "
+        #           f"RANK: {self.dist.rank}, total_num_active_requests={total_num_active_requests}, "
+        #           f"total_max_num_active_requests={total_max_num_active_requests}, "
+        #           f"max_num_active_requests_per_rank={self.max_num_active_requests}")
 
         # fetch and process requests into waiting queue
-        if self.dist.cp_size > 1:
-            print(f"[ExecutorRequestQueue::_fetch_new_requests_attention_dp] "
-                  f"RANK: {self.dist.rank}, CALLING _fetch_and_process_requests")
+        # if self.dist.cp_size > 1:
+        #     print(f"[ExecutorRequestQueue::_fetch_new_requests_attention_dp] "
+        #           f"RANK: {self.dist.rank}, CALLING _fetch_and_process_requests")
 
         new_requests = self._fetch_and_process_requests(
             total_num_active_requests,
@@ -441,36 +441,36 @@ class ExecutorRequestQueue:
             enable_attention_dp=True,
             all_ranks_num_active_requests=all_ranks_num_active_requests)
 
-        if self.dist.cp_size > 1:
-            print(f"[ExecutorRequestQueue::_fetch_new_requests_attention_dp] "
-                  f"RANK: {self.dist.rank}, _fetch_and_process_requests RETURNED: "
-                  f"num_new_requests={len(new_requests)}, "
-                  f"new_request_ids={[req.id for req in new_requests]}")
+        # if self.dist.cp_size > 1:
+        #     print(f"[ExecutorRequestQueue::_fetch_new_requests_attention_dp] "
+        #           f"RANK: {self.dist.rank}, _fetch_and_process_requests RETURNED: "
+        #           f"num_new_requests={len(new_requests)}, "
+        #           f"new_request_ids={[req.id for req in new_requests]}")
 
         # Schedule attention dp requests
-        if self.dist.cp_size > 1:
-            print(f"[ExecutorRequestQueue::_fetch_new_requests_attention_dp] "
-                  f"RANK: {self.dist.rank}, CALLING _schedule_attention_dp_requests")
+        # if self.dist.cp_size > 1:
+        #     print(f"[ExecutorRequestQueue::_fetch_new_requests_attention_dp] "
+        #           f"RANK: {self.dist.rank}, CALLING _schedule_attention_dp_requests")
 
         all_ranks_new_requests = self._schedule_attention_dp_requests(
             new_requests, all_ranks_num_active_requests,
             all_ranks_num_active_tokens)
 
-        if self.dist.cp_size > 1:
-            print(f"[ExecutorRequestQueue::_fetch_new_requests_attention_dp] "
-                  f"RANK: {self.dist.rank}, _schedule_attention_dp_requests RETURNED")
-            for tp_rank, reqs in all_ranks_new_requests.items():
-                print(f"[ExecutorRequestQueue::_fetch_new_requests_attention_dp] "
-                      f"RANK: {self.dist.rank}, TP_RANK {tp_rank} assigned {len(reqs)} requests: "
-                      f"ids={[req.id for req in reqs]}")
+        # if self.dist.cp_size > 1:
+        #     print(f"[ExecutorRequestQueue::_fetch_new_requests_attention_dp] "
+        #           f"RANK: {self.dist.rank}, _schedule_attention_dp_requests RETURNED")
+        #     for tp_rank, reqs in all_ranks_new_requests.items():
+        #         print(f"[ExecutorRequestQueue::_fetch_new_requests_attention_dp] "
+        #               f"RANK: {self.dist.rank}, TP_RANK {tp_rank} assigned {len(reqs)} requests: "
+        #               f"ids={[req.id for req in reqs]}")
 
         new_requests_cur_rank = all_ranks_new_requests[self.dist.tp_rank]
 
-        if self.dist.cp_size > 1:
-            print(f"[ExecutorRequestQueue::_fetch_new_requests_attention_dp] "
-                  f"RANK: {self.dist.rank}, current_tp_rank={self.dist.tp_rank}, "
-                  f"new_requests_cur_rank_count={len(new_requests_cur_rank)}, "
-                  f"new_requests_cur_rank_ids={[req.id for req in new_requests_cur_rank]}")
+        # if self.dist.cp_size > 1:
+        #     print(f"[ExecutorRequestQueue::_fetch_new_requests_attention_dp] "
+        #           f"RANK: {self.dist.rank}, current_tp_rank={self.dist.tp_rank}, "
+        #           f"new_requests_cur_rank_count={len(new_requests_cur_rank)}, "
+        #           f"new_requests_cur_rank_ids={[req.id for req in new_requests_cur_rank]}")
 
         # Update performance metrics
         if self.enable_iter_perf_stats and self.start_times:
@@ -481,25 +481,25 @@ class ExecutorRequestQueue:
         self.num_fetch_requests += len(new_requests)
         self.num_fetch_requests_cur_rank += len(new_requests_cur_rank)
 
-        if self.dist.cp_size > 1:
-            print(f"[ExecutorRequestQueue::_fetch_new_requests_attention_dp] "
-                  f"RANK: {self.dist.rank}, UPDATED COUNTERS: "
-                  f"num_fetch_requests={self.num_fetch_requests}, "
-                  f"num_fetch_requests_cur_rank={self.num_fetch_requests_cur_rank}")
+        # if self.dist.cp_size > 1:
+        #     print(f"[ExecutorRequestQueue::_fetch_new_requests_attention_dp] "
+        #           f"RANK: {self.dist.rank}, UPDATED COUNTERS: "
+        #           f"num_fetch_requests={self.num_fetch_requests}, "
+        #           f"num_fetch_requests_cur_rank={self.num_fetch_requests_cur_rank}")
 
         # Merge requests and add to active list
-        if self.dist.cp_size > 1:
-            print(f"[ExecutorRequestQueue::_fetch_new_requests_attention_dp] "
-                  f"RANK: {self.dist.rank}, CALLING _merge_requests with "
-                  f"{len(new_requests_cur_rank)} requests")
+        # if self.dist.cp_size > 1:
+        #     print(f"[ExecutorRequestQueue::_fetch_new_requests_attention_dp] "
+        #           f"RANK: {self.dist.rank}, CALLING _merge_requests with "
+        #           f"{len(new_requests_cur_rank)} requests")
 
         new_requests_cur_rank = self._merge_requests(new_requests_cur_rank)
 
-        if self.dist.cp_size > 1:
-            print(f"[ExecutorRequestQueue::_fetch_new_requests_attention_dp] "
-                  f"RANK: {self.dist.rank}, FUNCTION RETURNING: "
-                  f"num_requests={len(new_requests_cur_rank)}, "
-                  f"request_ids={[req.py_request_id if hasattr(req, 'py_request_id') else 'N/A' for req in new_requests_cur_rank]}")
+        # if self.dist.cp_size > 1:
+        #     print(f"[ExecutorRequestQueue::_fetch_new_requests_attention_dp] "
+        #           f"RANK: {self.dist.rank}, FUNCTION RETURNING: "
+        #           f"num_requests={len(new_requests_cur_rank)}, "
+        #           f"request_ids={[req.py_request_id if hasattr(req, 'py_request_id') else 'N/A' for req in new_requests_cur_rank]}")
 
         return new_requests_cur_rank
 

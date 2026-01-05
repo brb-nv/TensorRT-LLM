@@ -8,7 +8,6 @@ cuda_graph_config: null
 context_servers:
   num_instances: 1
   enable_chunked_prefill: False
-  load_format: "dummy"
   kv_cache_config:
     enable_block_reuse: False
     enable_partial_reuse: False
@@ -26,7 +25,6 @@ generation_servers:
   pipeline_parallel_size: 1
   context_parallel_size: 2
   enable_chunked_prefill: False
-  load_format: "dummy"
   enable_attention_dp: true
   cp_config:
     cp_type: HELIX
