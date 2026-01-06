@@ -932,15 +932,41 @@ class MLA(nn.Module):
             requires_grad=False,
         )
 
-        mapping_o = Mapping(
-            world_size=tp_size * pp_size * cp_size,
-            tp_size=tp_size * cp_size,
-            pp_size=pp_size,
-            cp_size=1,
-            rank=self.mapping.rank,
-            gpus_per_node=self.mapping.gpus_per_node,
-            enable_attention_dp=self.mapping.enable_attention_dp,
-        )
+        # For o_proj, we fold CP into TP so all CP ranks do all-reduce together.
+        # 
+        # When enable_attention_dp=True:
+        #   - tp_size is forced to 1 (each DP group processes independently)
+        #   - Each DP group has its own independent all-reduce among CP ranks
+        #   - We use pp_size to represent DP groups (original tp_size), so that
+        #     mapping_o.tp_group contains the correct actual world ranks for each DP group
+        #   Example with original tp=2, cp=2:
+        #     - DP group 0 (ranks 0, 1): tp_group = [0, 1]
+        #     - DP group 1 (ranks 2, 3): tp_group = [2, 3]
+        #
+        # When enable_attention_dp=False:
+        #   - All TP*CP ranks participate in a single all-reduce
+        if self.mapping.enable_attention_dp and cp_size > 1:
+            # Get original TP size (before it was forced to 1 for attention DP)
+            original_tp_size = self.mapping.tp_size
+            mapping_o = Mapping(
+                world_size=original_tp_size * pp_size * cp_size,
+                tp_size=cp_size,  # Only CP ranks all-reduce together
+                pp_size=pp_size * original_tp_size,  # DP groups as separate PP groups
+                cp_size=1,
+                rank=self.mapping.rank,  # Use actual world rank
+                gpus_per_node=self.mapping.gpus_per_node,
+                enable_attention_dp=self.mapping.enable_attention_dp,
+            )
+        else:
+            mapping_o = Mapping(
+                world_size=tp_size * pp_size * cp_size,
+                tp_size=tp_size * cp_size,
+                pp_size=pp_size,
+                cp_size=1,
+                rank=self.mapping.rank,
+                gpus_per_node=self.mapping.gpus_per_node,
+                enable_attention_dp=self.mapping.enable_attention_dp,
+            )
         self.o_proj = Linear(
             self.num_key_value_heads * self.v_head_dim,
             self.hidden_size,
@@ -2244,6 +2270,11 @@ class MLA(nn.Module):
                               output=attn_output,
                               latent_cache_gen=latent_cache_gen)
 
+        # Print only for the first layer and first decode iteration.
+        print_condition = self.layer_idx == 0 and len(position_ids) == 1 and position_ids[0][0].item() == 52
+        if print_condition:
+            print(f"[MLA::forward][rank {self.mapping.rank}][cp_rank {self.mapping.cp_rank}]: BEFORE O_PROJ attn_output: {attn_output.shape} \n {attn_output}")
+
         if self.enable_helix_test and self.mapping.has_cp_helix():
             # note: for allowing testing Helix parallelism, we ensure that
             # the output is compatible with o_proj even in the context phase,
@@ -2253,6 +2284,10 @@ class MLA(nn.Module):
 
         attn_output = self.o_proj(attn_output,
                                   all_reduce_params=all_reduce_params)
+
+        if print_condition:
+            print(f"[MLA::forward][rank {self.mapping.rank}][cp_rank {self.mapping.cp_rank}]: AFTER O_PROJ attn_output: {attn_output.shape} \n {attn_output}")
+
         return attn_output
 
     def resmooth_parameters(self,
