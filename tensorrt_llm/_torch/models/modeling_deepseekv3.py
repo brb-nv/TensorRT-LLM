@@ -1285,7 +1285,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
 
         # Print only for the first layer and first decode iteration.
-        print_condition = self.layer_idx == 0 and len(position_ids) == 1 and position_ids[0][0].item() == 52
+        print_condition = False # self.layer_idx == 0 and len(position_ids) == 1 and position_ids[0][0].item() == 52
         if print_condition:
             print(f"[DeepseekV3DecoderLayer::forward][rank {self.mapping.rank}][cp_rank {self.mapping.cp_rank}]: BEFORE INPUT LAYERNORM hidden_states: {hidden_states.shape} \n {hidden_states}")
             save_tensor(hidden_states, "before_input_layernorm", self.mapping.rank, self.mapping.cp_rank, self.mapping.tp_rank)
@@ -1785,13 +1785,13 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
         return_context_logits: bool = False,
         **kwargs,
     ) -> torch.Tensor:
-        # Debug logging for gen server with CP enabled
-        if self.model_config.mapping.enable_attention_dp or self.model_config.mapping.cp_size > 1:
-            print(f"[DeepseekV3ForCausalLM::forward] "
-                  f"RANK: {self.model_config.mapping.rank}, "
-                  f"cp_rank: {self.model_config.mapping.cp_rank}, "
-                  f"input_ids: {input_ids.tolist() if input_ids is not None else None}, "
-                  f"position_ids: {position_ids.tolist() if position_ids is not None else None}")
+        # # Debug logging for gen server with CP enabled
+        # if self.model_config.mapping.enable_attention_dp or self.model_config.mapping.cp_size > 1:
+        #     print(f"[DeepseekV3ForCausalLM::forward] "
+        #           f"RANK: {self.model_config.mapping.rank}, "
+        #           f"cp_rank: {self.model_config.mapping.cp_rank}, "
+        #           f"input_ids: {input_ids.tolist() if input_ids is not None else None}, "
+        #           f"position_ids: {position_ids.tolist() if position_ids is not None else None}")
         return super().forward(attn_metadata=attn_metadata,
                                input_ids=input_ids,
                                position_ids=position_ids,
