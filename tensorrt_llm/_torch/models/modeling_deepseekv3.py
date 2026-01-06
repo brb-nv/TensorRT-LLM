@@ -943,13 +943,7 @@ class Deepseekv3MoE(nn.Module):
             reduce_output=False)
 
         self.allreduce = None
-        # When attention DP is enabled with CP, we need AllReduce across CP ranks.
-        if self.use_dp:
-            if self.mapping.cp_size > 1:
-                # CP ranks act as TP ranks, need AllReduce across CP group
-                self.allreduce = AllReduce(mapping=model_config.mapping,
-                                           strategy=model_config.allreduce_strategy)
-        elif self.mapping.tp_size > 1:
+        if not self.use_dp and self.mapping.tp_size > 1:
             self.allreduce = AllReduce(mapping=model_config.mapping,
                                        strategy=model_config.allreduce_strategy)
         self.aux_stream = aux_stream_dict[AuxStreamType.MoeShared]
@@ -982,20 +976,8 @@ class Deepseekv3MoE(nn.Module):
         shared_output_scale = None
         # The block scale size is 128, which requires shared_expert_intermediate_size to be divisible by 128.
         if self.use_dp:
-            if self.mapping.cp_size > 1:
-                # When attention DP is enabled with CP, CP ranks act as TP ranks within each DP group.
-                # Use cp_size as the effective TP size for shared experts.
-                effective_tp_size = self.mapping.cp_size
-                shared_tp_size = math.gcd(
-                    intermediate_size // block_size,
-                    effective_tp_size,
-                )
-                # If shared_tp_size has been overridden, scale the output accordingly.
-                if shared_tp_size != effective_tp_size:
-                    shared_output_scale = shared_tp_size / effective_tp_size
-            else:
-                # If using attention DP without CP, no TP within DP group.
-                shared_tp_size = 1
+            # If using attention DP, the shared experts also use DP instead of TP.
+            shared_tp_size = 1
         else:
             # Due to the restriction of block scale size (i.e., 128), the supported TP sizes only include 1, 2, 4, 8, and 16.
             # The math.gcd operation ensures that shared_tp_size falls in the supported TP sizes.
@@ -1130,26 +1112,21 @@ class DeepseekV3DecoderLayer(DecoderLayer):
             #KVCacheManager only support 1 layer for separate draft engine
             layer_idx_for_attention = layer_idx - model_config.pretrained_config.num_hidden_layers
 
-        # Determine if attention should reduce output (AllReduce across TP ranks).
-        # When attention DP is enabled with CP, CP ranks act as TP ranks and need reduction.
-        if self.enable_attention_dp:
-            attn_reduce_output = self.mapping.cp_size > 1
-        else:
-            attn_reduce_output = self.mapping.tp_size > 1
-
         if config.model_type == "deepseek_v32":
             self.self_attn = DeepseekV32Attention(
                 model_config,
                 layer_idx=layer_idx_for_attention,
                 aux_stream=aux_stream_dict[AuxStreamType.Attention],
-                reduce_output=attn_reduce_output)
+                reduce_output=not self.enable_attention_dp
+                and self.mapping.tp_size > 1)
         else:
             self.self_attn = DeepseekV3Attention(
                 model_config,
                 layer_idx=layer_idx_for_attention,
                 aux_stream=aux_stream_dict[AuxStreamType.Attention],
                 mapping_with_cp=mapping_with_cp,
-                reduce_output=attn_reduce_output)
+                reduce_output=not self.enable_attention_dp
+                and self.mapping.tp_size > 1)
 
         self.fusion_config = EagerFusionConfig()
         self.enable_fusion = os.environ.get(
@@ -1166,15 +1143,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
 
         self.allreduce = None
         self.moe_allreduce = None
-        # When attention DP is enabled with CP, we need AllReduce across CP ranks.
-        if self.enable_attention_dp:
-            if self.mapping.cp_size > 1:
-                # CP ranks act as TP ranks, need AllReduce across CP group
-                self.allreduce = AllReduce(mapping=model_config.mapping,
-                                           strategy=model_config.allreduce_strategy,
-                                           dtype=config.torch_dtype)
-                self.moe_allreduce = MoEAllReduce(self.mapping)
-        elif self.mapping.tp_size > 1:
+        if not self.enable_attention_dp and self.mapping.tp_size > 1:
             self.allreduce = AllReduce(mapping=model_config.mapping,
                                        strategy=model_config.allreduce_strategy,
                                        dtype=config.torch_dtype)
@@ -1223,20 +1192,10 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                                        eps=config.rms_norm_eps,
                                        dtype=config.torch_dtype)
 
-        # Determine if attention AllReduce should be disabled.
-        # When attention DP is enabled with CP, we still need AllReduce across CP ranks.
-        if self.enable_attention_dp:
-            if self.mapping.cp_size > 1:
-                # CP ranks act as TP ranks, AllReduce is needed
-                self.disable_attn_allreduce = (self.fusion_config.PRE_MOE_FUSION
-                                               or self.fusion_config.PRE_MLP_FUSION)
-            else:
-                # No TP within DP group without CP, AllReduce not needed
-                self.disable_attn_allreduce = True
-        else:
-            self.disable_attn_allreduce = (self.fusion_config.PRE_MOE_FUSION
-                                           or self.fusion_config.PRE_MLP_FUSION
-                                           or self.mapping.tp_size == 1)
+        self.disable_attn_allreduce = (self.fusion_config.PRE_MOE_FUSION
+                                       or self.fusion_config.PRE_MLP_FUSION
+                                       or self.mapping.tp_size == 1
+                                       or self.enable_attention_dp)
 
         self.post_attention_layernorm = RMSNorm(hidden_size=config.hidden_size,
                                                 eps=config.rms_norm_eps,
@@ -1279,19 +1238,8 @@ class DeepseekV3DecoderLayer(DecoderLayer):
 
         assert intermediate_size % block_size == 0, "intermediate_size must be divisible by block_size."
         if self.enable_attention_dp:
-            if self.mapping.cp_size > 1:
-                # When attention DP is enabled with CP, CP ranks act as TP ranks within each DP group.
-                # Use cp_size as the effective TP size.
-                effective_tp_size = self.mapping.cp_size
-                tp = math.gcd(
-                    intermediate_size // block_size,
-                    effective_tp_size,
-                )
-                # Note: Inter-node check not needed for CP as CP is typically within a node
-                mlp_tp_size = tp
-            else:
-                # If using attention DP without CP, no TP within DP group.
-                mlp_tp_size = 1
+            # If using attention DP, the MLP also uses DP instead of TP.
+            mlp_tp_size = 1
         else:
             # The two math.gcd operations ensure that mlp_tp_size falls in the candidate TP sizes.
             tp = math.gcd(
@@ -1522,30 +1470,14 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
                              eps=config.rms_norm_eps,
                              dtype=config.torch_dtype)
         if model_config.mapping.enable_attention_dp:
-            if model_config.mapping.cp_size > 1:
-                # When attention DP is enabled with CP, CP ranks act as TP ranks.
-                # Create TP Linear using CP mapping.
-                self.eh_proj = Linear(
-                    config.hidden_size * 2,
-                    config.hidden_size,
-                    bias=False,
-                    dtype=config.torch_dtype,
-                    tensor_parallel_mode=TensorParallelMode.ROW,
-                    mapping=model_config.mapping,
-                    reduce_output=True,
-                    skip_create_weights_in_init=model_config.
-                    skip_create_weights_in_init,
-                )
-            else:
-                # No TP within DP group without CP.
-                self.eh_proj = Linear(
-                    config.hidden_size * 2,
-                    config.hidden_size,
-                    bias=False,
-                    dtype=config.torch_dtype,
-                    skip_create_weights_in_init=model_config.
-                    skip_create_weights_in_init,
-                )
+            self.eh_proj = Linear(
+                config.hidden_size * 2,
+                config.hidden_size,
+                bias=False,
+                dtype=config.torch_dtype,
+                skip_create_weights_in_init=model_config.
+                skip_create_weights_in_init,
+            )
         else:
             self.eh_proj = Linear(
                 config.hidden_size * 2,
@@ -1587,21 +1519,12 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
             self.aux_stream,
         )
         hidden_states = torch.concat([inputs_embeds, hidden_states], dim=-1)
-        # Split hidden_states columnwise based on effective TP size
-        # When attention DP is enabled with CP, CP ranks act as TP ranks.
-        if self.model_config.mapping.enable_attention_dp:
-            if self.model_config.mapping.cp_size > 1:
-                effective_tp_size = self.model_config.mapping.cp_size
-                effective_tp_rank = self.model_config.mapping.cp_rank
-            else:
-                effective_tp_size = 1
-                effective_tp_rank = 0
-        else:
-            effective_tp_size = self.model_config.mapping.tp_size
-            effective_tp_rank = self.model_config.mapping.tp_rank
+        # Split hidden_states columnwise based on TP
+        tp_size = self.model_config.mapping.tp_size
+        tp_rank = self.model_config.mapping.tp_rank
 
-        if effective_tp_size > 1:
-            hidden_states = torch.chunk(hidden_states, effective_tp_size, dim=-1)[effective_tp_rank]
+        if tp_size > 1 and not (self.model_config.mapping.enable_attention_dp):
+            hidden_states = torch.chunk(hidden_states, tp_size, dim=-1)[tp_rank]
         hidden_states = self.eh_proj(hidden_states)
 
         # Input layer norm
