@@ -2356,11 +2356,35 @@ class PyExecutor:
                     f'Unsupported cp type {cp_type.name}.')
         self._update_request_states_tp(scheduled_requests)
 
+    def _verify_logits_across_cp(self, logits: torch.Tensor):
+        """Debug: Verify that logits are close across CP ranks."""
+        from tensorrt_llm._torch.distributed import MPIDist
+        if not isinstance(self.dist, MPIDist) or self.dist.cp_size <= 1:
+            return
+        
+        # Gather logits from all CP ranks to cp_rank 0 for comparison
+        # Use a small subset to avoid memory issues
+        logits_sample = logits[:min(10, logits.shape[0])].clone().cuda()
+        
+        # All-gather logits across CP ranks
+        all_logits = self.dist.cp_comm.allgather(logits_sample.cpu().numpy())
+        
+        if self.dist.mapping.cp_rank == 0:
+            import numpy as np
+            ref_logits = all_logits[0]
+            for cp_rank, other_logits in enumerate(all_logits[1:], start=1):
+                max_diff = np.abs(ref_logits - other_logits).max()
+                mean_diff = np.abs(ref_logits - other_logits).mean()
+                print(f"[LOGITS CHECK] cp_rank 0 vs cp_rank {cp_rank}: max_diff={max_diff:.6f}, mean_diff={mean_diff:.6f}", flush=True)
+                if max_diff > 0.01:
+                    print(f"[LOGITS CHECK] WARNING: Large logits difference detected!", flush=True)
+                    # Print some sample values
+                    print(f"[LOGITS CHECK] cp_rank 0 sample: {ref_logits[0, :5]}", flush=True)
+                    print(f"[LOGITS CHECK] cp_rank {cp_rank} sample: {other_logits[0, :5]}", flush=True)
+
     @nvtx_range("_sample_async")
     def _sample_async(self, scheduled_batch,
                       batch_outputs) -> SampleState | None:
-        # if self.dist.cp_size > 1:
-        #     print(f"[PyExecutor::_sample_async] FUNCTION CALLED. RANK: {self.dist.rank}, CP_SIZE: {self.dist.cp_size}")
         try:
             if batch_outputs is not None:
                 num_context_logits_prefix_sum = [0]
@@ -2374,6 +2398,10 @@ class PyExecutor:
 
                 beam_width = self.sampler.beam_width(
                     scheduled_batch.all_requests())
+
+                # Debug: verify logits are close across CP ranks before sampling
+                if self.dist.cp_size > 1:
+                    self._verify_logits_across_cp(batch_outputs["logits"])
 
                 HandleLogits()(scheduled_batch.context_requests,
                                scheduled_batch.generation_requests,
@@ -2404,13 +2432,44 @@ class PyExecutor:
             logger.error(f"Encountered an error in sampling: {error_msg}")
             self._handle_errors(error_msg)
 
+    def _sync_sampled_tokens_across_cp(self, sample_state: SampleState):
+        """Synchronize sampled tokens from cp_rank 0 to all CP ranks in the same DP group."""
+        from tensorrt_llm._torch.distributed import MPIDist
+        assert isinstance(self.dist, MPIDist), \
+            f"Expected MPIDist for CP token sync, got {type(self.dist).__name__}"
+        
+        # NOTE: cp_broadcast uses the MPI cp_comm sub-communicator where ranks are renumbered.
+        # The first rank in cp_group (cp_rank 0) always has local rank 0 in cp_comm.
+        # So we use root=0 to broadcast from cp_rank 0, NOT the global rank.
+        cp_local_root = 0
+        
+        # Sync new_tokens (move to GPU for NCCL, broadcast, move back if needed)
+        new_tokens = sample_state.host.new_tokens
+        if isinstance(new_tokens, torch.Tensor):
+            was_cpu = new_tokens.device.type == 'cpu'
+            if was_cpu:
+                new_tokens = new_tokens.cuda()
+            new_tokens = self.dist.cp_broadcast(new_tokens, root=cp_local_root)
+            sample_state.host.new_tokens = new_tokens.cpu() if was_cpu else new_tokens
+        
+        # Sync finish_reasons for consistent termination
+        if hasattr(sample_state.host, 'finish_reasons'):
+            finish_reasons = sample_state.host.finish_reasons
+            if isinstance(finish_reasons, torch.Tensor):
+                was_cpu = finish_reasons.device.type == 'cpu'
+                if was_cpu:
+                    finish_reasons = finish_reasons.cuda()
+                finish_reasons = self.dist.cp_broadcast(finish_reasons, root=cp_local_root)
+                sample_state.host.finish_reasons = finish_reasons.cpu() if was_cpu else finish_reasons
+
     @nvtx_range("_update_requests")
     def _update_requests(self,
                          sample_state: SampleState,
                          resource_manager: Optional[ResourceManager] = None):
-        # if self.dist.cp_size > 1:
-        #     print(f"[PyExecutor::_update_requests] FUNCTION CALLED. RANK: {self.dist.rank}, CP_SIZE: {self.dist.cp_size}")
         try:
+            # Sync sampled tokens across CP ranks so all use the same input_ids next iteration
+            if self.dist.cp_size > 1 and sample_state.host is not None:
+                self._sync_sampled_tokens_across_cp(sample_state)
             self.sampler.update_requests(sample_state, resource_manager)
         except Exception as e:
             traceback.print_exc()
