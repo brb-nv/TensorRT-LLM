@@ -374,6 +374,10 @@ class ExecutorRequestQueue:
         num_active_tokens = sum(
             [req.py_orig_prompt_len for req in activate_requests])
 
+        # Collect request IDs and is_dummy status for CP rank consistency verification
+        request_ids = [req.py_request_id for req in activate_requests]
+        is_dummy_flags = [req.is_dummy for req in activate_requests]
+
         # if self.dist.cp_size > 1:
         #     print(f"[ExecutorRequestQueue::_fetch_new_requests_attention_dp] "
         #           f"RANK: {self.dist.rank}, local_num_active_tokens={num_active_tokens}, "
@@ -383,7 +387,7 @@ class ExecutorRequestQueue:
         #           f"[{len(activate_requests)}, {num_active_tokens}]")
 
         responses_list = self.dist.tp_allgather(
-            [len(activate_requests), num_active_tokens])
+            [len(activate_requests), num_active_tokens, request_ids, is_dummy_flags])
 
         if self.dist.cp_size > 1:
         #     print(f"[ExecutorRequestQueue::_fetch_new_requests_attention_dp] "
@@ -392,12 +396,29 @@ class ExecutorRequestQueue:
             # within the same DP group (same tp_rank) handle the same requests with
             # different token portions (sequence is split across CP ranks).
             # Verify that CP ranks within the same DP group have the same number of requests,
-            # and aggregate by summing the token counts.
+            # same request IDs (in order), and same is_dummy status, then aggregate by
+            # summing the token counts.
             aggregated_responses = []
             for dp_group_idx in range(self.dist.tp_size):
                 # Get all entries for this DP group (cp_size entries per group)
                 group_start = dp_group_idx * self.dist.cp_size
                 group_entries = responses_list[group_start:group_start + self.dist.cp_size]
+
+                # Request IDs (third element) should be identical across CP ranks
+                for i, entry in enumerate(group_entries[1:], start=1):
+                    assert entry[2] == group_entries[0][2], (
+                        f"CP ranks within DP group {dp_group_idx} have mismatched request IDs: "
+                        f"cp_rank=0 has {group_entries[0][2]}, cp_rank={i} has {entry[2]}. "
+                        f"Full responses_list: {responses_list}"
+                    )
+                # is_dummy flags (fourth element) should be identical across CP ranks
+                for i, entry in enumerate(group_entries[1:], start=1):
+                    assert entry[3] == group_entries[0][3], (
+                        f"CP ranks within DP group {dp_group_idx} have mismatched is_dummy flags: "
+                        f"cp_rank=0 has {group_entries[0][3]}, cp_rank={i} has {entry[3]}. "
+                        f"Full responses_list: {responses_list}"
+                    )
+
                 # Number of requests (first element) should be identical across CP ranks
                 for i, entry in enumerate(group_entries[1:], start=1):
                     assert entry[0] == group_entries[0][0], (

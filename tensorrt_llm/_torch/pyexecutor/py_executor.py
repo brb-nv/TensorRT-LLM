@@ -2158,6 +2158,8 @@ class PyExecutor:
                 for beam in range(0, beam_width):
                     print(f"[PyExecutor::_prepare_disagg_gen_transmission_complete][rank {self.dist.rank}][cp_rank {self.dist.cp_rank}]: TRANSMISSION COMPLETE for request ID: {req.py_request_id}; first_gen_tokens: {first_gen_tokens[beam]}, beam: {beam}")
                     req.add_new_token(first_gen_tokens[beam], beam)
+            else:
+                print(f"[PyExecutor::_prepare_disagg_gen_transmission_complete][rank {self.dist.rank}][cp_rank {self.dist.cp_rank}]: TRANSMISSION STILL IN PROGRESS for request ID: {req.py_request_id}")
 
     @nvtx_range("_recv_disagg_gen_cache")
     def _recv_disagg_gen_cache(self, new_gen_reqs):
@@ -2375,7 +2377,7 @@ class PyExecutor:
             for cp_rank, other_logits in enumerate(all_logits[1:], start=1):
                 max_diff = np.abs(ref_logits - other_logits).max()
                 mean_diff = np.abs(ref_logits - other_logits).mean()
-                print(f"[LOGITS CHECK] cp_rank 0 vs cp_rank {cp_rank}: max_diff={max_diff:.6f}, mean_diff={mean_diff:.6f}", flush=True)
+                # print(f"[LOGITS CHECK] cp_rank 0 vs cp_rank {cp_rank}: max_diff={max_diff:.6f}, mean_diff={mean_diff:.6f}", flush=True)
                 if max_diff > 0.01:
                     print(f"[LOGITS CHECK] WARNING: Large logits difference detected!", flush=True)
                     # Print some sample values
