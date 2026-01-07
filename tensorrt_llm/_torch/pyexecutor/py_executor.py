@@ -2434,44 +2434,11 @@ class PyExecutor:
             logger.error(f"Encountered an error in sampling: {error_msg}")
             self._handle_errors(error_msg)
 
-    def _sync_sampled_tokens_across_cp(self, sample_state: SampleState):
-        """Synchronize sampled tokens from cp_rank 0 to all CP ranks in the same DP group."""
-        from tensorrt_llm._torch.distributed import MPIDist
-        assert isinstance(self.dist, MPIDist), \
-            f"Expected MPIDist for CP token sync, got {type(self.dist).__name__}"
-        
-        # NOTE: cp_broadcast uses the MPI cp_comm sub-communicator where ranks are renumbered.
-        # The first rank in cp_group (cp_rank 0) always has local rank 0 in cp_comm.
-        # So we use root=0 to broadcast from cp_rank 0, NOT the global rank.
-        cp_local_root = 0
-        
-        # Sync new_tokens (move to GPU for NCCL, broadcast, move back if needed)
-        new_tokens = sample_state.host.new_tokens
-        if isinstance(new_tokens, torch.Tensor):
-            was_cpu = new_tokens.device.type == 'cpu'
-            if was_cpu:
-                new_tokens = new_tokens.cuda()
-            new_tokens = self.dist.cp_broadcast(new_tokens, root=cp_local_root)
-            sample_state.host.new_tokens = new_tokens.cpu() if was_cpu else new_tokens
-        
-        # Sync finish_reasons for consistent termination
-        if hasattr(sample_state.host, 'finish_reasons'):
-            finish_reasons = sample_state.host.finish_reasons
-            if isinstance(finish_reasons, torch.Tensor):
-                was_cpu = finish_reasons.device.type == 'cpu'
-                if was_cpu:
-                    finish_reasons = finish_reasons.cuda()
-                finish_reasons = self.dist.cp_broadcast(finish_reasons, root=cp_local_root)
-                sample_state.host.finish_reasons = finish_reasons.cpu() if was_cpu else finish_reasons
-
     @nvtx_range("_update_requests")
     def _update_requests(self,
                          sample_state: SampleState,
                          resource_manager: Optional[ResourceManager] = None):
         try:
-            # Sync sampled tokens across CP ranks so all use the same input_ids next iteration
-            if self.dist.cp_size > 1 and sample_state.host is not None:
-                self._sync_sampled_tokens_across_cp(sample_state)
             self.sampler.update_requests(sample_state, resource_manager)
         except Exception as e:
             traceback.print_exc()
