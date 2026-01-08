@@ -914,6 +914,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             "kv_cache_config": kv_cache_config,
             "enable_chunked_prefill": False,
             "cuda_graph_config": None,
+            "print_iter_log": True,
             "cache_transceiver_config": {
                 "backend": "UCX",
                 "max_tokens_in_buffer": 8192,
@@ -931,6 +932,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             },
             "disable_overlap_scheduler": True,
             "kv_cache_config": kv_cache_config,
+            "print_iter_log": True,
             "enable_chunked_prefill": False,
             "cuda_graph_config": cuda_graph_config,
             "cache_transceiver_config": {

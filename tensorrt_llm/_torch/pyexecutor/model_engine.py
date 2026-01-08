@@ -26,7 +26,7 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_helper import LoraConfig
 from tensorrt_llm.lora_manager import LoraModelConfig
 from tensorrt_llm.mapping import CpType, Mapping
-
+from tensorrt_llm._mnnvl_utils import init_helix_cp_comm
 from ..attention_backend.interface import (AttentionMetadata,
                                            AttentionRuntimeFeatures)
 from ..attention_backend.trtllm import TrtllmAttentionMetadata
@@ -162,6 +162,17 @@ class PyTorchModelEngine(ModelEngine):
         self.mapping = mapping
         if mapping.has_pp():
             init_pp_comm(mapping)
+            # Pre-initialize Helix CP communicator when CP > 1.
+            # This must happen before any PP pipeline divergence because
+            # MPI Split is a collective operation requiring all ranks.
+            if mapping.has_cp_helix():
+                logger.info(
+                    f"[ModelEngine::__init__] Pre-initializing Helix CP communicator for CP > 1."
+                )
+                init_helix_cp_comm(mapping)
+                logger.info(
+                    f"[ModelEngine::__init__] Helix CP communicator pre-initialized."
+                )
         self.dist = dist
         if dist is not None:
             ExpertStatistic.create(self.dist.rank)

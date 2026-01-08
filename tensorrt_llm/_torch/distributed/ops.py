@@ -84,9 +84,24 @@ def get_or_scale_allreduce_mnnvl_workspace(
         # Creating the workspace if it doesn't exist
         if mapping not in allreduce_mnnvl_workspaces:
             # Do the communicator split if there is no communicator in the workspace
-            comm = mpi_comm().Split(
-                int(mapping.pp_rank * mapping.cp_size + mapping.cp_rank),
-                mapping.tp_rank)
+            world_comm = mpi_comm()
+            world_rank = world_comm.Get_rank()
+            world_size = world_comm.Get_size()
+            color = int(mapping.pp_rank * mapping.cp_size + mapping.cp_rank)
+            key = mapping.tp_rank
+            logger.info(
+                f"[get_or_scale_allreduce_mnnvl_workspace] world_rank={world_rank}/{world_size} "
+                f"pp_rank={mapping.pp_rank} cp_rank={mapping.cp_rank} tp_rank={mapping.tp_rank} "
+                f"color={color} key={key} - BEFORE Split"
+            )
+            world_comm.Barrier()
+            logger.info(
+                f"[get_or_scale_allreduce_mnnvl_workspace] world_rank={world_rank} - Barrier passed, calling Split"
+            )
+            comm = world_comm.Split(color, key)
+            logger.info(
+                f"[get_or_scale_allreduce_mnnvl_workspace] world_rank={world_rank} - AFTER Split"
+            )
             # Use the predefined buffer size if no buffer size is provided
             buffer_size_bytes = buffer_size_bytes or init_buffer_size_bytes
             if mapping.tp_rank == 0:
@@ -396,24 +411,52 @@ class HelixAllToAllNative:
             Cached or newly-created HelixAllToAllNative instance
         """
         if mapping not in HelixAllToAllNative._cache:
+            from tensorrt_llm._utils import mpi_comm as get_mpi_comm
+            world_rank = get_mpi_comm().Get_rank()
             logger.info(
-                f"Rank {mapping.cp_rank} initializing HelixCpMnnvlMemory for Helix"
+                f"[HelixAllToAllNative.get] world_rank={world_rank} cp_rank={mapping.cp_rank} "
+                f"pp_rank={mapping.pp_rank} tp_rank={mapping.tp_rank} - START initialization"
             )
             MnnvlMemory.initialize()
+            logger.info(
+                f"[HelixAllToAllNative.get] world_rank={world_rank} - MnnvlMemory.initialize() done"
+            )
 
             # Get workspace size (in bytes)
             workspace_size_per_rank = _tllm_internal.thop.get_helix_workspace_size_per_rank(
                 mapping.cp_size)
+            logger.info(
+                f"[HelixAllToAllNative.get] world_rank={world_rank} - workspace_size={workspace_size_per_rank}, "
+                f"creating HelixCpMnnvlMemory..."
+            )
 
             # Allocate MNNVL memory using CP communicator for Helix
             workspace = HelixCpMnnvlMemory(mapping, workspace_size_per_rank)
+            logger.info(
+                f"[HelixAllToAllNative.get] world_rank={world_rank} - HelixCpMnnvlMemory created"
+            )
             workspace_tensor = workspace.as_torch_strided_tensor(torch.uint64)
+            logger.info(
+                f"[HelixAllToAllNative.get] world_rank={world_rank} - workspace_tensor created, "
+                f"calling initialize_helix_workspace..."
+            )
 
             torch.ops.trtllm.initialize_helix_workspace(workspace_tensor,
                                                         mapping.cp_rank,
                                                         mapping.cp_size)
+            logger.info(
+                f"[HelixAllToAllNative.get] world_rank={world_rank} - initialize_helix_workspace done, "
+                f"calling cuda.synchronize..."
+            )
             torch.cuda.synchronize()
+            logger.info(
+                f"[HelixAllToAllNative.get] world_rank={world_rank} - cuda.synchronize done, "
+                f"calling barrier..."
+            )
             HelixCpMnnvlMemory.get_comm(mapping).barrier()
+            logger.info(
+                f"[HelixAllToAllNative.get] world_rank={world_rank} - barrier done, caching instance"
+            )
 
             HelixAllToAllNative._cache[mapping] = HelixAllToAllNative(
                 mapping, workspace, workspace_tensor)

@@ -112,8 +112,23 @@ class IpcMemory:
 
             allgather = torch_comm().tp_allgather
         else:
-            comm = mpi_comm().Split(
-                mapping.pp_rank * mapping.cp_size + mapping.cp_rank, mapping.tp_rank
+            world_comm = mpi_comm()
+            world_rank = world_comm.Get_rank()
+            world_size = world_comm.Get_size()
+            color = mapping.pp_rank * mapping.cp_size + mapping.cp_rank
+            key = mapping.tp_rank
+            logger.info(
+                f"[IpcMemory.open_ipc_memory] world_rank={world_rank}/{world_size} "
+                f"pp_rank={mapping.pp_rank} cp_rank={mapping.cp_rank} tp_rank={mapping.tp_rank} "
+                f"color={color} key={key} - BEFORE Split"
+            )
+            world_comm.Barrier()
+            logger.info(
+                f"[IpcMemory.open_ipc_memory] world_rank={world_rank} - Barrier passed, calling Split"
+            )
+            comm = world_comm.Split(color, key)
+            logger.info(
+                f"[IpcMemory.open_ipc_memory] world_rank={world_rank} - AFTER Split"
             )
             allgather = comm.allgather
 

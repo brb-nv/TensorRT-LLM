@@ -7,6 +7,7 @@ from typing import List, Optional, Tuple, Union
 import torch
 
 from tensorrt_llm._utils import mpi_comm
+from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
 try:
@@ -21,7 +22,24 @@ class VariableLengthBuffer:
     """
 
     def __init__(self, mapping: Mapping):
-        self.comm = mpi_comm().Split(mapping.pp_rank, mapping.moe_ep_rank)
+        world_comm = mpi_comm()
+        world_rank = world_comm.Get_rank()
+        world_size = world_comm.Get_size()
+        color = mapping.pp_rank
+        key = mapping.moe_ep_rank
+        logger.info(
+            f"[VariableLengthBuffer.__init__] world_rank={world_rank}/{world_size} "
+            f"pp_rank={mapping.pp_rank} moe_ep_rank={mapping.moe_ep_rank} "
+            f"color={color} key={key} - BEFORE Split"
+        )
+        world_comm.Barrier()
+        logger.info(
+            f"[VariableLengthBuffer.__init__] world_rank={world_rank} - Barrier passed, calling Split"
+        )
+        self.comm = world_comm.Split(color, key)
+        logger.info(
+            f"[VariableLengthBuffer.__init__] world_rank={world_rank} - AFTER Split"
+        )
         self.buffer = None
 
     def __del__(self):
@@ -101,7 +119,24 @@ class VariableLengthLowLatencyBuffer:
     """
 
     def __init__(self, mapping: Mapping):
-        self.comm = mpi_comm().Split(mapping.pp_rank, mapping.moe_ep_rank)
+        world_comm = mpi_comm()
+        world_rank = world_comm.Get_rank()
+        world_size = world_comm.Get_size()
+        color = mapping.pp_rank
+        key = mapping.moe_ep_rank
+        logger.info(
+            f"[VariableLengthBuffer.__init__] world_rank={world_rank}/{world_size} "
+            f"pp_rank={mapping.pp_rank} moe_ep_rank={mapping.moe_ep_rank} "
+            f"color={color} key={key} - BEFORE Split"
+        )
+        world_comm.Barrier()
+        logger.info(
+            f"[VariableLengthBuffer.__init__] world_rank={world_rank} - Barrier passed, calling Split"
+        )
+        self.comm = world_comm.Split(color, key)
+        logger.info(
+            f"[VariableLengthBuffer.__init__] world_rank={world_rank} - AFTER Split"
+        )
         self.buffer = None
         self.num_experts = None
 
