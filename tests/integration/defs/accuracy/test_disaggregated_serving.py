@@ -30,6 +30,10 @@ from .accuracy_core import (GSM8K, MMLU, JsonModeEval,
                             LlmapiAccuracyTestHarness, get_accuracy_task)
 
 
+class MiniMMLU(MMLU):
+    """Mini MMLU dataset - 5% of original size for faster iteration."""
+    NUM_SAMPLES = 10
+
 class Result(GenerationResultBase):
 
     def __init__(self, id: int, sampling_params: SamplingParams,
@@ -871,6 +875,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
+    @skip_pre_blackwell
     @pytest.mark.skip_less_device(8)
     @pytest.mark.parametrize(
         "gen_pp,gen_tp,gen_cp,enable_attention_dp", [
@@ -914,6 +919,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             "kv_cache_config": kv_cache_config,
             "enable_chunked_prefill": False,
             "cuda_graph_config": None,
+            "print_iter_log": True,
             "cache_transceiver_config": {
                 "backend": "UCX",
                 "max_tokens_in_buffer": 8192,
@@ -929,6 +935,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                 "tokens_per_block": 32,
                 "use_nccl_for_alltoall": use_nccl_for_alltoall
             },
+            "print_iter_log": True,
             "disable_overlap_scheduler": True,
             "kv_cache_config": kv_cache_config,
             "enable_chunked_prefill": False,

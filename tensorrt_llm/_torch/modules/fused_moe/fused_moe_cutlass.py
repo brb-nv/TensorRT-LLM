@@ -829,6 +829,7 @@ class CutlassFusedMoE(MoE):
             outputs = torch.cat(outputs_list)
 
         if self.use_dp and self.parallel_size > 1:
+            # print(f"[HAIDER][parallel_size: {self.parallel_size}, parallel_rank: {self.parallel_rank}] outputs.shape: {outputs.shape}, all_rank_num_tokens: {all_rank_num_tokens}")
             rank = self.parallel_rank
             outputs = outputs[:all_rank_num_tokens[rank]]
         self.repeat_idx = 0 if self.repeat_idx == self.repeat_count - 1 else self.repeat_idx + 1

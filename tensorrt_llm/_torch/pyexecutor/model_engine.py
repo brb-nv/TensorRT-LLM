@@ -1324,7 +1324,11 @@ class PyTorchModelEngine(ModelEngine):
 
     def _get_all_rank_num_tokens(self, attn_metadata: AttentionMetadata):
         if self.enable_attention_dp:
-            return list(self.dist.tp_allgather(attn_metadata.num_tokens))
+            result = list(self.dist.tp_cp_allgather(attn_metadata.num_tokens))
+            # print(f"[MoE DEBUG] _get_all_rank_num_tokens: num_tokens={attn_metadata.num_tokens}, "
+            #       f"result={result}, len={len(result)}, "
+            #       f"tp_size={self.mapping.tp_size}, tp_rank={self.mapping.tp_rank}")
+            return result
         return None
 
     def _get_all_rank_ctx_requests(self, num_ctx_requests: int):
