@@ -120,23 +120,10 @@ class MnnvlMemory:
         """Get TP-based communicator (ranks grouped by PP+CP+MOE_TP, ordered by TP rank)."""
         if cls.comm is not None:
             return cls.comm
-        world_comm = mpi_comm()
-        world_rank = world_comm.Get_rank()
-        world_size = world_comm.Get_size()
-        color = (mapping.pp_rank * mapping.cp_size + mapping.cp_rank) * mapping.moe_tp_size + mapping.moe_tp_rank
-        key = mapping.tp_rank
-        logger.info(
-            f"[{cls.__name__}.get_comm] world_rank={world_rank}/{world_size} "
-            f"pp_rank={mapping.pp_rank} cp_rank={mapping.cp_rank} tp_rank={mapping.tp_rank} "
-            f"moe_tp_rank={mapping.moe_tp_rank} color={color} key={key} - BEFORE Split"
-        )
-        world_comm.Barrier()
-        logger.info(
-            f"[{cls.__name__}.get_comm] world_rank={world_rank} - Barrier passed, calling Split"
-        )
-        comm = world_comm.Split(color, key)
-        logger.info(
-            f"[{cls.__name__}.get_comm] world_rank={world_rank} - AFTER Split"
+        comm = mpi_comm().Split(
+            (mapping.pp_rank * mapping.cp_size + mapping.cp_rank) * mapping.moe_tp_size
+            + mapping.moe_tp_rank,
+            mapping.tp_rank,
         )
         cls.comm = comm
         return comm
@@ -197,10 +184,6 @@ class MnnvlMemory:
     def open_mnnvl_memory(cls, mapping: Mapping, size: int):
         # Ensure MnnvlMemory is initialized (for dev_id and allocation_granularity)
         MnnvlMemory.initialize()
-        world_rank = mpi_comm().Get_rank()
-        logger.info(
-            f"[{cls.__name__}.open_mnnvl_memory] world_rank={world_rank} - START, size={size}"
-        )
 
         dev = _check_cu_result(cuda.cuCtxGetDevice())
         dev_id = int(dev)
@@ -209,20 +192,10 @@ class MnnvlMemory:
         assert dev_id == MnnvlMemory.dev_id, (
             f"Different dev_id found dev_id={dev_id} but MnnvlMemory.dev_id={MnnvlMemory.dev_id}"
         )
-        logger.info(
-            f"[{cls.__name__}.open_mnnvl_memory] world_rank={world_rank} - calling get_comm"
-        )
         comm = cls.get_comm(mapping)
         comm_rank = comm.Get_rank()
         comm_size = comm.Get_size()
-        logger.info(
-            f"[{cls.__name__}.open_mnnvl_memory] world_rank={world_rank} - get_comm done, "
-            f"comm_rank={comm_rank} comm_size={comm_size}, calling allgather"
-        )
         all_rank_allocate_sizes = comm.allgather(size)
-        logger.info(
-            f"[{cls.__name__}.open_mnnvl_memory] world_rank={world_rank} - allgather done"
-        )
         assert len(all_rank_allocate_sizes) == comm_size
         assert all(x == size for x in all_rank_allocate_sizes), "Not all rank allocating same size."
         granularity = MnnvlMemory.get_allocation_granularity(dev_id)
@@ -393,26 +366,12 @@ class HelixCpMnnvlMemory(MnnvlMemory):
 
     @classmethod
     def get_comm(cls, mapping: Mapping):
-        """Get CP-based communicator (ranks grouped by PP+TP, ordered by CP rank)."""
+        """Get CP-based communicator (ranks grouped by PP+TP+MOE_TP, ordered by CP rank)."""
         if cls.comm is not None:
             return cls.comm
-        world_comm = mpi_comm()
-        world_rank = world_comm.Get_rank()
-        world_size = world_comm.Get_size()
-        color = mapping.pp_rank * mapping.tp_size + mapping.tp_rank
-        key = mapping.cp_rank
-        logger.info(
-            f"[HelixCpMnnvlMemory.get_comm] world_rank={world_rank}/{world_size} "
-            f"pp_rank={mapping.pp_rank} tp_rank={mapping.tp_rank} cp_rank={mapping.cp_rank} "
-            f"color={color} key={key} - BEFORE Split"
-        )
-        world_comm.Barrier()
-        logger.info(
-            f"[HelixCpMnnvlMemory.get_comm] world_rank={world_rank} - Barrier passed, calling Split"
-        )
-        comm = world_comm.Split(color, key)
-        logger.info(
-            f"[HelixCpMnnvlMemory.get_comm] world_rank={world_rank} - AFTER Split"
+        comm = mpi_comm().Split(
+            mapping.pp_rank * mapping.tp_size + mapping.tp_rank,
+            mapping.cp_rank,
         )
         cls.comm = comm
         return comm
@@ -433,15 +392,9 @@ def init_helix_cp_comm(mapping: Mapping) -> None:
     Args:
         mapping: The mapping object containing parallelism configuration.
     """
-    if mapping.has_cp_helix():
-        world_rank = mpi_comm().Get_rank()
-        logger.info(
-            f"[init_helix_cp_comm] world_rank={world_rank} - Pre-initializing Helix CP communicator"
-        )
+    if mapping.has_cp_helix() and not mapping.cp_config.get(
+            'use_nccl_for_alltoall', True):
         HelixCpMnnvlMemory.get_comm(mapping)
-        logger.info(
-            f"[init_helix_cp_comm] world_rank={world_rank} - Helix CP communicator initialized"
-        )
 
 
 @dataclass
