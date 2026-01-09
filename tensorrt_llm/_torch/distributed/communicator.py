@@ -16,7 +16,6 @@ try:
 except Exception:
     MPI = None  # deferred; functions will error if used when ENABLE_MULTI_DEVICE is True
 
-from tensorrt_llm._mnnvl_utils import init_helix_cp_comm
 from tensorrt_llm._utils import (mpi_allgather, mpi_barrier, mpi_comm,
                                  mpi_disabled, mpi_isend, mpi_isend_object,
                                  mpi_recv, mpi_recv_object, mpi_send,
@@ -131,7 +130,6 @@ class Distributed(ABC):
         This is used when both TP and CP parallelism are enabled (e.g., helix parallelism).
         First broadcasts within the TP group, then within the CP group.
         """
-        # @B: Swap the order of broadcasts?
         if self.tp_size > 1:
             obj = self.tp_broadcast(obj, root=root, **kwargs)
         if self.cp_size > 1:
@@ -910,7 +908,6 @@ def init_pp_comm(mapping):
         _pp_comm = PPCommTorch(mapping)
     else:
         _pp_comm = PPCommNCCL(mapping)
-    init_helix_cp_comm(mapping)
 
 
 @TorchDist.log_op

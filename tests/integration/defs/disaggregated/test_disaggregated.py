@@ -30,7 +30,7 @@ except ImportError:
     import tensorrt_llm.ray_stub as ray
 
 import yaml
-from defs.common import (parse_gsm8k_output,
+from defs.common import (get_free_port_in_ci, parse_gsm8k_output,
                          revise_disagg_config_file_with_free_ports,
                          wait_for_server)
 from defs.conftest import (get_sm_version, llm_models_root, skip_arm,
@@ -40,7 +40,7 @@ from defs.trt_test_alternative import (check_call, check_output, popen,
 from test_common.perf_metrics_utils import (get_timing_metrics,
                                             validate_timing_metrics)
 
-from tensorrt_llm._utils import get_free_port, mpi_disabled
+from tensorrt_llm._utils import mpi_disabled
 from tensorrt_llm.logger import logger
 
 
@@ -58,7 +58,7 @@ class TestConfig:
 
 def cleanup_output_files():
     """Clean up output files from previous runs."""
-    for file in ['output.json']:
+    for file in ['output.json', 'output_streaming.json']:
         try:
             os.remove(file)
         except FileNotFoundError:
@@ -190,12 +190,8 @@ def get_test_config(test_desc, example_dir, test_root):
         "llama4_kv_cache_overflow":
         (8, f"{test_configs_root}/disagg_config_llama4_kv_cache_overflow.yaml"),
         "deepseek_v3_lite_bf16_tllm_gen_helix":
-        (8,
+        (4,
          f"{test_configs_root}/disagg_config_ctxtp2_gentp1cp2_deepseek_v3_lite_bf16_tllm_gen.yaml"
-         ),
-        "deepseek_v3_lite_bf16_tllm_gen_helix_ref":
-        (6,
-         f"{test_configs_root}/disagg_config_ctxtp2_gentp1cp2_deepseek_v3_lite_bf16_tllm_gen_ref.yaml"
          ),
         "deepseek_r1_v2_fp4_stress":
         (8,
@@ -261,14 +257,16 @@ def run_client_tests(example_dir,
                      use_ray=False):
     """Run client tests against the disaggregated server."""
     client_dir = f"{example_dir}/clients"
-    # Always run only 1 iteration
-    for _ in range(1):
+    for _ in range(num_iters):
         client_cmd = [
             'python3', f'{client_dir}/disagg_client.py', '-c', f'{config_file}',
             '-p', f'{client_dir}/{prompt_file}', '--ignore-eos',
             '--server-start-timeout',
             str(server_start_timeout)
         ]
+        if prompt_file == "long_prompts.json":
+            # Use max_tokens 4 for long prompts to reduce test time
+            client_cmd.extend(['--max-tokens', '4'])
 
         # Prepare poll processes
         worker_processes = []
@@ -281,6 +279,12 @@ def run_client_tests(example_dir,
         poll_procs = worker_processes + [server_proc]
         check_call(client_cmd, env=env, poll_procs=poll_procs)
 
+        # Streaming client run
+        streaming_client_cmd = client_cmd + [
+            '--streaming', '-o', 'output_streaming.json'
+        ]
+        check_call(streaming_client_cmd, env=env, poll_procs=poll_procs)
+
         # Run the chat completion endpoint test only for TinyLlama
         if test_desc == "overlap" or test_desc == "trtllm_sampler":
             chat_client_cmd = client_cmd + [
@@ -288,26 +292,55 @@ def run_client_tests(example_dir,
             ]
             check_call(chat_client_cmd, env=env, poll_procs=poll_procs)
 
+            streaming_chat_client_cmd = chat_client_cmd + [
+                '--streaming', '-o', 'output_streaming_chat.json'
+            ]
+            check_call(streaming_chat_client_cmd,
+                       env=env,
+                       poll_procs=poll_procs)
+
+        # Skip output verification for long prompts test
+        if prompt_file == "long_prompts.json":
+            continue
+
         if extra_endpoints_test is not None:
             extra_endpoints_test(server_url)
+
+        # Verify outputs
+        not_expected_strings = ["Berlin Berlin"]
+
+        output_files = ['output.json', 'output_streaming.json']
+        if test_desc == "overlap" or test_desc == "trtllm_sampler":
+            # Disable streaming chat completion for overlap test
+            # due to bug
+            output_files.extend(['output_chat.json'])
 
         if test_desc.startswith("gen_only"):
             continue
 
-        # Print output from output.json files
-        output_files = ['output.json']
-        if test_desc == "overlap" or test_desc == "trtllm_sampler":
-            output_files.extend(['output_chat.json'])
-
         for output_file in output_files:
-            try:
-                with open(output_file, 'r') as f:
-                    content = f.read()
-                    print(f"\n===== Output from {output_file} =====")
-                    print(content)
-                    print(f"===== End of {output_file} =====\n")
-            except FileNotFoundError:
-                print(f"Warning: {output_file} not found")
+            with open(output_file, 'r') as f:
+                content = f.read()
+                if "deepseek_v3_lite" in test_desc or output_file == "output_chat.json":
+                    expected_strings = [
+                        "Berlin", ["Asyncio is a", "Asyncio module in"]
+                    ]
+                else:
+                    expected_strings = [
+                        "The capital of Germany is Berlin",
+                        "Asyncio is a Python library"
+                    ]
+                for expected_string in expected_strings:
+                    if isinstance(expected_string, list):
+                        # At least one of the strings in the list should be found in the content
+                        assert any(
+                            string in content for string in expected_string
+                        ), f"None of the strings in {expected_string} found in {output_file}"
+                    else:
+                        assert expected_string in content, f"Expected string '{expected_string}' not found in {output_file}"
+                for not_expected_string in not_expected_strings:
+                    assert not_expected_string not in content, f"Unexpected string '{not_expected_string}' found in {output_file}"
+
 
 # TODO: add test for disaggregated server prometheus metrics
 def fetch_prometheus_metrics(server_url: str):
@@ -1568,7 +1601,7 @@ def get_config_for_benchmark(model_root, backend):
     serve_config = {
         "model": model_root,
         "hostname": "localhost",
-        "port": get_free_port(),
+        "port": get_free_port_in_ci(),
         "backend": "pytorch",
         "context_servers": {
             "num_instances": 1,
@@ -1582,7 +1615,7 @@ def get_config_for_benchmark(model_root, backend):
                 "backend": backend,
                 "max_tokens_in_buffer": 512,
             },
-            "urls": [f"localhost:{get_free_port()}"]
+            "urls": [f"localhost:{get_free_port_in_ci()}"]
         },
         "generation_servers": {
             "num_instances": 1,
@@ -1595,7 +1628,7 @@ def get_config_for_benchmark(model_root, backend):
                 "backend": backend,
                 "max_tokens_in_buffer": 512,
             },
-            "urls": [f"localhost:{get_free_port()}"]
+            "urls": [f"localhost:{get_free_port_in_ci()}"]
         }
     }
     return serve_config
@@ -1989,7 +2022,7 @@ def test_llama4_long_context_kv_cache_overflow(disaggregated_test_root,
                              cwd=llm_venv.get_working_directory())
 
 
-@pytest.mark.skip_less_device(8)
+@pytest.mark.skip_less_device(4)
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-bf16'],
                          indirect=True)
 def test_disaggregated_deepseek_v3_lite_bf16_tllm_gen_helix(
@@ -2006,28 +2039,6 @@ def test_disaggregated_deepseek_v3_lite_bf16_tllm_gen_helix(
 
     run_disaggregated_test(disaggregated_example_root,
                            "deepseek_v3_lite_bf16_tllm_gen_helix",
-                           env=llm_venv._new_env,
-                           cwd=llm_venv.get_working_directory(),
-                           prompt_file="long_prompts.json")
-
-
-@pytest.mark.skip_less_device(6)
-@pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-bf16'],
-                         indirect=True)
-def test_disaggregated_deepseek_v3_lite_bf16_tllm_gen_helix_ref(
-        disaggregated_test_root, disaggregated_example_root, llm_venv,
-        deepseek_v3_model_root):
-    src_dst_dict = {
-        deepseek_v3_model_root:
-        f"{llm_venv.get_working_directory()}/DeepSeek-V3-Lite/bf16",
-    }
-    for src, dst in src_dst_dict.items():
-        if not os.path.islink(dst):
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            os.symlink(src, dst, target_is_directory=True)
-
-    run_disaggregated_test(disaggregated_example_root,
-                           "deepseek_v3_lite_bf16_tllm_gen_helix_ref",
                            env=llm_venv._new_env,
                            cwd=llm_venv.get_working_directory(),
                            prompt_file="long_prompts.json")

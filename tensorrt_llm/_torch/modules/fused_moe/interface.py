@@ -197,17 +197,6 @@ class MoE(nn.Module):
         self.mapping = model_config.mapping
         self.parallel_rank = self.mapping.tp_rank
         self.parallel_size = self.mapping.tp_size
-        
-        # # Debug logging for MoE parallelism configuration
-        # print(f"[MoE DEBUG] rank={self.rank}, "
-        #       f"tp_rank={self.tp_rank}, tp_size={self.tp_size}, "
-        #       f"ep_rank={self.ep_rank}, ep_size={self.ep_size}, "
-        #       f"cluster_rank={self.cluster_rank}, cluster_size={self.cluster_size}, "
-        #       f"parallel_rank={self.parallel_rank}, parallel_size={self.parallel_size}, "
-        #       f"use_dp={self.use_dp}, "
-        #       f"mapping.tp_rank={self.mapping.tp_rank}, mapping.tp_size={self.mapping.tp_size}, "
-        #       f"mapping.moe_tp_rank={self.mapping.moe_tp_rank}, mapping.moe_tp_size={self.mapping.moe_tp_size}")
-        
         self.intermediate_size_per_partition = intermediate_size // self.tp_size
 
         self.all_reduce = None
