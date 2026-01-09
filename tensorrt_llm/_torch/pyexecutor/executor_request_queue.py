@@ -358,15 +358,24 @@ class ExecutorRequestQueue:
 
     def _fetch_new_requests_attention_dp(
             self, activate_requests: List[LlmRequest]) -> List[LlmRequest]:
-        """Handle attention DP request fetching with load balancing."""
-        # With Helix CP, only CP rank 0 in each DP group participates in load balancing.
-        # Other CP ranks receive the load-balanced requests via cp_broadcast.
-        if self.dist.has_cp_helix and self.dist.cp_rank != 0:
-            # Wait for CP rank 0 to broadcast the scheduled requests and total count
-            new_requests_cur_rank, num_fetch_requests_total = self.dist.cp_broadcast(
-                None, root=0)
+        """Handle attention DP request fetching with load balancing.
+
+        With Helix CP, divergence between CP ranks happens only at broadcast points:
+        1. Allgather results: CP rank 0 computes and broadcasts to other CP ranks
+        2. Scheduling results: CP rank 0 computes and broadcasts to other CP ranks
+        All other code (fetch, special item handling, merge) runs on all CP ranks.
+        """
+        is_helix_cp = self.dist.has_cp_helix
+
+        # ═══════════════════════════════════════════════════════════════════
+        # BROADCAST POINT 1: Allgather results (only CP rank 0 participates)
+        # ═══════════════════════════════════════════════════════════════════
+        if is_helix_cp and self.dist.cp_rank != 0:
+            # Receive allgather results from CP rank 0
+            all_ranks_num_active_requests, all_ranks_num_active_tokens = \
+                self.dist.cp_broadcast(None, root=0)
         else:
-            # CP rank 0 (or non-Helix): perform allgather, fetch, and scheduling
+            # CP rank 0 (or non-Helix): compute allgather
             all_ranks_num_active_requests = []
             all_ranks_num_active_tokens = []
             num_active_tokens = sum(
@@ -377,17 +386,34 @@ class ExecutorRequestQueue:
                 all_ranks_num_active_requests.append(num_active_requests)
                 all_ranks_num_active_tokens.append(num_active_tokens)
 
-            total_num_active_requests = sum(all_ranks_num_active_requests)
-            total_max_num_active_requests = self.dist.tp_size * self.max_num_active_requests
+            # Broadcast allgather results to other CP ranks
+            if is_helix_cp:
+                self.dist.cp_broadcast(
+                    (all_ranks_num_active_requests, all_ranks_num_active_tokens),
+                    root=0)
 
-            # Fetch and process requests into waiting queue
-            new_requests = self._fetch_and_process_requests(
-                total_num_active_requests,
-                total_max_num_active_requests,
-                enable_attention_dp=True,
-                all_ranks_num_active_requests=all_ranks_num_active_requests)
+        # ═══════════════════════════════════════════════════════════════════
+        # SHARED: All CP ranks fetch and process requests
+        # This ensures shutdown/cancel/control signals and waiting_queue are in sync
+        # ═══════════════════════════════════════════════════════════════════
+        total_num_active_requests = sum(all_ranks_num_active_requests)
+        total_max_num_active_requests = self.dist.tp_size * self.max_num_active_requests
 
-            # Schedule attention dp requests
+        new_requests = self._fetch_and_process_requests(
+            total_num_active_requests,
+            total_max_num_active_requests,
+            enable_attention_dp=True,
+            all_ranks_num_active_requests=all_ranks_num_active_requests)
+
+        # ═══════════════════════════════════════════════════════════════════
+        # BROADCAST POINT 2: Scheduling results (only CP rank 0 computes)
+        # ═══════════════════════════════════════════════════════════════════
+        if is_helix_cp and self.dist.cp_rank != 0:
+            # Receive scheduled requests from CP rank 0
+            new_requests_cur_rank, num_fetch_requests_total, self.expected_num_active_requests = \
+                self.dist.cp_broadcast(None, root=0)
+        else:
+            # CP rank 0 (or non-Helix): schedule requests across DP ranks
             all_ranks_new_requests = self._schedule_attention_dp_requests(
                 new_requests, all_ranks_num_active_requests,
                 all_ranks_num_active_tokens)
@@ -400,12 +426,14 @@ class ExecutorRequestQueue:
 
             num_fetch_requests_total = len(new_requests)
 
-            # Broadcast to other CP ranks if Helix CP
-            if self.dist.has_cp_helix:
+            # Broadcast scheduled requests to other CP ranks
+            if is_helix_cp:
                 self.dist.cp_broadcast(
-                    (new_requests_cur_rank, num_fetch_requests_total), root=0)
+                    (new_requests_cur_rank, num_fetch_requests_total, self.expected_num_active_requests), root=0)
 
-        # Shared code for all CP ranks: update counters and merge requests
+        # ═══════════════════════════════════════════════════════════════════
+        # SHARED: All CP ranks update counters and merge requests
+        # ═══════════════════════════════════════════════════════════════════
         self.num_fetch_requests += num_fetch_requests_total
         self.num_fetch_requests_cur_rank += len(new_requests_cur_rank)
 
