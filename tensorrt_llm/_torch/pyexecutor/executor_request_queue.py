@@ -372,8 +372,6 @@ class ExecutorRequestQueue:
             responses_list = self.dist.tp_cp_allgather(
                 [len(activate_requests), num_active_tokens])
 
-            # @B: Do we really need to check for all CP ranks? Should num_tokens be 1
-            # for all generation requests?
             aggregated_responses = []
             for dp_group_idx in range(self.dist.tp_size):
                 # Get all entries for this DP group (cp_size entries per group).
@@ -385,9 +383,8 @@ class ExecutorRequestQueue:
                 assert all(entry[0] == group_entries[0][0] for entry in group_entries), \
                     f"CP ranks within DP group {dp_group_idx} have mismatched request counts: " \
                     f"{[entry[0] for entry in group_entries]}"
-                # Sum the token counts across CP ranks (sequence is split).
-                total_tokens = sum(entry[1] for entry in group_entries)
-                aggregated_responses.append([group_entries[0][0], total_tokens])
+                # Use token count from cp_rank0.
+                aggregated_responses.append([group_entries[0][0], group_entries[0][1]])
             responses_list = aggregated_responses
         else:
             responses_list = self.dist.tp_allgather(
