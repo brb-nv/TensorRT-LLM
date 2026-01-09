@@ -359,67 +359,57 @@ class ExecutorRequestQueue:
     def _fetch_new_requests_attention_dp(
             self, activate_requests: List[LlmRequest]) -> List[LlmRequest]:
         """Handle attention DP request fetching with load balancing."""
-        # Get active request counts across all ranks.
-        all_ranks_num_active_requests = []
-        all_ranks_num_active_tokens = []
-        num_active_tokens = sum(
-            [req.py_orig_prompt_len for req in activate_requests])
-
-        if self.dist.has_cp_helix:
-            # When CP is enabled with Helix parallelism, we need to gather from all ranks
-            # in the TP x CP space. CP ranks within the same DP group (same tp_rank) handle
-            # the same requests with different token portions (sequence is split across CP ranks).
-            responses_list = self.dist.tp_cp_allgather(
-                [len(activate_requests), num_active_tokens])
-
-            aggregated_responses = []
-            for dp_group_idx in range(self.dist.tp_size):
-                # Get all entries for this DP group (cp_size entries per group).
-                group_start = dp_group_idx * self.dist.cp_size
-                group_end = (dp_group_idx + 1) * self.dist.cp_size
-                group_entries = responses_list[group_start:group_end]
-
-                # All CP ranks within a DP group should have the same number of requests.
-                assert all(entry[0] == group_entries[0][0] for entry in group_entries), \
-                    f"CP ranks within DP group {dp_group_idx} have mismatched request counts: " \
-                    f"{[entry[0] for entry in group_entries]}"
-                # Use token count from cp_rank0.
-                aggregated_responses.append(group_entries[0])
-            responses_list = aggregated_responses
+        # With Helix CP, only CP rank 0 in each DP group participates in load balancing.
+        # Other CP ranks receive the load-balanced requests via cp_broadcast.
+        if self.dist.has_cp_helix and self.dist.cp_rank != 0:
+            # Wait for CP rank 0 to broadcast the scheduled requests and total count
+            new_requests_cur_rank, num_fetch_requests_total = self.dist.cp_broadcast(
+                None, root=0)
         else:
+            # CP rank 0 (or non-Helix): perform allgather, fetch, and scheduling
+            all_ranks_num_active_requests = []
+            all_ranks_num_active_tokens = []
+            num_active_tokens = sum(
+                [req.py_orig_prompt_len for req in activate_requests])
             responses_list = self.dist.tp_allgather(
                 [len(activate_requests), num_active_tokens])
+            for num_active_requests, num_active_tokens in responses_list:
+                all_ranks_num_active_requests.append(num_active_requests)
+                all_ranks_num_active_tokens.append(num_active_tokens)
 
-        for num_active_requests, num_active_tokens in responses_list:
-            all_ranks_num_active_requests.append(num_active_requests)
-            all_ranks_num_active_tokens.append(num_active_tokens)
+            total_num_active_requests = sum(all_ranks_num_active_requests)
+            total_max_num_active_requests = self.dist.tp_size * self.max_num_active_requests
 
-        total_num_active_requests = sum(all_ranks_num_active_requests)
-        total_max_num_active_requests = self.dist.tp_size * self.max_num_active_requests
+            # Fetch and process requests into waiting queue
+            new_requests = self._fetch_and_process_requests(
+                total_num_active_requests,
+                total_max_num_active_requests,
+                enable_attention_dp=True,
+                all_ranks_num_active_requests=all_ranks_num_active_requests)
 
-        # fetch and process requests into waiting queue
-        new_requests = self._fetch_and_process_requests(
-            total_num_active_requests,
-            total_max_num_active_requests,
-            enable_attention_dp=True,
-            all_ranks_num_active_requests=all_ranks_num_active_requests)
+            # Schedule attention dp requests
+            all_ranks_new_requests = self._schedule_attention_dp_requests(
+                new_requests, all_ranks_num_active_requests,
+                all_ranks_num_active_tokens)
+            new_requests_cur_rank = all_ranks_new_requests[self.dist.tp_rank]
 
-        # Schedule attention dp requests
-        all_ranks_new_requests = self._schedule_attention_dp_requests(
-            new_requests, all_ranks_num_active_requests,
-            all_ranks_num_active_tokens)
-        new_requests_cur_rank = all_ranks_new_requests[self.dist.tp_rank]
+            # Update performance metrics (only meaningful on rank 0 where start_times exist)
+            if self.enable_iter_perf_stats and self.start_times:
+                self._update_new_active_requests_queue_latency(
+                    new_requests_cur_rank)
 
-        # Update performance metrics
-        if self.enable_iter_perf_stats and self.start_times:
-            self._update_new_active_requests_queue_latency(
-                new_requests_cur_rank)
+            num_fetch_requests_total = len(new_requests)
 
-        # Update counters
-        self.num_fetch_requests += len(new_requests)
+            # Broadcast to other CP ranks if Helix CP
+            if self.dist.has_cp_helix:
+                self.dist.cp_broadcast(
+                    (new_requests_cur_rank, num_fetch_requests_total), root=0)
+
+        # Shared code for all CP ranks: update counters and merge requests
+        self.num_fetch_requests += num_fetch_requests_total
         self.num_fetch_requests_cur_rank += len(new_requests_cur_rank)
 
-        # Merge requests and add to active list
+        # Merge requests and add to active list (partitions tokens for Helix CP)
         new_requests_cur_rank = self._merge_requests(new_requests_cur_rank)
         return new_requests_cur_rank
 
