@@ -16,10 +16,10 @@ CONFIGS_DIR="${WORK_DIR}/saved_configs/${TIMESTAMP}"
 # =============================================================================
 # DEFINE SWEEP PARAMETERS - Modify these arrays as needed
 # =============================================================================
-NUM_GPUS=8                       # Total number of GPUs (TP = NUM_GPUS / CP)
-CP_VALUES=(8)                    # Context Parallel sizes
-ISL_VALUES=(65536 131072 262144 524288 1048576)              # Input Sequence Lengths
-BATCH_SIZE_VALUES=(8)          # Batch sizes
+NUM_GPUS=16                       # Total number of GPUs (TP = NUM_GPUS / CP)
+CP_VALUES=(1 8 16)                    # Context Parallel sizes
+ISL_VALUES=(1048576)              # Input Sequence Lengths
+BATCH_SIZE_VALUES=(32 64)          # Batch sizes
 
 # =============================================================================
 # Helper functions
@@ -52,8 +52,8 @@ update_config() {
     local batch_size=$5
 
     # Calculate derived values
-    local concurrency=$(( batch_size * 8 < 64 ? batch_size * 8 : 64 ))
-    local max_seq_len=$((isl / cp + 2560))  # osl is 1024.
+    local concurrency=$(( batch_size * 8 < 64 ? batch_size * 8 : batch_size * 2 ))
+    local max_seq_len=$((isl + 2560))  # osl is 1024.
 
     echo "=========================================="
     echo "Updating config with:"

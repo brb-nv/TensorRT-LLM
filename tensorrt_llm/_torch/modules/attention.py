@@ -1125,6 +1125,7 @@ class MLA(nn.Module):
 
             # Switch between NCCL-based and FIFO-based (MNNVL) all-to-all based on cp_config.
             if self.mapping.cp_config.get("use_nccl_for_alltoall", True):
+                assert False, "Expected to use MNNVL-based all-to-all."
                 # NCCL-based implementation using alltoall_helix.
                 # This is the post-processing of helix parallel attention,
                 # similar to the post-processing of ring attention.
