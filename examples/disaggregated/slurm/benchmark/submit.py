@@ -172,6 +172,11 @@ def submit_job(config, log_dir, dry_run):
 
     worker_env_var = env_config.get('worker_env_var')
     server_env_var = env_config.get('server_env_var')
+
+    # Disable deterministic allreduce to avoid int32 overflow with high TP
+    worker_env_var += " FORCE_DETERMINISTIC=0 FORCE_ALL_REDUCE_DETERMINISTIC=0"
+    server_env_var += " FORCE_DETERMINISTIC=0 FORCE_ALL_REDUCE_DETERMINISTIC=0"
+
     if benchmark_config['mode'] == "gen_only_no_context":
         worker_env_var += " TRTLLM_DISAGG_BENCHMARK_GEN_ONLY=1"
         server_env_var += " TRTLLM_DISAGG_BENCHMARK_GEN_ONLY=1"
