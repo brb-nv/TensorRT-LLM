@@ -16,9 +16,9 @@ benchmark:
   multi_round: 1  # Number of benchmark rounds
   benchmark_ratio: 1.0  # Benchmark ratio
   streaming: true  # Enable streaming mode
-  concurrency_list: "128"
-  input_length: 1048576  # Input sequence length
-  output_length: 1024  # Output sequence length
+  concurrency_list: "16"
+  input_length: 131072  # Input sequence length
+  output_length: 8192  # Output sequence length
   dataset_file: ""
 
 # Hardware Configuration
@@ -30,13 +30,12 @@ hardware:
 # Environment Configuration
 environment:
   container_mount: "/lustre/fsw/coreai_comparch_trtllm:/lustre/fsw/coreai_comparch_trtllm"  # Format: path1:path1,path2:path2
-  container_image: "/lustre/fsw/coreai_comparch_trtllm/bbuddharaju/sqsh/tensorrt_llm_pytorch_25.10_py3_aarch64_ubuntu24.04_trt10.13.3.9_skip_tritondevel_202512151112_9977.sqsh"
+  container_image: "/lustre/fsw/coreai_comparch_trtllm/bbuddharaju/sqsh/tensorrt_llm_pytorch_25.10_py3_aarch64_ubuntu24.04_trt10.13.3.9_skip_tritondevel_202512241744_10055.sqsh"
   model_path: "/lustre/fsw/coreai_comparch_trtllm/jiaganc/model/DeepSeek-R1/DeepSeek-R1-0528-FP4-v2/"
   trtllm_repo: "/lustre/fsw/coreai_comparch_trtllm/bbuddharaju/TensorRT-LLM/"
-  build_wheel: true  # Don't build the wheel when launching multiple jobs
+  build_wheel: false  # Don't build the wheel when launching multiple jobs
   cuda_architectures: "100-real"  # Optional CUDA architectures to build for (e.g. "90-real;100-real"). If empty, builds for all architectures
-  #trtllm_wheel_path: "/lustre/fsw/coreai_comparch_trtllm/bbuddharaju/TensorRT-LLM/build/tensorrt_llm-1.2.0rc7-cp312-cp312-linux_aarch64.whl"  # Path to pre-built TensorRT-LLM wheel. If provided, install from this wheel instead
-  trtllm_wheel_path: ""
+  trtllm_wheel_path: "/lustre/fsw/coreai_comparch_trtllm/bbuddharaju/TensorRT-LLM/build/tensorrt_llm-1.2.0rc7-cp312-cp312-linux_aarch64.whl"  # Path to pre-built TensorRT-LLM wheel. If provided, install from this wheel instead
   work_dir: "/lustre/fsw/coreai_comparch_trtllm/bbuddharaju/TensorRT-LLM/examples/disaggregated/slurm/benchmark/"
   worker_env_var: "TLLM_LOG_LEVEL=INFO TRTLLM_SERVER_DISABLE_GC=1 TRTLLM_WORKER_DISABLE_GC=1 TRTLLM_ENABLE_PDL=1 ENROOT_ALLOW_DEV=yes"
   server_env_var: "TRTLLM_SERVER_DISABLE_GC=1"
@@ -56,23 +55,23 @@ accuracy:
 
 worker_config:
   gen:
-    tensor_parallel_size: 1
-    moe_expert_parallel_size: 8
+    tensor_parallel_size: 32
+    moe_expert_parallel_size: 32
     enable_attention_dp: false
     enable_lm_head_tp_in_adp: false
     pipeline_parallel_size: 1
-    context_parallel_size: 16
+    context_parallel_size: 2
     cp_config:
       cp_type: "HELIX"
       tokens_per_block: 32
       use_nccl_for_alltoall: false
-    max_batch_size: 64
-    max_num_tokens: 2048
-    max_seq_len: 1051136
+    max_batch_size: 8
+    max_num_tokens: 256
+    max_seq_len: 139776
     cuda_graph_config:
       enable_padding: true
       batch_sizes:
-      - 64
+      - 8
     print_iter_log: true
     trust_remote_code: true
     kv_cache_config:
