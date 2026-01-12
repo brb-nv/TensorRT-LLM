@@ -234,9 +234,9 @@ def submit_job(config, log_dir, dry_run):
         # Determine config suffix based on attention_dp
         if gen_enable_attention_dp:
             assert False, "Attention DP is not supported."
-            config_suffix = f"ctx{ctx_num}_gen{gen_num}_dep{gen_tp_size}_cp{gen_cp_size}_batch{gen_batch_size}"
+            config_suffix = f"ctx{ctx_num}_gen{gen_num}_tp{gen_tp_size}_pp{gen_pp_size}_ep{gen_ep_size}_cp{gen_cp_size}_batch{gen_batch_size}"
         else:
-            config_suffix = f"ctx{ctx_num}_gen{gen_num}_tp{gen_tp_size}_ep{gen_ep_size}_cp{gen_cp_size}_batch{gen_batch_size}"
+            config_suffix = f"ctx{ctx_num}_gen{gen_num}_tp{gen_tp_size}_pp{gen_pp_size}_ep{gen_ep_size}_cp{gen_cp_size}_batch{gen_batch_size}"
 
         # Create full log directory path as a single flat directory
         log_dir = os.path.join(env_config['work_dir'],

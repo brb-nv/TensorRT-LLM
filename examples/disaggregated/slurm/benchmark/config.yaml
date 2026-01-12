@@ -73,6 +73,7 @@ worker_config:
       batch_sizes:
       - 8
     print_iter_log: true
+    disable_overlap_scheduler: true
     trust_remote_code: true
     kv_cache_config:
       enable_block_reuse: false
