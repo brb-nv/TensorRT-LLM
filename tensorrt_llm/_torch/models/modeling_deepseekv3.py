@@ -39,6 +39,7 @@ from transformers import PretrainedConfig
 
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 from tensorrt_llm._ipc_utils import can_access_peer
+from tensorrt_llm.logger import logger
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.mapping import Mapping
@@ -1276,9 +1277,21 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         spec_metadata: Optional[SpecMetadata] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        rank = self.mapping.rank if self.mapping else "?"
+        layer_idx = self.layer_idx
+        # Only log for first few layers to avoid log spam
+        should_log = layer_idx < 3
+        
+        if should_log:
+            logger.warning(f"[DecoderLayer] rank={rank} layer={layer_idx} Starting forward")
+        
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
+        
+        if should_log:
+            logger.warning(f"[DecoderLayer] rank={rank} layer={layer_idx} After input_layernorm, about to start self_attn")
+        
         # Self Attention
         hidden_states = self.self_attn(
             position_ids=position_ids,
@@ -1288,26 +1301,36 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                 enable_allreduce=not (self.disable_attn_allreduce)),
             **kwargs,
         )
+        
+        if should_log:
+            logger.warning(f"[DecoderLayer] rank={rank} layer={layer_idx} After self_attn, about to start MLP/MoE")
+        
         if isinstance(self.mlp, Deepseekv3MoE):
             if spec_metadata is not None and spec_metadata.is_layer_capture(
                     self.layer_idx):
                 self.fusion_config.POST_MOE_FUSION = False
-            return self.forward_MoE(
+            result = self.forward_MoE(
                 hidden_states=hidden_states,
                 attn_metadata=attn_metadata,
                 residual=residual,
                 spec_metadata=spec_metadata,
             )
+            if should_log:
+                logger.warning(f"[DecoderLayer] rank={rank} layer={layer_idx} After MoE, forward complete")
+            return result
         else:
             if spec_metadata is not None and spec_metadata.is_layer_capture(
                     self.layer_idx):
                 self.fusion_config.POST_MLP_FUSION = False
             assert isinstance(self.mlp, GatedMLP)
-            return self.forward_mlp(
+            result = self.forward_mlp(
                 hidden_states=hidden_states,
                 residual=residual,
                 spec_metadata=spec_metadata,
             )
+            if should_log:
+                logger.warning(f"[DecoderLayer] rank={rank} layer={layer_idx} After MLP, forward complete")
+            return result
 
     def forward_MoE(
         self,
@@ -1316,6 +1339,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         residual: torch.Tensor,
         spec_metadata: Optional[SpecMetadata] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        logger.warning(f"[forward_MoE] rank={self.mapping.rank} layer={self.layer_idx} Starting, PRE_MOE_FUSION={self.fusion_config.PRE_MOE_FUSION}")
 
         def _run_MoE(hidden_states, hidden_states_fp4, do_finalize):
             return self.mlp(
@@ -1331,6 +1355,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         if self.fusion_config.PRE_MOE_FUSION:
             # moe_backend can be either CUTLASS or TRTLLM here
             # TODO: unify the two min-latency MoE backends by enabling quant fusion
+            logger.warning(f"[forward_MoE] rank={self.mapping.rank} layer={self.layer_idx} About to call allreduce (PRE_MOE_FUSION)")
             hidden_states, residual = self.allreduce(
                 hidden_states,
                 all_reduce_params=AllReduceParams(
@@ -1340,10 +1365,13 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                     eps=self.post_attention_layernorm.variance_epsilon,
                     trigger_completion_at_end=False,
                 ))
+            logger.warning(f"[forward_MoE] rank={self.mapping.rank} layer={self.layer_idx} allreduce (PRE_MOE_FUSION) completed")
         else:
             # No fusion
+            logger.warning(f"[forward_MoE] rank={self.mapping.rank} layer={self.layer_idx} About to call post_attention_layernorm (no fusion)")
             hidden_states, residual = self.post_attention_layernorm(
                 hidden_states, residual)
+            logger.warning(f"[forward_MoE] rank={self.mapping.rank} layer={self.layer_idx} post_attention_layernorm completed")
 
         # Note: this fusion pattern is only supported for single-node TRTLLM-nvfp4 backend now
         do_finalize = self.mapping.is_multi_node() or (
@@ -1352,12 +1380,16 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                  and self.model_config.moe_backend == "TRTLLM"
                  and self.mlp.experts.has_nvfp4 and self.is_p2p_supported))
 
+        logger.warning(f"[forward_MoE] rank={self.mapping.rank} layer={self.layer_idx} About to call _run_MoE, do_finalize={do_finalize}")
         hidden_states = _run_MoE(hidden_states,
                                  hidden_states_fp4=None,
                                  do_finalize=do_finalize)
+        logger.warning(f"[forward_MoE] rank={self.mapping.rank} layer={self.layer_idx} _run_MoE completed")
 
         if self.fusion_config.POST_MOE_FUSION:
+            logger.warning(f"[forward_MoE] rank={self.mapping.rank} layer={self.layer_idx} POST_MOE_FUSION, do_finalize={do_finalize}")
             if do_finalize:
+                logger.warning(f"[forward_MoE] rank={self.mapping.rank} layer={self.layer_idx} About to call allreduce (POST_MOE_FUSION, do_finalize)")
                 hidden_states, residual = self.allreduce(
                     hidden_states,
                     all_reduce_params=AllReduceParams(
@@ -1367,6 +1399,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                         eps=self.next_layer_layernorm.variance_epsilon,
                         trigger_completion_at_end=False,
                     ))
+                logger.warning(f"[forward_MoE] rank={self.mapping.rank} layer={self.layer_idx} allreduce (POST_MOE_FUSION) completed")
             else:
                 assert len(
                     hidden_states) == 4, "hidden_states must have 4 elements"
@@ -1385,8 +1418,10 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                     eps=self.next_layer_layernorm.variance_epsilon,
                     is_cutlass_min_latency=False,
                 )
+                logger.warning(f"[forward_MoE] rank={self.mapping.rank} layer={self.layer_idx} About to call moe_allreduce")
                 hidden_states, residual = self.moe_allreduce(
                     fc2_output, all_reduce_params=moe_all_reduce_params)
+                logger.warning(f"[forward_MoE] rank={self.mapping.rank} layer={self.layer_idx} moe_allreduce completed")
         else:
             if spec_metadata is not None and spec_metadata.is_layer_capture(
                     self.layer_idx):
@@ -1396,6 +1431,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                 hidden_states, residual = self.next_layer_layernorm(
                     hidden_states, residual)
 
+        logger.warning(f"[forward_MoE] rank={self.mapping.rank} layer={self.layer_idx} Completed")
         return hidden_states, residual
 
     def forward_mlp(
@@ -1404,8 +1440,10 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         residual: torch.Tensor,
         spec_metadata: Optional[SpecMetadata] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        logger.warning(f"[forward_mlp] rank={self.mapping.rank} layer={self.layer_idx} Starting, PRE_MLP_FUSION={self.fusion_config.PRE_MLP_FUSION}")
 
         if self.fusion_config.PRE_MLP_FUSION:
+            logger.warning(f"[forward_mlp] rank={self.mapping.rank} layer={self.layer_idx} About to call allreduce (PRE_MLP_FUSION)")
             act_fp4, act_sf, residual = self.allreduce(
                 hidden_states,
                 all_reduce_params=AllReduceParams(
@@ -1416,20 +1454,26 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                     eps=self.post_attention_layernorm.variance_epsilon,
                 ),
             )
+            logger.warning(f"[forward_mlp] rank={self.mapping.rank} layer={self.layer_idx} allreduce (PRE_MLP_FUSION) completed")
             hidden_states = Fp4QuantizedTensor(act_fp4, act_sf)
         else:
             # No fusion
             # We need to add twoshot allreduce here to avoid modifying MLA logic
+            logger.warning(f"[forward_mlp] rank={self.mapping.rank} layer={self.layer_idx} About to call post_attention_layernorm (no fusion)")
             hidden_states, residual = self.post_attention_layernorm(
                 hidden_states, residual)
+            logger.warning(f"[forward_mlp] rank={self.mapping.rank} layer={self.layer_idx} post_attention_layernorm completed")
 
+        logger.warning(f"[forward_mlp] rank={self.mapping.rank} layer={self.layer_idx} About to call self.mlp, POST_MLP_FUSION={self.fusion_config.POST_MLP_FUSION}")
         hidden_states = self.mlp(
             hidden_states,
             final_all_reduce_params=AllReduceParams(enable_allreduce=not (
                 self.fusion_config.POST_MLP_FUSION or self.mlp_tp_size == 1)),
         )
+        logger.warning(f"[forward_mlp] rank={self.mapping.rank} layer={self.layer_idx} self.mlp completed")
 
         if self.fusion_config.POST_MLP_FUSION:
+            logger.warning(f"[forward_mlp] rank={self.mapping.rank} layer={self.layer_idx} About to call allreduce (POST_MLP_FUSION)")
             hidden_states, residual = self.allreduce(
                 hidden_states,
                 all_reduce_params=AllReduceParams(
@@ -1439,6 +1483,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                     eps=self.next_layer_layernorm.variance_epsilon,
                 ),
             )
+            logger.warning(f"[forward_mlp] rank={self.mapping.rank} layer={self.layer_idx} allreduce (POST_MLP_FUSION) completed")
         else:
             if spec_metadata is not None and spec_metadata.is_layer_capture(
                     self.layer_idx):
@@ -1448,6 +1493,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                 hidden_states, residual = self.next_layer_layernorm(
                     hidden_states, residual)
 
+        logger.warning(f"[forward_mlp] rank={self.mapping.rank} layer={self.layer_idx} Completed")
         return hidden_states, residual
 
 
@@ -1651,8 +1697,16 @@ class DeepseekV3Model(DecoderModel):
         hidden_states = inputs_embeds
         residual = None
 
+        mapping = self.model_config.mapping
+        rank = mapping.rank if mapping else "?"
+        pp_rank = mapping.pp_rank if mapping else "?"
+        num_layers = self.num_hidden_layers
+        logger.warning(f"[DeepseekV3Model.forward] rank={rank} pp_rank={pp_rank} Starting forward, num_layers={num_layers}")
+        
         for idx, decoder_layer in enumerate(
                 self.layers[:self.num_hidden_layers]):
+            if idx % 10 == 0 or idx == num_layers - 1:
+                logger.warning(f"[DeepseekV3Model.forward] rank={rank} pp_rank={pp_rank} Processing layer {idx}/{num_layers}")
             hidden_states, residual = decoder_layer(
                 position_ids=position_ids,
                 hidden_states=hidden_states,
@@ -1660,7 +1714,8 @@ class DeepseekV3Model(DecoderModel):
                 residual=residual,
                 spec_metadata=spec_metadata,
             )
-
+        
+        logger.warning(f"[DeepseekV3Model.forward] rank={rank} pp_rank={pp_rank} Forward completed all layers")
         return hidden_states
 
 

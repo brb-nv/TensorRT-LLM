@@ -84,9 +84,11 @@ def get_or_scale_allreduce_mnnvl_workspace(
         # Creating the workspace if it doesn't exist
         if mapping not in allreduce_mnnvl_workspaces:
             # Do the communicator split if there is no communicator in the workspace
+            logger.warning(f"[MNNVL_WORKSPACE] rank={mapping.rank} pp_rank={mapping.pp_rank} tp_rank={mapping.tp_rank} About to call mpi_comm().Split() - THIS IS A COLLECTIVE ACROSS ALL RANKS!")
             comm = mpi_comm().Split(
                 int(mapping.pp_rank * mapping.cp_size + mapping.cp_rank),
                 mapping.tp_rank)
+            logger.warning(f"[MNNVL_WORKSPACE] rank={mapping.rank} mpi_comm().Split() completed")
             # Use the predefined buffer size if no buffer size is provided
             buffer_size_bytes = buffer_size_bytes or init_buffer_size_bytes
             if mapping.tp_rank == 0:
@@ -545,6 +547,16 @@ class MNNVLAllReduce(nn.Module):
         is_on_aarch64 = "aarch64" in arch
         # Add a bypass so that we can run the unittest on single-node
         is_testing = os.environ.get("TLLM_TEST_MNNVL", "0") == "1"
+        # MNNVL workspace initialization requires an MPI Split (collective across all ranks).
+        # When PP > 1, this causes a deadlock because PP stages execute asynchronously
+        # and the Split is called lazily during the first forward pass.
+        # Disable MNNVL when PP > 1 to avoid this deadlock.
+        if mapping.has_pp():
+            logger.debug_once(
+                f"MNNVL AllReduce disabled when PP > 1 to avoid deadlock during lazy workspace initialization",
+                key="mnnvl_pp_disabled",
+            )
+            return False
         return is_testing or (dtype in MNNVLAllReduce.get_supported_dtypes() and
                               not mapping.has_cp() and mapping.is_multi_node()
                               and MnnvlMemory.supports_mnnvl()
@@ -580,6 +592,7 @@ class MNNVLAllReduce(nn.Module):
         Returns:
             Union[torch.Tensor, Tuple[torch.Tensor, ...]]: Reduced tensor(s)
         """
+        logger.warning(f"[MNNVLAllReduce.forward] rank={self.mapping.rank} Starting, fusion_op={all_reduce_params.fusion_op}")
 
         fusion_op = all_reduce_params.fusion_op
         shape = input.shape
@@ -597,11 +610,13 @@ class MNNVLAllReduce(nn.Module):
                 f"for shard ({num_tokens}, {hidden_dim}), TP {self.mapping.tp_size}."
             )
 
+        logger.warning(f"[MNNVLAllReduce.forward] rank={self.mapping.rank} About to get/scale workspace")
         workspace = get_or_scale_allreduce_mnnvl_workspace(
             self.mapping,
             self.dtype,
             buffer_size_bytes=workspace_size_bytes,
         )
+        logger.warning(f"[MNNVLAllReduce.forward] rank={self.mapping.rank} Workspace obtained")
 
         # We don't expect the buffer to be directly used in this level. The tensor is only used for passing the pointer to the kernel
         buffer_base = workspace["uc_buffer"].view(self.dtype).view(3, -1)
@@ -793,12 +808,15 @@ class AllReduce(nn.Module):
 
         # Try Symmetric Memory AllReduce first if available
         # Note: Currently only supports NONE fusion op (plain allreduce)
+        logger.warning(f"[AllReduce.forward] rank={self.mapping.rank} tp_rank={self.mapping.tp_rank} tp_group={self.mapping.tp_group} strategy={self.strategy} fusion_op={all_reduce_params.fusion_op} input_shape={input.shape}")
         if self.symm_mem_allreduce and all_reduce_params.fusion_op == AllReduceFusionOp.NONE:
+            logger.warning(f"[AllReduce.forward] rank={self.mapping.rank} Trying symm_mem_allreduce")
             symm_mem_output = self.symm_mem_allreduce(input)
             if symm_mem_output is not None:
                 logger.debug(
                     f"Using SymmetricMemoryAllReduce (MULTIMEM) for input shape {input.shape}"
                 )
+                logger.warning(f"[AllReduce.forward] rank={self.mapping.rank} symm_mem_allreduce completed")
                 return symm_mem_output
         elif self.symm_mem_allreduce and all_reduce_params.fusion_op != AllReduceFusionOp.NONE:
             # Log once per rank that we're skipping symm_mem due to fusion
@@ -810,10 +828,13 @@ class AllReduce(nn.Module):
 
         # Try MNNVL AllReduce if symm_mem didn't handle it
         if self.mnnvl_allreduce:
+            logger.warning(f"[AllReduce.forward] rank={self.mapping.rank} Trying mnnvl_allreduce")
             mnnvl_output = self.mnnvl_allreduce(
                 input, all_reduce_params=all_reduce_params)
             if mnnvl_output is not None:
+                logger.warning(f"[AllReduce.forward] rank={self.mapping.rank} mnnvl_allreduce completed")
                 return mnnvl_output
+            logger.warning(f"[AllReduce.forward] rank={self.mapping.rank} mnnvl_allreduce returned None, falling back")
 
         # Fall back to regular AllReduce if specialized methods are not available or not applicable
         # Make sure the strategy is AUTO since allreduceOp does not have the branch for MNNVL/SYMM_MEM
@@ -837,6 +858,7 @@ class AllReduce(nn.Module):
             "TLLM_DISABLE_ALLREDUCE_AUTOTUNE", "0") == "1"
 
         if allreduce_strategy == AllReduceStrategy.AUTO and not disable_allreduce_autotune and not self._disable_mpi:
+            logger.warning(f"[AllReduce.forward] rank={self.mapping.rank} About to call tunable_allreduce, tp_group={self.mapping.tp_group}")
             output = torch.ops.trtllm.tunable_allreduce(
                 input=input,
                 residual=all_reduce_params.residual,
@@ -851,7 +873,9 @@ class AllReduce(nn.Module):
                 trigger_completion_at_end=all_reduce_params.
                 trigger_completion_at_end,
             )
+            logger.warning(f"[AllReduce.forward] rank={self.mapping.rank} tunable_allreduce completed")
         else:
+            logger.warning(f"[AllReduce.forward] rank={self.mapping.rank} About to call all_reduce_op, strategy={allreduce_strategy}, disable_mpi={self._disable_mpi}")
             output = self.all_reduce_op(
                 input=input,
                 residual=all_reduce_params.residual,
@@ -867,6 +891,7 @@ class AllReduce(nn.Module):
                 trigger_completion_at_end,
                 **additional_args,
             )
+            logger.warning(f"[AllReduce.forward] rank={self.mapping.rank} all_reduce_op completed")
 
         return output if len(output) > 1 else output[0]
 

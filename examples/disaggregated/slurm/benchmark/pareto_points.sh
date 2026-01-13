@@ -66,17 +66,9 @@ save_config() {
     echo "Saved config to: $save_path"
 }
 
-# Function to determine moe_backend based on EP for GB200 with NVFP4
-# Reference: deployment-guide-for-deepseek-r1-on-trtllm.md
-#   GB200 EP<=8, NVFP4 -> CUTLASS or TRTLLM
-#   GB200 EP>8, NVFP4 -> WIDEEP
+# Function to determine moe_backend
 get_moe_backend() {
-    local ep=$1
-    if [ "$ep" -le 8 ]; then
-        echo "CUTLASS"
-    else
-        echo "WIDEEP"
-    fi
+    echo "CUTLASS"
 }
 
 # Function to generate pp_partition YAML block for 61 layers

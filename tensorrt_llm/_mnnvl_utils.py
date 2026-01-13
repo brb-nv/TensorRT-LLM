@@ -392,8 +392,13 @@ def init_helix_cp_comm(mapping: Mapping) -> None:
     Args:
         mapping: The mapping object containing parallelism configuration.
     """
+    from tensorrt_llm.logger import logger
+    logger.warning(f"[init_helix_cp_comm] rank={mapping.rank} Starting, has_cp_helix={mapping.has_cp_helix()}, cp_config={mapping.cp_config}")
     if mapping.has_cp_helix() and not mapping.cp_config.get("use_nccl_for_alltoall", True):
+        logger.warning(f"[init_helix_cp_comm] rank={mapping.rank} About to call HelixCpMnnvlMemory.get_comm (MPI collective!)")
         HelixCpMnnvlMemory.get_comm(mapping)
+        logger.warning(f"[init_helix_cp_comm] rank={mapping.rank} HelixCpMnnvlMemory.get_comm completed")
+    logger.warning(f"[init_helix_cp_comm] rank={mapping.rank} Completed")
 
 
 @dataclass

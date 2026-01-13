@@ -141,6 +141,7 @@ class PyTorchModelEngine(ModelEngine):
                                                  torch.nn.Module]] = None,
         model: Optional[torch.nn.Module] = None,
     ):
+        logger.warning(f"[PyTorchModelEngine.__init__] Starting, rank={mapping.rank if mapping else 'N/A'}, pp_rank={mapping.pp_rank if mapping else 'N/A'}, tp_rank={mapping.tp_rank if mapping else 'N/A'}, cp_rank={mapping.cp_rank if mapping else 'N/A'}")
         self.forward_pass_callable = None
         self.ub_buffers = None
         (
@@ -155,13 +156,17 @@ class PyTorchModelEngine(ModelEngine):
         self.max_seq_len = max_seq_len
         self.max_beam_width = max_beam_width
 
+        logger.warning(f"[PyTorchModelEngine.__init__] rank={mapping.rank if mapping else 'N/A'} About to construct checkpoint_loader")
         checkpoint_loader = _construct_checkpoint_loader(
             llm_args.backend, llm_args.checkpoint_loader,
             llm_args.checkpoint_format)
+        logger.warning(f"[PyTorchModelEngine.__init__] rank={mapping.rank if mapping else 'N/A'} checkpoint_loader constructed")
 
         self.mapping = mapping
         if mapping.has_pp():
+            logger.warning(f"[PyTorchModelEngine.__init__] rank={mapping.rank} About to call init_pp_comm, pp_size={mapping.pp_size}")
             init_pp_comm(mapping)
+            logger.warning(f"[PyTorchModelEngine.__init__] rank={mapping.rank} init_pp_comm completed")
         self.dist = dist
         if dist is not None:
             ExpertStatistic.create(self.dist.rank)
@@ -190,6 +195,7 @@ class PyTorchModelEngine(ModelEngine):
         self.input_processor_with_hash = create_input_processor_with_hash(
             self.input_processor)
         if model is None:
+            logger.warning(f"[PyTorchModelEngine.__init__] rank={self.mapping.rank} About to create ModelLoader")
             lora_config: Optional[
                 LoraConfig] = None if is_draft_model else llm_args.lora_config
             # Keep the model_loader to support reloading the model weights later
@@ -202,8 +208,10 @@ class PyTorchModelEngine(ModelEngine):
                 max_seq_len=self.max_seq_len,
                 lora_config=lora_config,
             )
+            logger.warning(f"[PyTorchModelEngine.__init__] rank={self.mapping.rank} ModelLoader created, about to call model_loader.load()")
             self.model, moe_load_balancer = self.model_loader.load(
                 checkpoint_dir=model_path, checkpoint_loader=checkpoint_loader)
+            logger.warning(f"[PyTorchModelEngine.__init__] rank={self.mapping.rank} model_loader.load() completed")
             if isinstance(moe_load_balancer, MoeLoadBalancer):
                 setattr(self, "moe_load_balancer", moe_load_balancer)
         else:

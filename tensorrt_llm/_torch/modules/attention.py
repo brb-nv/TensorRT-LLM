@@ -1130,12 +1130,23 @@ class MLA(nn.Module):
                           k: torch.Tensor, v: torch.Tensor,
                           position_ids: Optional[torch.Tensor],
                           attn_metadata: AttentionMetadata, **kwargs):
+        layer_idx = getattr(self, 'layer_idx', None)
+        rank = self.mapping.rank if self.mapping else "?"
+        should_log = layer_idx is not None and layer_idx < 3
+        
         if self.mapping.has_cp_helix():
+            if should_log:
+                logger.warning(f"[_attn_forward_gen] rank={rank} layer={layer_idx} Has CP Helix, use_nccl={self.mapping.cp_config.get('use_nccl_for_alltoall', True)}")
+            
             # partial_o: [num_tokens, num_heads_tp * kv_lora_rank]
             # softmax_stats: [num_tokens, num_heads_tp, 2]
             softmax_stats = torch.empty((q.shape[0], self.num_heads_tp, 2),
                                         device=q.device,
                                         dtype=torch.float32)
+            
+            if should_log:
+                logger.warning(f"[_attn_forward_gen] rank={rank} layer={layer_idx} About to call attn_backend.forward")
+            
             partial_o = attn_backend.forward(
                 q,
                 k,
@@ -1144,12 +1155,17 @@ class MLA(nn.Module):
                 softmax_stats_tensor=softmax_stats,
                 **kwargs,
             )
+            
+            if should_log:
+                logger.warning(f"[_attn_forward_gen] rank={rank} layer={layer_idx} attn_backend.forward completed")
+            
             kv_lora_rank = partial_o.shape[-1] // self.num_heads_tp
             assert self.kv_lora_rank == kv_lora_rank
 
             # Switch between NCCL-based and FIFO-based (MNNVL) all-to-all based on cp_config.
             if self.mapping.cp_config.get("use_nccl_for_alltoall", True):
-                assert False, "Expected to use MNNVL-based all-to-all."
+                if should_log:
+                    logger.warning(f"[_attn_forward_gen] rank={rank} layer={layer_idx} Using NCCL alltoall_helix")
                 # NCCL-based implementation using alltoall_helix.
                 # This is the post-processing of helix parallel attention,
                 # similar to the post-processing of ring attention.
@@ -1160,7 +1176,15 @@ class MLA(nn.Module):
                     t = t.transpose(1, 0).contiguous()
                     chunks.extend(
                         torch.split(t, t.shape[0] // self.mapping.cp_size))
+                
+                if should_log:
+                    logger.warning(f"[_attn_forward_gen] rank={rank} layer={layer_idx} About to call alltoall_helix")
+                
                 gathered = alltoall_helix(chunks, self.mapping.cp_group)
+                
+                if should_log:
+                    logger.warning(f"[_attn_forward_gen] rank={rank} layer={layer_idx} alltoall_helix completed")
+                
                 # Transpose the tensors back to ensure dimensions are ordered correctly.
                 # Note: an additional dimension was added at the first index for all-to-all,
                 # so the transpose dimensions are shifted by 1.
@@ -1168,9 +1192,18 @@ class MLA(nn.Module):
                 return torch.ops.trtllm.helix_post_process(
                     gathered[0], gathered[1], 1.0)
             else:
+                if should_log:
+                    logger.warning(f"[_attn_forward_gen] rank={rank} layer={layer_idx} Using FIFO-based MNNVL alltoall")
                 # FIFO-based implementation using MNNVL workspace and LL128 Proto.
                 # Get or create Helix All-to-All instance.
+                
+                if should_log:
+                    logger.warning(f"[_attn_forward_gen] rank={rank} layer={layer_idx} About to call HelixAllToAllNative.get")
+                
                 helix = HelixAllToAllNative.get(self.mapping)
+                
+                if should_log:
+                    logger.warning(f"[_attn_forward_gen] rank={rank} layer={layer_idx} HelixAllToAllNative.get completed")
 
                 # Get dimensions.
                 num_tokens = partial_o.shape[0]
@@ -1188,9 +1221,15 @@ class MLA(nn.Module):
                                                    2).transpose(1,
                                                                 2).contiguous()
 
+                if should_log:
+                    logger.warning(f"[_attn_forward_gen] rank={rank} layer={layer_idx} About to call helix.alltoall_native")
+                
                 # Call FIFO-based helixAllToAll.
                 partial_o_out, softmax_stats_out = helix.alltoall_native(
                     partial_o, softmax_stats)
+                
+                if should_log:
+                    logger.warning(f"[_attn_forward_gen] rank={rank} layer={layer_idx} helix.alltoall_native completed")
 
                 # partial_o_out: [num_tokens, num_heads_tp_cp, cp_size, kv_lora_rank]
                 # softmax_stats_out: [num_tokens, num_heads_tp_cp, cp_size, 2]
@@ -1200,7 +1239,11 @@ class MLA(nn.Module):
                 return torch.ops.trtllm.helix_post_process_native(
                     partial_o_out, softmax_stats_out, 1.0, 2)
         else:
+            if should_log:
+                logger.warning(f"[_attn_forward_gen] rank={rank} layer={layer_idx} No CP Helix, calling attn_backend.forward directly")
             attn_output = attn_backend.forward(q, k, v, attn_metadata, **kwargs)
+            if should_log:
+                logger.warning(f"[_attn_forward_gen] rank={rank} layer={layer_idx} attn_backend.forward completed")
             return attn_output
 
     def create_output(self, hidden_states: torch.Tensor, num_contexts: int):
@@ -2227,9 +2270,20 @@ class MLA(nn.Module):
         all_reduce_params: Optional[AllReduceParams] = None,
         latent_cache_gen: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        # Only log for first few layers to avoid log spam
+        layer_idx = getattr(self, 'layer_idx', None)
+        rank = self.mapping.rank if hasattr(self, 'mapping') and self.mapping else "?"
+        should_log = layer_idx is not None and layer_idx < 3
+        
+        if should_log:
+            logger.warning(f"[MLA.forward] rank={rank} layer={layer_idx} Starting, is_dsa={self.is_dsa}, register_to_config={self.register_to_config}")
 
         attn_output = self.create_output(hidden_states,
                                          attn_metadata.num_contexts)
+        
+        if should_log:
+            logger.warning(f"[MLA.forward] rank={rank} layer={layer_idx} After create_output, about to call attention impl")
+        
         if self.is_dsa:
             self.forward_impl_with_dsa(position_ids,
                                        hidden_states,
@@ -2247,6 +2301,9 @@ class MLA(nn.Module):
                               output=attn_output,
                               latent_cache_gen=latent_cache_gen)
 
+        if should_log:
+            logger.warning(f"[MLA.forward] rank={rank} layer={layer_idx} After attention impl, checking helix")
+
         if self.enable_helix_test and self.mapping.has_cp_helix():
             # note: for allowing testing Helix parallelism, we ensure that
             # the output is compatible with o_proj even in the context phase,
@@ -2254,8 +2311,15 @@ class MLA(nn.Module):
             attn_output = attn_output[:, :self.num_heads_tp_cp *
                                       self.v_head_dim].contiguous()
 
+        if should_log:
+            logger.warning(f"[MLA.forward] rank={rank} layer={layer_idx} About to call o_proj with all_reduce")
+        
         attn_output = self.o_proj(attn_output,
                                   all_reduce_params=all_reduce_params)
+        
+        if should_log:
+            logger.warning(f"[MLA.forward] rank={rank} layer={layer_idx} Completed")
+        
         return attn_output
 
     def resmooth_parameters(self,
