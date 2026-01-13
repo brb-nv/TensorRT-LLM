@@ -911,27 +911,14 @@ class PPCommTorch:
 _pp_comm = None
 
 
-def get_pp_comm_mapping():
-    """Get the mapping from the initialized PPComm."""
-    global _pp_comm
-    if _pp_comm is not None:
-        return _pp_comm.mapping
-    return None
-
-
 def init_pp_comm(mapping):
     """Initialize PPComm once at startup"""
     global _pp_comm
-    logger.warning(f"[init_pp_comm] rank={mapping.rank} Starting, mpi_disabled={mpi_disabled()}")
     if mpi_disabled():
-        logger.warning(f"[init_pp_comm] rank={mapping.rank} Creating PPCommTorch")
         _pp_comm = PPCommTorch(mapping)
     else:
-        logger.warning(f"[init_pp_comm] rank={mapping.rank} Creating PPCommNCCL")
         _pp_comm = PPCommNCCL(mapping)
-    logger.warning(f"[init_pp_comm] rank={mapping.rank} PPComm created, about to call init_helix_cp_comm")
     init_helix_cp_comm(mapping)
-    logger.warning(f"[init_pp_comm] rank={mapping.rank} init_helix_cp_comm completed")
 
 
 @TorchDist.log_op

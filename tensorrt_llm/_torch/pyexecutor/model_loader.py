@@ -227,21 +227,17 @@ class ModelLoader:
         Returns:
             The loaded and initialized PyTorch model.
         """
-        logger.warning(f"[ModelLoader.load] rank={self.mapping.rank} Starting load, checkpoint_dir={checkpoint_dir}")
         config = self._load_and_validate_config(checkpoint_dir,
                                                 checkpoint_loader)
-        logger.warning(f"[ModelLoader.load] rank={self.mapping.rank} Config validated")
         load_format = self.llm_args.load_format
 
         with timing("Model init total"), maybe_create_moe_load_balancer(
                 config, self.mapping) as moe_load_balancer:
-            logger.warning(f"[ModelLoader.load] rank={self.mapping.rank} Inside timing context, about to create model from config")
             try:
                 # config will be modified in-place for some models, like Qwen2
                 config_copy = copy.deepcopy(config)
                 with MetaInitMode():
                     model = AutoModelForCausalLM.from_config(config_copy)
-                logger.warning(f"[ModelLoader.load] rank={self.mapping.rank} Model created from config (meta mode)")
 
                 memo = dict()
 
@@ -254,7 +250,6 @@ class ModelLoader:
 
                 model._apply(init_meta_tensor)
                 config = config_copy
-                logger.warning(f"[ModelLoader.load] rank={self.mapping.rank} Meta tensors initialized")
 
             except Exception:
                 logger.info(
@@ -262,29 +257,23 @@ class ModelLoader:
                 )
                 model = AutoModelForCausalLM.from_config(config)
 
-            logger.warning(f"[ModelLoader.load] rank={self.mapping.rank} About to move model to CUDA")
             model.to("cuda")
-            logger.warning(f"[ModelLoader.load] rank={self.mapping.rank} Model moved to CUDA")
             rank_model_storage = get_rank_model_storage(model)
             logger.info(
                 f"Use {rank_model_storage / (1024**3):.2f} GB for model weights."
             )
             if load_format == LoadFormat.AUTO:
-                logger.warning(f"[ModelLoader.load] rank={self.mapping.rank} LoadFormat.AUTO: About to load weights from checkpoint")
                 if hasattr(model, 'llm_checkpoint_dir'):
                     weights = checkpoint_loader.load_weights(
                         model.llm_checkpoint_dir, mapping=self.mapping)
                 else:
                     weights = checkpoint_loader.load_weights(
                         checkpoint_dir, mapping=self.mapping)
-                logger.warning(f"[ModelLoader.load] rank={self.mapping.rank} Weights loaded from checkpoint")
 
                 self.weight_mapper = checkpoint_loader.get_initialized_weight_mapper(
                     model, config)
-                logger.warning(f"[ModelLoader.load] rank={self.mapping.rank} About to call model.load_weights")
                 self._call_load_weights(model.load_weights, weights,
                                         self.weight_mapper)
-                logger.warning(f"[ModelLoader.load] rank={self.mapping.rank} model.load_weights completed")
 
                 if self.spec_config is not None and self.spec_config.spec_dec_mode.need_load_draft_weights(
                 ):
@@ -320,12 +309,10 @@ class ModelLoader:
                 raise NotImplementedError(
                     f"No load support for load format: {load_format}")
 
-            logger.warning(f"[ModelLoader.load] rank={self.mapping.rank} About to call post_load_weights on modules")
             for module in model.modules():
                 if hasattr(module, 'post_load_weights') and not getattr(
                         module, '_weights_removed', False):
                     module.post_load_weights()
-            logger.warning(f"[ModelLoader.load] rank={self.mapping.rank} post_load_weights completed")
 
             if isinstance(moe_load_balancer, MoeLoadBalancer):
                 moe_load_balancer.register_weight_slots_after_to_cuda()
@@ -333,11 +320,8 @@ class ModelLoader:
                 moe_load_balancer.finalize_model()
                 logger.info("moe_load_balancer finalize model done")
 
-            logger.warning(f"[ModelLoader.load] rank={self.mapping.rank} About to synchronize CUDA stream")
             torch.cuda.current_stream().synchronize()
-            logger.warning(f"[ModelLoader.load] rank={self.mapping.rank} CUDA stream synchronized")
 
-        logger.warning(f"[ModelLoader.load] rank={self.mapping.rank} Model loading complete, returning")
         return model, moe_load_balancer
 
     def reload(self,

@@ -882,39 +882,30 @@ class PyExecutor:
 
     def _pp_schedule_and_propagate(self):
         """The first PP rank schedules the requests and propagates the result to all other PP ranks."""
-        logger.warning(f"[PP{self.dist.pp_rank}] iter={self.iter_counter} _pp_schedule_and_propagate: Starting, is_first_pp_rank={self.dist.is_first_pp_rank}")
 
         # The first PP rank schedules the requests, other ranks receive the schedule result from the previous PP rank.
         if self.dist.is_first_pp_rank:
-            logger.warning(f"[PP{self.dist.pp_rank}] iter={self.iter_counter} _pp_schedule_and_propagate: First PP rank, scheduling requests")
             scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs = self._schedule(
             )
             serializable_schedule = SerializableSchedulerOutput.from_scheduler_result(
                 scheduled_batch, fitting_disagg_gen_init_requests,
                 num_fitting_reqs)
-            logger.warning(f"[PP{self.dist.pp_rank}] iter={self.iter_counter} _pp_schedule_and_propagate: First PP rank, scheduling completed")
         else:
-            logger.warning(f"[PP{self.dist.pp_rank}] iter={self.iter_counter} _pp_schedule_and_propagate: About to recv_schedule from PP{self.dist.prev_pp_rank}")
             with nvtx_range("recv_schedule_from_prev_pp"):
                 serializable_schedule = self.dist.recv_object(
                     self.dist.prev_pp_rank, PP_COMM_TAG_SCHEDULE_RESULT)
-            logger.warning(f"[PP{self.dist.pp_rank}] iter={self.iter_counter} _pp_schedule_and_propagate: Received schedule from PP{self.dist.prev_pp_rank}")
             scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs = serializable_schedule.to_scheduler_result(
                 self.active_requests)
 
         # Propagate the schedule result to the next PP rank except the last PP rank.
         if not self.dist.is_last_pp_rank:
             if self.send_schedule_handler is not None:
-                logger.warning(f"[PP{self.dist.pp_rank}] iter={self.iter_counter} _pp_schedule_and_propagate: Waiting for previous send_schedule_handler")
                 with nvtx_range("wait_send_schedule_handler"):
                     self.send_schedule_handler.wait()
-            logger.warning(f"[PP{self.dist.pp_rank}] iter={self.iter_counter} _pp_schedule_and_propagate: About to isend_schedule to PP{self.dist.next_pp_rank}")
             with nvtx_range("send_schedule_to_next_pp"):
                 self.send_schedule_handler = self.dist.isend_object(
                     serializable_schedule, self.dist.next_pp_rank,
                     PP_COMM_TAG_SCHEDULE_RESULT)
-            logger.warning(f"[PP{self.dist.pp_rank}] iter={self.iter_counter} _pp_schedule_and_propagate: Completed isend_schedule to PP{self.dist.next_pp_rank}")
-        logger.warning(f"[PP{self.dist.pp_rank}] iter={self.iter_counter} _pp_schedule_and_propagate: Completed, batch_size={scheduled_batch.batch_size}, num_fitting_reqs={num_fitting_reqs}")
         return scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs
 
     def _pp_retry_until_can_schedule(self, scheduled_batch):
@@ -924,10 +915,8 @@ class PyExecutor:
         2. Terminate requests that have finished context cache transmission.
         3. Check if current rank has enough KV cache resources to run the scheduled batch.
         """
-        logger.warning(f"[PP{self.dist.pp_rank}] iter={self.iter_counter} _pp_retry_until_can_schedule: Starting, batch_size={scheduled_batch.batch_size}")
         scheduled_batch_requests = scheduled_batch.all_requests()
         if self.scheduler.can_schedule(scheduled_batch_requests):
-            logger.warning(f"[PP{self.dist.pp_rank}] iter={self.iter_counter} _pp_retry_until_can_schedule: Can schedule immediately, returning")
             return
 
         logger.warning(
@@ -948,10 +937,9 @@ class PyExecutor:
 
         for retry_count in range(self.pp_scheduler_max_retry_count):
             if self.scheduler.can_schedule(scheduled_batch_requests):
-                logger.warning(f"[PP{self.dist.pp_rank}] iter={self.iter_counter} _pp_retry_until_can_schedule: Can schedule after {retry_count} retries")
                 break
-            logger.warning(
-                f"[PP{self.dist.pp_rank}] iter={self.iter_counter} _pp_retry_until_can_schedule: Retrying ({retry_count + 1}/{self.pp_scheduler_max_retry_count})"
+            logger.debug(
+                f"Retrying to run first PP's schedule result ({retry_count + 1}/{self.pp_scheduler_max_retry_count})"
             )
 
             # Let cache transceiver finish at least one cache transmission and release requests' KV cache resources
@@ -1126,31 +1114,25 @@ class PyExecutor:
                     sample_state = previous_batch.sample_state
                     if not self.dist.is_last_pp_rank:
                         # Receive tokens from previous pp rank (w.r.t model forward direction)
-                        logger.warning(f"[PP{self.dist.pp_rank}] iter={self.iter_counter} Stage2: About to recv_sample_state from PP{self.dist.prev_pp_rank}, tag={tag}, microbatch={prev_microbatch_id}")
                         with nvtx_range("recv_sample_state"):
                             sample_state.host = self.dist.recv_object(
                                 src=self.dist.prev_pp_rank,
                                 tag=tag,
                             )
-                        logger.warning(f"[PP{self.dist.pp_rank}] iter={self.iter_counter} Stage2: Completed recv_sample_state from PP{self.dist.prev_pp_rank}, tag={tag}")
 
                     # Send tokens to next pp rank (w.r.t model forward direction)
                     # Second last rank does not need to since last rank has original decoded tokens
                     if not self.dist.is_second_last_pp_rank:
-                        logger.warning(f"[PP{self.dist.pp_rank}] iter={self.iter_counter} Stage2: Calling wait_on_pp_send_handles for microbatch={prev_microbatch_id}")
                         self.wait_on_pp_send_handles(prev_microbatch_id)
-                        logger.warning(f"[PP{self.dist.pp_rank}] iter={self.iter_counter} Stage2: About to isend_sample_state to PP{self.dist.next_pp_rank}, tag={tag}")
                         with nvtx_range("send_sample_state"):
                             self.send_handles[
                                 prev_microbatch_id] = self.dist.isend_object(
                                     sample_state.host,
                                     dest=self.dist.next_pp_rank,
                                     tag=tag)
-                        logger.warning(f"[PP{self.dist.pp_rank}] iter={self.iter_counter} Stage2: Completed isend_sample_state to PP{self.dist.next_pp_rank}")
 
                 # Stage 3: Finalize previous batch that finished sample state communication
                 # In last pp rank, stage 2 and 3 process different previous batches
-                logger.warning(f"[PP{self.dist.pp_rank}] iter={self.iter_counter} Stage3: Starting, microbatch={microbatch_id}")
                 prev_microbatch_id = (microbatch_id +
                                       1) % self.num_micro_batches
                 previous_batch = self.micro_batches[prev_microbatch_id]
@@ -1193,10 +1175,8 @@ class PyExecutor:
 
                         self._remove_inflight_ids(previous_batch)
 
-                    logger.warning(f"[PP{self.dist.pp_rank}] iter={self.iter_counter} Stage3: Calling final wait_on_pp_send_handles for microbatch={prev_microbatch_id}")
                     self.wait_on_pp_send_handles(prev_microbatch_id)
                     self.micro_batches[prev_microbatch_id] = None
-                    logger.warning(f"[PP{self.dist.pp_rank}] iter={self.iter_counter} Stage3: Completed finalization for microbatch={prev_microbatch_id}")
 
                 if self.kv_cache_transceiver and self.ctx_in_transmission_requests:
                     self._check_kv_transfer_timeout()
@@ -1220,14 +1200,11 @@ class PyExecutor:
 
     @nvtx_range("wait_on_pp_send_handles")
     def wait_on_pp_send_handles(self, microbatch_id):
-        logger.warning(f"[PP{self.dist.pp_rank}] iter={self.iter_counter} wait_on_pp_send_handles: Starting, microbatch_id={microbatch_id}, has_handle={self.send_handles[microbatch_id] is not None}")
         if self.send_handles[microbatch_id] is not None:
             self.send_handles[microbatch_id].wait()
             self.send_handles[microbatch_id] = None
-        logger.warning(f"[PP{self.dist.pp_rank}] iter={self.iter_counter} wait_on_pp_send_handles: Completed, microbatch_id={microbatch_id}")
 
     def _can_queue(self, scheduled_batch):
-        logger.warning(f"[PP{self.dist.pp_rank}] iter={self.iter_counter} _can_queue: Starting, batch_size={scheduled_batch.batch_size}, enable_attention_dp={self.enable_attention_dp}")
 
         if self.enable_attention_dp:
             tp_batch_sizes = self.dist.tp_cp_allgather(
@@ -1236,7 +1213,6 @@ class PyExecutor:
         else:
             can_queue = scheduled_batch.batch_size > 0
 
-        logger.warning(f"[PP{self.dist.pp_rank}] iter={self.iter_counter} _can_queue: Completed, can_queue={can_queue}")
         return can_queue
 
     def _prepare_and_schedule_batch(self):
@@ -1510,7 +1486,6 @@ class PyExecutor:
             self._handle_errors(error_msg)
 
     def _handle_control_request(self):
-        logger.warning(f"[PP{self.dist.pp_rank}] iter={self.iter_counter} _handle_control_request: Checking, active_reqs={len(self.active_requests)}, waiting_queue={self.executor_request_queue.get_waiting_queue_size()}, control_reqs={len(self.executor_request_queue.control_requests)}")
         if len(self.active_requests) == 0 and \
             self.executor_request_queue.get_waiting_queue_size() == 0 and \
             len(self.executor_request_queue.control_requests) > 0:
@@ -1521,10 +1496,8 @@ class PyExecutor:
             )
             self.executor_request_queue.control_requests.pop(0)
             self.control_request_barrier.set()
-            logger.warning(f"[PP{self.dist.pp_rank}] iter={self.iter_counter} _handle_control_request: Waiting for control action")
             self.control_action_done.wait()
             self.control_action_done.clear()
-            logger.warning(f"[PP{self.dist.pp_rank}] iter={self.iter_counter} _handle_control_request: Control action completed")
 
     @contextmanager
     def control_action(self):
@@ -1863,12 +1836,10 @@ class PyExecutor:
                                      self.previous_batch)
 
     def _forward_step_inter_pp(self, scheduled_batch) -> SampleState:
-        logger.warning(f"[PP{self.dist.pp_rank}] iter={self.iter_counter} _forward_step_inter_pp: Starting, ctx_reqs={len(scheduled_batch.context_requests)}, gen_reqs={len(scheduled_batch.generation_requests)}")
         self._forward_step(scheduled_batch)
         sampler_event = torch.cuda.Event()
         sampler_event.record()
         self._update_request_states(scheduled_batch)
-        logger.warning(f"[PP{self.dist.pp_rank}] iter={self.iter_counter} _forward_step_inter_pp: Completed")
         return self.sampler.SampleState(
             scheduled_requests=scheduled_batch,
             sampler_event=SamplerEvent(cuda_event=sampler_event),
@@ -1909,7 +1880,6 @@ class PyExecutor:
                 raise ValueError("Token ID out of range")
 
     def _fetch_and_activate_new_requests(self) -> List[LlmRequest]:
-        logger.warning(f"[PP{self.dist.pp_rank}] iter={self.iter_counter} _fetch_and_activate_new_requests: Starting, active_requests={len(self.active_requests)}")
 
         def _respond_if_invalid(request: LlmRequest) -> bool:
             """Immediately fail invalid request.
@@ -1936,7 +1906,6 @@ class PyExecutor:
         ]
 
         self.active_requests.extend(validated_requests)
-        logger.warning(f"[PP{self.dist.pp_rank}] iter={self.iter_counter} _fetch_and_activate_new_requests: Completed, new_requests={len(validated_requests)}, total_active={len(self.active_requests)}")
         return validated_requests
 
     def _add_kv_cache_events(self):
@@ -2050,7 +2019,6 @@ class PyExecutor:
 
     @nvtx_range("_check_disagg_gen_transfer_status")
     def _check_disagg_gen_transfer_status(self):
-        logger.warning(f"[PP{self.dist.pp_rank}] iter={self.iter_counter} _check_disagg_gen_transfer_status: Starting")
 
         need_check = any([
             req.is_disagg_generation_transmission_in_progress
@@ -2063,9 +2031,7 @@ class PyExecutor:
 
         if need_check:
             at_least_num = 1 if need_check_one else 0
-            logger.warning(f"[PP{self.dist.pp_rank}] iter={self.iter_counter} _check_disagg_gen_transfer_status: Calling check with at_least_num={at_least_num}")
             self._check_disagg_gen_cache_transfer_status(at_least_num)
-        logger.warning(f"[PP{self.dist.pp_rank}] iter={self.iter_counter} _check_disagg_gen_transfer_status: Completed, need_check={need_check}")
 
         return
 
@@ -2102,7 +2068,6 @@ class PyExecutor:
         """
         Pad with a generation dummy request, if required, to ensure every attention_dp rank has at least one active request.
         """
-        logger.warning(f"[PP{self.dist.pp_rank}] iter={self.iter_counter} _pad_attention_dp_dummy_request: Starting, enable_attention_dp={self.enable_attention_dp}")
         if not self.enable_attention_dp:
             return
 
@@ -2129,11 +2094,9 @@ class PyExecutor:
             if spec_resource_manager is not None:
                 spec_resource_manager.add_dummy_requests([0])
             self.active_requests.append(llm_request)
-            logger.warning(f"[PP{self.dist.pp_rank}] iter={self.iter_counter} _pad_attention_dp_dummy_request: Added dummy request")
 
     @nvtx_range("_prepare_disagg_gen_init")
     def _prepare_disagg_gen_init(self, fitting_disagg_gen_init_requests):
-        logger.warning(f"[PP{self.dist.pp_rank}] iter={self.iter_counter} _prepare_disagg_gen_init: Starting, num_requests={len(fitting_disagg_gen_init_requests) if fitting_disagg_gen_init_requests else 0}")
         if fitting_disagg_gen_init_requests:
             disagg_gen_init_to_prepare = ScheduledRequests()
             disagg_gen_init_to_prepare.context_requests = fitting_disagg_gen_init_requests
@@ -2156,7 +2119,6 @@ class PyExecutor:
 
     @nvtx_range("_prepare_disagg_gen_transmission_complete")
     def _prepare_disagg_gen_transmission_complete(self, scheduled_batch):
-        logger.warning(f"[PP{self.dist.pp_rank}] iter={self.iter_counter} _prepare_disagg_gen_transmission_complete: Starting")
         cache_trans_complete_requests = []
         for req in scheduled_batch.generation_requests:
             if req.is_disagg_generation_transmission_complete:
@@ -2182,7 +2144,6 @@ class PyExecutor:
                 beam_width = req.sampling_config.beam_width
                 for beam in range(0, beam_width):
                     req.add_new_token(first_gen_tokens[beam], beam)
-        logger.warning(f"[PP{self.dist.pp_rank}] iter={self.iter_counter} _prepare_disagg_gen_transmission_complete: Completed, cache_trans_complete_reqs={len(cache_trans_complete_requests)}")
 
     @nvtx_range("_recv_disagg_gen_cache")
     def _recv_disagg_gen_cache(self, new_gen_reqs):
@@ -2215,7 +2176,6 @@ class PyExecutor:
 
     @nvtx_range("_send_disagg_ctx_cache")
     def _send_disagg_ctx_cache(self, scheduled_ctx_requests):
-        logger.warning(f"[PP{self.dist.pp_rank}] iter={self.iter_counter} _send_disagg_ctx_cache: Starting, num_ctx_reqs={len(scheduled_ctx_requests) if scheduled_ctx_requests else 0}")
         if (scheduled_ctx_requests is None or len(scheduled_ctx_requests) == 0):
             return []
         for req in scheduled_ctx_requests:
@@ -2242,7 +2202,6 @@ class PyExecutor:
             for req in ctx_transmission_reqs:
                 req.py_kv_transfer_start_time = time.time()
 
-        logger.warning(f"[PP{self.dist.pp_rank}] iter={self.iter_counter} _send_disagg_ctx_cache: Completed, ctx_transmission_reqs={len(ctx_transmission_reqs)}")
         return ctx_transmission_reqs
 
     def _get_disagg_reqs_in_error_state(self):
@@ -2261,10 +2220,8 @@ class PyExecutor:
 
     @nvtx_range("_check_disagg_ctx_cache_transfer_status")
     def _check_disagg_ctx_cache_transfer_status(self, atLeastNum: int = 0):
-        logger.warning(f"[PP{self.dist.pp_rank}] iter={self.iter_counter} _check_disagg_ctx_cache_transfer_status: Starting, atLeastNum={atLeastNum}")
         self.kv_cache_transceiver.check_context_transfer_status(atLeastNum)
         self._check_cache_transfer_errors("context requests")
-        logger.warning(f"[PP{self.dist.pp_rank}] iter={self.iter_counter} _check_disagg_ctx_cache_transfer_status: Completed")
 
     @nvtx_range("_check_disagg_gen_cache_transfer_status")
     def _check_disagg_gen_cache_transfer_status(self, atLeastNum: int = 0):
@@ -2276,7 +2233,6 @@ class PyExecutor:
             scheduled_requests,
             new_tensors_device: Optional[SampleStateTensors] = None,
             num_accepted_tokens_device: Optional[torch.Tensor] = None):
-        logger.warning(f"[PP{self.dist.pp_rank}] iter={self.iter_counter} _forward_step: Starting, ctx_reqs={len(scheduled_requests.context_requests)}, gen_reqs={len(scheduled_requests.generation_requests)}")
         ExpertStatistic.set_iter(self.iter_counter)
 
         @nvtx_range(
@@ -2314,7 +2270,6 @@ class PyExecutor:
 
             self._kv_connector_wait_for_save()
 
-            logger.warning(f"[PP{self.dist.pp_rank}] iter={self.iter_counter} _forward_step: Completed successfully")
             return outputs
         except Exception as e:
             traceback.print_exc()
@@ -2368,7 +2323,6 @@ class PyExecutor:
 
     @nvtx_range("_update_request_states")
     def _update_request_states(self, scheduled_requests: ScheduledRequests):
-        logger.warning(f"[PP{self.dist.pp_rank}] iter={self.iter_counter} _update_request_states: Starting")
         cp_config = self.dist.cp_config
         if 'cp_type' in cp_config:
             cp_type = cp_config['cp_type']
@@ -2385,7 +2339,6 @@ class PyExecutor:
     @nvtx_range("_sample_async")
     def _sample_async(self, scheduled_batch,
                       batch_outputs) -> SampleState | None:
-        logger.warning(f"[PP{self.dist.pp_rank}] iter={self.iter_counter} _sample_async: Starting, ctx_reqs={len(scheduled_batch.context_requests)}, gen_reqs={len(scheduled_batch.generation_requests)}")
         try:
             if batch_outputs is not None:
                 num_context_logits_prefix_sum = [0]
@@ -2411,10 +2364,8 @@ class PyExecutor:
                                           batch_outputs, beam_width,
                                           num_context_tokens)
 
-                result = self.sampler.sample_async(scheduled_batch, batch_outputs,
+                return self.sampler.sample_async(scheduled_batch, batch_outputs,
                                                  num_context_logits_prefix_sum)
-                logger.warning(f"[PP{self.dist.pp_rank}] iter={self.iter_counter} _sample_async: Completed successfully")
-                return result
         except Exception as e:
             traceback.print_exc()
             error_msg = str(e)
@@ -2435,10 +2386,8 @@ class PyExecutor:
     def _update_requests(self,
                          sample_state: SampleState,
                          resource_manager: Optional[ResourceManager] = None):
-        logger.warning(f"[PP{self.dist.pp_rank}] iter={self.iter_counter} _update_requests: Starting")
         try:
             self.sampler.update_requests(sample_state, resource_manager)
-            logger.warning(f"[PP{self.dist.pp_rank}] iter={self.iter_counter} _update_requests: Completed")
         except Exception as e:
             traceback.print_exc()
             error_msg = str(e)
@@ -2523,7 +2472,6 @@ class PyExecutor:
 
     @nvtx_range("_handle_canceled_requests")
     def _handle_canceled_requests(self):
-        logger.warning(f"[PP{self.dist.pp_rank}] iter={self.iter_counter} _handle_canceled_requests: Starting, canceled_size={self.executor_request_queue.get_canceled_req_ids_size()}")
         if self.executor_request_queue.get_canceled_req_ids_size() == 0:
             return
 
@@ -2592,7 +2540,6 @@ class PyExecutor:
 
     @nvtx_range("_handle_first_token_response")
     def _handle_first_token_response(self, scheduled_batch):
-        logger.warning(f"[PP{self.dist.pp_rank}] iter={self.iter_counter} _handle_first_token_response: Starting")
         new_responses = []
         for req in scheduled_batch.generation_requests:
             if req.py_decoding_iter == 1:
@@ -2602,12 +2549,10 @@ class PyExecutor:
                 response = req.create_response(False, self.dist.rank)
                 new_responses.append((req.py_request_id, response))
 
-        logger.warning(f"[PP{self.dist.pp_rank}] iter={self.iter_counter} _handle_first_token_response: Completed, new_responses={len(new_responses)}")
         self._enqueue_responses(new_responses)
 
     @nvtx_range("_handle_responses")
     def _handle_responses(self):
-        logger.warning(f"[PP{self.dist.pp_rank}] iter={self.iter_counter} _handle_responses: Starting, active_requests={len(self.active_requests)}")
         new_responses = []
         requests_to_terminate = []
         new_active_requests = []
@@ -2701,12 +2646,10 @@ class PyExecutor:
         self._enqueue_responses(new_responses)
         for request in requests_to_terminate:
             self._terminate_request(request)
-        logger.warning(f"[PP{self.dist.pp_rank}] iter={self.iter_counter} _handle_responses: Completed, finished_reqs={len(requests_to_terminate)}, new_active={len(new_active_requests)}")
         return requests_to_terminate
 
     @nvtx_range("_terminate_disagg_ctx_finished_requests")
     def _terminate_disagg_ctx_finished_requests(self):
-        logger.warning(f"[PP{self.dist.pp_rank}] iter={self.iter_counter} _terminate_disagg_ctx_finished_requests: Starting, ctx_in_transmission={len(self.ctx_in_transmission_requests)}")
         # make a copy of the keys, since we are modifying the dictionary in the loop
         in_transmission_requests_id = list(
             self.ctx_in_transmission_requests.keys())
@@ -2733,7 +2676,6 @@ class PyExecutor:
                                                                       block_id,
                                                                       counter -
                                                                       1))
-        logger.warning(f"[PP{self.dist.pp_rank}] iter={self.iter_counter} _terminate_disagg_ctx_finished_requests: Completed")
 
     def _handle_logits_communication(self, previous_batch, prev_microbatch_id):
         """Handle logits communication between pipeline parallel ranks.
@@ -2745,7 +2687,6 @@ class PyExecutor:
             previous_batch: The previous batch state
             prev_microbatch_id: The microbatch ID for the previous batch
         """
-        logger.warning(f"[PP{self.dist.pp_rank}] iter={self.iter_counter} _handle_logits_communication: Starting, microbatch_id={prev_microbatch_id}")
         # NOTE: If the rank processing the logits ever becomes the same as
         # the rank sending the responses, this code can be removed.
         finished_reqs = [
@@ -2817,7 +2758,6 @@ class PyExecutor:
         are inserted into the inflight set and collected into finished_ctx_reqs.
         All generation requests are still inserted into the inflight set.
         """
-        logger.warning(f"[PP{self.dist.pp_rank}] iter={self.iter_counter} _add_inflight_ids: Starting, ctx_reqs={len(scheduled_requests.context_requests)}, gen_reqs={len(scheduled_requests.generation_requests)}")
         finished_ctx_reqs = []
         for req in scheduled_requests.context_requests:
             if req.is_last_context_chunk:
@@ -2831,7 +2771,6 @@ class PyExecutor:
                 f"Generation request with ID {req.request_id} added to DECODER model inflight set"
             )
             self.inflight_req_ids.insert(req.request_id)
-        logger.warning(f"[PP{self.dist.pp_rank}] iter={self.iter_counter} _add_inflight_ids: Completed, finished_ctx_reqs={len(finished_ctx_reqs)}")
         return finished_ctx_reqs
 
     def _remove_inflight_ids(self, batch_state: BatchStatePP):
@@ -2840,7 +2779,6 @@ class PyExecutor:
         Context IDs are erased from the inflight set using batch_state.finished_ctx_reqs.
         Generation IDs are erased using batch_state.sample_state.scheduled_requests.generation_requests.
         """
-        logger.warning(f"[PP{self.dist.pp_rank}] iter={self.iter_counter} _remove_inflight_ids: Starting")
         for req in batch_state.finished_ctx_reqs:
             logger.debug(
                 f"Context request with ID {req.request_id} removed from DECODER model inflight set"

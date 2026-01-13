@@ -174,17 +174,12 @@ def forward_after_recv(forward_fn):
         residual=...,
         **kwargs,
     ):
-        from tensorrt_llm._torch.distributed.communicator import get_pp_comm_mapping
-        mapping = get_pp_comm_mapping()
-        rank = mapping.rank if mapping else "?"
-        logger.warning(f"[PP_RECV] rank={rank} About to pp_recv_tensors, hidden_states.shape={hidden_states.shape}")
         if residual is not ...:
             if residual is None:
                 residual = torch.empty_like(hidden_states)
             pp_recv_tensors([hidden_states, residual])
         else:
             pp_recv_tensors([hidden_states])
-        logger.warning(f"[PP_RECV] rank={rank} pp_recv_tensors completed")
         return forward_fn(
             position_ids,
             hidden_states,
@@ -208,10 +203,6 @@ def forward_before_send(forward_fn):
         residual=...,
         **kwargs,
     ):
-        from tensorrt_llm._torch.distributed.communicator import get_pp_comm_mapping
-        mapping = get_pp_comm_mapping()
-        rank = mapping.rank if mapping else "?"
-        logger.warning(f"[PP_SEND] rank={rank} About to call forward_fn for layer before send")
         output = forward_fn(
             position_ids,
             hidden_states,
@@ -219,14 +210,12 @@ def forward_before_send(forward_fn):
             residual=residual,
             **kwargs,
         )
-        logger.warning(f"[PP_SEND] rank={rank} forward_fn completed, about to pp_send_tensors")
         if residual is not ...:
             hidden_states, residual = output
             pp_send_tensors([hidden_states, residual])
         else:
             hidden_states = output
             pp_send_tensors([hidden_states])
-        logger.warning(f"[PP_SEND] rank={rank} pp_send_tensors completed")
         return output
 
     forward_before_send_fn.__wrapped_by_forward_before_send__ = True
