@@ -230,6 +230,7 @@ def submit_job(config, log_dir, dry_run):
     ctx_worker_env_var = env_config.get('ctx_worker_env_var', '')
     gen_worker_env_var = env_config.get('gen_worker_env_var', '')
     server_env_var = env_config.get('server_env_var', '')
+
     if benchmark_config['mode'] == "gen_only_no_context":
         worker_env_var += " TRTLLM_DISAGG_BENCHMARK_GEN_ONLY=1"
         server_env_var += " TRTLLM_DISAGG_BENCHMARK_GEN_ONLY=1"
@@ -261,7 +262,11 @@ def submit_job(config, log_dir, dry_run):
     ucx_warmup_requests = 2 * ctx_world_size * \
         gen_world_size if benchmark_config['mode'] == "e2e" else 0
 
-    total_nodes = ctx_nodes + gen_nodes
+    mode = config['benchmark']['mode']
+    if mode == 'gen_only_no_context':
+        total_nodes = gen_nodes
+    else:
+        total_nodes = ctx_nodes + gen_nodes
     total_tasks = total_nodes * gpus_per_node
 
     # Generate log directory path based on configuration
@@ -286,19 +291,26 @@ def submit_job(config, log_dir, dry_run):
     if 'log_dir' in env_config and env_config['log_dir']:
         log_dir = env_config['log_dir']
     if log_dir is None:
-        log_base = os.path.join(script_dir, "logs")
+        # Create flat log directory path with timestamp including hours, minutes and seconds
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-        date_prefix = datetime.now().strftime("%Y%m%d-%H%M%S")
-        log_base = os.path.join(log_base, f"{date_prefix}/{isl}-{osl}")
+        # Get eplb num_slots for gen worker
+        load_balancer_config = worker_config['gen'].get('moe_config', {}).get(
+            'load_balancer', {})
+        if isinstance(load_balancer_config, str):
+            with open(load_balancer_config, 'r') as f:
+                load_balancer_config = yaml.safe_load(f)
+        eplb_num_slots = load_balancer_config.get('num_slots', 0)
 
-        # Determine directory suffix based on attention_dp
-        if gen_enable_attention_dp:
-            dir_suffix = f"disagg_ctx{ctx_num}_gen{gen_num}_dep{gen_tp_size}_batch{gen_batch_size}_eplb{eplb_num_slots}_mtp{mtp_size}"
-        else:
-            dir_suffix = f"disagg_ctx{ctx_num}_gen{gen_num}_tep{gen_tp_size}_batch{gen_batch_size}_eplb{eplb_num_slots}_mtp{mtp_size}"
+        gen_ep_size = worker_config['gen'].get('moe_expert_parallel_size', 1)
 
-        # Create full log directory path
-        log_dir = os.path.join(log_base, dir_suffix)
+        # Determine config suffix based on attention_dp
+        attn_dp_str = "_attnDP" if gen_enable_attention_dp else ""
+        config_suffix = f"ctx{ctx_num}_gen{gen_num}_tp{gen_tp_size}_pp{gen_pp_size}_ep{gen_ep_size}_cp{gen_cp_size}_batch{gen_batch_size}{attn_dp_str}"
+
+        # Create full log directory path as a single flat directory
+        log_dir = os.path.join(env_config['work_dir'],
+                               f"{timestamp}_{isl}-{osl}_{config_suffix}")
 
     # if trtllm_config.yaml exists, don't remove the directory, remove other files in the directory except trtllm_config.yaml
     # also don't remove concurrency_* folders
