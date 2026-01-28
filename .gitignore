@@ -75,6 +75,8 @@ ad-test-workspace/
 *.patch
 !cpp/tensorrt_llm/deep_ep/*.patch
 examples/disaggregated/slurm/benchmark/logs/
+examples/disaggregated/slurm/benchmark/20*/
+examples/disaggregated/slurm/benchmark/saved_configs/
 
 # Generated files
 cpp/include/tensorrt_llm/executor/version.h
