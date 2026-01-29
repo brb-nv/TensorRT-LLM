@@ -14,11 +14,11 @@ TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 CONFIGS_DIR="${WORK_DIR}/saved_configs/${TIMESTAMP}"
 
 # =============================================================================
-# DEFINE SPECIFIC COMBINATIONS - Modify this array as needed
+# HELIX COMBINATIONS - Helix-optimized parallelism with KV parallelism
 # Format: "num_gpus,batch_size,isl,osl,gen_pp,gen_tp,gen_cp,gen_moe_ep,attn_dp"
 # attn_dp: 0=false, 1=true
 # =============================================================================
-COMBINATIONS=(
+HELIX_COMBINATIONS=(
     # num_gpus, batch_size, isl, osl, gen_pp, gen_tp, gen_cp, gen_moe_ep, attn_dp
     # ck-1_ctp8tp8 (Attn DP=FALSE)
     "64,1,131072,8192,1,8,8,1,0"
@@ -55,6 +55,40 @@ COMBINATIONS=(
 )
 
 # =============================================================================
+# BASELINE COMBINATIONS - Traditional parallelism without Helix optimizations
+# Format: "num_gpus,batch_size,isl,osl,gen_pp,gen_tp,gen_cp,gen_moe_ep,attn_dp"
+# attn_dp: 0=false, 1=true
+# =============================================================================
+BASELINE_COMBINATIONS=(
+    # Pareto-optimal baseline points only (12 out of 22)
+    # Format: num_gpus, batch_size, isl, osl, gen_pp, gen_tp, gen_cp, gen_moe_ep, attn_dp
+    # ck-1_tp64 (Attn DP=FALSE)
+    "64,1,131072,8192,1,64,1,1,0"
+    # ck-2_tp32pp2 (Attn DP=FALSE)
+    "64,2,131072,8192,2,32,1,1,0"
+    # ck-4_tp16pp4 (Attn DP=FALSE)
+    "64,4,131072,8192,4,16,1,1,0"
+    # ck-8_tep8pp8 (Attn DP=FALSE)
+    "64,8,131072,8192,8,8,1,8,0"
+    # ck-16_tep4pp16 (Attn DP=FALSE)
+    "64,16,131072,8192,16,4,1,4,0"
+    # ck-32_tep4pp16 (Attn DP=FALSE)
+    "64,32,131072,8192,16,4,1,4,0"
+    # ck-1_ep64 (Attn DP=TRUE) globalBS=1*64=64
+    "64,64,131072,8192,1,64,1,64,1"
+    # ck-2_ep64 (Attn DP=TRUE) globalBS=2*64=128
+    "64,128,131072,8192,1,64,1,64,1"
+    # ck-4_ep64 (Attn DP=TRUE) globalBS=4*64=256
+    "64,256,131072,8192,1,64,1,64,1"
+    # ck-8_ep64 (Attn DP=TRUE) globalBS=8*64=512
+    "64,512,131072,8192,1,64,1,64,1"
+    # ck-16_ep64 (Attn DP=TRUE) globalBS=16*64=1024
+    "64,1024,131072,8192,1,64,1,64,1"
+    # ck-32_ep64 (Attn DP=TRUE) globalBS=32*64=2048
+    "64,2048,131072,8192,1,64,1,64,1"
+)
+
+# =============================================================================
 # Helper functions
 # =============================================================================
 
@@ -83,7 +117,7 @@ save_config() {
 
 # Function to determine moe_backend
 get_moe_backend() {
-    echo "CUTLASS"
+    echo "CUTEDSL"
 }
 
 # Function to generate pp_partition YAML block for 61 layers
@@ -123,6 +157,24 @@ update_config() {
     local max_seq_len=$((isl + osl + 512))  # buffer for special tokens
     local moe_backend=$(get_moe_backend "$ep")
     local attn_dp_bool=$( [ "$attn_dp" -eq 1 ] && echo "true" || echo "false" )
+    # Worker max_batch_size calculation:
+    # - max_batch_size in config = micro-batch size (per forward pass)
+    # - Runtime computes: max_num_sequences = max_batch_size * pp_size (total in-flight capacity)
+    # - With AttnDP: max_batch_size is per-rank, so micro-batch = batch_size / (tp * pp)
+    # - Without AttnDP: micro-batch = batch_size / pp
+    local worker_max_batch_size
+    local micro_batch_size
+    if [ "$attn_dp" -eq 1 ]; then
+        # With AttnDP: per-rank micro-batch = batch_size / (tp * pp)
+        # Runtime will compute max_num_sequences = micro_batch * pp = batch_size / tp (per-rank total)
+        worker_max_batch_size=$(( batch_size / (tp * pp) ))
+        micro_batch_size=$worker_max_batch_size
+    else
+        # Without AttnDP: micro-batch = batch_size / pp
+        # Runtime will compute max_num_sequences = micro_batch * pp = batch_size (total)
+        worker_max_batch_size=$(( batch_size / pp ))
+        micro_batch_size=$worker_max_batch_size
+    fi
 
     echo "=========================================="
     echo "Updating config with:"
@@ -131,6 +183,13 @@ update_config() {
     echo "  enable_attention_dp=$attn_dp_bool"
     echo "  concurrency=$concurrency, max_seq_len=$max_seq_len"
     echo "  moe_backend=$moe_backend (auto-selected for GB200 NVFP4)"
+    if [ "$attn_dp" -eq 1 ]; then
+        echo "  worker max_batch_size=$worker_max_batch_size (micro-batch = batch_size / (tp * pp) with AttnDP)"
+        echo "  max_num_sequences per rank=$(( worker_max_batch_size * pp )) (= batch_size / tp)"
+    else
+        echo "  worker max_batch_size=$worker_max_batch_size (micro-batch = batch_size / pp)"
+        echo "  max_num_sequences=$(( worker_max_batch_size * pp )) (= batch_size)"
+    fi
     if [ "$pp" -gt 1 ]; then
         local layers_per_rank=$(( (61 + pp - 1) / pp ))
         local last_rank_layers=$(( 61 - (pp - 1) * layers_per_rank ))
@@ -144,13 +203,14 @@ update_config() {
     sed -i "s/concurrency_list: \"[0-9]*\"/concurrency_list: \"$concurrency\"/" "$CONFIG_FILE"
 
     # Update gen worker config
+    # Note: max_batch_size is the micro-batch size; runtime computes max_num_sequences = max_batch_size * pp
     sed -i "/worker_config:/,/ctx:/ {
         s/tensor_parallel_size: [0-9]*/tensor_parallel_size: $tp/
         s/pipeline_parallel_size: [0-9]*/pipeline_parallel_size: $pp/
         s/moe_expert_parallel_size: [0-9]*/moe_expert_parallel_size: $ep/
         s/context_parallel_size: [0-9]*/context_parallel_size: $cp/
-        s/max_batch_size: [0-9]*/max_batch_size: $batch_size/
-        s/max_num_tokens: [0-9]*/max_num_tokens: $((batch_size * 32))/
+        s/max_batch_size: [0-9]*/max_batch_size: $worker_max_batch_size/
+        s/max_num_tokens: [0-9]*/max_num_tokens: $((worker_max_batch_size * 2))/
         s/max_seq_len: [0-9]*/max_seq_len: $max_seq_len/
     }" "$CONFIG_FILE"
 
@@ -166,9 +226,12 @@ update_config() {
         }
     }" "$CONFIG_FILE"
 
-    # Update cuda_graph_config.batch_sizes (multi-line YAML list format)
-    sed -i "/batch_sizes:$/,/^[^-]/ {
-        s/^\( *- \)[0-9][0-9]*/\1$batch_size/
+    # Update cuda_graph_config.max_batch_size with micro_batch_size
+    # With PP and/or AttnDP, each forward pass only sees micro_batch_size requests
+    sed -i "/^  gen:/,/^  ctx:/ {
+        /cuda_graph_config:/,/print_iter_log:/ {
+            s/max_batch_size: [0-9]*/max_batch_size: $micro_batch_size/
+        }
     }" "$CONFIG_FILE"
 
     # Handle pp_partition: remove existing and add new if pp > 1
@@ -207,6 +270,38 @@ submit_job() {
 # Main execution
 # =============================================================================
 
+# Parse command line arguments
+MODE="${1:-helix}"  # Default to helix if not specified
+
+usage() {
+    echo "Usage: $0 [helix|baseline]"
+    echo ""
+    echo "Options:"
+    echo "  helix     Run Helix-optimized combinations (default)"
+    echo "  baseline  Run baseline combinations (traditional parallelism)"
+    echo ""
+    exit 1
+}
+
+# Select the appropriate combinations array based on mode
+case "$MODE" in
+    helix)
+        COMBINATIONS=("${HELIX_COMBINATIONS[@]}")
+        MODE_DESC="Helix"
+        ;;
+    baseline)
+        COMBINATIONS=("${BASELINE_COMBINATIONS[@]}")
+        MODE_DESC="Baseline"
+        ;;
+    -h|--help)
+        usage
+        ;;
+    *)
+        echo "Error: Unknown mode '$MODE'"
+        usage
+        ;;
+esac
+
 # Navigate to work directory
 cd "$WORK_DIR"
 
@@ -215,7 +310,7 @@ total_combinations=${#COMBINATIONS[@]}
 current=0
 
 echo "============================================"
-echo "Starting benchmark with $total_combinations specific combinations"
+echo "Starting $MODE_DESC benchmark with $total_combinations combinations"
 echo "============================================"
 
 # Iterate through specific combinations
@@ -228,7 +323,7 @@ for combo in "${COMBINATIONS[@]}"; do
     attn_dp_str=$( [ "$attn_dp" -eq 1 ] && echo "true" || echo "false" )
     echo ""
     echo "============================================"
-    echo "Processing combination $current/$total_combinations"
+    echo "[$MODE_DESC] Processing combination $current/$total_combinations"
     echo "  Config: GPUs=$num_gpus, BS=$batch_size, ISL=$isl, OSL=$osl, PP=$gen_pp, TP=$gen_tp, CP=$gen_cp, EP=$gen_moe_ep, AttnDP=$attn_dp_str"
     echo "============================================"
 
@@ -247,6 +342,6 @@ done
 
 echo ""
 echo "============================================"
-echo "Benchmark complete! Submitted $total_combinations jobs"
+echo "$MODE_DESC benchmark complete! Submitted $total_combinations jobs"
 echo "Configs saved to: $CONFIGS_DIR"
 echo "============================================"

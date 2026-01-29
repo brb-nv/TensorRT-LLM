@@ -237,6 +237,9 @@ def submit_job(config, log_dir, dry_run):
     if benchmark_config['mode'] == "gen_only":
         worker_env_var += " TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP=1"
 
+    # Force NVLink two-sided alltoall method for workers to avoid hangs.
+    worker_env_var += " TRTLLM_FORCE_ALLTOALL_METHOD=NVLinkTwoSided"
+
     profiling_config = config.get('profiling', {})
     profiling_config.setdefault('nsys_on', False)
     profiling_config.setdefault('ctx_profile_range', '10-30')
