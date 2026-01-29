@@ -239,6 +239,8 @@ def submit_job(config, log_dir, dry_run):
 
     # Force NVLink two-sided alltoall method for workers to avoid hangs.
     worker_env_var += " TRTLLM_FORCE_ALLTOALL_METHOD=NVLinkTwoSided"
+    # Enable perfect router for MoE load balancing.
+    worker_env_var += " ENABLE_PERFECT_ROUTER=1"
 
     profiling_config = config.get('profiling', {})
     profiling_config.setdefault('nsys_on', False)
@@ -278,6 +280,13 @@ def submit_job(config, log_dir, dry_run):
     gen_batch_size = worker_config['gen']['max_batch_size']
     gen_enable_attention_dp = worker_config['gen']['enable_attention_dp']
 
+    # Calculate global batch size
+    # With AttnDP: dp_size = tp_size (tensor parallel acts as data parallel)
+    # Without AttnDP: dp_size = 1
+    # Global batch size = cuda_graph_config.max_batch_size * pp_size * dp_size
+    dp_size = gen_tp_size if gen_enable_attention_dp else 1
+    global_batch_size = gen_batch_size * gen_pp_size * dp_size
+
     # Get eplb num_slots for gen worker
     load_balancer_config = worker_config['gen'].get('moe_config', {}).get(
         'load_balancer', {})
@@ -308,8 +317,9 @@ def submit_job(config, log_dir, dry_run):
         gen_ep_size = worker_config['gen'].get('moe_expert_parallel_size', 1)
 
         # Determine config suffix based on attention_dp
+        # Use global_batch_size (= max_batch_size * pp_size * dp_size) for clarity
         attn_dp_str = "_attnDP" if gen_enable_attention_dp else ""
-        config_suffix = f"ctx{ctx_num}_gen{gen_num}_tp{gen_tp_size}_pp{gen_pp_size}_ep{gen_ep_size}_cp{gen_cp_size}_batch{gen_batch_size}{attn_dp_str}"
+        config_suffix = f"ctx{ctx_num}_gen{gen_num}_tp{gen_tp_size}_pp{gen_pp_size}_ep{gen_ep_size}_cp{gen_cp_size}_batch{global_batch_size}{attn_dp_str}"
 
         # Create full log directory path as a single flat directory
         log_dir = os.path.join(env_config['work_dir'],
