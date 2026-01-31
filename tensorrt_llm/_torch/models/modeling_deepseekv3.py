@@ -1137,32 +1137,6 @@ class Deepseekv3MoE(nn.Module):
             self._helix_check_logged = True
         return result
 
-    def _deduplicate_all_rank_num_tokens(self, all_rank_num_tokens: list[int]) -> list[int]:
-        """
-        In Helix mode, CP ranks within the same DP group have identical data.
-        To avoid duplicate computation in MoE, we set token counts to 0 for
-        non-primary CP ranks (cp_rank > 0).
-        
-        For example, with tp_size=2, cp_size=2:
-          Original:    [1, 1, 1, 1]  (all ranks report 1 token each)
-          Deduplicated: [1, 0, 1, 0]  (only cp_rank=0 ranks contribute)
-        """
-        if not self._is_helix_with_cp():
-            return all_rank_num_tokens
-        
-        # Create a deduplicated version where only cp_rank=0 ranks have non-zero counts
-        cp_size = self.mapping_with_cp.cp_size
-        deduped = []
-        for i, count in enumerate(all_rank_num_tokens):
-            # In the repurposed mapping, ranks are ordered as:
-            # [dp0cp0, dp0cp1, dp1cp0, dp1cp1, ...] 
-            # Index i % cp_size gives the cp_rank for that position
-            if i % cp_size == 0:  # cp_rank == 0
-                deduped.append(count)
-            else:
-                deduped.append(0)
-        return deduped
-
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -1174,39 +1148,19 @@ class Deepseekv3MoE(nn.Module):
         if not do_finalize:
             assert not self.use_dp
 
-        # Helix deduplication: modify all_rank_num_tokens to avoid duplicate computation
-        original_all_rank_num_tokens = all_rank_num_tokens
         is_helix = self._is_helix_with_cp()
-        
-        # Track deduplication stats for verification (CUDA graph safe - uses CPU counters)
-        if not hasattr(self, '_dedup_call_count'):
-            self._dedup_call_count = 0
-            self._dedup_tokens_saved = 0
-        
-        # For Helix deduplication: slice hidden_states to match deduped token count
-        # This ensures the MoE sees consistent sizes across all ranks
-        # NOTE: We can't skip the MoE call entirely because it has internal collectives
-        # that ALL ranks must participate in. Instead, we pass empty tensors for cp_rank > 0.
+
+        # For Helix deduplication: all_rank_num_tokens is already deduplicated by model_engine
+        # (cp_rank > 0 entries are zeroed out). We need to slice hidden_states accordingly
+        # since cp_rank > 0 ranks have 0 tokens in the deduplicated array.
         hidden_states_for_routed = hidden_states
         hidden_states_fp4_for_routed = hidden_states_fp4
-        
+
         if is_helix and all_rank_num_tokens is not None:
-            all_rank_num_tokens = self._deduplicate_all_rank_num_tokens(all_rank_num_tokens)
-            
             cp_rank = self.mapping_with_cp.cp_rank
-            my_rank = self.mapping_with_cp.rank
-            
-            # Get original and deduped token counts for this rank
-            original_my_tokens = original_all_rank_num_tokens[my_rank] if original_all_rank_num_tokens else 0
-            deduped_my_tokens = all_rank_num_tokens[my_rank]
-            tokens_saved = original_my_tokens - deduped_my_tokens
-            
-            self._dedup_call_count += 1
-            self._dedup_tokens_saved += tokens_saved
-            
+
             # For non-primary CP ranks (cp_rank > 0), slice hidden_states to empty
             # The MoE will still participate in collectives but with 0 tokens
-            # compute_routed_output handles the 0-token case by skipping CUBLAS ops
             if cp_rank != 0:
                 hidden_states_for_routed = hidden_states[:0]
                 if hidden_states_fp4 is not None:
@@ -1214,62 +1168,6 @@ class Deepseekv3MoE(nn.Module):
                         hidden_states_fp4.data[:0],
                         hidden_states_fp4.scale_factors[:0] if hidden_states_fp4.scale_factors is not None else None
                     )
-                
-                # Defensive assertions: verify deduplication is correct for cp_rank > 0
-                assert deduped_my_tokens == 0, (
-                    f"[Helix Dedup Assert] cp_rank={cp_rank} > 0 should have 0 deduped tokens, "
-                    f"but got {deduped_my_tokens}. original={original_my_tokens}, "
-                    f"all_rank_num_tokens={all_rank_num_tokens}"
-                )
-                assert hidden_states_for_routed.shape[0] == 0, (
-                    f"[Helix Dedup Assert] cp_rank={cp_rank} > 0 should have empty hidden_states, "
-                    f"but got shape {hidden_states_for_routed.shape}"
-                )
-            else:
-                # Defensive assertions: cp_rank == 0 should retain its original tokens
-                # (can be 0 if DP group received no requests - that's valid)
-                assert deduped_my_tokens == original_my_tokens, (
-                    f"[Helix Dedup Assert] cp_rank=0 should retain original tokens, "
-                    f"but got deduped={deduped_my_tokens} vs original={original_my_tokens}"
-                )
-                assert hidden_states_for_routed.shape[0] == original_my_tokens, (
-                    f"[Helix Dedup Assert] cp_rank=0 hidden_states should have {original_my_tokens} tokens, "
-                    f"but got shape {hidden_states_for_routed.shape}"
-                )
-            
-            # Verbose logging: 
-            # TRTLLM_HELIX_DEDUP_DEBUG=1: Log via TRT-LLM logger (only visible from RANK 0)
-            # TRTLLM_HELIX_DEDUP_DEBUG=2: Also write to per-rank files /tmp/helix_dedup_rank{N}.log
-            debug_level = os.environ.get('TRTLLM_HELIX_DEDUP_DEBUG', '0')
-            verbose_debug = debug_level in ('1', '2')
-            file_debug = debug_level == '2'
-            
-            if verbose_debug or not hasattr(self, '_dedup_logged'):
-                input_shape = tuple(hidden_states.shape)
-                routed_shape = tuple(hidden_states_for_routed.shape)
-                
-                log_msg = (
-                    f"[Helix MoE Dedup] layer={self.layer_idx}, rank={my_rank}, cp_rank={cp_rank}, "
-                    f"call={self._dedup_call_count}, "
-                    f"original_tokens={original_all_rank_num_tokens}, "
-                    f"deduped_tokens={all_rank_num_tokens}, "
-                    f"my_original={original_my_tokens}, my_deduped={deduped_my_tokens}, "
-                    f"input_shape={input_shape}, routed_shape={routed_shape}, "
-                    f"tokens_saved_this_call={tokens_saved}, total_saved={self._dedup_tokens_saved}"
-                )
-                logger.info(log_msg)
-                
-                # File-based per-rank logging (all ranks write to their own file in cwd)
-                # Include cp_size in filename to distinguish different server configs
-                if file_debug:
-                    cp_size = self.mapping_with_cp.cp_size
-                    log_file = f"helix_dedup_cp{cp_size}_rank{my_rank}.log"
-                    with open(log_file, 'a') as f:
-                        import datetime
-                        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
-                        f.write(f"[{timestamp}] {log_msg}\n")
-                
-                self._dedup_logged = True
 
         def _compute_shared_output():
             # Shared experts use original hidden_states (not sliced)
@@ -1284,8 +1182,6 @@ class Deepseekv3MoE(nn.Module):
         def _compute_routed_output():
             # All ranks must call compute_routed_output because it has internal collectives
             # cp_rank > 0 will have empty hidden_states_for_routed (0 tokens)
-            # The MoE handles the 0-token case by skipping CUBLAS ops but still
-            # participating in collectives
             routed_output = self.compute_routed_output(hidden_states_for_routed,
                                                        hidden_states_fp4_for_routed,
                                                        all_rank_num_tokens,
@@ -1299,71 +1195,21 @@ class Deepseekv3MoE(nn.Module):
 
         # Helix CP allgather: non-primary CP ranks have empty output (0 tokens)
         # due to deduplication. Use cp_allgather to get cp_rank=0's data.
-        # 
-        # Example with tp_size=2, cp_size=2, deduped_tokens=[1, 0, 1, 0]:
-        #   rank0 (cp_rank=0): routed_output.shape = [1, hidden]
-        #   rank1 (cp_rank=1): routed_output.shape = [0, hidden]
-        #   After cp_allgather with sizes=[1, 0]: both get [1, hidden]
         if is_helix and all_rank_num_tokens is not None:
             from tensorrt_llm._torch.distributed import cp_allgather
-            
-            # Compute sizes for variable-length allgather
-            # Each CP rank's token count from deduplicated list
+
             cp_size = self.mapping_with_cp.cp_size
-            cp_rank = self.mapping_with_cp.cp_rank
             my_rank = self.mapping_with_cp.rank
-            
+
             # Find my DP group's starting index in all_rank_num_tokens
             # Ranks are ordered as [dp0cp0, dp0cp1, dp1cp0, dp1cp1, ...]
             dp_rank = my_rank // cp_size
             cp_group_start = dp_rank * cp_size
-            
+
             # Sizes for this CP group
             sizes = [all_rank_num_tokens[cp_group_start + i] for i in range(cp_size)]
-            
-            # Get shapes before allgather (CUDA graph safe - cached metadata)
-            routed_shape_before = tuple(routed_output.shape)
-            
-            debug_level = os.environ.get('TRTLLM_HELIX_DEDUP_DEBUG', '0')
-            verbose_debug = debug_level in ('1', '2')
-            file_debug = debug_level == '2'
-            
-            if verbose_debug or not hasattr(self, '_allgather_logged'):
-                log_msg = (
-                    f"[Helix MoE Allgather PRE] layer={self.layer_idx}, rank={my_rank}, cp_rank={cp_rank}, "
-                    f"dp_rank={dp_rank}, cp_group_start={cp_group_start}, "
-                    f"sizes={sizes}, routed_shape_before={routed_shape_before}, "
-                    f"shared_output.shape={tuple(shared_output.shape)}"
-                )
-                logger.info(log_msg)
-                if file_debug:
-                    log_file = f"helix_dedup_cp{cp_size}_rank{my_rank}.log"
-                    with open(log_file, 'a') as f:
-                        import datetime
-                        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
-                        f.write(f"[{timestamp}] {log_msg}\n")
-                self._allgather_logged = True
-            
+
             routed_output = cp_allgather(routed_output, self.mapping_with_cp, dim=0, sizes=sizes)
-            
-            # Log after allgather to verify correct broadcast
-            if verbose_debug:
-                routed_shape_after = tuple(routed_output.shape)
-                log_msg = (
-                    f"[Helix MoE Allgather POST] layer={self.layer_idx}, rank={my_rank}, cp_rank={cp_rank}, "
-                    f"routed_shape_after={routed_shape_after}, "
-                    f"expected_tokens={sum(sizes)}"
-                )
-                logger.info(log_msg)
-                if file_debug:
-                    log_file = f"helix_dedup_cp{cp_size}_rank{my_rank}.log"
-                    with open(log_file, 'a') as f:
-                        import datetime
-                        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
-                        f.write(f"[{timestamp}] {log_msg}\n")
-            
-            # shared_output is computed locally and should be identical for all CP ranks
-            # (same input hidden_states after Helix attention all-to-all), so no allgather needed
 
         if not do_finalize:
             return [shared_output, *routed_output]
