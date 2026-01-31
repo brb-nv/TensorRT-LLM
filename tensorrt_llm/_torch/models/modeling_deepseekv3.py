@@ -1071,6 +1071,11 @@ class Deepseekv3MoE(nn.Module):
         else:
             # No tokens for this rank - create empty router_logits
             # Shape: (0, num_experts)
+            # This can happen for two reasons:
+            # 1. Helix deduplication: cp_rank > 0 has tokens zeroed out
+            # 2. Request imbalance: DP group received no requests (even cp_rank=0 has 0 tokens)
+            # Both cases are valid - no assertion needed here
+            
             num_experts = self.gate.num_experts if hasattr(self.gate, 'num_experts') else self.experts.num_experts
             router_logits = torch.empty(0, num_experts, 
                                         dtype=hidden_states.dtype, 
@@ -1209,6 +1214,28 @@ class Deepseekv3MoE(nn.Module):
                         hidden_states_fp4.data[:0],
                         hidden_states_fp4.scale_factors[:0] if hidden_states_fp4.scale_factors is not None else None
                     )
+                
+                # Defensive assertions: verify deduplication is correct for cp_rank > 0
+                assert deduped_my_tokens == 0, (
+                    f"[Helix Dedup Assert] cp_rank={cp_rank} > 0 should have 0 deduped tokens, "
+                    f"but got {deduped_my_tokens}. original={original_my_tokens}, "
+                    f"all_rank_num_tokens={all_rank_num_tokens}"
+                )
+                assert hidden_states_for_routed.shape[0] == 0, (
+                    f"[Helix Dedup Assert] cp_rank={cp_rank} > 0 should have empty hidden_states, "
+                    f"but got shape {hidden_states_for_routed.shape}"
+                )
+            else:
+                # Defensive assertions: cp_rank == 0 should retain its original tokens
+                # (can be 0 if DP group received no requests - that's valid)
+                assert deduped_my_tokens == original_my_tokens, (
+                    f"[Helix Dedup Assert] cp_rank=0 should retain original tokens, "
+                    f"but got deduped={deduped_my_tokens} vs original={original_my_tokens}"
+                )
+                assert hidden_states_for_routed.shape[0] == original_my_tokens, (
+                    f"[Helix Dedup Assert] cp_rank=0 hidden_states should have {original_my_tokens} tokens, "
+                    f"but got shape {hidden_states_for_routed.shape}"
+                )
             
             # Verbose logging: Enable with TRTLLM_HELIX_DEDUP_DEBUG=1
             verbose_debug = os.environ.get('TRTLLM_HELIX_DEDUP_DEBUG', '0') == '1'
