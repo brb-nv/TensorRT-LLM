@@ -1101,19 +1101,51 @@ class Deepseekv3MoE(nn.Module):
                 hidden_states,
                 (0, 0, 0, max(all_rank_num_tokens) - hidden_states.shape[0]))
 
-        router_logits = self.gate(hidden_states)
+        # Check if this rank has 0 tokens (happens with Helix deduplication for cp_rank > 0)
+        # In this case, we need to create dummy tensors to avoid CUBLAS errors with 0-sized inputs
+        # but we still participate in the MoE's internal collectives
+        my_num_tokens = hidden_states.shape[0]
+        has_tokens = my_num_tokens > 0
+        
+        if has_tokens:
+            router_logits = self.gate(hidden_states)
 
-        # Use ideal load balanced logits if enabled, otherwise use gate output.
-        if os.environ.get('ENABLE_PERFECT_ROUTER', '0') == '1':
-            # WARNING: This discards the learned gate output and uses ideal logits for perfect load balancing.
-            # Only use this for testing load balancing strategies, not for actual inference.
-            # The gate is still computed to maintain realistic performance measurement.
-            num_tokens, num_experts = router_logits.shape
-            router_logits = self._create_ideal_expert_load_balanced_logits(
-                num_tokens=num_tokens,
-                num_experts=num_experts,
-                device=hidden_states.device)
+            # Use ideal load balanced logits if enabled, otherwise use gate output.
+            if os.environ.get('ENABLE_PERFECT_ROUTER', '0') == '1':
+                # WARNING: This discards the learned gate output and uses ideal logits for perfect load balancing.
+                # Only use this for testing load balancing strategies, not for actual inference.
+                # The gate is still computed to maintain realistic performance measurement.
+                num_tokens, num_experts = router_logits.shape
+                router_logits = self._create_ideal_expert_load_balanced_logits(
+                    num_tokens=num_tokens,
+                    num_experts=num_experts,
+                    device=hidden_states.device)
+        else:
+            # No tokens for this rank - create empty router_logits
+            # Shape: (0, num_experts)
+            num_experts = self.gate.num_experts if hasattr(self.gate, 'num_experts') else self.experts.num_experts
+            router_logits = torch.empty(0, num_experts, 
+                                        dtype=hidden_states.dtype, 
+                                        device=hidden_states.device)
+            
+            verbose_debug = os.environ.get('TRTLLM_HELIX_DEDUP_DEBUG', '0') == '1'
+            if verbose_debug:
+                logger.info(
+                    f"[Helix MoE compute_routed] layer={self.layer_idx}, has_tokens=False, "
+                    f"hidden_states.shape={tuple(hidden_states.shape)}, "
+                    f"router_logits.shape={tuple(router_logits.shape)}, "
+                    f"all_rank_num_tokens={all_rank_num_tokens}"
+                )
 
+        verbose_debug = os.environ.get('TRTLLM_HELIX_DEDUP_DEBUG', '0') == '1'
+        if verbose_debug and not has_tokens:
+            logger.info(
+                f"[Helix MoE experts PRE] layer={self.layer_idx}, calling experts with "
+                f"hidden_states.shape={tuple(hidden_states.shape)}, "
+                f"router_logits.shape={tuple(router_logits.shape)}, "
+                f"all_rank_num_tokens={all_rank_num_tokens}"
+            )
+        
         routed_output = self.experts(
             hidden_states_fp4
             if hidden_states_fp4 is not None else hidden_states,
@@ -1126,6 +1158,13 @@ class Deepseekv3MoE(nn.Module):
                 "alltoall_result_do_sum": False
             } if isinstance(self.experts, WideEPMoE) else {}),
         )
+
+        if verbose_debug and not has_tokens:
+            output_shape = tuple(routed_output.shape) if hasattr(routed_output, 'shape') else 'list'
+            logger.info(
+                f"[Helix MoE experts POST] layer={self.layer_idx}, "
+                f"routed_output shape={output_shape}"
+            )
 
         return routed_output
 
@@ -1197,10 +1236,12 @@ class Deepseekv3MoE(nn.Module):
             self._dedup_call_count = 0
             self._dedup_tokens_saved = 0
         
-        # Track if we should skip routed computation (for cp_rank > 0 in Helix mode)
-        # In Helix CP mode, all CP ranks have identical data, so only cp_rank=0 needs to
-        # compute routed experts. Other ranks skip computation and get results via allgather.
-        skip_routed_computation = False
+        # For Helix deduplication: slice hidden_states to match deduped token count
+        # This ensures the MoE sees consistent sizes across all ranks
+        # NOTE: We can't skip the MoE call entirely because it has internal collectives
+        # that ALL ranks must participate in. Instead, we pass empty tensors for cp_rank > 0.
+        hidden_states_for_routed = hidden_states
+        hidden_states_fp4_for_routed = hidden_states_fp4
         
         if is_helix and all_rank_num_tokens is not None:
             all_rank_num_tokens = self._deduplicate_all_rank_num_tokens(all_rank_num_tokens)
@@ -1216,17 +1257,23 @@ class Deepseekv3MoE(nn.Module):
             self._dedup_call_count += 1
             self._dedup_tokens_saved += tokens_saved
             
-            # For non-primary CP ranks, skip the routed computation entirely
-            # We can't just pass empty tensors because CUBLAS doesn't handle 0-sized matrices
-            # Instead, we'll create a placeholder output and use allgather to get real data
+            # For non-primary CP ranks (cp_rank > 0), slice hidden_states to empty
+            # The MoE will still participate in collectives but with 0 tokens
+            # compute_routed_output handles the 0-token case by skipping CUBLAS ops
             if cp_rank != 0:
-                skip_routed_computation = True
+                hidden_states_for_routed = hidden_states[:0]
+                if hidden_states_fp4 is not None:
+                    hidden_states_fp4_for_routed = Fp4QuantizedTensor(
+                        hidden_states_fp4.data[:0],
+                        hidden_states_fp4.scale_factors[:0] if hidden_states_fp4.scale_factors is not None else None
+                    )
             
             # Verbose logging: Enable with TRTLLM_HELIX_DEDUP_DEBUG=1
             verbose_debug = os.environ.get('TRTLLM_HELIX_DEDUP_DEBUG', '0') == '1'
             
             if verbose_debug or not hasattr(self, '_dedup_logged'):
                 input_shape = tuple(hidden_states.shape)
+                routed_shape = tuple(hidden_states_for_routed.shape)
                 
                 logger.info(
                     f"[Helix MoE Dedup] layer={self.layer_idx}, rank={my_rank}, cp_rank={cp_rank}, "
@@ -1234,7 +1281,7 @@ class Deepseekv3MoE(nn.Module):
                     f"original_tokens={original_all_rank_num_tokens}, "
                     f"deduped_tokens={all_rank_num_tokens}, "
                     f"my_original={original_my_tokens}, my_deduped={deduped_my_tokens}, "
-                    f"input_shape={input_shape}, skip_routed={skip_routed_computation}, "
+                    f"input_shape={input_shape}, routed_shape={routed_shape}, "
                     f"tokens_saved_this_call={tokens_saved}, total_saved={self._dedup_tokens_saved}"
                 )
                 self._dedup_logged = True
@@ -1250,22 +1297,15 @@ class Deepseekv3MoE(nn.Module):
             return shared_output
 
         def _compute_routed_output():
-            if skip_routed_computation:
-                # For cp_rank > 0: Create empty output placeholder
-                # The real data will come from cp_allgather later
-                # Shape: (0, hidden_size) for do_finalize=True, or list format otherwise
-                hidden_size = hidden_states.shape[-1]
-                empty_output = torch.empty(0, hidden_size, 
-                                          dtype=hidden_states.dtype, 
-                                          device=hidden_states.device)
-                return empty_output
-            else:
-                # cp_rank == 0: Run actual MoE computation with original hidden_states
-                routed_output = self.compute_routed_output(hidden_states,
-                                                           hidden_states_fp4,
-                                                           all_rank_num_tokens,
-                                                           do_finalize)
-                return routed_output
+            # All ranks must call compute_routed_output because it has internal collectives
+            # cp_rank > 0 will have empty hidden_states_for_routed (0 tokens)
+            # The MoE handles the 0-token case by skipping CUBLAS ops but still
+            # participating in collectives
+            routed_output = self.compute_routed_output(hidden_states_for_routed,
+                                                       hidden_states_fp4_for_routed,
+                                                       all_rank_num_tokens,
+                                                       do_finalize)
+            return routed_output
 
         routed_output, shared_output = maybe_execute_in_parallel(
             _compute_routed_output, _compute_shared_output,
