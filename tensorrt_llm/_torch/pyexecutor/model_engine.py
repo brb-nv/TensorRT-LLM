@@ -1399,7 +1399,19 @@ class PyTorchModelEngine(ModelEngine):
 
     def _get_all_rank_num_tokens(self, attn_metadata: AttentionMetadata):
         if self.enable_attention_dp:
-            return list(self.dist.tp_cp_allgather(attn_metadata.num_tokens))
+            local_num_tokens = attn_metadata.num_tokens
+            all_rank_num_tokens = list(self.dist.tp_cp_allgather(local_num_tokens))
+            # Diagnostic logging for Helix CP + DP duplicate computation investigation
+            if self.mapping.has_cp_helix() and self.mapping.cp_size > 1:
+                logger.info(
+                    f"[Helix CP+DP Debug] _get_all_rank_num_tokens: "
+                    f"rank={self.mapping.rank}, tp_rank={self.mapping.tp_rank}, cp_rank={self.mapping.cp_rank}, "
+                    f"tp_size={self.mapping.tp_size}, cp_size={self.mapping.cp_size}, "
+                    f"local_num_tokens={local_num_tokens}, "
+                    f"all_rank_num_tokens={all_rank_num_tokens}, "
+                    f"sum={sum(all_rank_num_tokens)}"
+                )
+            return all_rank_num_tokens
         return None
 
     def _get_all_rank_ctx_requests(self, num_ctx_requests: int):

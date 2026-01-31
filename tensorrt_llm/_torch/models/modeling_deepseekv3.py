@@ -41,6 +41,7 @@ import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 from tensorrt_llm._ipc_utils import can_access_peer
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.functional import PositionEmbeddingType
+from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
@@ -56,6 +57,58 @@ from ..modules.embedding import Embedding
 from ..modules.fused_moe import (DeepSeekV3MoeRoutingMethod, MoE,
                                  MoEWeightLoadingMode, create_moe)
 from ..modules.fused_moe.fused_moe_wide_ep import WideEPMoE
+
+# Module-level cache for CP process groups (for Helix mode)
+# Using a dict to cache process groups by the frozenset of ranks
+_CP_PROCESS_GROUP_CACHE = {}
+
+def _get_cp_process_group(cp_ranks: list):
+    """
+    Get or create a CP process group. Uses caching to avoid creating
+    duplicate groups.
+    
+    Returns None if torch.distributed is not initialized.
+    
+    FIXME: dist.new_group() is a collective operation that requires ALL ranks
+    in the world to participate, not just the ranks in the new group. This can
+    cause deadlocks with pipeline parallelism if:
+    1. MoE layers only exist on certain PP stages
+    2. Different PP stages call new_group() at different times
+    3. Lazy creation in forward() is called by some stages but not others
+    
+    Current mitigations:
+    - Group creation happens in __init__ when all ranks build the model structure
+    - Fallback lazy creation in forward() handles cases where dist isn't ready at init
+    
+    The proper fix is to create all process groups during global distributed
+    initialization (in the Distributed/Communicator class), before any model
+    construction. This would require plumbing CP groups through the Mapping class
+    similar to how tp_group_pg and other groups are handled.
+    
+    For now, this works because:
+    - With PP=1: All ranks execute MoE layers
+    - With PP>1: All ranks initialize full model structure (including MoE __init__)
+      even if some layers are empty due to PP sharding, ensuring new_group() is
+      called collectively during initialization, not during forward().
+    """
+    import torch.distributed as dist
+    is_init = dist.is_initialized()
+    logger.info(
+        f"[_get_cp_process_group] Called with cp_ranks={cp_ranks}, "
+        f"dist.is_initialized()={is_init}, cache_keys={list(_CP_PROCESS_GROUP_CACHE.keys())}"
+    )
+    if not is_init:
+        logger.warning(f"[_get_cp_process_group] dist NOT initialized, returning None")
+        return None
+    
+    key = frozenset(cp_ranks)
+    if key not in _CP_PROCESS_GROUP_CACHE:
+        logger.info(f"[_get_cp_process_group] Creating new group for {cp_ranks}")
+        _CP_PROCESS_GROUP_CACHE[key] = dist.new_group(ranks=cp_ranks)
+        logger.info(f"[_get_cp_process_group] Created: {_CP_PROCESS_GROUP_CACHE[key]}")
+    else:
+        logger.info(f"[_get_cp_process_group] Using cached group: {_CP_PROCESS_GROUP_CACHE[key]}")
+    return _CP_PROCESS_GROUP_CACHE[key]
 
 # isort: off
 from ..modules.fused_moe.routing import (Deepseekv3RoutingImpl,
@@ -887,10 +940,14 @@ class Deepseekv3MoE(nn.Module):
                  dtype: Optional[torch.dtype] = None,
                  model_config: ModelConfig = ModelConfig(),
                  override_quant_config: Optional[QuantConfig] = None,
-                 layer_idx: Optional[int] = None):
+                 layer_idx: Optional[int] = None,
+                 mapping_with_cp: Optional[Mapping] = None):
         from ..distributed import AllReduce
 
         super().__init__()
+        # Store original mapping with CP info for Helix deduplication
+        self.mapping_with_cp = mapping_with_cp
+        self.layer_idx = layer_idx  # Store for logging
         config = model_config.pretrained_config
         self.top_k = top_k
         self.use_dp = model_config.mapping.enable_attention_dp
@@ -957,7 +1014,7 @@ class Deepseekv3MoE(nn.Module):
             key: torch.cuda.Event()
             for key in [EventType.Main, EventType.MoeShared]
         }
-
+        
         # Store config values for perfect routing.
         self.model_config = model_config
         self.dtype = dtype
@@ -1072,6 +1129,54 @@ class Deepseekv3MoE(nn.Module):
 
         return routed_output
 
+    def _is_helix_with_cp(self) -> bool:
+        """Check if running in Helix CP mode with cp_size > 1."""
+        result = (self.mapping_with_cp is not None and 
+                  self.mapping_with_cp.has_cp_helix() and 
+                  self.mapping_with_cp.cp_size > 1)
+        # Log only once per instance to avoid spam
+        if not hasattr(self, '_helix_check_logged'):
+            logger.info(
+                f"[_is_helix_with_cp] mapping_with_cp={self.mapping_with_cp is not None}, "
+                f"has_cp_helix={self.mapping_with_cp.has_cp_helix() if self.mapping_with_cp else 'N/A'}, "
+                f"cp_size={self.mapping_with_cp.cp_size if self.mapping_with_cp else 'N/A'}, "
+                f"result={result}"
+            )
+            self._helix_check_logged = True
+        return result
+
+    def _is_primary_cp_rank(self) -> bool:
+        """Check if this is the primary CP rank (cp_rank=0) in Helix mode."""
+        if not self._is_helix_with_cp():
+            return True
+        return self.mapping_with_cp.cp_rank == 0
+
+    def _deduplicate_all_rank_num_tokens(self, all_rank_num_tokens: list[int]) -> list[int]:
+        """
+        In Helix mode, CP ranks within the same DP group have identical data.
+        To avoid duplicate computation in MoE, we set token counts to 0 for
+        non-primary CP ranks (cp_rank > 0).
+        
+        For example, with tp_size=2, cp_size=2:
+          Original:    [1, 1, 1, 1]  (all ranks report 1 token each)
+          Deduplicated: [1, 0, 1, 0]  (only cp_rank=0 ranks contribute)
+        """
+        if not self._is_helix_with_cp():
+            return all_rank_num_tokens
+        
+        # Create a deduplicated version where only cp_rank=0 ranks have non-zero counts
+        cp_size = self.mapping_with_cp.cp_size
+        deduped = []
+        for i, count in enumerate(all_rank_num_tokens):
+            # In the repurposed mapping, ranks are ordered as:
+            # [dp0cp0, dp0cp1, dp1cp0, dp1cp1, ...] 
+            # Index i % cp_size gives the cp_rank for that position
+            if i % cp_size == 0:  # cp_rank == 0
+                deduped.append(count)
+            else:
+                deduped.append(0)
+        return deduped
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -1083,7 +1188,60 @@ class Deepseekv3MoE(nn.Module):
         if not do_finalize:
             assert not self.use_dp
 
+        # Helix deduplication: modify all_rank_num_tokens to avoid duplicate computation
+        original_all_rank_num_tokens = all_rank_num_tokens
+        is_helix = self._is_helix_with_cp()
+        
+        # Track deduplication stats for verification (CUDA graph safe - uses CPU counters)
+        if not hasattr(self, '_dedup_call_count'):
+            self._dedup_call_count = 0
+            self._dedup_tokens_saved = 0
+        
+        # Track if we should skip routed computation (for cp_rank > 0 in Helix mode)
+        # In Helix CP mode, all CP ranks have identical data, so only cp_rank=0 needs to
+        # compute routed experts. Other ranks skip computation and get results via allgather.
+        skip_routed_computation = False
+        
+        if is_helix and all_rank_num_tokens is not None:
+            all_rank_num_tokens = self._deduplicate_all_rank_num_tokens(all_rank_num_tokens)
+            
+            cp_rank = self.mapping_with_cp.cp_rank
+            my_rank = self.mapping_with_cp.rank
+            
+            # Get original and deduped token counts for this rank
+            original_my_tokens = original_all_rank_num_tokens[my_rank] if original_all_rank_num_tokens else 0
+            deduped_my_tokens = all_rank_num_tokens[my_rank]
+            tokens_saved = original_my_tokens - deduped_my_tokens
+            
+            self._dedup_call_count += 1
+            self._dedup_tokens_saved += tokens_saved
+            
+            # For non-primary CP ranks, skip the routed computation entirely
+            # We can't just pass empty tensors because CUBLAS doesn't handle 0-sized matrices
+            # Instead, we'll create a placeholder output and use allgather to get real data
+            if cp_rank != 0:
+                skip_routed_computation = True
+            
+            # Verbose logging: Enable with TRTLLM_HELIX_DEDUP_DEBUG=1
+            verbose_debug = os.environ.get('TRTLLM_HELIX_DEDUP_DEBUG', '0') == '1'
+            
+            if verbose_debug or not hasattr(self, '_dedup_logged'):
+                input_shape = tuple(hidden_states.shape)
+                
+                logger.info(
+                    f"[Helix MoE Dedup] layer={self.layer_idx}, rank={my_rank}, cp_rank={cp_rank}, "
+                    f"call={self._dedup_call_count}, "
+                    f"original_tokens={original_all_rank_num_tokens}, "
+                    f"deduped_tokens={all_rank_num_tokens}, "
+                    f"my_original={original_my_tokens}, my_deduped={deduped_my_tokens}, "
+                    f"input_shape={input_shape}, skip_routed={skip_routed_computation}, "
+                    f"tokens_saved_this_call={tokens_saved}, total_saved={self._dedup_tokens_saved}"
+                )
+                self._dedup_logged = True
+
         def _compute_shared_output():
+            # Shared experts use original hidden_states (not sliced)
+            # Each CP rank computes locally - results will be identical
             shared_output = self.shared_experts(
                 hidden_states_fp4
                 if hidden_states_fp4 is not None else hidden_states)
@@ -1092,18 +1250,78 @@ class Deepseekv3MoE(nn.Module):
             return shared_output
 
         def _compute_routed_output():
-            routed_output = self.compute_routed_output(hidden_states,
-                                                       hidden_states_fp4,
-                                                       all_rank_num_tokens,
-                                                       do_finalize)
-            return routed_output
-
-        # NOTE: define compiled helpers at module scope to avoid defining decorators inside compiled frames
+            if skip_routed_computation:
+                # For cp_rank > 0: Create empty output placeholder
+                # The real data will come from cp_allgather later
+                # Shape: (0, hidden_size) for do_finalize=True, or list format otherwise
+                hidden_size = hidden_states.shape[-1]
+                empty_output = torch.empty(0, hidden_size, 
+                                          dtype=hidden_states.dtype, 
+                                          device=hidden_states.device)
+                return empty_output
+            else:
+                # cp_rank == 0: Run actual MoE computation with original hidden_states
+                routed_output = self.compute_routed_output(hidden_states,
+                                                           hidden_states_fp4,
+                                                           all_rank_num_tokens,
+                                                           do_finalize)
+                return routed_output
 
         routed_output, shared_output = maybe_execute_in_parallel(
             _compute_routed_output, _compute_shared_output,
             self.event_dict[EventType.Main],
             self.event_dict[EventType.MoeShared], self.aux_stream)
+
+        # Helix CP allgather: non-primary CP ranks have empty output (0 tokens)
+        # due to deduplication. Use cp_allgather to get cp_rank=0's data.
+        # 
+        # Example with tp_size=2, cp_size=2, deduped_tokens=[1, 0, 1, 0]:
+        #   rank0 (cp_rank=0): routed_output.shape = [1, hidden]
+        #   rank1 (cp_rank=1): routed_output.shape = [0, hidden]
+        #   After cp_allgather with sizes=[1, 0]: both get [1, hidden]
+        if is_helix and all_rank_num_tokens is not None:
+            from tensorrt_llm._torch.distributed import cp_allgather
+            
+            # Compute sizes for variable-length allgather
+            # Each CP rank's token count from deduplicated list
+            cp_size = self.mapping_with_cp.cp_size
+            cp_rank = self.mapping_with_cp.cp_rank
+            my_rank = self.mapping_with_cp.rank
+            
+            # Find my DP group's starting index in all_rank_num_tokens
+            # Ranks are ordered as [dp0cp0, dp0cp1, dp1cp0, dp1cp1, ...]
+            dp_rank = my_rank // cp_size
+            cp_group_start = dp_rank * cp_size
+            
+            # Sizes for this CP group
+            sizes = [all_rank_num_tokens[cp_group_start + i] for i in range(cp_size)]
+            
+            # Get shapes before allgather (CUDA graph safe - cached metadata)
+            routed_shape_before = tuple(routed_output.shape)
+            
+            verbose_debug = os.environ.get('TRTLLM_HELIX_DEDUP_DEBUG', '0') == '1'
+            if verbose_debug or not hasattr(self, '_allgather_logged'):
+                logger.info(
+                    f"[Helix MoE Allgather PRE] layer={self.layer_idx}, rank={my_rank}, cp_rank={cp_rank}, "
+                    f"dp_rank={dp_rank}, cp_group_start={cp_group_start}, "
+                    f"sizes={sizes}, routed_shape_before={routed_shape_before}, "
+                    f"shared_output.shape={tuple(shared_output.shape)}"
+                )
+                self._allgather_logged = True
+            
+            routed_output = cp_allgather(routed_output, self.mapping_with_cp, dim=0, sizes=sizes)
+            
+            # Log after allgather to verify correct broadcast
+            if verbose_debug:
+                routed_shape_after = tuple(routed_output.shape)
+                logger.info(
+                    f"[Helix MoE Allgather POST] layer={self.layer_idx}, rank={my_rank}, cp_rank={cp_rank}, "
+                    f"routed_shape_after={routed_shape_after}, "
+                    f"expected_tokens={sum(sizes)}"
+                )
+            
+            # shared_output is computed locally and should be identical for all CP ranks
+            # (same input hidden_states after Helix attention all-to-all), so no allgather needed
 
         if not do_finalize:
             return [shared_output, *routed_output]
@@ -1137,6 +1355,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                  mapping_with_cp: Optional[Mapping] = None):
         super().__init__()
         self.model_config = model_config
+        self.mapping_with_cp = mapping_with_cp  # Store for MoE Helix deduplication
         self.config = model_config.pretrained_config
         config = self.config
 
@@ -1219,7 +1438,8 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                 model_config=model_config,
                 override_quant_config=quant_config,
                 aux_stream_dict=aux_stream_dict,
-                layer_idx=layer_idx)
+                layer_idx=layer_idx,
+                mapping_with_cp=self.mapping_with_cp)
         else:
             block_size = 1
             if quant_config and quant_config.group_size is not None:
@@ -1517,6 +1737,34 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
             key: torch.cuda.Event()
             for key in [EventType.Main, EventType.MoeShared]
         }
+        
+        # Get CP process group for Helix broadcast
+        # Use the mapping's existing cp_group_pg if available (DeviceMesh has it)
+        self._cp_process_group = None
+        if self.mapping_with_cp is not None and self.mapping_with_cp.has_cp_helix():
+            try:
+                self._cp_process_group = self.mapping_with_cp.cp_group_pg
+                logger.info(
+                    f"[Helix MoE Init] Using mapping's CP process group: "
+                    f"mapping_with_cp.rank={self.mapping_with_cp.rank}, "
+                    f"cp_group={self.mapping_with_cp.cp_group}, "
+                    f"_cp_process_group={self._cp_process_group}"
+                )
+            except NotImplementedError:
+                # Fallback to creating our own (for base Mapping class)
+                self._cp_process_group = _get_cp_process_group(self.mapping_with_cp.cp_group)
+                logger.info(
+                    f"[Helix MoE Init] Created CP process group (fallback): "
+                    f"mapping_with_cp.rank={self.mapping_with_cp.rank}, "
+                    f"cp_group={self.mapping_with_cp.cp_group}, "
+                    f"_cp_process_group={self._cp_process_group}"
+                )
+        else:
+            logger.info(
+                f"[Helix MoE Init] CP process group NOT needed: "
+                f"mapping_with_cp={self.mapping_with_cp}, "
+                f"has_cp_helix={self.mapping_with_cp.has_cp_helix() if self.mapping_with_cp else 'N/A'}"
+            )
 
         self.enorm = RMSNorm(hidden_size=config.hidden_size,
                              eps=config.rms_norm_eps,
