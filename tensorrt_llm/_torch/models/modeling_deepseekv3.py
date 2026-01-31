@@ -58,58 +58,6 @@ from ..modules.fused_moe import (DeepSeekV3MoeRoutingMethod, MoE,
                                  MoEWeightLoadingMode, create_moe)
 from ..modules.fused_moe.fused_moe_wide_ep import WideEPMoE
 
-# Module-level cache for CP process groups (for Helix mode)
-# Using a dict to cache process groups by the frozenset of ranks
-_CP_PROCESS_GROUP_CACHE = {}
-
-def _get_cp_process_group(cp_ranks: list):
-    """
-    Get or create a CP process group. Uses caching to avoid creating
-    duplicate groups.
-    
-    Returns None if torch.distributed is not initialized.
-    
-    FIXME: dist.new_group() is a collective operation that requires ALL ranks
-    in the world to participate, not just the ranks in the new group. This can
-    cause deadlocks with pipeline parallelism if:
-    1. MoE layers only exist on certain PP stages
-    2. Different PP stages call new_group() at different times
-    3. Lazy creation in forward() is called by some stages but not others
-    
-    Current mitigations:
-    - Group creation happens in __init__ when all ranks build the model structure
-    - Fallback lazy creation in forward() handles cases where dist isn't ready at init
-    
-    The proper fix is to create all process groups during global distributed
-    initialization (in the Distributed/Communicator class), before any model
-    construction. This would require plumbing CP groups through the Mapping class
-    similar to how tp_group_pg and other groups are handled.
-    
-    For now, this works because:
-    - With PP=1: All ranks execute MoE layers
-    - With PP>1: All ranks initialize full model structure (including MoE __init__)
-      even if some layers are empty due to PP sharding, ensuring new_group() is
-      called collectively during initialization, not during forward().
-    """
-    import torch.distributed as dist
-    is_init = dist.is_initialized()
-    logger.info(
-        f"[_get_cp_process_group] Called with cp_ranks={cp_ranks}, "
-        f"dist.is_initialized()={is_init}, cache_keys={list(_CP_PROCESS_GROUP_CACHE.keys())}"
-    )
-    if not is_init:
-        logger.warning(f"[_get_cp_process_group] dist NOT initialized, returning None")
-        return None
-    
-    key = frozenset(cp_ranks)
-    if key not in _CP_PROCESS_GROUP_CACHE:
-        logger.info(f"[_get_cp_process_group] Creating new group for {cp_ranks}")
-        _CP_PROCESS_GROUP_CACHE[key] = dist.new_group(ranks=cp_ranks)
-        logger.info(f"[_get_cp_process_group] Created: {_CP_PROCESS_GROUP_CACHE[key]}")
-    else:
-        logger.info(f"[_get_cp_process_group] Using cached group: {_CP_PROCESS_GROUP_CACHE[key]}")
-    return _CP_PROCESS_GROUP_CACHE[key]
-
 # isort: off
 from ..modules.fused_moe.routing import (Deepseekv3RoutingImpl,
                                          get_cached_perfect_router_logits,
@@ -1184,12 +1132,6 @@ class Deepseekv3MoE(nn.Module):
             self._helix_check_logged = True
         return result
 
-    def _is_primary_cp_rank(self) -> bool:
-        """Check if this is the primary CP rank (cp_rank=0) in Helix mode."""
-        if not self._is_helix_with_cp():
-            return True
-        return self.mapping_with_cp.cp_rank == 0
-
     def _deduplicate_all_rank_num_tokens(self, all_rank_num_tokens: list[int]) -> list[int]:
         """
         In Helix mode, CP ranks within the same DP group have identical data.
@@ -1777,34 +1719,6 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
             key: torch.cuda.Event()
             for key in [EventType.Main, EventType.MoeShared]
         }
-        
-        # Get CP process group for Helix broadcast
-        # Use the mapping's existing cp_group_pg if available (DeviceMesh has it)
-        self._cp_process_group = None
-        if self.mapping_with_cp is not None and self.mapping_with_cp.has_cp_helix():
-            try:
-                self._cp_process_group = self.mapping_with_cp.cp_group_pg
-                logger.info(
-                    f"[Helix MoE Init] Using mapping's CP process group: "
-                    f"mapping_with_cp.rank={self.mapping_with_cp.rank}, "
-                    f"cp_group={self.mapping_with_cp.cp_group}, "
-                    f"_cp_process_group={self._cp_process_group}"
-                )
-            except NotImplementedError:
-                # Fallback to creating our own (for base Mapping class)
-                self._cp_process_group = _get_cp_process_group(self.mapping_with_cp.cp_group)
-                logger.info(
-                    f"[Helix MoE Init] Created CP process group (fallback): "
-                    f"mapping_with_cp.rank={self.mapping_with_cp.rank}, "
-                    f"cp_group={self.mapping_with_cp.cp_group}, "
-                    f"_cp_process_group={self._cp_process_group}"
-                )
-        else:
-            logger.info(
-                f"[Helix MoE Init] CP process group NOT needed: "
-                f"mapping_with_cp={self.mapping_with_cp}, "
-                f"has_cp_helix={self.mapping_with_cp.has_cp_helix() if self.mapping_with_cp else 'N/A'}"
-            )
 
         self.enorm = RMSNorm(hidden_size=config.hidden_size,
                              eps=config.rms_norm_eps,
