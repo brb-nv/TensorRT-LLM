@@ -1237,14 +1237,18 @@ class Deepseekv3MoE(nn.Module):
                     f"but got shape {hidden_states_for_routed.shape}"
                 )
             
-            # Verbose logging: Enable with TRTLLM_HELIX_DEDUP_DEBUG=1
-            verbose_debug = os.environ.get('TRTLLM_HELIX_DEDUP_DEBUG', '0') == '1'
+            # Verbose logging: 
+            # TRTLLM_HELIX_DEDUP_DEBUG=1: Log via TRT-LLM logger (only visible from RANK 0)
+            # TRTLLM_HELIX_DEDUP_DEBUG=2: Also write to per-rank files /tmp/helix_dedup_rank{N}.log
+            debug_level = os.environ.get('TRTLLM_HELIX_DEDUP_DEBUG', '0')
+            verbose_debug = debug_level in ('1', '2')
+            file_debug = debug_level == '2'
             
             if verbose_debug or not hasattr(self, '_dedup_logged'):
                 input_shape = tuple(hidden_states.shape)
                 routed_shape = tuple(hidden_states_for_routed.shape)
                 
-                logger.info(
+                log_msg = (
                     f"[Helix MoE Dedup] layer={self.layer_idx}, rank={my_rank}, cp_rank={cp_rank}, "
                     f"call={self._dedup_call_count}, "
                     f"original_tokens={original_all_rank_num_tokens}, "
@@ -1253,6 +1257,18 @@ class Deepseekv3MoE(nn.Module):
                     f"input_shape={input_shape}, routed_shape={routed_shape}, "
                     f"tokens_saved_this_call={tokens_saved}, total_saved={self._dedup_tokens_saved}"
                 )
+                logger.info(log_msg)
+                
+                # File-based per-rank logging (all ranks write to their own file in cwd)
+                # Include cp_size in filename to distinguish different server configs
+                if file_debug:
+                    cp_size = self.mapping_with_cp.cp_size
+                    log_file = f"helix_dedup_cp{cp_size}_rank{my_rank}.log"
+                    with open(log_file, 'a') as f:
+                        import datetime
+                        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
+                        f.write(f"[{timestamp}] {log_msg}\n")
+                
                 self._dedup_logged = True
 
         def _compute_shared_output():
@@ -1308,14 +1324,24 @@ class Deepseekv3MoE(nn.Module):
             # Get shapes before allgather (CUDA graph safe - cached metadata)
             routed_shape_before = tuple(routed_output.shape)
             
-            verbose_debug = os.environ.get('TRTLLM_HELIX_DEDUP_DEBUG', '0') == '1'
+            debug_level = os.environ.get('TRTLLM_HELIX_DEDUP_DEBUG', '0')
+            verbose_debug = debug_level in ('1', '2')
+            file_debug = debug_level == '2'
+            
             if verbose_debug or not hasattr(self, '_allgather_logged'):
-                logger.info(
+                log_msg = (
                     f"[Helix MoE Allgather PRE] layer={self.layer_idx}, rank={my_rank}, cp_rank={cp_rank}, "
                     f"dp_rank={dp_rank}, cp_group_start={cp_group_start}, "
                     f"sizes={sizes}, routed_shape_before={routed_shape_before}, "
                     f"shared_output.shape={tuple(shared_output.shape)}"
                 )
+                logger.info(log_msg)
+                if file_debug:
+                    log_file = f"helix_dedup_cp{cp_size}_rank{my_rank}.log"
+                    with open(log_file, 'a') as f:
+                        import datetime
+                        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
+                        f.write(f"[{timestamp}] {log_msg}\n")
                 self._allgather_logged = True
             
             routed_output = cp_allgather(routed_output, self.mapping_with_cp, dim=0, sizes=sizes)
@@ -1323,11 +1349,18 @@ class Deepseekv3MoE(nn.Module):
             # Log after allgather to verify correct broadcast
             if verbose_debug:
                 routed_shape_after = tuple(routed_output.shape)
-                logger.info(
+                log_msg = (
                     f"[Helix MoE Allgather POST] layer={self.layer_idx}, rank={my_rank}, cp_rank={cp_rank}, "
                     f"routed_shape_after={routed_shape_after}, "
                     f"expected_tokens={sum(sizes)}"
                 )
+                logger.info(log_msg)
+                if file_debug:
+                    log_file = f"helix_dedup_cp{cp_size}_rank{my_rank}.log"
+                    with open(log_file, 'a') as f:
+                        import datetime
+                        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
+                        f.write(f"[{timestamp}] {log_msg}\n")
             
             # shared_output is computed locally and should be identical for all CP ranks
             # (same input hidden_states after Helix attention all-to-all), so no allgather needed
