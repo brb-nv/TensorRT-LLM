@@ -1169,6 +1169,20 @@ class Deepseekv3MoE(nn.Module):
                         hidden_states_fp4.scale_factors[:0] if hidden_states_fp4.scale_factors is not None else None
                     )
 
+            # File-based logging for deduplication verification
+            debug_level = os.environ.get('TRTLLM_HELIX_DEDUP_DEBUG', '0')
+            if debug_level == '2':
+                import datetime
+                my_rank = self.mapping_with_cp.rank
+                cp_size = self.mapping_with_cp.cp_size
+                log_file = f"helix_dedup_cp{cp_size}_rank{my_rank}.log"
+                with open(log_file, 'a') as f:
+                    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
+                    f.write(f"[{timestamp}] layer={self.layer_idx}, rank={my_rank}, cp_rank={cp_rank}, "
+                            f"all_rank_num_tokens={all_rank_num_tokens}, "
+                            f"input_shape={tuple(hidden_states.shape)}, "
+                            f"routed_shape={tuple(hidden_states_for_routed.shape)}\n")
+
         def _compute_shared_output():
             # Shared experts use original hidden_states (not sliced)
             # Each CP rank computes locally - results will be identical
