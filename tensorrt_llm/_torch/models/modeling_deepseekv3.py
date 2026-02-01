@@ -1039,66 +1039,43 @@ class Deepseekv3MoE(nn.Module):
 
     def compute_routed_output(self, hidden_states, hidden_states_fp4,
                               all_rank_num_tokens, do_finalize):
-        # max-throughput
+        """Compute routed expert output with MoE.
+
+        Handles the case where hidden_states may be empty (0 tokens) due to
+        Helix deduplication or request imbalance. Empty tensors still participate
+        in MoE's internal collectives.
+        """
         use_dp_padding = False
-        # Add DP padding on SM120 for context comm performance
-        # TODO: Move this model-agonostic part to MoE
+        # Add DP padding on SM120 for context comm performance.
+        # TODO: Move this model-agnostic part to MoE.
         if self.use_dp and self.mapping.tp_size > 1 and get_sm_version() == 120:
             use_dp_padding = True
             hidden_states = torch.nn.functional.pad(
                 hidden_states,
                 (0, 0, 0, max(all_rank_num_tokens) - hidden_states.shape[0]))
 
-        # Check if this rank has 0 tokens (happens with Helix deduplication for cp_rank > 0)
-        # In this case, we need to create dummy tensors to avoid CUBLAS errors with 0-sized inputs
-        # but we still participate in the MoE's internal collectives
         my_num_tokens = hidden_states.shape[0]
-        has_tokens = my_num_tokens > 0
-        
-        if has_tokens:
+
+        if my_num_tokens > 0:
             router_logits = self.gate(hidden_states)
 
             # Use ideal load balanced logits if enabled, otherwise use gate output.
             if os.environ.get('ENABLE_PERFECT_ROUTER', '0') == '1':
-                # WARNING: This discards the learned gate output and uses ideal logits for perfect load balancing.
-                # Only use this for testing load balancing strategies, not for actual inference.
-                # The gate is still computed to maintain realistic performance measurement.
+                # WARNING: This discards the learned gate output and uses ideal
+                # logits for perfect load balancing. Only use for testing.
                 num_tokens, num_experts = router_logits.shape
                 router_logits = self._create_ideal_expert_load_balanced_logits(
                     num_tokens=num_tokens,
                     num_experts=num_experts,
                     device=hidden_states.device)
         else:
-            # No tokens for this rank - create empty router_logits
-            # Shape: (0, num_experts)
-            # This can happen for two reasons:
-            # 1. Helix deduplication: cp_rank > 0 has tokens zeroed out
-            # 2. Request imbalance: DP group received no requests (even cp_rank=0 has 0 tokens)
-            # Both cases are valid - no assertion needed here
-            
-            num_experts = self.gate.num_experts if hasattr(self.gate, 'num_experts') else self.experts.num_experts
-            router_logits = torch.empty(0, num_experts, 
-                                        dtype=hidden_states.dtype, 
+            # Empty tensor: create empty router_logits to participate in collectives.
+            num_experts = (self.gate.num_experts if hasattr(self.gate, 'num_experts')
+                           else self.experts.num_experts)
+            router_logits = torch.empty(0, num_experts,
+                                        dtype=hidden_states.dtype,
                                         device=hidden_states.device)
-            
-            verbose_debug = os.environ.get('TRTLLM_HELIX_DEDUP_DEBUG', '0') == '1'
-            if verbose_debug:
-                logger.info(
-                    f"[Helix MoE compute_routed] layer={self.layer_idx}, has_tokens=False, "
-                    f"hidden_states.shape={tuple(hidden_states.shape)}, "
-                    f"router_logits.shape={tuple(router_logits.shape)}, "
-                    f"all_rank_num_tokens={all_rank_num_tokens}"
-                )
 
-        verbose_debug = os.environ.get('TRTLLM_HELIX_DEDUP_DEBUG', '0') == '1'
-        if verbose_debug and not has_tokens:
-            logger.info(
-                f"[Helix MoE experts PRE] layer={self.layer_idx}, calling experts with "
-                f"hidden_states.shape={tuple(hidden_states.shape)}, "
-                f"router_logits.shape={tuple(router_logits.shape)}, "
-                f"all_rank_num_tokens={all_rank_num_tokens}"
-            )
-        
         routed_output = self.experts(
             hidden_states_fp4
             if hidden_states_fp4 is not None else hidden_states,
@@ -1112,30 +1089,88 @@ class Deepseekv3MoE(nn.Module):
             } if isinstance(self.experts, WideEPMoE) else {}),
         )
 
-        if verbose_debug and not has_tokens:
-            output_shape = tuple(routed_output.shape) if hasattr(routed_output, 'shape') else 'list'
-            logger.info(
-                f"[Helix MoE experts POST] layer={self.layer_idx}, "
-                f"routed_output shape={output_shape}"
-            )
-
         return routed_output
 
     def _is_helix_with_cp(self) -> bool:
         """Check if running in Helix CP mode with cp_size > 1."""
-        result = (self.mapping_with_cp is not None and 
-                  self.mapping_with_cp.has_cp_helix() and 
-                  self.mapping_with_cp.cp_size > 1)
-        # Log only once per instance to avoid spam
-        if not hasattr(self, '_helix_check_logged'):
-            logger.info(
-                f"[_is_helix_with_cp] mapping_with_cp={self.mapping_with_cp is not None}, "
-                f"has_cp_helix={self.mapping_with_cp.has_cp_helix() if self.mapping_with_cp else 'N/A'}, "
-                f"cp_size={self.mapping_with_cp.cp_size if self.mapping_with_cp else 'N/A'}, "
-                f"result={result}"
+        return (self.mapping_with_cp is not None
+                and self.mapping_with_cp.has_cp_helix()
+                and self.mapping_with_cp.cp_size > 1)
+
+    def _prepare_helix_inputs(
+        self,
+        hidden_states: torch.Tensor,
+        hidden_states_fp4: Optional[Fp4QuantizedTensor],
+    ) -> Tuple[torch.Tensor, Optional[Fp4QuantizedTensor]]:
+        """Prepare inputs for Helix MoE deduplication.
+
+        For cp_rank > 0, slice hidden_states to empty tensors. These ranks
+        will participate in MoE collectives but contribute 0 tokens, avoiding
+        duplicate computation since cp_rank=0 processes all tokens.
+
+        Args:
+            hidden_states: Input tensor of shape (num_tokens, hidden_dim).
+            hidden_states_fp4: Optional FP4-quantized input tensor.
+
+        Returns:
+            Tuple of (hidden_states, hidden_states_fp4) sliced for this rank.
+        """
+        assert self.mapping_with_cp is not None, (
+            "_prepare_helix_inputs called without mapping_with_cp")
+
+        cp_rank = self.mapping_with_cp.cp_rank
+
+        if cp_rank == 0:
+            # Primary CP rank: process all tokens.
+            return hidden_states, hidden_states_fp4
+
+        # Non-primary CP ranks: slice to empty tensor.
+        hidden_states_sliced = hidden_states[:0]
+        hidden_states_fp4_sliced = None
+
+        if hidden_states_fp4 is not None:
+            scale_factors = hidden_states_fp4.scale_factors
+            hidden_states_fp4_sliced = Fp4QuantizedTensor(
+                hidden_states_fp4.data[:0],
+                scale_factors[:0] if scale_factors is not None else None
             )
-            self._helix_check_logged = True
-        return result
+
+        return hidden_states_sliced, hidden_states_fp4_sliced
+
+    def _broadcast_helix_output(
+        self,
+        routed_output: torch.Tensor,
+        all_rank_num_tokens: List[int],
+    ) -> torch.Tensor:
+        """Broadcast routed output from cp_rank=0 to other CP ranks.
+
+        After Helix deduplication, only cp_rank=0 has computed the routed output.
+        Use cp_allgather to distribute the result to all CP ranks in the group.
+
+        Args:
+            routed_output: Output from routed experts (may be empty for cp_rank > 0).
+            all_rank_num_tokens: Token counts per rank (deduplicated).
+
+        Returns:
+            Broadcasted routed output for all CP ranks.
+        """
+        from tensorrt_llm._torch.distributed import cp_allgather
+
+        assert self.mapping_with_cp is not None, (
+            "_broadcast_helix_output called without mapping_with_cp")
+
+        cp_size = self.mapping_with_cp.cp_size
+        my_rank = self.mapping_with_cp.rank
+
+        # Find this DP group's starting index in all_rank_num_tokens.
+        # Ranks are ordered as [dp0cp0, dp0cp1, dp1cp0, dp1cp1, ...].
+        dp_rank = my_rank // cp_size
+        cp_group_start = dp_rank * cp_size
+
+        # Gather sizes for this CP group.
+        sizes = [all_rank_num_tokens[cp_group_start + i] for i in range(cp_size)]
+
+        return cp_allgather(routed_output, self.mapping_with_cp, dim=0, sizes=sizes)
 
     def forward(
         self,
@@ -1150,42 +1185,18 @@ class Deepseekv3MoE(nn.Module):
 
         is_helix = self._is_helix_with_cp()
 
-        # For Helix deduplication: all_rank_num_tokens is already deduplicated by model_engine
-        # (cp_rank > 0 entries are zeroed out). We need to slice hidden_states accordingly
-        # since cp_rank > 0 ranks have 0 tokens in the deduplicated array.
+        # Prepare inputs for Helix deduplication if applicable.
+        # For cp_rank > 0, hidden_states will be sliced to empty.
         hidden_states_for_routed = hidden_states
         hidden_states_fp4_for_routed = hidden_states_fp4
 
         if is_helix and all_rank_num_tokens is not None:
-            cp_rank = self.mapping_with_cp.cp_rank
-
-            # For non-primary CP ranks (cp_rank > 0), slice hidden_states to empty
-            # The MoE will still participate in collectives but with 0 tokens
-            if cp_rank != 0:
-                hidden_states_for_routed = hidden_states[:0]
-                if hidden_states_fp4 is not None:
-                    hidden_states_fp4_for_routed = Fp4QuantizedTensor(
-                        hidden_states_fp4.data[:0],
-                        hidden_states_fp4.scale_factors[:0] if hidden_states_fp4.scale_factors is not None else None
-                    )
-
-            # File-based logging for deduplication verification
-            debug_level = os.environ.get('TRTLLM_HELIX_DEDUP_DEBUG', '0')
-            if debug_level == '2':
-                import datetime
-                my_rank = self.mapping_with_cp.rank
-                cp_size = self.mapping_with_cp.cp_size
-                log_file = f"helix_dedup_cp{cp_size}_rank{my_rank}.log"
-                with open(log_file, 'a') as f:
-                    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
-                    f.write(f"[{timestamp}] layer={self.layer_idx}, rank={my_rank}, cp_rank={cp_rank}, "
-                            f"all_rank_num_tokens={all_rank_num_tokens}, "
-                            f"input_shape={tuple(hidden_states.shape)}, "
-                            f"routed_shape={tuple(hidden_states_for_routed.shape)}\n")
+            hidden_states_for_routed, hidden_states_fp4_for_routed = (
+                self._prepare_helix_inputs(hidden_states, hidden_states_fp4))
 
         def _compute_shared_output():
-            # Shared experts use original hidden_states (not sliced)
-            # Each CP rank computes locally - results will be identical
+            # Shared experts use original hidden_states (not sliced).
+            # Each CP rank computes locally; results will be identical.
             shared_output = self.shared_experts(
                 hidden_states_fp4
                 if hidden_states_fp4 is not None else hidden_states)
@@ -1194,49 +1205,34 @@ class Deepseekv3MoE(nn.Module):
             return shared_output
 
         def _compute_routed_output():
-            # All ranks must call compute_routed_output because it has internal collectives
-            # cp_rank > 0 will have empty hidden_states_for_routed (0 tokens)
-            routed_output = self.compute_routed_output(hidden_states_for_routed,
-                                                       hidden_states_fp4_for_routed,
-                                                       all_rank_num_tokens,
-                                                       do_finalize)
-            return routed_output
+            # All ranks must call compute_routed_output for internal collectives.
+            # For Helix cp_rank > 0, hidden_states_for_routed is empty.
+            return self.compute_routed_output(hidden_states_for_routed,
+                                              hidden_states_fp4_for_routed,
+                                              all_rank_num_tokens,
+                                              do_finalize)
 
         routed_output, shared_output = maybe_execute_in_parallel(
             _compute_routed_output, _compute_shared_output,
             self.event_dict[EventType.Main],
             self.event_dict[EventType.MoeShared], self.aux_stream)
 
-        # Helix CP allgather: non-primary CP ranks have empty output (0 tokens)
-        # due to deduplication. Use cp_allgather to get cp_rank=0's data.
+        # Helix broadcast: distribute routed output from cp_rank=0 to all CP ranks.
         if is_helix and all_rank_num_tokens is not None:
-            from tensorrt_llm._torch.distributed import cp_allgather
-
-            cp_size = self.mapping_with_cp.cp_size
-            my_rank = self.mapping_with_cp.rank
-
-            # Find my DP group's starting index in all_rank_num_tokens
-            # Ranks are ordered as [dp0cp0, dp0cp1, dp1cp0, dp1cp1, ...]
-            dp_rank = my_rank // cp_size
-            cp_group_start = dp_rank * cp_size
-
-            # Sizes for this CP group
-            sizes = [all_rank_num_tokens[cp_group_start + i] for i in range(cp_size)]
-
-            routed_output = cp_allgather(routed_output, self.mapping_with_cp, dim=0, sizes=sizes)
+            routed_output = self._broadcast_helix_output(
+                routed_output, all_rank_num_tokens)
 
         if not do_finalize:
             return [shared_output, *routed_output]
         else:
             if routed_output.dim() == 3:
-                assert shared_output.numel(
-                ) * self.top_k == routed_output.numel(
-                ), 'unmatched tensor shape'
+                assert shared_output.numel() * self.top_k == routed_output.numel(), (
+                    'unmatched tensor shape')
                 final_hidden_states = moe_reduce_add_shared_output(
                     routed_output, shared_output)
             else:
-                assert shared_output.size() == routed_output.size(
-                ), 'unmatched tensor shape'
+                assert shared_output.size() == routed_output.size(), (
+                    'unmatched tensor shape')
                 final_hidden_states = shared_output + routed_output
 
             if not self.use_dp and self.mapping.tp_size > 1:

@@ -1402,18 +1402,39 @@ class PyTorchModelEngine(ModelEngine):
             all_rank_num_tokens = list(
                 self.dist.tp_cp_allgather(attn_metadata.num_tokens))
 
-            # Helix deduplication: zero out cp_rank > 0 entries
-            # In Helix mode, CP ranks have identical data after attention,
-            # so we only count tokens from cp_rank=0 to avoid duplicate MoE computation
-            if self.mapping.has_cp_helix() and self.mapping.cp_size > 1:
-                cp_size = self.mapping.cp_size
-                all_rank_num_tokens = [
-                    t if i % cp_size == 0 else 0
-                    for i, t in enumerate(all_rank_num_tokens)
-                ]
+            # Apply Helix deduplication if applicable.
+            all_rank_num_tokens = self._apply_helix_deduplication(
+                all_rank_num_tokens)
 
             return all_rank_num_tokens
         return None
+
+    def _apply_helix_deduplication(
+            self, all_rank_num_tokens: List[int]) -> List[int]:
+        """
+        Deduplicate token counts for Helix Context Parallelism.
+
+        In Helix mode, all CP ranks have identical data after attention.
+        To avoid duplicate MoE computation, we zero out the token counts
+        for cp_rank > 0, keeping only cp_rank=0 tokens per DP group.
+
+        Args:
+            all_rank_num_tokens: Token counts for all ranks in TP*CP group.
+
+        Returns:
+            Deduplicated token counts with cp_rank > 0 entries zeroed out.
+        """
+        if not (self.mapping.has_cp_helix() and self.mapping.cp_size > 1):
+            return all_rank_num_tokens
+
+        cp_size = self.mapping.cp_size
+
+        # Ranks are ordered as [dp0cp0, dp0cp1, dp1cp0, dp1cp1, ...].
+        # Keep only cp_rank=0 entries (indices 0, cp_size, 2*cp_size, ...).
+        return [
+            count if idx % cp_size == 0 else 0
+            for idx, count in enumerate(all_rank_num_tokens)
+        ]
 
     def _get_all_rank_ctx_requests(self, num_ctx_requests: int):
         if self.enable_attention_dp:
