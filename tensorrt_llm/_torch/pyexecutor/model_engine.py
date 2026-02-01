@@ -1424,13 +1424,13 @@ class PyTorchModelEngine(ModelEngine):
         Returns:
             Deduplicated token counts with cp_rank > 0 entries zeroed out.
         """
-        if not (self.mapping.has_cp_helix() and self.mapping.cp_size > 1):
+        if not self.mapping.has_cp_helix():
             return all_rank_num_tokens
 
         cp_size = self.mapping.cp_size
 
-        # Ranks are ordered as [dp0cp0, dp0cp1, dp1cp0, dp1cp1, ...].
-        # Keep only cp_rank=0 entries (indices 0, cp_size, 2*cp_size, ...).
+        # Ranks are ordered as [dp0cp0, dp0cp1, ... dp1cp0, dp1cp1, ...].
+        # Keep only cp_rank=0 entries as is, zero out entries for cp_rank > 0.
         return [
             count if idx % cp_size == 0 else 0
             for idx, count in enumerate(all_rank_num_tokens)

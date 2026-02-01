@@ -49,7 +49,8 @@ from tensorrt_llm.quantization.mode import QuantAlgo
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
 from ..distributed import (AllReduce, AllReduceFusionOp, AllReduceParams,
-                           MoEAllReduce, MoEAllReduceParams, allgather)
+                           MoEAllReduce, MoEAllReduceParams, allgather,
+                           cp_allgather)
 from ..model_config import ModelConfig
 from ..modules.attention import MLA
 from ..modules.decoder_layer import DecoderLayer
@@ -895,7 +896,6 @@ class Deepseekv3MoE(nn.Module):
         super().__init__()
         # Store original mapping with CP info for Helix deduplication
         self.mapping_with_cp = mapping_with_cp
-        self.layer_idx = layer_idx  # Store for logging
         config = model_config.pretrained_config
         self.top_k = top_k
         self.use_dp = model_config.mapping.enable_attention_dp
@@ -962,7 +962,7 @@ class Deepseekv3MoE(nn.Module):
             key: torch.cuda.Event()
             for key in [EventType.Main, EventType.MoeShared]
         }
-        
+
         # Store config values for perfect routing.
         self.model_config = model_config
         self.dtype = dtype
@@ -1054,9 +1054,8 @@ class Deepseekv3MoE(nn.Module):
                 hidden_states,
                 (0, 0, 0, max(all_rank_num_tokens) - hidden_states.shape[0]))
 
-        my_num_tokens = hidden_states.shape[0]
-
-        if my_num_tokens > 0:
+        # Hidden states may be empty due to Helix deduplication on cp_rank > 0.
+        if hidden_states.shape[0] > 0:
             router_logits = self.gate(hidden_states)
 
             # Use ideal load balanced logits if enabled, otherwise use gate output.
@@ -1092,10 +1091,9 @@ class Deepseekv3MoE(nn.Module):
         return routed_output
 
     def _is_helix_with_cp(self) -> bool:
-        """Check if running in Helix CP mode with cp_size > 1."""
+        """Check if running in Helix CP mode."""
         return (self.mapping_with_cp is not None
-                and self.mapping_with_cp.has_cp_helix()
-                and self.mapping_with_cp.cp_size > 1)
+                and self.mapping_with_cp.has_cp_helix())
 
     def _prepare_helix_inputs(
         self,
@@ -1154,20 +1152,15 @@ class Deepseekv3MoE(nn.Module):
         Returns:
             Broadcasted routed output for all CP ranks.
         """
-        from tensorrt_llm._torch.distributed import cp_allgather
 
         assert self.mapping_with_cp is not None, (
             "_broadcast_helix_output called without mapping_with_cp")
 
         cp_size = self.mapping_with_cp.cp_size
-        my_rank = self.mapping_with_cp.rank
-
-        # Find this DP group's starting index in all_rank_num_tokens.
-        # Ranks are ordered as [dp0cp0, dp0cp1, dp1cp0, dp1cp1, ...].
-        dp_rank = my_rank // cp_size
+        dp_rank = self.mapping_with_cp.tp_rank
         cp_group_start = dp_rank * cp_size
 
-        # Gather sizes for this CP group.
+        # Gather sizes for this CP group (raises IndexError if out of bounds).
         sizes = [all_rank_num_tokens[cp_group_start + i] for i in range(cp_size)]
 
         return cp_allgather(routed_output, self.mapping_with_cp, dim=0, sizes=sizes)
@@ -1253,7 +1246,8 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                  mapping_with_cp: Optional[Mapping] = None):
         super().__init__()
         self.model_config = model_config
-        self.mapping_with_cp = mapping_with_cp  # Store for MoE Helix deduplication
+        # Store original mapping with CP info for Helix deduplication.
+        self.mapping_with_cp = mapping_with_cp
         self.config = model_config.pretrained_config
         config = self.config
 
