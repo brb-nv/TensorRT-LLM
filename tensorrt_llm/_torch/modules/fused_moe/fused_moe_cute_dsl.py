@@ -409,7 +409,13 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             )
 
         if x_sf is not None:
-            x_sf = x_sf.view(x_row, -1)
+            # Handle empty tensor case: cannot use -1 when x_row == 0
+            # because the second dimension cannot be inferred from 0 elements.
+            if x_row == 0:
+                sf_cols = self.hidden_size // self.scaling_vector_size
+                x_sf = x_sf.view(0, sf_cols)
+            else:
+                x_sf = x_sf.view(x_row, -1)
         return x, x_sf
 
     def run_moe_nvfp4(
