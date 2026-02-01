@@ -1415,24 +1415,34 @@ class PyTorchModelEngine(ModelEngine):
         Deduplicate token counts for Helix Context Parallelism.
 
         In Helix mode, all CP ranks have identical data after attention.
-        To avoid duplicate MoE computation, we zero out the token counts
+        To avoid duplicate MoE computation, we set the token counts to 1
         for cp_rank > 0, keeping only cp_rank=0 tokens per DP group.
+        We use 1 instead of 0 to avoid empty tensor issues in MoE all-to-all
+        kernels. The dummy token is sliced off before the helix broadcast.
 
         Args:
             all_rank_num_tokens: Token counts for all ranks in TP*CP group.
 
         Returns:
-            Deduplicated token counts with cp_rank > 0 entries zeroed out.
+            Deduplicated token counts with cp_rank > 0 entries set to 1.
         """
         if not self.mapping.has_cp_helix():
             return all_rank_num_tokens
 
         cp_size = self.mapping.cp_size
 
+        # Assert that we have at least 1 token to use as the dummy for cp_rank > 0.
+        # In Helix mode, all CP ranks have identical data, so this should always hold.
+        for idx, count in enumerate(all_rank_num_tokens):
+            if idx % cp_size != 0:
+                assert count >= 1, (
+                    f"Helix dedup requires at least 1 token for cp_rank > 0, "
+                    f"but rank {idx} has {count} tokens")
+
         # Ranks are ordered as [dp0cp0, dp0cp1, ... dp1cp0, dp1cp1, ...].
-        # Keep only cp_rank=0 entries as is, zero out entries for cp_rank > 0.
+        # Keep only cp_rank=0 entries as is, set entries to 1 for cp_rank > 0.
         return [
-            count if idx % cp_size == 0 else 0
+            count if idx % cp_size == 0 else 1
             for idx, count in enumerate(all_rank_num_tokens)
         ]
 
