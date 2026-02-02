@@ -33,8 +33,25 @@ else
     echo "Not binding memory. If on GB200/GB300 NVL72, use \"numactl -m 0,1\" to only allocate memory from nodes."
 fi
 
-if [ "${benchmark_mode}" = "gen_only" ]; then
-    export TLLM_BENCHMARK_REQ_QUEUES_SIZE=${concurrency}
+if [ "${benchmark_mode}" = "gen_only" ] && [ "${role}" = "GEN" ]; then
+    # Parse enable_attention_dp and tensor_parallel_size from GEN config file
+    enable_attention_dp=$(grep -E "^enable_attention_dp:" "${config_file}" | awk '{print $2}' | tr -d ' ')
+    tp_size=$(grep -E "^tensor_parallel_size:" "${config_file}" | awk '{print $2}' | tr -d ' ')
+    
+    # Default values if not found
+    enable_attention_dp=${enable_attention_dp:-false}
+    tp_size=${tp_size:-1}
+    
+    if [ "${enable_attention_dp}" = "true" ] && [ "${tp_size}" -gt 1 ]; then
+        # With AttnDP, requests are distributed across TP ranks
+        # So per-rank queue size = concurrency / tp_size
+        queue_size=$((concurrency / tp_size))
+        echo "AttnDP enabled: TLLM_BENCHMARK_REQ_QUEUES_SIZE=${queue_size} (concurrency=${concurrency} / tp_size=${tp_size})"
+    else
+        queue_size=${concurrency}
+        echo "AttnDP disabled: TLLM_BENCHMARK_REQ_QUEUES_SIZE=${queue_size}"
+    fi
+    export TLLM_BENCHMARK_REQ_QUEUES_SIZE=${queue_size}
 fi
 
 echo "config_file: ${config_file}"

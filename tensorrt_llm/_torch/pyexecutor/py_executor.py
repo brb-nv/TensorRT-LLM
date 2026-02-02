@@ -1703,11 +1703,27 @@ class PyExecutor:
                             local_can_forward)
                         if all(all_can_forward):
                             can_forward = True
+                            if self.dist.rank == 0:
+                                logger.info(
+                                    f"[AttnDP] All ranks ready, starting forward. "
+                                    f"num_fetched_requests: {self.executor_request_queue.num_fetch_requests}, "
+                                    f"num_fetched_requests_cur_rank: {self.executor_request_queue.num_fetch_requests_cur_rank}, "
+                                    f"scheduled_gen_batch: {len(scheduled_batch.generation_requests)}, "
+                                    f"required_queue_size: {self.benchmark_req_queues_size}, "
+                                    f"tp_size: {self.dist.tp_size}"
+                                )
                             time.sleep(10)
                         else:
                             if self.dist.rank == 0:
                                 logger.info(
-                                    f"sleep 10 seconds, num_fetched_requests: {self.executor_request_queue.num_fetch_requests}, scheduled_gen_batch: {len(scheduled_batch.generation_requests)}"
+                                    f"[AttnDP] Waiting for all ranks. "
+                                    f"num_fetched_requests: {self.executor_request_queue.num_fetch_requests}, "
+                                    f"num_fetched_requests_cur_rank: {self.executor_request_queue.num_fetch_requests_cur_rank}, "
+                                    f"scheduled_gen_batch: {len(scheduled_batch.generation_requests)}, "
+                                    f"required_queue_size: {self.benchmark_req_queues_size}, "
+                                    f"tp_size: {self.dist.tp_size}, "
+                                    f"local_can_forward: {local_can_forward}, "
+                                    f"all_can_forward: {all_can_forward}"
                                 )
                             time.sleep(10)
                             continue
@@ -1716,12 +1732,18 @@ class PyExecutor:
                                ) < self.benchmark_req_queues_size:
                             if self.dist.rank == 0:
                                 logger.info(
-                                    f"sleep 10 seconds, scheduled_gen_batch: {len(scheduled_batch.generation_requests)}"
+                                    f"[NonAttnDP] Waiting. scheduled_gen_batch: {len(scheduled_batch.generation_requests)}, "
+                                    f"required_queue_size: {self.benchmark_req_queues_size}"
                                 )
                             time.sleep(10)
                             continue
                         else:
                             can_forward = True
+                            if self.dist.rank == 0:
+                                logger.info(
+                                    f"[NonAttnDP] Ready, starting forward. scheduled_gen_batch: {len(scheduled_batch.generation_requests)}, "
+                                    f"required_queue_size: {self.benchmark_req_queues_size}"
+                                )
 
                 self._terminate_requests(scheduled_batch.paused_requests)
 

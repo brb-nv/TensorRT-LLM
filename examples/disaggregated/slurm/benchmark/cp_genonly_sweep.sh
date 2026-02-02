@@ -117,6 +117,25 @@ GEN32_COMBINATIONS=(
 )
 
 # =============================================================================
+# PROBLEMATIC COMBINATIONS - Failed configs that need investigation
+# =============================================================================
+PROBLEMATIC_COMBINATIONS=(
+    # TP=1, EP=2, CP=2 (Port Binding Issue) - https://nvbugspro.nvidia.com/bug/5863464
+    "2,2,131072,8192,1,1,2,2,0"
+    "2,8,131072,8192,1,1,2,2,0"
+    "2,16,131072,8192,1,1,2,2,0"
+
+    # TP=2, EP=4, CP=2 (without attnDP) - https://nvbugspro.nvidia.com/bug/5863443
+    "4,2,131072,8192,1,2,2,4,0"
+    "4,4,131072,8192,1,2,2,4,0"
+
+    # TP=2, EP=8, CP=4 (without attnDP) - https://nvbugspro.nvidia.com/bug/5863443
+    "8,2,131072,8192,1,2,4,8,0"
+    "8,4,131072,8192,1,2,4,8,0"
+    "8,8,131072,8192,1,2,4,8,0"
+)
+
+# =============================================================================
 # Helper functions
 # =============================================================================
 
@@ -312,18 +331,19 @@ submit_job() {
 MODE="${1:-all}"  # Default to all if not specified
 
 usage() {
-    echo "Usage: $0 [gen2|gen4|gen8|gen16|gen32|all]"
+    echo "Usage: $0 [gen2|gen4|gen8|gen16|gen32|problematic|all]"
     echo ""
     echo "Context Parallelism (CP) sweep for gen-only mode"
     echo "global_batch_size = concurrency"
     echo ""
     echo "Options:"
-    echo "  gen2      Run 2 GPU instance combinations only (4 experiments)"
-    echo "  gen4      Run 4 GPU instance combinations only (8 experiments)"
-    echo "  gen8      Run 8 GPU instance combinations only (11 experiments)"
-    echo "  gen16     Run 16 GPU instance combinations only (12 experiments)"
-    echo "  gen32     Run 32 GPU instance combinations only (14 experiments)"
-    echo "  all       Run all combinations (default, 49 experiments)"
+    echo "  gen2        Run 2 GPU instance combinations only (4 experiments)"
+    echo "  gen4        Run 4 GPU instance combinations only (8 experiments)"
+    echo "  gen8        Run 8 GPU instance combinations only (11 experiments)"
+    echo "  gen16       Run 16 GPU instance combinations only (12 experiments)"
+    echo "  gen32       Run 32 GPU instance combinations only (14 experiments)"
+    echo "  problematic Run failed configs that need investigation (18 experiments)"
+    echo "  all         Run all combinations (default, 49 experiments)"
     echo ""
     echo "Naming convention:"
     echo "  tep_N  - TEP mode with N GPUs (AttnDP=false, max CP for low batch)"
@@ -353,6 +373,10 @@ case "$MODE" in
     gen32)
         COMBINATIONS=("${GEN32_COMBINATIONS[@]}")
         MODE_DESC="32 GPU CP"
+        ;;
+    problematic)
+        COMBINATIONS=("${PROBLEMATIC_COMBINATIONS[@]}")
+        MODE_DESC="Problematic CP"
         ;;
     all)
         COMBINATIONS=("${GEN2_COMBINATIONS[@]}" "${GEN4_COMBINATIONS[@]}" "${GEN8_COMBINATIONS[@]}" "${GEN16_COMBINATIONS[@]}" "${GEN32_COMBINATIONS[@]}")
