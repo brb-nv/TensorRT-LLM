@@ -30,23 +30,23 @@ CONFIGS_DIR="${WORK_DIR}/saved_configs/${TIMESTAMP}_cp_sweep"
 # 2 GPU COMBINATIONS - PP x TP x CP = 2
 # =============================================================================
 GEN2_COMBINATIONS=(
-    # tep_2: TEP mode (PP=1, TP=1, CP=2) - concurrency 1,2,4,8
-    "2,1,131072,8192,1,1,2,2,0"
+    # tep_2: TEP mode (PP=1, TP=1, CP=2) - concurrency 2,4,8,16
     "2,2,131072,8192,1,1,2,2,0"
     "2,4,131072,8192,1,1,2,2,0"
     "2,8,131072,8192,1,1,2,2,0"
-    # dep_2: DEP mode (PP=1, TP=1, CP=2) - concurrency 16
-    "2,16,131072,8192,1,1,2,2,1"
+    "2,16,131072,8192,1,1,2,2,0"
 )
 
 # =============================================================================
 # 4 GPU COMBINATIONS - PP x TP x CP = 4
 # =============================================================================
 GEN4_COMBINATIONS=(
-    # tep_4: TEP mode (PP=1, TP=1, CP=4) - concurrency 1,2,4
-    "4,1,131072,8192,1,1,4,4,0"
+    # tep_4: TEP mode (PP=1, TP=1, CP=4) - concurrency 2,4
     "4,2,131072,8192,1,1,4,4,0"
     "4,4,131072,8192,1,1,4,4,0"
+    # tep_4: TEP mode (PP=1, TP=2, CP=2) - concurrency 2,4
+    "4,2,131072,8192,1,2,2,4,0"
+    "4,4,131072,8192,1,2,2,4,0"
     # dep_4: DEP mode (PP=1, TP=2, CP=2) - concurrency 8,16,32,64
     "4,8,131072,8192,1,2,2,4,1"
     "4,16,131072,8192,1,2,2,4,1"
@@ -58,13 +58,11 @@ GEN4_COMBINATIONS=(
 # 8 GPU COMBINATIONS - PP x TP x CP = 8
 # =============================================================================
 GEN8_COMBINATIONS=(
-    # tep_8: TEP mode (PP=1, TP=1, CP=8) - concurrency 1,2,4,8
-    "8,1,131072,8192,1,1,8,8,0"
+    # tep_8: TEP mode (PP=1, TP=1, CP=8) - concurrency 2,4,8
     "8,2,131072,8192,1,1,8,8,0"
     "8,4,131072,8192,1,1,8,8,0"
     "8,8,131072,8192,1,1,8,8,0"
-    # tep_8: TEP mode (PP=1, TP=2, CP=4) - concurrency 1,2,4,8
-    "8,1,131072,8192,1,2,4,8,0"
+    # tep_8: TEP mode (PP=1, TP=2, CP=4) - concurrency 2,4,8
     "8,2,131072,8192,1,2,4,8,0"
     "8,4,131072,8192,1,2,4,8,0"
     "8,8,131072,8192,1,2,4,8,0"
@@ -80,6 +78,13 @@ GEN8_COMBINATIONS=(
 # 16 GPU COMBINATIONS - PP x TP x CP = 16 (DEP only for high batch)
 # =============================================================================
 GEN16_COMBINATIONS=(
+    # dep_16: DEP mode (PP=1, TP=4, CP=4) - concurrency 16,32,64,128,256,512
+    "16,16,131072,8192,1,4,4,16,1"
+    "16,32,131072,8192,1,4,4,16,1"
+    "16,64,131072,8192,1,4,4,16,1"
+    "16,128,131072,8192,1,4,4,16,1"
+    "16,256,131072,8192,1,4,4,16,1"
+    "16,512,131072,8192,1,4,4,16,1"
     # dep_16: DEP mode (PP=1, TP=8, CP=2) - concurrency 16,32,64,128,256,512
     "16,16,131072,8192,1,8,2,16,1"
     "16,32,131072,8192,1,8,2,16,1"
@@ -93,6 +98,14 @@ GEN16_COMBINATIONS=(
 # 32 GPU COMBINATIONS - PP x TP x CP = 32 (DEP only for high batch)
 # =============================================================================
 GEN32_COMBINATIONS=(
+    # dep_32: DEP mode (PP=1, TP=8, CP=4) - concurrency 32,64,128,256,512,1024,2048
+    "32,32,131072,8192,1,8,4,32,1"
+    "32,64,131072,8192,1,8,4,32,1"
+    "32,128,131072,8192,1,8,4,32,1"
+    "32,256,131072,8192,1,8,4,32,1"
+    "32,512,131072,8192,1,8,4,32,1"
+    "32,1024,131072,8192,1,8,4,32,1"
+    "32,2048,131072,8192,1,8,4,32,1"
     # dep_32: DEP mode (PP=1, TP=16, CP=2) - concurrency 32,64,128,256,512,1024,2048
     "32,32,131072,8192,1,16,2,32,1"
     "32,64,131072,8192,1,16,2,32,1"
@@ -305,12 +318,12 @@ usage() {
     echo "global_batch_size = concurrency"
     echo ""
     echo "Options:"
-    echo "  gen2      Run 2 GPU instance combinations only (5 experiments)"
-    echo "  gen4      Run 4 GPU instance combinations only (7 experiments)"
-    echo "  gen8      Run 8 GPU instance combinations only (9 experiments)"
-    echo "  gen16     Run 16 GPU instance combinations only (6 experiments)"
-    echo "  gen32     Run 32 GPU instance combinations only (6 experiments)"
-    echo "  all       Run all combinations (default, 33 experiments)"
+    echo "  gen2      Run 2 GPU instance combinations only (4 experiments)"
+    echo "  gen4      Run 4 GPU instance combinations only (8 experiments)"
+    echo "  gen8      Run 8 GPU instance combinations only (11 experiments)"
+    echo "  gen16     Run 16 GPU instance combinations only (12 experiments)"
+    echo "  gen32     Run 32 GPU instance combinations only (14 experiments)"
+    echo "  all       Run all combinations (default, 49 experiments)"
     echo ""
     echo "Naming convention:"
     echo "  tep_N  - TEP mode with N GPUs (AttnDP=false, max CP for low batch)"
@@ -364,7 +377,7 @@ current=0
 echo "============================================"
 echo "Starting $MODE_DESC benchmark with $total_combinations combinations"
 echo "Segment limit: 72 GPUs"
-echo "Mode: gen_only_no_context"
+echo "Mode: gen_only"
 echo "Note: global_batch_size = concurrency"
 echo "============================================"
 
