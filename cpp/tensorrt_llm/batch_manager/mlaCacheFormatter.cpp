@@ -219,24 +219,10 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
             }
             return bufferSizeForTarget;
         };
-            auto bufferEleSizes = getBufferSizeForTarget();
-
-            // Debug logging for send buffer sizes
-            auto selfRank = mpi::MpiComm::world().getRank();
-            auto selfCPSize = selfConfig.getParallelConfig().mContextParallelism;
-            auto selfCPRank = selfIdx % selfCPSize;
-            auto selfTPRank = (selfIdx % (selfConfig.getParallelConfig().mTensorParallelism * selfCPSize)) / selfCPSize;
-            TLLM_LOG_INFO("[MLACacheFormatter::format][Rank %d] reqId=%zu: selfIdx=%d, selfTPRank=%d, selfCPRank=%d, pPDomainSize=%zu, cPDomainSize=%zu, blockNum=%d, connections.size=%zu",
-                selfRank, llmRequest.mRequestId, selfIdx, selfTPRank, selfCPRank, pPDomainSize, cPDomainSize, blockNum, connections.size());
-            for (size_t dbgIdx = 0; dbgIdx < bufferEleSizes.size(); dbgIdx++)
-            {
-                TLLM_LOG_INFO("[MLACacheFormatter::format][Rank %d] reqId=%zu: bufferEleSizes[%zu]=%zu bytes",
-                    selfRank, llmRequest.mRequestId, dbgIdx, bufferEleSizes[dbgIdx]);
-            }
-
-            auto cacheBufferId = mCacheTransBufferManagers[transferIndexerKCache]->assignBufferIndexForSend();
-            auto result = mCacheTransBufferManagers[transferIndexerKCache]->getOrAllocateSendBuffers(
-                cacheBufferId, static_cast<int>(pPDomainSize * cPDomainSize), bufferEleSizes, bufferManager);
+        auto bufferEleSizes = getBufferSizeForTarget();
+        auto cacheBufferId = mCacheTransBufferManagers[transferIndexerKCache]->assignBufferIndexForSend();
+        auto result = mCacheTransBufferManagers[transferIndexerKCache]->getOrAllocateSendBuffers(
+            cacheBufferId, static_cast<int>(pPDomainSize * cPDomainSize), bufferEleSizes, bufferManager);
         auto& outputSplitCaches = std::get<0>(result);
         auto& bufferCoverTargetNum = std::get<1>(result);
         auto& onlyUseDynamicBuffer = std::get<2>(result);
@@ -270,19 +256,6 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
         auto connectionsPerCPDomain = connections.size() / cPDomainSize;
         TLLM_CHECK_WITH_INFO(connectionsPerCPDomain > 0, "connectionsPerCPDomain must be > 0");
 
-        TLLM_LOG_INFO("[MLACacheFormatter::format][Rank %d] reqId=%zu: connectionsPerCPDomain=%zu (connections.size=%zu / cPDomainSize=%zu)",
-            selfRank, llmRequest.mRequestId, connectionsPerCPDomain, connections.size(), cPDomainSize);
-
-        // Log the connection-to-cacheIdx mapping for verification
-        for (size_t i = 0; i < connections.size(); i++)
-        {
-            auto cpIdx = i / connectionsPerCPDomain;
-            auto ppIdx = (i % connectionsPerCPDomain) % pPDomainSize;
-            auto cIdx = cpIdx * pPDomainSize + ppIdx;
-            TLLM_LOG_INFO("[MLACacheFormatter::format][Rank %d] reqId=%zu: Connection mapping: processIdx=%zu -> cpDomainIdx=%zu, ppDomainIdx=%zu, cacheIdx=%zu, expectedSize=%zu bytes",
-                selfRank, llmRequest.mRequestId, i, cpIdx, ppIdx, cIdx, bufferEleSizes[cIdx]);
-        }
-
         auto sendBufferFun = [&](int deviceId, size_t processIdx)
         {
             NVTX3_SCOPED_RANGE(sendBufferFun);
@@ -298,8 +271,6 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
             if (cacheIdx < bufferCoverTargetNum)
             {
                 size_t size = outputSplitCaches.at(cacheIdx)->getSizeInBytes();
-                TLLM_LOG_INFO("[MLACacheFormatter::format][Rank %d] reqId=%zu: SEND processIdx=%zu, cpDomainIdx=%zu, ppDomainIdx=%zu, cacheIdx=%zu, size=%zu bytes",
-                    selfRank, llmRequest.mRequestId, processIdx, cpDomainIdx, ppDomainIdx, cacheIdx, size);
                 session.send(processIdx, outputSplitCaches.at(cacheIdx)->data(), size);
             }
             else
@@ -503,18 +474,6 @@ void MLACacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& s
             };
             auto bufferEleSizes = getBufferSizeForTarget();
 
-            // Debug logging for recv buffer sizes
-            auto selfRank = mpi::MpiComm::world().getRank();
-            auto selfCPSize = selfConfig.getParallelConfig().mContextParallelism;
-            auto selfCPRank = selfIdx % selfCPSize;
-            TLLM_LOG_INFO("[MLACacheFormatter::unformat][Rank %d] ctxReqId=%zu: selfIdx=%d, selfCPSize=%d, selfCPRank=%d, targetNum=%zu, blockNum=%zu, pickUpConnections.size=%zu",
-                selfRank, ctxReqId, selfIdx, selfCPSize, selfCPRank, targetNum, blockNum, pickUpConnections.size());
-            for (size_t dbgIdx = 0; dbgIdx < bufferEleSizes.size(); dbgIdx++)
-            {
-                TLLM_LOG_INFO("[MLACacheFormatter::unformat][Rank %d] ctxReqId=%zu: Expected from connection[%zu] (ctxRank=%zu): bufferSize=%zu bytes",
-                    selfRank, ctxReqId, dbgIdx, pickUpConnections[dbgIdx], bufferEleSizes[dbgIdx]);
-            }
-
             auto result = mCacheTransBufferManagers[transferIndexerKCache]->getOrAllocateRecvBuffers(
                 cacheBufferId, static_cast<int>(targetNum), bufferEleSizes, bufferManager);
             auto& recvSplitCaches = std::get<0>(result);
@@ -546,8 +505,6 @@ void MLACacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& s
                     auto& buffer = recvSplitCaches.at(processIdx);
                     llmRequest.updateKvCacheSize(buffer->getSizeInBytes());
                     size = buffer->getSizeInBytes();
-                    TLLM_LOG_INFO("[MLACacheFormatter::unformat][Rank %d] ctxReqId=%zu: RECV processIdx=%zu, connection=%zu, bufferSize=%zu bytes",
-                        selfRank, ctxReqId, processIdx, pickUpConnections.at(processIdx), size);
                     session.recv(pickUpConnections.at(processIdx), buffer->data(), buffer->getSizeInBytes());
                 }
                 else
