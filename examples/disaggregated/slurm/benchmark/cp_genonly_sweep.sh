@@ -120,19 +120,19 @@ GEN32_COMBINATIONS=(
 # PROBLEMATIC COMBINATIONS - Failed configs that need investigation
 # =============================================================================
 PROBLEMATIC_COMBINATIONS=(
-    # TP=1, EP=2, CP=2 (Port Binding Issue) - https://nvbugspro.nvidia.com/bug/5863464
-    "2,2,131072,8192,1,1,2,2,0"
-    "2,8,131072,8192,1,1,2,2,0"
-    "2,16,131072,8192,1,1,2,2,0"
+    # # TP=1, EP=2, CP=2 (Port Binding Issue) - https://nvbugspro.nvidia.com/bug/5863464
+    # "2,2,131072,8192,1,1,2,2,0"
+    # "2,8,131072,8192,1,1,2,2,0"
+    # "2,16,131072,8192,1,1,2,2,0"
 
     # TP=2, EP=4, CP=2 (without attnDP) - https://nvbugspro.nvidia.com/bug/5863443
     "4,2,131072,8192,1,2,2,4,0"
-    "4,4,131072,8192,1,2,2,4,0"
+    # "4,4,131072,8192,1,2,2,4,0"
 
-    # TP=2, EP=8, CP=4 (without attnDP) - https://nvbugspro.nvidia.com/bug/5863443
-    "8,2,131072,8192,1,2,4,8,0"
-    "8,4,131072,8192,1,2,4,8,0"
-    "8,8,131072,8192,1,2,4,8,0"
+    # # TP=2, EP=8, CP=4 (without attnDP) - https://nvbugspro.nvidia.com/bug/5863443
+    # "8,2,131072,8192,1,2,4,8,0"
+    # "8,4,131072,8192,1,2,4,8,0"
+    # "8,8,131072,8192,1,2,4,8,0"
 )
 
 # =============================================================================
