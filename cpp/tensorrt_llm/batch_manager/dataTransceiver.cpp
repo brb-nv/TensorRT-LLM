@@ -356,6 +356,11 @@ public:
         auto* agentConnectionManager = dynamic_cast<executor::kv_cache::AgentConnectionManager*>(mManager);
         bool isAgent = agentConnectionManager != nullptr;
 
+        auto selfRank = mpi::MpiComm::world().getRank();
+        auto selfIdx = mSelfState.getCommState().value().getSelfIdx();
+        TLLM_LOG_INFO("[CacheSender][Rank %d][SelfIdx %d] Waiting to receive request info from gen rank...",
+            selfRank, selfIdx);
+
         TransceiverTag::Id id;
         RequestInfo info;
         auto const* connection = isAgent
@@ -363,7 +368,8 @@ public:
             : mManager->recvConnect(DataContext{TransceiverTag::kID_TAG, mTerminate}, &id, sizeof(id));
         if (connection == nullptr && !mManager->isRunning())
         {
-            TLLM_LOG_WARNING(" recvRequestInfo connection is nullptr, maybe the server is terminating");
+            TLLM_LOG_WARNING("[CacheSender][Rank %d] recvRequestInfo connection is nullptr, server may be terminating",
+                selfRank);
             return info;
         }
 
@@ -380,6 +386,10 @@ public:
         }
 
         auto requestId = info.getRequestId();
+        auto genPeerIdx = info.getTransState().getCommState()->getSelfIdx();
+        TLLM_LOG_INFO("[CacheSender][Rank %d][SelfIdx %d] Received request info: reqId=%zu from genPeerIdx=%d",
+            selfRank, selfIdx, requestId, genPeerIdx);
+
         TLLM_CHECK_WITH_INFO(mFormatter->inquireSupport(
                                  mSelfState.getCacheState().value(), info.getTransState().getCacheState().value()),
             "Disagg server does not currently support these cacheState, please check the cacheState of the context and "
@@ -390,11 +400,17 @@ public:
         int peerIdx = std::distance(peerRelativeRanks.begin(),
             std::find(
                 peerRelativeRanks.begin(), peerRelativeRanks.end(), info.getTransState().getCommState()->getSelfIdx()));
+
+        TLLM_LOG_INFO("[CacheSender][Rank %d][SelfIdx %d] ReqId=%zu: peerRelativeRanks.size=%zu, peerIdx=%d",
+            selfRank, selfIdx, requestId, peerRelativeRanks.size(), peerIdx);
+
         {
             std::unique_lock<std::mutex> lk(mMtxForMap);
             auto it = mRequestToSession.find(requestId);
             if (it == mRequestToSession.end())
             {
+                TLLM_LOG_INFO("[CacheSender][Rank %d][SelfIdx %d] ReqId=%zu: Creating new session with %zu peer connections",
+                    selfRank, selfIdx, requestId, peerRelativeRanks.size());
                 auto session = TransferSession(std::vector<Connection const*>(peerRelativeRanks.size(), nullptr),
                     DataContext{tagFromRequestId(requestId), mTerminate}, mSelfState, info.getTransState(),
                     mBufferManager, info.getIndexFromEnd(), info.getLastBlockKey(), nullptr,
@@ -403,12 +419,19 @@ public:
                 it = mRequestToSession.emplace(requestId, std::move(session)).first;
             }
             it->second.setConnection(peerIdx, connection);
+            TLLM_LOG_INFO("[CacheSender][Rank %d][SelfIdx %d] ReqId=%zu: Connection set for peerIdx=%d",
+                selfRank, selfIdx, requestId, peerIdx);
         }
         return info;
     }
 
     void sendSync(LlmRequest const& llmRequest)
     {
+        auto selfRank = mpi::MpiComm::world().getRank();
+        auto selfIdx = mSelfState.getCommState().value().getSelfIdx();
+        TLLM_LOG_INFO("[CacheSender][Rank %d][SelfIdx %d] sendSync START: reqId=%zu",
+            selfRank, selfIdx, llmRequest.mRequestId);
+
         TransferSession* session = nullptr;
         {
             std::unique_lock<std::mutex> lk(mMtxForMap);
@@ -416,8 +439,17 @@ public:
             TLLM_CHECK(it != mRequestToSession.end());
             session = std::addressof(it->second);
         }
+        TLLM_LOG_INFO("[CacheSender][Rank %d][SelfIdx %d] sendSync: reqId=%zu, numConnections=%zu",
+            selfRank, selfIdx, llmRequest.mRequestId, session->getConnections().size());
+
         session->setLlmRequest(llmRequest);
+        auto formatStart = std::chrono::steady_clock::now();
         mFormatter->format(*session);
+        auto formatEnd = std::chrono::steady_clock::now();
+        auto formatDurationMs = std::chrono::duration<double, std::milli>(formatEnd - formatStart).count();
+
+        TLLM_LOG_INFO("[CacheSender][Rank %d][SelfIdx %d] sendSync DONE: reqId=%zu, formatDuration=%.2fms",
+            selfRank, selfIdx, llmRequest.mRequestId, formatDurationMs);
         llmRequest.setKvCacheTransferEnd(LlmRequest::getSteadyClockNow());
     }
 
@@ -442,6 +474,11 @@ public:
 
     void sendReadySignal(LlmRequest::RequestIdType requestId, bool isReady)
     {
+        auto selfRank = mpi::MpiComm::world().getRank();
+        auto selfIdx = mSelfState.getCommState().value().getSelfIdx();
+        TLLM_LOG_INFO("[CacheSender][Rank %d][SelfIdx %d] sendReadySignal: reqId=%zu, isReady=%s",
+            selfRank, selfIdx, requestId, isReady ? "true" : "false");
+
         TransferSession* session = nullptr;
         {
             std::unique_lock<std::mutex> lock(mMtxForMap);
@@ -450,6 +487,9 @@ public:
             session = std::addressof(it->second);
         }
         auto const& connections = session->getConnections();
+        TLLM_LOG_INFO("[CacheSender][Rank %d][SelfIdx %d] sendReadySignal: reqId=%zu, sending to %zu gen peers",
+            selfRank, selfIdx, requestId, connections.size());
+
         for (size_t i = 0; i < connections.size(); i++)
         {
             auto* agentConnectionManager = dynamic_cast<executor::kv_cache::AgentConnectionManager*>(mManager);
@@ -465,6 +505,8 @@ public:
                 connections.at(i)->send(
                     executor::kv_cache::DataContext{TransceiverTag::kREADY_SIGNAL_TAG}, &isReady, sizeof(isReady));
             }
+            TLLM_LOG_INFO("[CacheSender][Rank %d][SelfIdx %d] sendReadySignal SENT to peer %zu for reqId=%zu",
+                selfRank, selfIdx, i, requestId);
         }
     }
 
@@ -609,19 +651,27 @@ private:
         {
             tensorrt_llm::common::setThreadName("dataTransResp");
             TLLM_CUDA_CHECK(cudaSetDevice(mDeviceId));
+            auto selfRank = mpi::MpiComm::world().getRank();
+            auto selfIdx = mSelfState.getCommState().value().getSelfIdx();
+            TLLM_LOG_INFO("[CacheSender][Rank %d][SelfIdx %d] Response thread started", selfRank, selfIdx);
+
             while (!mTerminate || !mAnyReady)
             {
                 if (!mAnyReady)
                 {
+                    TLLM_LOG_DEBUG(selfRank, "[CacheSender][SelfIdx %d] Waiting for requests...", selfIdx);
                     std::unique_lock lk(mCondMutex);
                     mSenderCv.wait(lk, [this]() { return (mAnyReady || mTerminate); });
                 }
                 if (mTerminate)
                 {
+                    TLLM_LOG_INFO("[CacheSender][Rank %d][SelfIdx %d] Response thread terminating", selfRank, selfIdx);
                     break;
                 }
                 if (!mReadyResponses.empty())
                 {
+                    TLLM_LOG_INFO("[CacheSender][Rank %d][SelfIdx %d] Have %zu ready responses, calling recvRequestInfo",
+                        selfRank, selfIdx, mReadyResponses.size());
                     auto const& requestInfo = recvRequestInfo();
                     if (mTerminate || !mManager->isRunning())
                     {
@@ -636,16 +686,23 @@ private:
 
                     if (mRemainSendCount.find(reqId) == mRemainSendCount.end())
                     {
-                        mRemainSendCount[reqId] = getCounterpartsCount(reqId);
+                        auto count = getCounterpartsCount(reqId);
+                        mRemainSendCount[reqId] = count;
+                        TLLM_LOG_INFO("[CacheSender][Rank %d][SelfIdx %d] reqId=%zu: initialized remainSendCount=%d",
+                            selfRank, selfIdx, reqId, count);
                     }
                 }
                 auto it = getCurrentResponse();
                 if (it != mReadyResponses.end())
                 {
+                    TLLM_LOG_INFO("[CacheSender][Rank %d][SelfIdx %d] reqId=%zu: calling sendResponse",
+                        selfRank, selfIdx, it->first);
                     sendResponse(it);
                 }
                 else
                 {
+                    TLLM_LOG_INFO("[CacheSender][Rank %d][SelfIdx %d] Waiting for response to become available",
+                        selfRank, selfIdx);
                     auto it = getCurrentResponse();
                     while (it == mReadyResponses.end())
                     {
@@ -660,6 +717,7 @@ private:
                     sendResponse(it);
                 }
             }
+            TLLM_LOG_INFO("[CacheSender][Rank %d][SelfIdx %d] Response thread exiting", selfRank, selfIdx);
         }
         catch (std::exception const& err)
         {
@@ -795,7 +853,22 @@ public:
 
     void receiveSync(TransferSession& session)
     {
+        auto selfRank = mpi::MpiComm::world().getRank();
+        auto selfIdx = mSelfState.getCommState().value().getSelfIdx();
+        auto const& llmRequest = session.getLlmRequest();
+        auto ctxReqId = llmRequest.getContextPhaseParams().value().getReqId();
+
+        TLLM_LOG_INFO("[CacheReceiver][Rank %d][SelfIdx %d] receiveSync START: ctxReqId=%zu, genReqId=%zu, numConnections=%zu",
+            selfRank, selfIdx, ctxReqId, llmRequest.mRequestId, session.getConnections().size());
+
+        auto unformatStart = std::chrono::steady_clock::now();
         mFormatter->unformat(session);
+        auto unformatEnd = std::chrono::steady_clock::now();
+        auto unformatDurationMs = std::chrono::duration<double, std::milli>(unformatEnd - unformatStart).count();
+
+        TLLM_LOG_INFO("[CacheReceiver][Rank %d][SelfIdx %d] receiveSync DONE: ctxReqId=%zu, genReqId=%zu, unformatDuration=%.2fms",
+            selfRank, selfIdx, ctxReqId, llmRequest.mRequestId, unformatDurationMs);
+
         if (!common::getEnvKVCacheTimeOutputPath().empty())
         {
             std::unique_lock<std::mutex> lock(mMeasuresFileMutex);
@@ -816,6 +889,12 @@ public:
         auto const& contextState = llmRequest.getDataTransceiverState();
         auto const& commState = contextState.getCommState().value();
         auto const& destCacheState = contextState.getCacheState().value();
+
+        auto selfRank = mpi::MpiComm::world().getRank();
+        auto selfIdx = mSelfState.getCommState().value().getSelfIdx();
+        TLLM_LOG_INFO("[CacheReceiver][Rank %d][SelfIdx %d] sendRequestInfo START: ctxReqId=%zu, genReqId=%zu",
+            selfRank, selfIdx, requestId, llmRequest.mRequestId);
+
         TLLM_CHECK_WITH_INFO(mFormatter->inquireSupport(mSelfState.getCacheState().value(), destCacheState),
             "Disagg server does not currently support these cacheState.");
 
@@ -861,6 +940,14 @@ public:
         auto counterParts = mFormatter->getCounterparts(
             mSelfState.getCacheState().value(), mSelfState.getCommState().value().getSelfIdx(), destCacheState);
 
+        TLLM_LOG_INFO("[CacheReceiver][Rank %d][SelfIdx %d] ctxReqId=%zu: counterParts.size=%zu, connecting to ctx ranks",
+            selfRank, selfIdx, requestId, counterParts.size());
+        for (size_t cpIdx = 0; cpIdx < counterParts.size(); cpIdx++)
+        {
+            TLLM_LOG_INFO("[CacheReceiver][Rank %d][SelfIdx %d] ctxReqId=%zu: counterPart[%zu]=%d",
+                selfRank, selfIdx, requestId, cpIdx, counterParts[cpIdx]);
+        }
+
         auto connections = mManager->getConnections(commState);
         std::vector<executor::kv_cache::Connection const*> counterPartConnections;
         for (auto index : counterParts)
@@ -870,9 +957,16 @@ public:
         }
         auto pickUpIdx = mFormatter->pickRecvConnections(counterParts.size(), mSelfState.getCacheState().value(),
             mSelfState.getCommState().value().getSelfIdx(), destCacheState);
+
+        TLLM_LOG_INFO("[CacheReceiver][Rank %d][SelfIdx %d] ctxReqId=%zu: Sending request info to %zu ctx ranks",
+            selfRank, selfIdx, requestId, counterPartConnections.size());
+
         for (size_t i = 0; i < counterPartConnections.size(); i++)
         {
             auto const* connection = counterPartConnections[i];
+            TLLM_LOG_INFO("[CacheReceiver][Rank %d][SelfIdx %d] ctxReqId=%zu: Sending to ctx counterPart[%zu]=%d",
+                selfRank, selfIdx, requestId, i, counterParts[i]);
+
             // if Manager is agentConnectionManager, then send request info to agent
             auto* agentConnectionManager = dynamic_cast<executor::kv_cache::AgentConnectionManager*>(mManager);
             if (agentConnectionManager)
@@ -889,6 +983,8 @@ public:
             {
                 sendRequestInfo(connection, requestInfo);
             }
+            TLLM_LOG_INFO("[CacheReceiver][Rank %d][SelfIdx %d] ctxReqId=%zu: SENT request info to ctx counterPart[%zu]=%d",
+                selfRank, selfIdx, requestId, i, counterParts[i]);
         }
         auto const& resource = getReceiveCacheResource(llmRequest);
         return TransferSession(std::move(counterPartConnections), DataContext{tagFromRequestId(requestId), mTerminate},
@@ -957,12 +1053,24 @@ public:
 
     bool receiveReadySignal(TransferSession& session)
     {
+        auto selfRank = mpi::MpiComm::world().getRank();
+        auto selfIdx = mSelfState.getCommState().value().getSelfIdx();
+        auto const& llmRequest = session.getLlmRequest();
+        auto ctxReqId = llmRequest.getContextPhaseParams().value().getReqId();
+
         bool isReadyFinal = true;
         bool isReady = false;
         auto const& connections = session.getConnections();
 
+        TLLM_LOG_INFO("[CacheReceiver][Rank %d][SelfIdx %d] receiveReadySignal: ctxReqId=%zu, WAITING for ready signals from %zu ctx ranks",
+            selfRank, selfIdx, ctxReqId, connections.size());
+
         for (size_t i = 0; i < connections.size(); i++)
         {
+            TLLM_LOG_INFO("[CacheReceiver][Rank %d][SelfIdx %d] receiveReadySignal: ctxReqId=%zu, WAITING on ctx connection[%zu]...",
+                selfRank, selfIdx, ctxReqId, i);
+            auto waitStart = std::chrono::steady_clock::now();
+
             auto* agentConnectionManager = dynamic_cast<executor::kv_cache::AgentConnectionManager*>(mManager);
             if (agentConnectionManager)
             {
@@ -976,8 +1084,17 @@ public:
                 connections.at(i)->recv(
                     executor::kv_cache::DataContext{TransceiverTag::kREADY_SIGNAL_TAG}, &isReady, sizeof(isReady));
             }
+
+            auto waitEnd = std::chrono::steady_clock::now();
+            auto waitDurationMs = std::chrono::duration<double, std::milli>(waitEnd - waitStart).count();
+            TLLM_LOG_INFO("[CacheReceiver][Rank %d][SelfIdx %d] receiveReadySignal: ctxReqId=%zu, RECEIVED from ctx connection[%zu], isReady=%s, waitTime=%.2fms",
+                selfRank, selfIdx, ctxReqId, i, isReady ? "true" : "false", waitDurationMs);
+
             isReadyFinal &= isReady;
         }
+
+        TLLM_LOG_INFO("[CacheReceiver][Rank %d][SelfIdx %d] receiveReadySignal DONE: ctxReqId=%zu, isReadyFinal=%s",
+            selfRank, selfIdx, ctxReqId, isReadyFinal ? "true" : "false");
 
         return isReadyFinal;
     }
@@ -999,27 +1116,56 @@ public:
 private:
     void requestSync(LlmRequest& llmRequest)
     {
-        TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
-            "Start calling requestSync for request ID: %zu, context request ID: %zu.", llmRequest.mRequestId,
-            llmRequest.getContextPhaseParams().value().getReqId());
-        llmRequest.setKvCacheTransferStart(std::chrono::steady_clock::now());
+        auto selfRank = mpi::MpiComm::world().getRank();
+        auto selfIdx = mSelfState.getCommState().value().getSelfIdx();
+        auto ctxReqId = llmRequest.getContextPhaseParams().value().getReqId();
+
+        TLLM_LOG_INFO("[CacheReceiver][Rank %d][SelfIdx %d] requestSync START: genReqId=%zu, ctxReqId=%zu",
+            selfRank, selfIdx, llmRequest.mRequestId, ctxReqId);
+
+        auto overallStart = std::chrono::steady_clock::now();
+        llmRequest.setKvCacheTransferStart(overallStart);
         TLLM_CUDA_CHECK(cudaSetDevice(mDeviceId));
+
+        // Phase 1: Send request info to ctx ranks
+        auto sendInfoStart = std::chrono::steady_clock::now();
         auto session = sendRequestInfo(llmRequest);
         session.setTime(TransferSession::kTimeRequestInfo);
+        auto sendInfoEnd = std::chrono::steady_clock::now();
+        auto sendInfoDurationMs = std::chrono::duration<double, std::milli>(sendInfoEnd - sendInfoStart).count();
+        TLLM_LOG_INFO("[CacheReceiver][Rank %d][SelfIdx %d] requestSync: ctxReqId=%zu, sendRequestInfo took %.2fms",
+            selfRank, selfIdx, ctxReqId, sendInfoDurationMs);
+
+        // Phase 2: Wait for ready signals from ctx ranks
+        auto waitReadyStart = std::chrono::steady_clock::now();
         bool isReady = receiveReadySignal(session);
+        auto waitReadyEnd = std::chrono::steady_clock::now();
+        auto waitReadyDurationMs = std::chrono::duration<double, std::milli>(waitReadyEnd - waitReadyStart).count();
+        TLLM_LOG_INFO("[CacheReceiver][Rank %d][SelfIdx %d] requestSync: ctxReqId=%zu, receiveReadySignal took %.2fms, isReady=%s",
+            selfRank, selfIdx, ctxReqId, waitReadyDurationMs, isReady ? "true" : "false");
+
         if (!isReady)
         {
-            // Reuse the error state for the cancelled request.
+            TLLM_LOG_WARNING("[CacheReceiver][Rank %d][SelfIdx %d] requestSync CANCELLED: ctxReqId=%zu, context not ready",
+                selfRank, selfIdx, ctxReqId);
             llmRequest.setState(LlmRequestState::kDISAGG_TRANS_ERROR);
             llmRequest.setKvCacheTransferEnd(std::chrono::steady_clock::now());
             return;
         }
-        receiveSync(session);
-        llmRequest.setKvCacheTransferEnd(std::chrono::steady_clock::now());
 
-        TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
-            "End calling requestSync for request ID: %zu, context request ID: %zu.", llmRequest.mRequestId,
-            llmRequest.getContextPhaseParams().value().getReqId());
+        // Phase 3: Receive cache data
+        auto recvCacheStart = std::chrono::steady_clock::now();
+        receiveSync(session);
+        auto recvCacheEnd = std::chrono::steady_clock::now();
+        auto recvCacheDurationMs = std::chrono::duration<double, std::milli>(recvCacheEnd - recvCacheStart).count();
+
+        llmRequest.setKvCacheTransferEnd(recvCacheEnd);
+
+        auto overallDurationMs = std::chrono::duration<double, std::milli>(recvCacheEnd - overallStart).count();
+        TLLM_LOG_INFO("[CacheReceiver][Rank %d][SelfIdx %d] requestSync DONE: ctxReqId=%zu, genReqId=%zu, "
+            "totalTime=%.2fms (sendInfo=%.2fms, waitReady=%.2fms, recvCache=%.2fms)",
+            selfRank, selfIdx, ctxReqId, llmRequest.mRequestId,
+            overallDurationMs, sendInfoDurationMs, waitReadyDurationMs, recvCacheDurationMs);
     }
 
     struct RequestAndPromise
