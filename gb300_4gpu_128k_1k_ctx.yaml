@@ -1,0 +1,23 @@
+cuda_graph_config: null
+disable_overlap_scheduler: true
+enable_attention_dp: false
+print_iter_log: true
+kv_cache_config:
+  dtype: fp8
+  free_gpu_memory_fraction: 0.5
+  enable_block_reuse: false
+stream_interval: 10
+tensor_parallel_size: 1
+pipeline_parallel_size: 4
+moe_expert_parallel_size: 1
+trust_remote_code: true
+backend: pytorch
+max_num_tokens: 131072
+max_seq_len: 131073
+max_input_len: 131072
+max_batch_size: 1
+pp_partition:
+- 16
+- 16
+- 16
+- 13
