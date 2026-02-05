@@ -400,7 +400,7 @@ usage() {
     echo "  gen4         Run 4 GPU combinations (concurrency >= 2)"
     echo "  gen8         Run 8 GPU combinations (concurrency >= 2)"
     echo "  gen16        Run 16 GPU combinations (concurrency >= 2)"
-    echo "  all          Run all feasible combinations (default, excludes concurrency=1 and infeasible)"
+    echo "  all          Run all feasible combinations (default, includes concurrency=1)"
     echo "  concurrency1 Run only concurrency=1 combinations (low latency baseline)"
     echo "  infeasible   Run only infeasible combinations (for testing/debugging)"
     echo ""
@@ -429,8 +429,8 @@ case "$MODE" in
         MODE_DESC="16 GPU TP/CP"
         ;;
     all)
-        COMBINATIONS=("${GEN2_COMBINATIONS[@]}" "${GEN4_COMBINATIONS[@]}" "${GEN8_COMBINATIONS[@]}" "${GEN16_COMBINATIONS[@]}")
-        MODE_DESC="All TP/CP Low Latency (concurrency >= 2, feasible only)"
+        COMBINATIONS=("${CONCURRENCY_1_COMBINATIONS[@]}" "${GEN2_COMBINATIONS[@]}" "${GEN4_COMBINATIONS[@]}" "${GEN8_COMBINATIONS[@]}" "${GEN16_COMBINATIONS[@]}")
+        MODE_DESC="All TP/CP Low Latency (concurrency 1-64, feasible only)"
         ;;
     concurrency1)
         COMBINATIONS=("${CONCURRENCY_1_COMBINATIONS[@]}")
