@@ -975,7 +975,7 @@ class Deepseekv3MoE(nn.Module):
                 num_experts=num_experts,
                 experts_per_token=top_k,
                 moe_ep_size=model_config.mapping.moe_ep_size,
-                dtype=dtype)
+                dtype=torch.float32)
         else:
             assert False, "Perfect router is not enabled. This is needed for benchmarking."
 

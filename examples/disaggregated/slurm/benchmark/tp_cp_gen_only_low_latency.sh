@@ -218,7 +218,12 @@ save_config() {
 
 # Function to determine moe_backend
 get_moe_backend() {
-    echo "CUTEDSL"
+    local gbs=$1
+    if [ "$gbs" -eq 1 ]; then
+        echo "TRTLLM"
+    else
+        echo "CUTEDSL"
+    fi
 }
 
 # Function to generate pp_partition YAML block for 61 layers
@@ -256,8 +261,8 @@ update_config() {
     # Calculate derived values
     # global_batch_size = concurrency (directly from experiments)
     local concurrency=$global_batch_size
-    local max_seq_len=$((isl + osl + 512))  # buffer for special tokens
-    local moe_backend=$(get_moe_backend "$ep")
+    local max_seq_len=$((isl / cp + osl + 512))  # isl/cp + osl + buffer for special tokens
+    local moe_backend=$(get_moe_backend "$global_batch_size")
     local attn_dp_bool=$( [ "$attn_dp" -eq 1 ] && echo "true" || echo "false" )
     local mode_str=$( [ "$attn_dp" -eq 1 ] && echo "DEP" || echo "TEP" )
     # Worker max_batch_size calculation:
@@ -292,7 +297,7 @@ update_config() {
     echo "  ISL=$isl, OSL=$osl"
     echo "  global_batch_size=$global_batch_size (= concurrency)"
     echo "  enable_attention_dp=$attn_dp_bool"
-    echo "  concurrency=$concurrency, max_seq_len=$max_seq_len"
+    echo "  concurrency=$concurrency, max_seq_len=$max_seq_len (isl/cp + osl + 512 = $isl/$cp + $osl + 512)"
     echo "  moe_backend=$moe_backend (auto-selected for GB200 NVFP4)"
     if [ "$attn_dp" -eq 1 ]; then
         echo "  worker max_batch_size=$worker_max_batch_size (micro-batch = global_batch_size / (tp * pp) with AttnDP)"
