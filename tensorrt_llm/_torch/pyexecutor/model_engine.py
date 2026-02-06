@@ -1415,36 +1415,48 @@ class PyTorchModelEngine(ModelEngine):
         Deduplicate token counts for Helix Context Parallelism.
 
         In Helix mode, all CP ranks have identical data after attention.
-        To avoid duplicate MoE computation, we set the token counts to 1
-        for cp_rank > 0, keeping only cp_rank=0 tokens per DP group.
-        We use 1 instead of 0 to avoid empty tensor issues in MoE all-to-all
-        kernels. The dummy token is sliced off before the helix broadcast.
+        To avoid duplicate MoE computation, we divide tokens evenly across
+        CP ranks within each DP group. Each CP rank routes its portion,
+        then results are gathered via cp_allgather.
 
         Args:
             all_rank_num_tokens: Token counts for all ranks in TP*CP group.
 
         Returns:
-            Deduplicated token counts with cp_rank > 0 entries set to 1.
+            Deduplicated token counts with tokens divided among CP ranks.
         """
         if not self.mapping.has_cp_helix():
             return all_rank_num_tokens
 
         cp_size = self.mapping.cp_size
-
-        # Assert that we have at least 1 token to use as the dummy for cp_rank > 0.
-        # In Helix mode, all CP ranks have identical data, so this should always hold.
-        for idx, count in enumerate(all_rank_num_tokens):
-            if idx % cp_size != 0:
-                assert count >= 1, (
-                    f"Helix dedup requires at least 1 token for cp_rank > 0, "
-                    f"but rank {idx} has {count} tokens")
+        result = []
 
         # Ranks are ordered as [dp0cp0, dp0cp1, ... dp1cp0, dp1cp1, ...].
-        # Keep only cp_rank=0 entries as is, set entries to 1 for cp_rank > 0.
-        return [
-            count if idx % cp_size == 0 else 1
-            for idx, count in enumerate(all_rank_num_tokens)
-        ]
+        # For each DP group, divide tokens evenly across CP ranks.
+        # Use cp_rank=0's count as the total for the group (all CP ranks have same data).
+        for idx, count in enumerate(all_rank_num_tokens):
+            cp_rank_within_group = idx % cp_size
+
+            if cp_rank_within_group == 0:
+                # This is cp_rank=0, use its count as the group total
+                group_total = count
+            else:
+                # For other CP ranks, use the group total from cp_rank=0
+                group_start_idx = idx - cp_rank_within_group
+                group_total = all_rank_num_tokens[group_start_idx]
+
+            # Divide tokens evenly, with remainder going to earlier ranks
+            base_count = group_total // cp_size
+            remainder = group_total % cp_size
+
+            if cp_rank_within_group < remainder:
+                result.append(base_count + 1)
+            else:
+                result.append(base_count)
+
+        logger.info(f"[Helix Balanced MoE] cp_rank={self.mapping.cp_rank} "
+                    f"input_tokens={all_rank_num_tokens} -> balanced_tokens={result}")
+        return result
 
     def _get_all_rank_ctx_requests(self, num_ctx_requests: int):
         if self.enable_attention_dp:
