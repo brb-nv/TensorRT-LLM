@@ -610,6 +610,24 @@ def analyze_job(job_dir: str, analyze_nsys: bool = False, gpu_filter: str = "gpu
     if all(v is not None for v in [tp, cp, pp]):
         result["num_gpus"] = tp * cp * pp
 
+    # Verify global_batch_size from directory name matches expected value from config.
+    # global_batch_size = cuda_graph_config.max_batch_size * pp * dp_size
+    # where dp_size = tp if attention_dp is enabled, else 1
+    global_batch_size = result["global_batch_size"]
+    is_attn_dp = result["is_attn_dp"]
+    assert all(v is not None for v in [global_batch_size, max_batch_size, pp, tp, is_attn_dp]), (
+        f"Missing required config values in {job_dir}: "
+        f"global_batch_size={global_batch_size}, max_batch_size={max_batch_size}, "
+        f"pp={pp}, tp={tp}, is_attn_dp={is_attn_dp}"
+    )
+    dp_size = tp if is_attn_dp else 1
+    expected_global_batch_size = max_batch_size * pp * dp_size
+    assert global_batch_size == expected_global_batch_size, (
+        f"global_batch_size mismatch in {job_dir}: "
+        f"directory name says {global_batch_size}, but expected "
+        f"{expected_global_batch_size} (cuda_graph_config.max_batch_size={max_batch_size} * pp={pp} * dp_size={dp_size})"
+    )
+
     # Parse bench log for completion status only.
     # NOTE: bench_median_tpot_ms is kept for reference but NOT used for throughput.
     # The bench client measures higher latency than actual device step time,

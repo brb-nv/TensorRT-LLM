@@ -326,13 +326,21 @@ def submit_job(config, log_dir, dry_run):
     # Generate log directory path based on configuration
     isl = benchmark_config['input_length']
     osl = benchmark_config['output_length']
-    gen_batch_size = worker_config['gen']['max_batch_size']
     gen_enable_attention_dp = worker_config['gen']['enable_attention_dp']
 
-    # Calculate global batch size
+    # Calculate global batch size from cuda_graph_config.max_batch_size (micro-batch)
     # With AttnDP: dp_size = tp_size (tensor parallel acts as data parallel)
     # Without AttnDP: dp_size = 1
     # Global batch size = cuda_graph_config.max_batch_size * pp_size * dp_size
+    # Note: We use cuda_graph_config.max_batch_size (micro-batch) instead of
+    # worker_config.max_batch_size because the latter may be inflated to avoid
+    # deadlocks in disaggregated serving with attention DP.
+    cuda_graph_config = worker_config['gen'].get('cuda_graph_config', {})
+    if cuda_graph_config:
+        gen_batch_size = cuda_graph_config.get('max_batch_size',
+                                                worker_config['gen']['max_batch_size'])
+    else:
+        gen_batch_size = worker_config['gen']['max_batch_size']
     dp_size = gen_tp_size if gen_enable_attention_dp else 1
     global_batch_size = gen_batch_size * gen_pp_size * dp_size
 
