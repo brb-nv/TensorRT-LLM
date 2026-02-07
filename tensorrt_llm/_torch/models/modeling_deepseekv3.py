@@ -43,7 +43,6 @@ from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
-from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.mode import QuantAlgo
 
 from ..attention_backend import AttentionMetadata
@@ -1142,9 +1141,6 @@ class Deepseekv3MoE(nn.Module):
                 hidden_states_fp4.data[start:end],
                 scale_factors[start:end] if scale_factors is not None else None)
 
-        logger.info(f"[Helix Balanced MoE] _prepare_helix_inputs: cp_rank={cp_rank} "
-                    f"num_tokens={num_tokens} slice=[{start}:{end}] "
-                    f"sliced_shape={hidden_states_sliced.shape}")
         return hidden_states_sliced, hidden_states_fp4_sliced
 
     def _broadcast_helix_output(
@@ -1176,18 +1172,10 @@ class Deepseekv3MoE(nn.Module):
             all_rank_num_tokens[cp_group_start + i] for i in range(cp_size)
         ]
 
-        logger.info(f"[Helix Balanced MoE] _broadcast_helix_output: "
-                    f"cp_rank={self.mapping_with_cp.cp_rank} "
-                    f"routed_output_shape={routed_output.shape} gather_sizes={sizes}")
-
-        gathered = cp_allgather(routed_output,
-                                self.mapping_with_cp,
-                                dim=0,
-                                sizes=sizes)
-
-        logger.info(f"[Helix Balanced MoE] _broadcast_helix_output: "
-                    f"gathered_shape={gathered.shape}")
-        return gathered
+        return cp_allgather(routed_output,
+                            self.mapping_with_cp,
+                            dim=0,
+                            sizes=sizes)
 
     def forward(
         self,

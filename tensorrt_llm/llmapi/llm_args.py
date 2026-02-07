@@ -116,6 +116,12 @@ class CudaGraphConfig(StrictBaseModel):
     max_batch_size: int = Field(
         default=0, description="Maximum batch size for CUDA graphs.")
 
+    min_batch_size: int = Field(
+        default=1,
+        description=
+        "Minimum batch size for CUDA graphs. Batch sizes below this are filtered out. "
+        "With Helix CP, this should be set to context_parallel_size.")
+
     enable_padding: bool = Field(
         default=False,
         description=
@@ -131,14 +137,25 @@ class CudaGraphConfig(StrictBaseModel):
                 "cuda_graph_config.max_batch_size must be non-negative")
         return v
 
+    @field_validator('min_batch_size')
+    @classmethod
+    def validate_cuda_graph_min_batch_size(cls, v):
+        """Validate cuda_graph_config.min_batch_size is positive."""
+        if v < 1:
+            raise ValueError(
+                "cuda_graph_config.min_batch_size must be at least 1")
+        return v
+
     @staticmethod
     def _generate_cuda_graph_batch_sizes(max_batch_size: int,
-                                         enable_padding: bool) -> List[int]:
+                                         enable_padding: bool,
+                                         min_batch_size: int = 1) -> List[int]:
         """Generate a list of batch sizes for CUDA graphs.
 
         Args:
             max_batch_size: Maximum batch size to generate up to
             enable_padding: Whether padding is enabled, which affects the batch size distribution
+            min_batch_size: Minimum batch size to include (batch sizes below this are filtered out)
 
         Returns:
             List of batch sizes to create CUDA graphs for
@@ -153,12 +170,18 @@ class CudaGraphConfig(StrictBaseModel):
             2**i for i in range(8, math.ceil(math.log(max_batch_size, 2)))
         ]
 
-        # Filter and sort batch sizes
-        batch_sizes = sorted(
-            [size for size in batch_sizes if size <= max_batch_size])
+        # Filter by min and max, then sort
+        batch_sizes = sorted([
+            size for size in batch_sizes
+            if min_batch_size <= size <= max_batch_size
+        ])
+
+        # Ensure min_batch_size is included
+        if not batch_sizes or batch_sizes[0] != min_batch_size:
+            batch_sizes.insert(0, min_batch_size)
 
         # Add max_batch_size if not already included
-        if max_batch_size != batch_sizes[-1]:
+        if batch_sizes[-1] != max_batch_size:
             batch_sizes.append(max_batch_size)
 
         return batch_sizes
@@ -3172,17 +3195,44 @@ class TorchLlmArgs(BaseLlmArgs):
         1. If cuda_graph_config.batch_sizes is provided, cuda_graph_config.max_batch_size must be 0
         2. If cuda_graph_config.batch_sizes is not provided, it is generated based on cuda_graph_config.max_batch_size
         3. If both are provided, cuda_graph_config.batch_sizes must match the generated values
+        4. With Helix CP, min_batch_size is automatically set to context_parallel_size
         """
         if self.cuda_graph_config is None:
             return self
 
         config = self.cuda_graph_config
 
+        # Auto-set min_batch_size for Helix CP if not explicitly configured
+        # With Helix, tokens are distributed across CP ranks, so the minimum
+        # batch size that can run CUDA graphs is context_parallel_size
+        if self.context_parallel_size > 1 and self.cp_config:
+            cp_type = self.cp_config.get('cp_type', None)
+            if cp_type is not None and str(cp_type).upper() == 'HELIX':
+                # Only override if min_batch_size wasn't explicitly set higher
+                if config.min_batch_size < self.context_parallel_size:
+                    config.min_batch_size = self.context_parallel_size
+
+        # Validate min_batch_size <= max_batch_size when both are set
+        if config.max_batch_size > 0 and config.min_batch_size > config.max_batch_size:
+            raise ValueError(
+                f"cuda_graph_config.min_batch_size ({config.min_batch_size}) cannot be "
+                f"greater than cuda_graph_config.max_batch_size ({config.max_batch_size}). "
+                f"With Helix CP (context_parallel_size={self.context_parallel_size}), "
+                f"ensure max_batch_size >= context_parallel_size.")
+
         if config.batch_sizes:
             config.batch_sizes = sorted(config.batch_sizes)
+            # Validate explicit batch_sizes respects min_batch_size (important for Helix CP)
+            if min(config.batch_sizes) < config.min_batch_size:
+                raise ValueError(
+                    f"cuda_graph_config.batch_sizes contains values below min_batch_size. "
+                    f"Minimum in batch_sizes: {min(config.batch_sizes)}, "
+                    f"min_batch_size: {config.min_batch_size}. "
+                    f"With Helix CP, all batch sizes must be >= context_parallel_size.")
             if config.max_batch_size != 0:
                 if config.batch_sizes != CudaGraphConfig._generate_cuda_graph_batch_sizes(
-                        config.max_batch_size, config.enable_padding):
+                        config.max_batch_size, config.enable_padding,
+                        config.min_batch_size):
                     raise ValueError(
                         "Please don't set both cuda_graph_config.batch_sizes "
                         "and cuda_graph_config.max_batch_size.\n"
@@ -3191,10 +3241,13 @@ class TorchLlmArgs(BaseLlmArgs):
                     )
             else:
                 config.max_batch_size = max(config.batch_sizes)
+                # Update min_batch_size only if explicit batch_sizes has a higher minimum
+                config.min_batch_size = max(config.min_batch_size,
+                                            min(config.batch_sizes))
         else:
             max_batch_size = config.max_batch_size or 128
             generated_sizes = CudaGraphConfig._generate_cuda_graph_batch_sizes(
-                max_batch_size, config.enable_padding)
+                max_batch_size, config.enable_padding, config.min_batch_size)
             config.batch_sizes = generated_sizes
             config.max_batch_size = max_batch_size
 

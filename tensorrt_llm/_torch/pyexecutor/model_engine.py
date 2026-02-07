@@ -1448,8 +1448,6 @@ class PyTorchModelEngine(ModelEngine):
             else:
                 result.append(base_count)
 
-        logger.info(f"[Helix Balanced MoE] cp_rank={self.mapping.cp_rank} "
-                    f"input_tokens={all_rank_num_tokens} -> balanced_tokens={result}")
         return result
 
     def _get_all_rank_ctx_requests(self, num_ctx_requests: int):
