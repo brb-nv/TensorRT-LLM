@@ -46,6 +46,12 @@ void helixPostProcess(HelixPostProcParams<T> const& params, cudaStream_t stream)
 template <typename T>
 void helixPostProcessNative(HelixPostProcParams<T> const& params, cudaStream_t stream);
 
+// Version 2: cp_dim=1 layout
+// gathered_o: [num_tokens, cp_size, num_heads, kv_lora_rank]
+// gathered_stats: [num_tokens, cp_size, num_heads, 2]
+template <typename T>
+void helixPostProcessNativeV2(HelixPostProcParams<T> const& params, cudaStream_t stream);
+
 } // namespace kernels
 
 TRTLLM_NAMESPACE_END
