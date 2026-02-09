@@ -1095,88 +1095,6 @@ class Deepseekv3MoE(nn.Module):
 
         return routed_output
 
-    def _is_helix_with_cp(self) -> bool:
-        """Check if running in Helix CP mode."""
-        return (self.mapping_with_cp is not None
-                and self.mapping_with_cp.has_cp_helix())
-
-    def _prepare_helix_inputs(
-        self,
-        hidden_states: torch.Tensor,
-        hidden_states_fp4: Optional[Fp4QuantizedTensor],
-    ) -> Tuple[torch.Tensor, Optional[Fp4QuantizedTensor]]:
-        """Prepare inputs for Helix MoE deduplication.
-
-        Divide tokens evenly across CP ranks. Each rank routes its portion,
-        avoiding duplicate computation while maintaining load balance.
-
-        Args:
-            hidden_states: Input tensor of shape (num_tokens, hidden_dim).
-            hidden_states_fp4: Optional FP4-quantized input tensor.
-
-        Returns:
-            Tuple of (hidden_states, hidden_states_fp4) sliced for this rank.
-        """
-        assert self.mapping_with_cp is not None, (
-            "_prepare_helix_inputs called without mapping_with_cp")
-
-        cp_rank = self.mapping_with_cp.cp_rank
-        cp_size = self.mapping_with_cp.cp_size
-        num_tokens = hidden_states.shape[0]
-
-        # Compute slice boundaries for this CP rank
-        base_count = num_tokens // cp_size
-        remainder = num_tokens % cp_size
-
-        # Earlier ranks get one extra token if there's a remainder
-        start = cp_rank * base_count + min(cp_rank, remainder)
-        end = start + base_count + (1 if cp_rank < remainder else 0)
-
-        hidden_states_sliced = hidden_states[start:end]
-        hidden_states_fp4_sliced = None
-
-        if hidden_states_fp4 is not None:
-            scale_factors = hidden_states_fp4.scale_factors
-            hidden_states_fp4_sliced = Fp4QuantizedTensor(
-                hidden_states_fp4.data[start:end],
-                scale_factors[start:end] if scale_factors is not None else None)
-
-        return hidden_states_sliced, hidden_states_fp4_sliced
-
-    def _broadcast_helix_output(
-        self,
-        routed_output: torch.Tensor,
-        all_rank_num_tokens: List[int],
-    ) -> torch.Tensor:
-        """Gather routed output from all CP ranks.
-
-        After balanced Helix deduplication, each CP rank has computed its portion
-        of the routed output. Use cp_allgather to combine results from all ranks.
-
-        Args:
-            routed_output: Output from routed experts for this rank's portion.
-            all_rank_num_tokens: Token counts per rank (already divided by deduplication).
-
-        Returns:
-            Gathered routed output containing all tokens.
-        """
-        assert self.mapping_with_cp is not None, (
-            "_broadcast_helix_output called without mapping_with_cp")
-
-        cp_size = self.mapping_with_cp.cp_size
-        dp_rank = self.mapping_with_cp.tp_rank
-        cp_group_start = dp_rank * cp_size
-
-        # Gather sizes for this CP group - each rank contributes its portion
-        sizes = [
-            all_rank_num_tokens[cp_group_start + i] for i in range(cp_size)
-        ]
-
-        return cp_allgather(routed_output,
-                            self.mapping_with_cp,
-                            dim=0,
-                            sizes=sizes)
-
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -1188,20 +1106,9 @@ class Deepseekv3MoE(nn.Module):
         if not do_finalize:
             assert not self.use_dp
 
-        is_helix = self._is_helix_with_cp()
-
-        # Prepare inputs for Helix deduplication if applicable.
-        # Each CP rank processes its portion of tokens for load balance.
-        hidden_states_for_routed = hidden_states
-        hidden_states_fp4_for_routed = hidden_states_fp4
-
-        if is_helix and all_rank_num_tokens is not None:
-            hidden_states_for_routed, hidden_states_fp4_for_routed = (
-                self._prepare_helix_inputs(hidden_states, hidden_states_fp4))
-
         def _compute_shared_output():
-            # Shared experts use original hidden_states (not sliced).
-            # Each CP rank computes locally; results will be identical.
+            # Shared experts process the input hidden_states.
+            # For Helix, hidden_states is already sliced by DecoderLayer.
             shared_output = self.shared_experts(
                 hidden_states_fp4
                 if hidden_states_fp4 is not None else hidden_states)
@@ -1210,21 +1117,16 @@ class Deepseekv3MoE(nn.Module):
             return shared_output
 
         def _compute_routed_output():
-            # All ranks call compute_routed_output with their portion of tokens.
-            # For Helix, each CP rank processes num_tokens/cp_size tokens.
-            return self.compute_routed_output(hidden_states_for_routed,
-                                              hidden_states_fp4_for_routed,
+            # Routed experts process the input hidden_states.
+            # For Helix, hidden_states is already sliced by DecoderLayer.
+            return self.compute_routed_output(hidden_states,
+                                              hidden_states_fp4,
                                               all_rank_num_tokens, do_finalize)
 
         routed_output, shared_output = maybe_execute_in_parallel(
             _compute_routed_output, _compute_shared_output,
             self.event_dict[EventType.Main],
             self.event_dict[EventType.MoeShared], self.aux_stream)
-
-        # Helix gather: combine routed output portions from all CP ranks.
-        if is_helix and all_rank_num_tokens is not None:
-            routed_output = self._broadcast_helix_output(
-                routed_output, all_rank_num_tokens)
 
         if not do_finalize:
             return [shared_output, *routed_output]
@@ -1262,6 +1164,13 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         self.mapping_with_cp = mapping_with_cp
         self.config = model_config.pretrained_config
         config = self.config
+
+        # Store aux stream and events for parallel execution (e.g., Helix gather).
+        self.aux_stream = aux_stream_dict[AuxStreamType.MoeShared]
+        self.event_dict = {
+            key: torch.cuda.Event()
+            for key in [EventType.Main, EventType.MoeShared]
+        }
 
         self.hidden_size = config.hidden_size
         self.moe_intermediate_size = config.moe_intermediate_size
@@ -1457,11 +1366,20 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                 enable_allreduce=not (self.disable_attn_allreduce)),
             **kwargs,
         )
+
+        # Prepare inputs for Helix deduplication if applicable.
+        # Each CP rank processes its portion of tokens for load balance.
+        # This benefits both MoE and Dense layers.
+        is_helix = self._is_helix_with_cp()
+        if is_helix and attn_metadata.all_rank_num_tokens is not None:
+            hidden_states, residual = self._prepare_helix_inputs(
+                hidden_states, residual)
+
         if isinstance(self.mlp, Deepseekv3MoE):
             if spec_metadata is not None and spec_metadata.is_layer_capture(
                     self.layer_idx):
                 self.fusion_config.POST_MOE_FUSION = False
-            return self.forward_MoE(
+            hidden_states, residual = self.forward_MoE(
                 hidden_states=hidden_states,
                 attn_metadata=attn_metadata,
                 residual=residual,
@@ -1472,11 +1390,109 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                     self.layer_idx):
                 self.fusion_config.POST_MLP_FUSION = False
             assert isinstance(self.mlp, GatedMLP)
-            return self.forward_mlp(
+            hidden_states, residual = self.forward_mlp(
                 hidden_states=hidden_states,
                 residual=residual,
                 spec_metadata=spec_metadata,
             )
+
+        # Helix gather: combine output portions from all CP ranks.
+        if is_helix and attn_metadata.all_rank_num_tokens is not None:
+            hidden_states, residual = self._gather_helix_output(
+                hidden_states, residual, attn_metadata.all_rank_num_tokens)
+
+        return hidden_states, residual
+
+    def _is_helix_with_cp(self) -> bool:
+        """Check if running in Helix CP mode."""
+        return (self.mapping_with_cp is not None
+                and self.mapping_with_cp.has_cp_helix())
+
+    def _prepare_helix_inputs(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Prepare inputs for Helix MoE deduplication.
+
+        Divide tokens evenly across CP ranks. Each rank processes its portion,
+        avoiding duplicate computation while maintaining load balance.
+
+        Args:
+            hidden_states: Input tensor of shape (num_tokens, hidden_dim).
+            residual: Residual tensor of shape (num_tokens, hidden_dim).
+
+        Returns:
+            Tuple of (hidden_states, residual) sliced for this rank.
+        """
+        assert self.mapping_with_cp is not None, (
+            "_prepare_helix_inputs called without mapping_with_cp")
+
+        cp_rank = self.mapping_with_cp.cp_rank
+        cp_size = self.mapping_with_cp.cp_size
+        num_tokens = hidden_states.shape[0]
+
+        # Compute slice boundaries for this CP rank
+        base_count = num_tokens // cp_size
+        remainder = num_tokens % cp_size
+
+        # Earlier ranks get one extra token if there's a remainder
+        start = cp_rank * base_count + min(cp_rank, remainder)
+        end = start + base_count + (1 if cp_rank < remainder else 0)
+
+        hidden_states_sliced = hidden_states[start:end]
+        residual_sliced = residual[start:end]
+        return hidden_states_sliced, residual_sliced
+
+    def _gather_helix_output(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        all_rank_num_tokens: List[int],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Gather MoE output from all CP ranks.
+
+        After balanced Helix deduplication, each CP rank has computed its portion
+        of the MoE output. Use cp_allgather to combine results from all ranks.
+
+        Args:
+            hidden_states: MoE output for this rank's portion.
+            residual: Residual for this rank's portion.
+            all_rank_num_tokens: Token counts per rank (already divided by deduplication).
+
+        Returns:
+            Tuple of (hidden_states, residual) gathered from all CP ranks.
+        """
+        assert self.mapping_with_cp is not None, (
+            "_gather_helix_output called without mapping_with_cp")
+
+        cp_size = self.mapping_with_cp.cp_size
+        dp_rank = self.mapping_with_cp.tp_rank
+        cp_group_start = dp_rank * cp_size
+
+        # Gather sizes for this CP group - each rank contributes its portion
+        sizes = [
+            all_rank_num_tokens[cp_group_start + i] for i in range(cp_size)
+        ]
+
+        def _gather_hidden():
+            return cp_allgather(hidden_states,
+                                self.mapping_with_cp,
+                                dim=0,
+                                sizes=sizes)
+
+        def _gather_residual():
+            return cp_allgather(residual,
+                                self.mapping_with_cp,
+                                dim=0,
+                                sizes=sizes)
+
+        gathered_hidden, gathered_residual = maybe_execute_in_parallel(
+            _gather_hidden, _gather_residual,
+            self.event_dict[EventType.Main],
+            self.event_dict[EventType.MoeShared],
+            self.aux_stream)
+        return gathered_hidden, gathered_residual
 
     def forward_MoE(
         self,

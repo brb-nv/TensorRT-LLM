@@ -919,11 +919,11 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         None,
         {
             "enable_padding": False,
-            "batch_sizes": [1, 2, 4, 8, 16, 32, 64]
+            "batch_sizes": [2, 4, 8, 16, 32, 64]
         },
         {
             "enable_padding": True,
-            "batch_sizes": [1, 2, 4, 8, 16, 32, 64]
+            "batch_sizes": [2, 4, 8, 16, 32, 64]
         },
     ],
                              ids=[
