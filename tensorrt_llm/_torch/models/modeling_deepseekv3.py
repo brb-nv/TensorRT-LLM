@@ -1470,28 +1470,17 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         dp_rank = self.mapping_with_cp.tp_rank
         cp_group_start = dp_rank * cp_size
 
-        # Gather sizes for this CP group - each rank contributes its portion
+        # Gather sizes for this CP group - each rank contributes its portion.
         sizes = [
             all_rank_num_tokens[cp_group_start + i] for i in range(cp_size)
         ]
 
-        def _gather_hidden():
-            return cp_allgather(hidden_states,
-                                self.mapping_with_cp,
-                                dim=0,
-                                sizes=sizes)
-
-        def _gather_residual():
-            return cp_allgather(residual,
-                                self.mapping_with_cp,
-                                dim=0,
-                                sizes=sizes)
-
-        gathered_hidden, gathered_residual = maybe_execute_in_parallel(
-            _gather_hidden, _gather_residual,
-            self.event_dict[EventType.Main],
-            self.event_dict[EventType.MoeShared],
-            self.aux_stream)
+        # Gather both tensors in a single collective call.
+        gathered_hidden, gathered_residual = cp_allgather(
+            [hidden_states, residual],
+            self.mapping_with_cp,
+            dim=0,
+            sizes=sizes)
         return gathered_hidden, gathered_residual
 
     def forward_MoE(
