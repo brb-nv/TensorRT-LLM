@@ -3202,10 +3202,10 @@ class TorchLlmArgs(BaseLlmArgs):
 
         config = self.cuda_graph_config
 
-        # Auto-set min_batch_size for Helix CP if not explicitly configured
-        # With Helix, tokens are distributed across CP ranks, so the minimum
+        # Auto-set min_batch_size for Helix CP with attention_dp if not explicitly configured
+        # With Helix + attention_dp, tokens are distributed across CP ranks, so the minimum
         # batch size that can run CUDA graphs is context_parallel_size
-        if self.context_parallel_size > 1 and self.cp_config:
+        if self.enable_attention_dp and self.context_parallel_size > 1 and self.cp_config:
             cp_type = self.cp_config.get('cp_type', None)
             if cp_type is not None and str(cp_type).upper() == 'HELIX':
                 # Only override if min_batch_size wasn't explicitly set higher
@@ -3216,19 +3216,16 @@ class TorchLlmArgs(BaseLlmArgs):
         if config.max_batch_size > 0 and config.min_batch_size > config.max_batch_size:
             raise ValueError(
                 f"cuda_graph_config.min_batch_size ({config.min_batch_size}) cannot be "
-                f"greater than cuda_graph_config.max_batch_size ({config.max_batch_size}). "
-                f"With Helix CP (context_parallel_size={self.context_parallel_size}), "
-                f"ensure max_batch_size >= context_parallel_size.")
+                f"greater than cuda_graph_config.max_batch_size ({config.max_batch_size}).")
 
         if config.batch_sizes:
             config.batch_sizes = sorted(config.batch_sizes)
-            # Validate explicit batch_sizes respects min_batch_size (important for Helix CP)
+            # Validate explicit batch_sizes respects min_batch_size
             if min(config.batch_sizes) < config.min_batch_size:
                 raise ValueError(
                     f"cuda_graph_config.batch_sizes contains values below min_batch_size. "
                     f"Minimum in batch_sizes: {min(config.batch_sizes)}, "
-                    f"min_batch_size: {config.min_batch_size}. "
-                    f"With Helix CP, all batch sizes must be >= context_parallel_size.")
+                    f"min_batch_size: {config.min_batch_size}.")
             if config.max_batch_size != 0:
                 if config.batch_sizes != CudaGraphConfig._generate_cuda_graph_batch_sizes(
                         config.max_batch_size, config.enable_padding,

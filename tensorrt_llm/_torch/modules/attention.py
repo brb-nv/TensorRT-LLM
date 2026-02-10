@@ -1167,6 +1167,7 @@ class MLA(nn.Module):
                 fifo_version = self.mapping.cp_config.get("fifo_version", 2)
 
                 if fifo_version == 1:
+                    assert False, "Force disabled version 1."
                     # Version 1: Uses transpose+contiguous before alltoall, cp_dim=2.
                     # Reshape for FIFO-based all-to-all. Overlap the two .contiguous() calls on separate streams.
                     # partial_o: [num_tokens, num_heads * kv_lora_rank] -> [num_tokens, cp_size, num_heads_tp_cp, kv_lora_rank]

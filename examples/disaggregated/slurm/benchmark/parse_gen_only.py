@@ -795,13 +795,13 @@ def plot_pareto(results: List[Dict], output_dir: str) -> Optional[str]:
         cp_x = [r["gen_output_tput_per_user"] for r in cp_jobs]
         cp_y = [r["gen_output_tput_per_gpu"] for r in cp_jobs]
         ax.scatter(cp_x, cp_y, alpha=0.25, color="blue", marker="o", s=40,
-                   label=f"CP jobs (CP>1) [{len(cp_jobs)}]")
+                   label="KVP>1")
 
     if tp_only_jobs:
         tp_x = [r["gen_output_tput_per_user"] for r in tp_only_jobs]
         tp_y = [r["gen_output_tput_per_gpu"] for r in tp_only_jobs]
         ax.scatter(tp_x, tp_y, alpha=0.25, color="orange", marker="s", s=40,
-                   label=f"TP-only jobs (CP=1) [{len(tp_only_jobs)}]")
+                   label="KVP=1")
 
     # Plot Pareto frontiers (brighter).
     if cp_pareto:
@@ -809,20 +809,32 @@ def plot_pareto(results: List[Dict], output_dir: str) -> Optional[str]:
         pareto_y = [r["gen_output_tput_per_gpu"] for r in cp_pareto]
         ax.plot(pareto_x, pareto_y, "b-", linewidth=2, alpha=0.8)
         ax.scatter(pareto_x, pareto_y, color="blue", s=80, zorder=5,
-                   edgecolors="black", linewidths=1,
-                   label=f"CP Pareto [{len(cp_pareto)}]")
+                   edgecolors="black", linewidths=1)
+        # Add batch size labels.
+        for r in cp_pareto:
+            ax.annotate(
+                f"bs={r['global_batch_size']}",
+                (r["gen_output_tput_per_user"], r["gen_output_tput_per_gpu"]),
+                textcoords="offset points", xytext=(5, 5), fontsize=4
+            )
 
     if tp_pareto:
         pareto_x = [r["gen_output_tput_per_user"] for r in tp_pareto]
         pareto_y = [r["gen_output_tput_per_gpu"] for r in tp_pareto]
         ax.plot(pareto_x, pareto_y, color="orange", linestyle="-", linewidth=2, alpha=0.8)
         ax.scatter(pareto_x, pareto_y, color="orange", s=80, zorder=5,
-                   edgecolors="black", linewidths=1,
-                   label=f"TP-only Pareto [{len(tp_pareto)}]")
+                   edgecolors="black", linewidths=1)
+        # Add batch size labels.
+        for r in tp_pareto:
+            ax.annotate(
+                f"bs={r['global_batch_size']}",
+                (r["gen_output_tput_per_user"], r["gen_output_tput_per_gpu"]),
+                textcoords="offset points", xytext=(5, 5), fontsize=4
+            )
 
     ax.set_xlabel("Output Throughput per User (tok/s)", fontsize=12)
     ax.set_ylabel("Output Throughput per GPU (tok/s/gpu)", fontsize=12)
-    ax.set_title("Gen-Only Performance: Pareto Analysis (All Points)", fontsize=14)
+    ax.set_title("DSR1 FP4 128k/8k TRTLLM Pareto, GB300 NVL72, Gen-Only SOL, #Gen GPUs Per Instance<=32", fontsize=10)
     ax.legend(loc="best")
     ax.grid(True, alpha=0.3)
 
@@ -841,13 +853,13 @@ def plot_pareto(results: List[Dict], output_dir: str) -> Optional[str]:
         ax.plot(pareto_x, pareto_y, "b-", linewidth=2, alpha=0.8)
         ax.scatter(pareto_x, pareto_y, color="blue", s=100, zorder=5,
                    edgecolors="black", linewidths=1.5,
-                   label=f"CP Pareto [{len(cp_pareto_deduped)}]")
+                   label="KVP>1")
         # Add batch size labels.
         for r in cp_pareto_deduped:
             ax.annotate(
                 f"bs={r['global_batch_size']}",
                 (r["gen_output_tput_per_user"], r["gen_output_tput_per_gpu"]),
-                textcoords="offset points", xytext=(5, 5), fontsize=8
+                textcoords="offset points", xytext=(5, 5), fontsize=4
             )
 
     if tp_pareto_deduped:
@@ -856,18 +868,18 @@ def plot_pareto(results: List[Dict], output_dir: str) -> Optional[str]:
         ax.plot(pareto_x, pareto_y, color="orange", linestyle="-", linewidth=2, alpha=0.8)
         ax.scatter(pareto_x, pareto_y, color="orange", s=100, zorder=5,
                    edgecolors="black", linewidths=1.5,
-                   label=f"TP-only Pareto [{len(tp_pareto_deduped)}]")
+                   label="KVP=1")
         # Add batch size labels.
         for r in tp_pareto_deduped:
             ax.annotate(
                 f"bs={r['global_batch_size']}",
                 (r["gen_output_tput_per_user"], r["gen_output_tput_per_gpu"]),
-                textcoords="offset points", xytext=(5, 5), fontsize=8
+                textcoords="offset points", xytext=(5, 5), fontsize=4
             )
 
     ax.set_xlabel("Output Throughput per User (tok/s)", fontsize=12)
     ax.set_ylabel("Output Throughput per GPU (tok/s/gpu)", fontsize=12)
-    ax.set_title("Gen-Only Performance: Pareto Frontier (Denoised, 1 per BS)", fontsize=14)
+    ax.set_title("DSR1 FP4 128k/8k TRTLLM Pareto, GB300 NVL72, Gen-Only SOL, #Gen GPUs Per Instance<=32 (Denoised)", fontsize=10)
     ax.legend(loc="best")
     ax.grid(True, alpha=0.3)
 
@@ -886,10 +898,10 @@ def plot_pareto(results: List[Dict], output_dir: str) -> Optional[str]:
 
     pareto_rows = []
 
-    # Add CP Pareto points.
+    # Add KVP>1 Pareto points.
     for r in cp_pareto:
         row = {
-            "category": "CP",
+            "category": "KVP>1",
             "deduped": r["job_dir"] not in cp_deduped_dirs,
             "slurm_id": r["slurm_id"],
             "global_batch_size": r["global_batch_size"],
@@ -908,10 +920,10 @@ def plot_pareto(results: List[Dict], output_dir: str) -> Optional[str]:
         }
         pareto_rows.append(row)
 
-    # Add TP-only Pareto points.
+    # Add KVP=1 Pareto points.
     for r in tp_pareto:
         row = {
-            "category": "TP-only",
+            "category": "KVP=1",
             "deduped": r["job_dir"] not in tp_deduped_dirs,
             "slurm_id": r["slurm_id"],
             "global_batch_size": r["global_batch_size"],
@@ -959,8 +971,8 @@ def plot_pareto(results: List[Dict], output_dir: str) -> Optional[str]:
     print(f"  Full plot: {plot_path_full}")
     print(f"  Denoised plot: {plot_path_denoised}")
     print(f"  Pareto CSV: {pareto_csv_path}")
-    print(f"  CP jobs (CP>1): {len(cp_jobs)} total, {len(cp_pareto)} Pareto, {len(cp_pareto_deduped)} kept after dedupe")
-    print(f"  TP-only jobs (CP=1): {len(tp_only_jobs)} total, {len(tp_pareto)} Pareto, {len(tp_pareto_deduped)} kept after dedupe")
+    print(f"  KVP>1 jobs: {len(cp_jobs)} total, {len(cp_pareto)} Pareto, {len(cp_pareto_deduped)} kept after dedupe")
+    print(f"  KVP=1 jobs: {len(tp_only_jobs)} total, {len(tp_pareto)} Pareto, {len(tp_pareto_deduped)} kept after dedupe")
 
     return plot_path_full
 

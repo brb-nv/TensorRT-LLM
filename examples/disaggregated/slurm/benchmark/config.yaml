@@ -16,7 +16,7 @@ benchmark:
   multi_round: 1  # Number of benchmark rounds
   benchmark_ratio: 1.0  # Benchmark ratio
   streaming: true  # Enable streaming mode
-  concurrency_list: "8"
+  concurrency_list: "16"
   input_length: 131072  # Input sequence length
   output_length: 8192  # Output sequence length
   dataset_file: "/lustre/fsw/coreai_comparch_trtllm/bbuddharaju/datasets/deepseek-r1-fp4-131072-8192-32768-ratio-1_for_serve.json"
@@ -42,9 +42,9 @@ environment:
 
 # Profiling Configuration
 profiling:
-  nsys_on: false  # Set to true to enable profiling
+  nsys_on: true  # Set to true to enable profiling
   ctx_profile_range: "10-30"  # Set TLLM_PROFILE_START_STOP for ctx workers
-  gen_profile_range: "200-250"  # Set TLLM_PROFILE_START_STOP for gen workers
+  gen_profile_range: "4500-4550"  # Set TLLM_PROFILE_START_STOP for gen workers
 
 # Accuracy Configuration
 accuracy:
@@ -58,9 +58,9 @@ accuracy:
 
 worker_config:
   gen:
-    tensor_parallel_size: 4
-    moe_expert_parallel_size: 4
-    enable_attention_dp: false
+    tensor_parallel_size: 2
+    moe_expert_parallel_size: 2
+    enable_attention_dp: true
     enable_lm_head_tp_in_adp: false
     pipeline_parallel_size: 1
     context_parallel_size: 1
@@ -69,8 +69,9 @@ worker_config:
       cp_type: "HELIX"
       tokens_per_block: 32
       use_nccl_for_alltoall: false
-    max_batch_size: 8
-    max_num_tokens: 16
+      fifo_version: 2
+    max_batch_size: 16
+    max_num_tokens: 32
     max_seq_len: 139776
     cuda_graph_config:
       enable_padding: true
