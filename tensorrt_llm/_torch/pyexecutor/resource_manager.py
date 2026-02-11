@@ -522,6 +522,8 @@ class KVCacheManager(BaseResourceManager):
         # we need to make the KV cache manager aware that multiple autoregressive steps will
         # occur.
         num_extra_decoding_steps: int = 0,
+        # Set to True during warmup to enable detailed logging.
+        is_warmup: bool = False,
     ):
         beam_width = max_beam_width
         requests = []
@@ -535,6 +537,13 @@ class KVCacheManager(BaseResourceManager):
             # during warmup.
             token_num = token_nums[
                 i] if token_nums is not None else 1 + max_num_draft_tokens
+            # For helix generation warmup, ensure token_num >= 2 so active rank has
+            # seqlen_this_rank_cp >= 1, avoiding negative past_seen_token_num.
+            if is_gen and self.mapping.has_cp_helix() and token_num < 2:
+                logger.info(
+                    f"[add_dummy_requests] Helix warmup: increasing token_num from {token_num} to 2"
+                )
+                token_num = 2
             encoder_input_tokens = [
                 1
             ] * token_num if self.impl.cross_kv else None
@@ -558,6 +567,7 @@ class KVCacheManager(BaseResourceManager):
 
             if is_gen:
                 req.state = LlmRequestState.GENERATION_IN_PROGRESS
+                req.py_decoding_iter = 1  # Simulate first decode iteration
                 req.prompt_len = token_num - 1
                 req.py_prompt_len = req.prompt_len
                 # Helix parallelism: each CP rank holds token_num tokens per sequence.
@@ -597,6 +607,24 @@ class KVCacheManager(BaseResourceManager):
                     req.py_multimodal_data["mrope_config"][
                         "mrope_position_deltas"] = dummy_mrope_position_deltas
             requests.append(req)
+
+        # Log dummy request details for debugging warmup issues
+        if is_warmup and requests:
+            for req in requests:
+                helix_info = ""
+                if self.mapping.has_cp_helix():
+                    helix_info = (
+                        f", helix_inactive={req.py_helix_is_inactive_rank}, "
+                        f"seqlen_this_rank_cp={req.seqlen_this_rank_cp}, "
+                        f"total_input_len_cp={req.total_input_len_cp}"
+                    )
+                logger.info(
+                    f"[add_dummy_requests] req_id={req.py_request_id}, "
+                    f"is_gen={is_gen}, orig_prompt_len={req.py_orig_prompt_len}, "
+                    f"prompt_len={req.py_prompt_len}, "
+                    f"decoding_iter={req.py_decoding_iter}"
+                    f"{helix_info}"
+                )
         return requests
 
     def update_resources(self,
