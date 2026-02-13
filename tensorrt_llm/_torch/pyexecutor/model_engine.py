@@ -1014,8 +1014,7 @@ class PyTorchModelEngine(ModelEngine):
                 is_gen=False,
                 max_num_draft_tokens=self.runtime_draft_len,
                 use_mrope=self.use_mrope,
-                num_extra_decoding_steps=num_extra_decoding_steps,
-                is_warmup=True)
+                num_extra_decoding_steps=num_extra_decoding_steps)
 
             if spec_resource_manager is not None:
                 spec_resource_manager.add_dummy_requests(
@@ -1031,8 +1030,7 @@ class PyTorchModelEngine(ModelEngine):
                 max_num_draft_tokens=self.max_total_draft_tokens,
                 use_mrope=self.use_mrope,
                 max_beam_width=self.max_beam_width,
-                num_extra_decoding_steps=num_extra_decoding_steps,
-                is_warmup=True)
+                num_extra_decoding_steps=num_extra_decoding_steps)
             if spec_resource_manager is not None:
                 spec_resource_manager.add_dummy_requests(request_ids=list(
                     range(num_ctx_requests, num_ctx_requests +

@@ -117,7 +117,12 @@ save_config() {
 
 # Function to determine moe_backend
 get_moe_backend() {
-    echo "CUTEDSL"
+    local gbs=$1
+    if [ "$gbs" -eq 1 ]; then
+        echo "TRTLLM"
+    else
+        echo "CUTEDSL"
+    fi
 }
 
 # Function to generate pp_partition YAML block for 61 layers
@@ -154,8 +159,8 @@ update_config() {
 
     # Calculate derived values
     local concurrency=$(( batch_size * 8 < 64 ? batch_size * 8 : batch_size * 2 ))
-    local max_seq_len=$((isl + osl + 512))  # buffer for special tokens
-    local moe_backend=$(get_moe_backend "$ep")
+    local max_seq_len=$((isl / cp + osl + 512))  # isl/cp + osl + buffer for special tokens
+    local moe_backend=$(get_moe_backend "$batch_size")
     local attn_dp_bool=$( [ "$attn_dp" -eq 1 ] && echo "true" || echo "false" )
     # Worker max_batch_size calculation:
     # - max_batch_size in config = micro-batch size (per forward pass)
@@ -166,9 +171,12 @@ update_config() {
     local micro_batch_size
     if [ "$attn_dp" -eq 1 ]; then
         # With AttnDP: per-rank micro-batch = batch_size / (tp * pp)
-        # Runtime will compute max_num_sequences = micro_batch * pp = batch_size / tp (per-rank total)
-        worker_max_batch_size=$(( batch_size / (tp * pp) ))
-        micro_batch_size=$worker_max_batch_size
+        micro_batch_size=$(( batch_size / (tp * pp) ))
+        # IMPORTANT: We intentionally set worker_max_batch_size to a high value (micro_batch_size * tp)
+        # to avoid deadlocking in disaggregated serving with attention DP. The runtime may add
+        # dummy requests for padding, and with tight max_batch_size limits, these dummy requests
+        # can block real requests from being scheduled, causing the system to hang.
+        worker_max_batch_size=$(( micro_batch_size * tp ))
     else
         # Without AttnDP: micro-batch = batch_size / pp
         # Runtime will compute max_num_sequences = micro_batch * pp = batch_size (total)
@@ -176,15 +184,22 @@ update_config() {
         micro_batch_size=$worker_max_batch_size
     fi
 
+    # Ensure minimum batch size of 1
+    if [ "$worker_max_batch_size" -lt 1 ]; then
+        worker_max_batch_size=1
+        micro_batch_size=1
+    fi
+
     echo "=========================================="
     echo "Updating config with:"
     echo "  NUM_GPUS=$num_gpus, PP=$pp, TP=$tp, CP=$cp, EP=$ep"
     echo "  ISL=$isl, OSL=$osl, batch_size=$batch_size"
     echo "  enable_attention_dp=$attn_dp_bool"
-    echo "  concurrency=$concurrency, max_seq_len=$max_seq_len"
+    echo "  concurrency=$concurrency, max_seq_len=$max_seq_len (isl/cp + osl + 512 = $isl/$cp + $osl + 512)"
     echo "  moe_backend=$moe_backend (auto-selected for GB200 NVFP4)"
     if [ "$attn_dp" -eq 1 ]; then
-        echo "  worker max_batch_size=$worker_max_batch_size (micro-batch = batch_size / (tp * pp) with AttnDP)"
+        echo "  worker max_batch_size=$worker_max_batch_size (= micro_batch * tp to avoid deadlock with AttnDP)"
+        echo "  micro_batch_size=$micro_batch_size (= batch_size / (tp * pp))"
         echo "  max_num_sequences per rank=$(( worker_max_batch_size * pp )) (= batch_size / tp)"
     else
         echo "  worker max_batch_size=$worker_max_batch_size (micro-batch = batch_size / pp)"
