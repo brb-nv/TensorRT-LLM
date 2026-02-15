@@ -1010,7 +1010,7 @@ class Deepseekv3MoE(nn.Module):
                 num_experts=num_experts,
                 experts_per_token=top_k,
                 moe_ep_size=model_config.mapping.moe_ep_size,
-                dtype=dtype)
+                dtype=torch.float32)
 
     def _compute_shared_expert_tp_size(
             self, intermediate_size: int,
@@ -1072,7 +1072,7 @@ class Deepseekv3MoE(nn.Module):
             experts_per_token=self.top_k,
             moe_ep_size=self.model_config.mapping.moe_ep_size,
             device=device,
-            dtype=self.dtype)
+            dtype=torch.float32)
 
     def compute_routed_output(self, hidden_states, hidden_states_fp4,
                               all_rank_num_tokens, do_finalize):
