@@ -1,9 +1,12 @@
 import math
+import os
 import weakref
 from typing import List, Optional, Union, cast
 
 import torch
 from torch import nn
+
+_HELIX_DEBUG_DIR = "/home/bbuddharaju/scratch/TensorRT-LLM/helix_debug_logs"
 
 import tensorrt_llm.quantization.utils.fp8_utils as fp8_utils
 from tensorrt_llm._utils import (get_sm_version, is_sm_100f, nvtx_range,
@@ -462,6 +465,20 @@ class Attention(nn.Module):
         attention outputs across CP ranks."""
         head_dim = self.head_dim
 
+        if self.enable_helix_test:
+            cp_rank = self.mapping.cp_rank
+            logger.info(
+                f"[HELIX_DEBUG] rank={cp_rank} _helix_post_process input: "
+                f"partial_o.shape={partial_o.shape}, "
+                f"softmax_stats.shape={softmax_stats.shape}, "
+                f"partial_o[:1,:8]={partial_o[0,:8].tolist()}, "
+                f"softmax_stats[:1,:4]={softmax_stats[0,:4].tolist()}"
+            )
+            # Save tensors for offline analysis
+            os.makedirs(_HELIX_DEBUG_DIR, exist_ok=True)
+            torch.save(partial_o, f"{_HELIX_DEBUG_DIR}/rank{cp_rank}_partial_o.pt")
+            torch.save(softmax_stats, f"{_HELIX_DEBUG_DIR}/rank{cp_rank}_softmax_stats.pt")
+
         if self.mapping.cp_config.get("use_nccl_for_alltoall", True):
             # NCCL-based implementation using alltoall_helix.
             chunks = []
@@ -471,8 +488,28 @@ class Attention(nn.Module):
                     torch.split(t, t.shape[0] // self.mapping.cp_size))
             gathered = alltoall_helix(chunks, self.mapping.cp_group)
             gathered = [t.transpose(1, 2).contiguous() for t in gathered]
-            return torch.ops.trtllm.helix_post_process(
+            if self.enable_helix_test:
+                logger.info(
+                    f"[HELIX_DEBUG] rank={cp_rank} after alltoall: "
+                    f"gathered[0].shape={gathered[0].shape}, "
+                    f"gathered[1].shape={gathered[1].shape}, "
+                    f"gathered[0][0,0,:8]={gathered[0][0,0,:8].tolist()}, "
+                    f"gathered[0][1,0,:8]={gathered[0][1,0,:8].tolist()}, "
+                    f"gathered[1][0,0,:4]={gathered[1][0,0,:4].tolist()}, "
+                    f"gathered[1][1,0,:4]={gathered[1][1,0,:4].tolist()}"
+                )
+                torch.save(gathered[0], f"{_HELIX_DEBUG_DIR}/rank{cp_rank}_gathered_o.pt")
+                torch.save(gathered[1], f"{_HELIX_DEBUG_DIR}/rank{cp_rank}_gathered_stats.pt")
+            result = torch.ops.trtllm.helix_post_process(
                 gathered[0], gathered[1], 1.0)
+            if self.enable_helix_test:
+                logger.info(
+                    f"[HELIX_DEBUG] rank={cp_rank} helix_post_process output: "
+                    f"shape={result.shape}, "
+                    f"result[0,:8]={result[0,:8].tolist()}"
+                )
+                torch.save(result, f"{_HELIX_DEBUG_DIR}/rank{cp_rank}_helix_result.pt")
+            return result
         else:
             # FIFO-based implementation using MNNVL workspace.
             helix = HelixAllToAllNative.get(self.mapping)
@@ -541,6 +578,19 @@ class Attention(nn.Module):
         # Helix CP generation path: get partial outputs with softmax stats,
         # then exchange and combine across CP ranks.
         if self.mapping.has_cp_helix() and attn_metadata.num_contexts == 0:
+            if self.enable_helix_test:
+                cp_rank = self.mapping.cp_rank
+                logger.info(
+                    f"[HELIX_DEBUG] rank={cp_rank} _attn_impl HELIX GEN path: "
+                    f"num_tokens={num_tokens}, num_heads={self.num_heads}, "
+                    f"head_dim={self.head_dim}, num_heads_tp_cp={self.num_heads_tp_cp}, "
+                    f"q.shape={q.shape}, k={k is not None}, v={v is not None}, "
+                    f"rope_fusion={self.rope_fusion}, "
+                    f"helix_position_offsets={getattr(attn_metadata, 'helix_position_offsets', None)}, "
+                    f"helix_is_inactive_rank={getattr(attn_metadata, 'helix_is_inactive_rank', None)}"
+                )
+                # Save QKV input to attention backend
+                torch.save(q, f"{_HELIX_DEBUG_DIR}/rank{cp_rank}_q_input.pt")
             softmax_stats = torch.empty((num_tokens, self.num_heads, 2),
                                         device=q.device,
                                         dtype=torch.float32)
@@ -557,10 +607,30 @@ class Attention(nn.Module):
                 attention_sinks=attention_sinks)
             if isinstance(attn_output, tuple):
                 attn_output = attn_output[0]
+            if self.enable_helix_test:
+                logger.info(
+                    f"[HELIX_DEBUG] rank={cp_rank} attn backend output: "
+                    f"attn_output.shape={attn_output.shape}, "
+                    f"attn_output[0,:8]={attn_output[0,:8].tolist()}, "
+                    f"softmax_stats[0,:4]={softmax_stats[0,:4].tolist()}, "
+                    f"softmax_stats has nan={torch.isnan(softmax_stats).any()}, "
+                    f"softmax_stats has inf={torch.isinf(softmax_stats).any()}"
+                )
+                torch.save(attn_output, f"{_HELIX_DEBUG_DIR}/rank{cp_rank}_attn_output_before_helix.pt")
+                torch.save(softmax_stats, f"{_HELIX_DEBUG_DIR}/rank{cp_rank}_softmax_stats_raw.pt")
             attn_output = self._helix_post_process(attn_output, softmax_stats)
             return attn_output, None
 
         # Normal (non-helix) path
+        if self.enable_helix_test:
+            cp_rank = self.mapping.cp_rank if self.mapping.cp_size > 1 else -1
+            logger.info(
+                f"[HELIX_DEBUG] rank={cp_rank} _attn_impl NORMAL path: "
+                f"num_tokens={num_tokens}, q.shape={q.shape}, "
+                f"k={'None' if k is None else k.shape}, "
+                f"v={'None' if v is None else v.shape}, "
+                f"num_contexts={attn_metadata.num_contexts}"
+            )
         out_scale = None
         out_scale_sf = None
         # Don't set out_scale if o_proj has pre_quant_scale - this prevents FP8/FP4 output
@@ -593,6 +663,14 @@ class Attention(nn.Module):
             output=output[:num_tokens, :] if output is not None else None,
             output_sf=output_sf,
             attention_sinks=attention_sinks)
+        if self.enable_helix_test and attn_metadata.num_contexts == 0:
+            cp_rank = self.mapping.cp_rank if self.mapping.cp_size > 1 else -1
+            ao = attn_output[0] if isinstance(attn_output, tuple) else attn_output
+            logger.info(
+                f"[HELIX_DEBUG] rank={cp_rank} NORMAL attn output: "
+                f"shape={ao.shape}, output[0,:8]={ao[0,:8].tolist()}"
+            )
+            torch.save(ao, f"{_HELIX_DEBUG_DIR}/rank{cp_rank}_normal_attn_output.pt")
         if isinstance(attn_output, tuple):
             assert len(
                 attn_output
@@ -707,6 +785,23 @@ class Attention(nn.Module):
             if qkv_lora is not None:
                 qkv = qkv + qkv_lora
 
+        if self.enable_helix_test:
+            cp_rank = self.mapping.cp_rank if self.mapping.cp_size > 1 else -1
+            is_gen = attn_metadata.num_contexts == 0
+            logger.info(
+                f"[HELIX_DEBUG] rank={cp_rank} forward: "
+                f"is_gen={is_gen}, "
+                f"hidden_states.shape={hidden_states.shape}, "
+                f"qkv.shape={qkv.shape}, "
+                f"position_ids={position_ids[:min(8, len(position_ids))].tolist() if position_ids is not None else None}, "
+                f"rope_fusion={self.rope_fusion}, "
+                f"support_fused_qkv={self.support_fused_qkv}, "
+                f"num_heads={self.num_heads}, num_kv_heads={self.num_key_value_heads}, "
+                f"q_size={self.q_size}, kv_size={self.kv_size}, "
+                f"cp_size={self.cp_size}, "
+                f"num_heads_tp_cp={self.num_heads_tp_cp}"
+            )
+
         if self.attn_output_gate:
             q_gate, k, v = qkv.split(
                 [self.q_size * 2, self.kv_size, self.kv_size], dim=-1)
@@ -721,6 +816,16 @@ class Attention(nn.Module):
 
         q, k, v = self.apply_rope(q, k, v, position_ids)
         q, k, v = self.convert_qkv(q, k, v)
+
+        if self.enable_helix_test:
+            logger.info(
+                f"[HELIX_DEBUG] rank={cp_rank} after rope+convert: "
+                f"q.shape={q.shape}, k={'None' if k is None else k.shape}, "
+                f"v={'None' if v is None else v.shape}, "
+                f"q[0,:8]={q[0,:8].tolist()}"
+            )
+            if is_gen:
+                torch.save(q, f"{_HELIX_DEBUG_DIR}/rank{cp_rank}_q_after_rope.pt")
 
         if attention_sinks is not None:
             assert self.attn_backend == "TRTLLM", "Attention sinks are only supported for TRTLLM backend."
@@ -743,6 +848,13 @@ class Attention(nn.Module):
                                         attention_sinks=attention_sinks,
                                         has_lora=bool(lora_params))
 
+        if self.enable_helix_test:
+            logger.info(
+                f"[HELIX_DEBUG] rank={cp_rank} forward_impl output: "
+                f"attn_output.shape={attn_output.shape}, "
+                f"attn_output[0,:8]={attn_output[0,:8].tolist()}"
+            )
+
         if self.attn_output_gate:
             gate = torch.sigmoid(gate)
             attn_output = attn_output * gate
@@ -753,11 +865,34 @@ class Attention(nn.Module):
             # thus we cut it to num_heads_tp_cp * head_dim
             attn_output = attn_output[:, :self.num_heads_tp_cp *
                                       self.head_dim].contiguous()
+            if is_gen:
+                logger.info(
+                    f"[HELIX_DEBUG] rank={cp_rank} after helix truncation: "
+                    f"attn_output.shape={attn_output.shape}, "
+                    f"attn_output[0,:8]={attn_output[0,:8].tolist()}"
+                )
+                torch.save(attn_output, f"{_HELIX_DEBUG_DIR}/rank{cp_rank}_attn_before_oproj.pt")
+
+        if self.enable_helix_test and is_gen:
+            logger.info(
+                f"[HELIX_DEBUG] rank={cp_rank} o_proj weight shape: "
+                f"{self.o_proj.weight.shape}, "
+                f"o_proj input shape: {attn_output.shape}"
+            )
 
         attn_output = self.o_proj(attn_output,
                                   all_reduce_params=all_reduce_params,
                                   lora_params=lora_params,
                                   layer_idx=self.layer_idx)
+
+        if self.enable_helix_test and is_gen:
+            logger.info(
+                f"[HELIX_DEBUG] rank={cp_rank} final output after o_proj: "
+                f"shape={attn_output.shape}, "
+                f"output[0,:8]={attn_output[0,:8].tolist()}"
+            )
+            torch.save(attn_output, f"{_HELIX_DEBUG_DIR}/rank{cp_rank}_final_output.pt")
+
         return attn_output
 
     def apply_rope(self, q: torch.Tensor, k: Optional[torch.Tensor],

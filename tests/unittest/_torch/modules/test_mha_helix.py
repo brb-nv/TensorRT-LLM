@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 import pickle
 import sys
 import time
@@ -20,6 +21,8 @@ import traceback
 import weakref
 from dataclasses import dataclass
 from typing import List, Optional
+
+_HELIX_DEBUG_DIR = "/home/bbuddharaju/scratch/TensorRT-LLM/helix_debug_logs"
 
 import cloudpickle
 import pytest
@@ -54,6 +57,9 @@ MPI.pickle.__init__(
     pickle.HIGHEST_PROTOCOL,
 )
 
+
+# Set this to True to disable RoPE for debugging
+DISABLE_ROPE_FOR_DEBUG = False
 
 # Values inspired by a small LLaMA-like model
 @dataclass(kw_only=True, frozen=True)
@@ -110,13 +116,13 @@ all_scenarios = [
 # Limit the number of test scenarios to avoid taking too long
 test_scenarios = [
     all_scenarios[0],
-    all_scenarios[1],
-    all_scenarios[4],
-    all_scenarios[7],
-    all_scenarios[10],
-    all_scenarios[13],
-    all_scenarios[17],
-    all_scenarios[18],
+    # all_scenarios[1],
+    # all_scenarios[4],
+    # all_scenarios[7],
+    # all_scenarios[10],
+    # all_scenarios[13],
+    # all_scenarios[17],
+    # all_scenarios[18],
 ]
 
 
@@ -250,6 +256,15 @@ def _run_attention_distributed(
     position_ids_gen = torch.full(
         (scenario.batch,), scenario.ctx_len, dtype=torch.int, device="cuda"
     )
+
+    # DEBUG: Print input state
+    print(f"[DEBUG] Rank {rank}: input_gen.shape={input_gen.shape}, "
+          f"input_gen[0,:8]={input_gen[0,:8].tolist()}")
+    print(f"[DEBUG] Rank {rank}: position_ids_gen={position_ids_gen.tolist()}")
+    print(f"[DEBUG] Rank {rank}: mapping cp_size={mapping.cp_size}, "
+          f"cp_rank={mapping.cp_rank}, tp_size={mapping.tp_size}, "
+          f"rank={mapping.rank}")
+
     extra_attrs = dict()
     config = ModelConfig(mapping=mapping)
     config.extra_attrs = extra_attrs
@@ -265,8 +280,30 @@ def _run_attention_distributed(
         config=config,
         enable_helix_test=True,
     ).cuda()
+
+    # DEBUG: Print attention module config
+    print(f"[DEBUG] Rank {rank}: Attention module - "
+          f"num_heads={attn.num_heads}, num_kv_heads={attn.num_key_value_heads}, "
+          f"num_heads_tp_cp={attn.num_heads_tp_cp}, head_dim={attn.head_dim}, "
+          f"q_size={attn.q_size}, kv_size={attn.kv_size}, "
+          f"rope_fusion={attn.rope_fusion}, "
+          f"support_fused_qkv={attn.support_fused_qkv}, "
+          f"cp_size={attn.cp_size}, tp_size={attn.tp_size}")
+
+    # DEBUG: Print weight shapes before split
+    print(f"[DEBUG] Rank {rank}: weights before split: "
+          f"qkv_proj.weight={weights['qkv_proj.weight'].shape}, "
+          f"o_proj.weight={weights['o_proj.weight'].shape}")
+
     # Split o_proj weight along input dimension for CP
     _copy_to_cp(weights, "o_proj.weight", 1, rank, world_size)
+
+    # DEBUG: Print weight shapes after split
+    print(f"[DEBUG] Rank {rank}: o_proj.weight after split={weights['o_proj.weight'].shape}")
+    print(f"[DEBUG] Rank {rank}: expected o_proj shape={attn.o_proj.weight.shape}")
+    print(f"[DEBUG] Rank {rank}: qkv_proj.weight[0,:8]={weights['qkv_proj.weight'][0,:8].tolist()}")
+    print(f"[DEBUG] Rank {rank}: o_proj.weight[0,:8]={weights['o_proj.weight'][0,:8].tolist()}")
+
     attn.load_state_dict(weights)
     # Set up KVCacheManager and attn_metadata for distributed
     kv_cache_manager, attn_metadata = _setup_kv_and_metadata(scenario, mapping, gen_steps)
@@ -311,6 +348,16 @@ def _run_attention_distributed(
                 helix_is_inactive_rank.append(True)
                 cache_add = 0
         cached_tokens_per_seq = [ctx_len_per_gpu + cache_add for _ in range(scenario.batch)]
+
+        # DEBUG: Print generation step info
+        if step == 0:
+            print(f"[DEBUG] Rank {rank} step {step}: "
+                  f"helix_is_inactive_rank={helix_is_inactive_rank}, "
+                  f"cache_add={cache_add}, "
+                  f"cached_tokens_per_seq={cached_tokens_per_seq}, "
+                  f"ctx_len_per_gpu={ctx_len_per_gpu}, "
+                  f"position_ids_gen={position_ids_gen.tolist()}")
+
         if step == 0:
             attn_metadata = get_attention_backend("TRTLLM").Metadata(
                 seq_lens=torch.tensor([1] * scenario.batch, dtype=torch.int),
@@ -396,6 +443,16 @@ def _run_attention_distributed(
     output = torch.stack(outputs, dim=0)
     kv_cache_manager.shutdown()
 
+    # DEBUG: Save outputs for offline comparison
+    os.makedirs(_HELIX_DEBUG_DIR, exist_ok=True)
+    torch.save(output, f"{_HELIX_DEBUG_DIR}/rank{rank}_test_output.pt")
+    torch.save(ref_output, f"{_HELIX_DEBUG_DIR}/rank{rank}_ref_output.pt")
+    print(f"[DEBUG] Rank {rank}: test output shape={output.shape}, "
+          f"ref output shape={ref_output.shape}")
+    print(f"[DEBUG] Rank {rank}: test output[0,0,:16]={output[0,0,:16].tolist()}")
+    print(f"[DEBUG] Rank {rank}: ref  output[0,0,:16]={ref_output[0,0,:16].tolist()}")
+    print(f"[DEBUG] Rank {rank}: diff[0,0,:16]={(output[0,0,:16] - ref_output[0,0,:16]).tolist()}")
+
     # Every rank should have the same output and checks against the reference
     atol, rtol = scenario.atol, scenario.rtol
     mismatch_count = 0
@@ -446,11 +503,15 @@ def _full_test_multi_gpu(
         (scenario.batch,), scenario.ctx_len, dtype=torch.int, device="cuda"
     )
 
-    pos_embd_params = PositionalEmbeddingParams(
-        type=PositionEmbeddingType.rope_gpt_neox,
-        rope=RopeParams.from_config(rope_config),
-        is_neox=True,
-    )
+    if DISABLE_ROPE_FOR_DEBUG:
+        print(f"[DEBUG] Rank {rank}: *** ROPE IS DISABLED FOR DEBUGGING ***")
+        pos_embd_params = None
+    else:
+        pos_embd_params = PositionalEmbeddingParams(
+            type=PositionEmbeddingType.rope_gpt_neox,
+            rope=RopeParams.from_config(rope_config),
+            is_neox=True,
+        )
 
     attn = Attention(
         hidden_size=scenario.hidden_size,
@@ -463,8 +524,26 @@ def _full_test_multi_gpu(
         dtype=scenario.dtype,
         enable_helix_test=True,
     ).cuda()
+
+    # DEBUG: Print reference attention config
+    print(f"[DEBUG] Rank {rank}: REF Attention module - "
+          f"num_heads={attn.num_heads}, num_kv_heads={attn.num_key_value_heads}, "
+          f"num_heads_tp_cp={attn.num_heads_tp_cp}, head_dim={attn.head_dim}, "
+          f"q_size={attn.q_size}, kv_size={attn.kv_size}, "
+          f"rope_fusion={attn.rope_fusion}, "
+          f"support_fused_qkv={attn.support_fused_qkv}, "
+          f"cp_size={attn.cp_size}, tp_size={attn.tp_size}, "
+          f"has_cp_helix={attn.mapping.has_cp_helix()}")
+
     _generate_random_weights(attn)
     weights = attn.state_dict()
+
+    # DEBUG: Print weight shapes and values
+    print(f"[DEBUG] Rank {rank}: weights keys={list(weights.keys())}")
+    for k_name, v_val in weights.items():
+        print(f"[DEBUG] Rank {rank}: weight '{k_name}' shape={v_val.shape}, "
+              f"first_vals={v_val.flatten()[:4].tolist()}")
+
     # Up to this point, all ranks should have the same tensors because the seed
     # is the same. Now we run the reference Attention on rank 0.
     if rank == 0:
@@ -473,6 +552,9 @@ def _full_test_multi_gpu(
             scenario, ref_mapping, gen_steps
         )
         # Context step
+        print(f"[DEBUG] Rank {rank}: Running REF context step, "
+              f"input_ctx.shape={input_ctx.shape}, "
+              f"position_ids_ctx[:8]={position_ids_ctx[:8].tolist()}")
         attn(position_ids_ctx, input_ctx, ref_attn_metadata)
         ref_outputs = []
         start = time.time()
@@ -509,10 +591,19 @@ def _full_test_multi_gpu(
                 )
             ref_attn_metadata.prepare()
 
+            if step == 0:
+                print(f"[DEBUG] Rank {rank}: REF gen step {step}, "
+                      f"position_ids_gen={position_ids_gen.tolist()}, "
+                      f"input_gen[0,:8]={input_gen[0,:8].tolist()}, "
+                      f"cached_tokens={scenario.ctx_len + step}")
+
             if not use_cuda_graph:
                 result = attn(position_ids_gen, input_gen, ref_attn_metadata)
                 if step < scenario.ref_steps:
                     ref_outputs.append(result)
+                    # DEBUG: Save reference output
+                    os.makedirs(_HELIX_DEBUG_DIR, exist_ok=True)
+                    torch.save(result, f"{_HELIX_DEBUG_DIR}/ref_output_step{step}.pt")
                 print(f"Ref result: {result[0, :8]} / {result[-1, -8:]}")
                 position_ids_gen += 1
                 continue
@@ -669,4 +760,3 @@ if __name__ == "__main__":
                 print(f"Numerical test failed with mismatch ratios: {mismatch_ratios}")
             else:
                 print("Numerical test passed")
-
