@@ -563,6 +563,18 @@ public:
             }
             else
             {
+                // Extract helix params for non-MLA generation.
+                if (mla_tensor_params.size() == 2)
+                {
+                    auto& helix_position_offsets = mla_tensor_params[0];
+                    auto& helix_is_inactive_rank = mla_tensor_params[1];
+                    if (helix_position_offsets.has_value())
+                        enqueue_params.helix_position_offsets = helix_position_offsets->data_ptr<int32_t>();
+                    if (helix_is_inactive_rank.has_value())
+                        enqueue_params.helix_is_inactive_rank = helix_is_inactive_rank->data_ptr<bool>();
+                    TLLM_LOG_INFO("[Helix] THOP non-MLA gen: helix_position_offsets=%p, helix_is_inactive_rank=%p",
+                        enqueue_params.helix_position_offsets, enqueue_params.helix_is_inactive_rank);
+                }
                 op.enqueueGeneration<T, KVBlockArray>(enqueue_params, stream);
             }
 

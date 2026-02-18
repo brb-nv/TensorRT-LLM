@@ -7,6 +7,7 @@ import torch
 from torch import nn
 
 _HELIX_DEBUG_DIR = "/home/bbuddharaju/scratch/TensorRT-LLM/helix_debug_logs"
+os.makedirs(_HELIX_DEBUG_DIR, exist_ok=True)
 
 import tensorrt_llm.quantization.utils.fp8_utils as fp8_utils
 from tensorrt_llm._utils import (get_sm_version, is_sm_100f, nvtx_range,
@@ -467,7 +468,7 @@ class Attention(nn.Module):
 
         if self.enable_helix_test:
             cp_rank = self.mapping.cp_rank
-            logger.info(
+            print(
                 f"[HELIX_DEBUG] rank={cp_rank} _helix_post_process input: "
                 f"partial_o.shape={partial_o.shape}, "
                 f"softmax_stats.shape={softmax_stats.shape}, "
@@ -489,7 +490,7 @@ class Attention(nn.Module):
             gathered = alltoall_helix(chunks, self.mapping.cp_group)
             gathered = [t.transpose(1, 2).contiguous() for t in gathered]
             if self.enable_helix_test:
-                logger.info(
+                print(
                     f"[HELIX_DEBUG] rank={cp_rank} after alltoall: "
                     f"gathered[0].shape={gathered[0].shape}, "
                     f"gathered[1].shape={gathered[1].shape}, "
@@ -503,7 +504,7 @@ class Attention(nn.Module):
             result = torch.ops.trtllm.helix_post_process(
                 gathered[0], gathered[1], 1.0)
             if self.enable_helix_test:
-                logger.info(
+                print(
                     f"[HELIX_DEBUG] rank={cp_rank} helix_post_process output: "
                     f"shape={result.shape}, "
                     f"result[0,:8]={result[0,:8].tolist()}"
@@ -580,7 +581,7 @@ class Attention(nn.Module):
         if self.mapping.has_cp_helix() and attn_metadata.num_contexts == 0:
             if self.enable_helix_test:
                 cp_rank = self.mapping.cp_rank
-                logger.info(
+                print(
                     f"[HELIX_DEBUG] rank={cp_rank} _attn_impl HELIX GEN path: "
                     f"num_tokens={num_tokens}, num_heads={self.num_heads}, "
                     f"head_dim={self.head_dim}, num_heads_tp_cp={self.num_heads_tp_cp}, "
@@ -608,7 +609,7 @@ class Attention(nn.Module):
             if isinstance(attn_output, tuple):
                 attn_output = attn_output[0]
             if self.enable_helix_test:
-                logger.info(
+                print(
                     f"[HELIX_DEBUG] rank={cp_rank} attn backend output: "
                     f"attn_output.shape={attn_output.shape}, "
                     f"attn_output[0,:8]={attn_output[0,:8].tolist()}, "
@@ -624,7 +625,7 @@ class Attention(nn.Module):
         # Normal (non-helix) path
         if self.enable_helix_test:
             cp_rank = self.mapping.cp_rank if self.mapping.cp_size > 1 else -1
-            logger.info(
+            print(
                 f"[HELIX_DEBUG] rank={cp_rank} _attn_impl NORMAL path: "
                 f"num_tokens={num_tokens}, q.shape={q.shape}, "
                 f"k={'None' if k is None else k.shape}, "
@@ -666,7 +667,7 @@ class Attention(nn.Module):
         if self.enable_helix_test and attn_metadata.num_contexts == 0:
             cp_rank = self.mapping.cp_rank if self.mapping.cp_size > 1 else -1
             ao = attn_output[0] if isinstance(attn_output, tuple) else attn_output
-            logger.info(
+            print(
                 f"[HELIX_DEBUG] rank={cp_rank} NORMAL attn output: "
                 f"shape={ao.shape}, output[0,:8]={ao[0,:8].tolist()}"
             )
@@ -788,7 +789,7 @@ class Attention(nn.Module):
         if self.enable_helix_test:
             cp_rank = self.mapping.cp_rank if self.mapping.cp_size > 1 else -1
             is_gen = attn_metadata.num_contexts == 0
-            logger.info(
+            print(
                 f"[HELIX_DEBUG] rank={cp_rank} forward: "
                 f"is_gen={is_gen}, "
                 f"hidden_states.shape={hidden_states.shape}, "
@@ -818,7 +819,7 @@ class Attention(nn.Module):
         q, k, v = self.convert_qkv(q, k, v)
 
         if self.enable_helix_test:
-            logger.info(
+            print(
                 f"[HELIX_DEBUG] rank={cp_rank} after rope+convert: "
                 f"q.shape={q.shape}, k={'None' if k is None else k.shape}, "
                 f"v={'None' if v is None else v.shape}, "
@@ -849,7 +850,7 @@ class Attention(nn.Module):
                                         has_lora=bool(lora_params))
 
         if self.enable_helix_test:
-            logger.info(
+            print(
                 f"[HELIX_DEBUG] rank={cp_rank} forward_impl output: "
                 f"attn_output.shape={attn_output.shape}, "
                 f"attn_output[0,:8]={attn_output[0,:8].tolist()}"
@@ -866,7 +867,7 @@ class Attention(nn.Module):
             attn_output = attn_output[:, :self.num_heads_tp_cp *
                                       self.head_dim].contiguous()
             if is_gen:
-                logger.info(
+                print(
                     f"[HELIX_DEBUG] rank={cp_rank} after helix truncation: "
                     f"attn_output.shape={attn_output.shape}, "
                     f"attn_output[0,:8]={attn_output[0,:8].tolist()}"
@@ -874,7 +875,7 @@ class Attention(nn.Module):
                 torch.save(attn_output, f"{_HELIX_DEBUG_DIR}/rank{cp_rank}_attn_before_oproj.pt")
 
         if self.enable_helix_test and is_gen:
-            logger.info(
+            print(
                 f"[HELIX_DEBUG] rank={cp_rank} o_proj weight shape: "
                 f"{self.o_proj.weight.shape}, "
                 f"o_proj input shape: {attn_output.shape}"
@@ -886,7 +887,7 @@ class Attention(nn.Module):
                                   layer_idx=self.layer_idx)
 
         if self.enable_helix_test and is_gen:
-            logger.info(
+            print(
                 f"[HELIX_DEBUG] rank={cp_rank} final output after o_proj: "
                 f"shape={attn_output.shape}, "
                 f"output[0,:8]={attn_output[0,:8].tolist()}"

@@ -251,6 +251,7 @@ def _run_attention_distributed(
     test_params: tuple,
     ref_output: torch.Tensor,
     gen_steps: int,
+    ref_pre_oproj: Optional[torch.Tensor] = None,
 ):
     input_ctx, input_gen, position_ids_ctx, weights, pos_embd_params = test_params
     position_ids_gen = torch.full(
@@ -305,6 +306,15 @@ def _run_attention_distributed(
     print(f"[DEBUG] Rank {rank}: o_proj.weight[0,:8]={weights['o_proj.weight'][0,:8].tolist()}")
 
     attn.load_state_dict(weights)
+
+    # Hook to capture distributed attention output before o_proj
+    dist_pre_oproj = {}
+    def _capture_dist_pre_oproj(module, args, kwargs=None):
+        inp = args[0] if args else None
+        if inp is not None:
+            dist_pre_oproj['value'] = inp.detach().clone()
+    dist_hook = attn.o_proj.register_forward_pre_hook(_capture_dist_pre_oproj)
+
     # Set up KVCacheManager and attn_metadata for distributed
     kv_cache_manager, attn_metadata = _setup_kv_and_metadata(scenario, mapping, gen_steps)
     extra_attrs["attention_metadata"] = weakref.ref(attn_metadata)
@@ -324,6 +334,11 @@ def _run_attention_distributed(
         scenario.batch * ctx_len_per_gpu
     ).contiguous()
     # Context step
+    print(f"[DEBUG] Rank {rank}: DIST context step, "
+          f"input_ctx_rank.shape={input_ctx_rank.shape}, "
+          f"position_ids_ctx_rank[:8]={position_ids_ctx_rank[:8].tolist()}, "
+          f"position_ids_ctx_rank[-8:]={position_ids_ctx_rank[-8:].tolist()}, "
+          f"mapping_for_attn_metadata: cp_size={mapping.cp_size}, cp_rank={mapping.cp_rank}")
     with model_extra_attrs(extra_attrs):
         attn(position_ids_ctx_rank, input_ctx_rank, attn_metadata)
 
@@ -356,7 +371,10 @@ def _run_attention_distributed(
                   f"cache_add={cache_add}, "
                   f"cached_tokens_per_seq={cached_tokens_per_seq}, "
                   f"ctx_len_per_gpu={ctx_len_per_gpu}, "
-                  f"position_ids_gen={position_ids_gen.tolist()}")
+                  f"position_ids_gen={position_ids_gen.tolist()}, "
+                  f"num_heads={scenario.num_heads}, "
+                  f"num_kv_heads={scenario.num_kv_heads}, "
+                  f"heads_per_rank={scenario.num_heads // world_size}")
 
         if step == 0:
             attn_metadata = get_attention_backend("TRTLLM").Metadata(
@@ -400,6 +418,37 @@ def _run_attention_distributed(
                 result = attn(position_ids_gen, input_gen, attn_metadata)
             if step < scenario.ref_steps:
                 outputs.append(result)
+
+            # Diagnostic: compare pre-oproj with reference
+            if step == 0 and 'value' in dist_pre_oproj and ref_pre_oproj is not None:
+                dist_attn_out = dist_pre_oproj['value']
+                heads_per_rank = scenario.num_heads // world_size
+                head_dim = scenario.head_dim
+                local_dim = heads_per_rank * head_dim
+                ref_slice = ref_pre_oproj[:, rank * local_dim : (rank + 1) * local_dim]
+                print(f"\n{'='*80}")
+                print(f"[DIAG] Rank {rank}: PRE-O_PROJ COMPARISON (step {step})")
+                print(f"[DIAG] Rank {rank}: dist_attn_out shape={dist_attn_out.shape}, "
+                      f"ref_slice shape={ref_slice.shape}")
+                print(f"[DIAG] Rank {rank}: dist_attn_out[0,:16]={dist_attn_out[0,:16].tolist()}")
+                print(f"[DIAG] Rank {rank}: ref_slice[0,:16]={ref_slice[0,:16].tolist()}")
+                diff = (dist_attn_out - ref_slice).abs()
+                max_diff = diff.max().item()
+                mean_diff = diff.mean().item()
+                print(f"[DIAG] Rank {rank}: max_abs_diff={max_diff:.6f}, "
+                      f"mean_abs_diff={mean_diff:.6f}")
+                # Per-head comparison
+                for h in range(min(heads_per_rank, 4)):
+                    h_start = h * head_dim
+                    h_end = (h + 1) * head_dim
+                    h_diff = diff[0, h_start:h_end]
+                    print(f"[DIAG] Rank {rank}: head {rank * heads_per_rank + h} (local {h}): "
+                          f"max_diff={h_diff.max().item():.6f}, "
+                          f"mean_diff={h_diff.mean().item():.6f}, "
+                          f"dist[0:4]={dist_attn_out[0, h_start:h_start+4].tolist()}, "
+                          f"ref[0:4]={ref_slice[0, h_start:h_start+4].tolist()}")
+                print(f"{'='*80}\n")
+
             print(f"Rank {rank} {world_size}-GPU: result: {result[0, :8]} / {result[-1, -8:]}")
             position_ids_gen += 1
             continue
@@ -441,6 +490,7 @@ def _run_attention_distributed(
         f"{end - start} s, throughput: {throughput} Attn/s"
     )
     output = torch.stack(outputs, dim=0)
+    dist_hook.remove()
     kv_cache_manager.shutdown()
 
     # DEBUG: Save outputs for offline comparison
@@ -452,6 +502,19 @@ def _run_attention_distributed(
     print(f"[DEBUG] Rank {rank}: test output[0,0,:16]={output[0,0,:16].tolist()}")
     print(f"[DEBUG] Rank {rank}: ref  output[0,0,:16]={ref_output[0,0,:16].tolist()}")
     print(f"[DEBUG] Rank {rank}: diff[0,0,:16]={(output[0,0,:16] - ref_output[0,0,:16]).tolist()}")
+
+    # Detailed error analysis: check which dimension ranges have errors
+    if output.shape == ref_output.shape:
+        abs_diff = (output[0, 0] - ref_output[0, 0]).abs()
+        hidden = output.shape[-1]
+        quarter = hidden // 4
+        for q_idx in range(4):
+            q_start = q_idx * quarter
+            q_end = (q_idx + 1) * quarter
+            q_max = abs_diff[q_start:q_end].max().item()
+            q_mean = abs_diff[q_start:q_end].mean().item()
+            print(f"[DIAG] Rank {rank}: output dim range [{q_start}:{q_end}]: "
+                  f"max_diff={q_max:.6f}, mean_diff={q_mean:.6f}")
 
     # Every rank should have the same output and checks against the reference
     atol, rtol = scenario.atol, scenario.rtol
@@ -551,6 +614,15 @@ def _full_test_multi_gpu(
         ref_kv_cache_manager, ref_attn_metadata = _setup_kv_and_metadata(
             scenario, ref_mapping, gen_steps
         )
+        # Hook to capture attention output before o_proj (all heads)
+        ref_pre_oproj = {}
+        def _capture_pre_oproj(module, args, kwargs=None):
+            # args[0] is the input tensor to o_proj
+            inp = args[0] if args else (kwargs.get('input', None) if kwargs else None)
+            if inp is not None:
+                ref_pre_oproj['value'] = inp.detach().clone()
+        hook_handle = attn.o_proj.register_forward_pre_hook(_capture_pre_oproj)
+
         # Context step
         print(f"[DEBUG] Rank {rank}: Running REF context step, "
               f"input_ctx.shape={input_ctx.shape}, "
@@ -601,9 +673,17 @@ def _full_test_multi_gpu(
                 result = attn(position_ids_gen, input_gen, ref_attn_metadata)
                 if step < scenario.ref_steps:
                     ref_outputs.append(result)
-                    # DEBUG: Save reference output
+                    # DEBUG: Save reference output and pre-o_proj attention output
                     os.makedirs(_HELIX_DEBUG_DIR, exist_ok=True)
                     torch.save(result, f"{_HELIX_DEBUG_DIR}/ref_output_step{step}.pt")
+                    if 'value' in ref_pre_oproj:
+                        ref_attn_out = ref_pre_oproj['value']
+                        torch.save(ref_attn_out, f"{_HELIX_DEBUG_DIR}/ref_pre_oproj_step{step}.pt")
+                        print(f"[DEBUG] Rank {rank}: REF pre-o_proj shape={ref_attn_out.shape}, "
+                              f"values[0,:16]={ref_attn_out[0,:16].tolist()}")
+                        print(f"[DEBUG] Rank {rank}: REF pre-o_proj first_half[0,:8]={ref_attn_out[0,:8].tolist()}, "
+                              f"second_half[0,{ref_attn_out.shape[-1]//2}:{ref_attn_out.shape[-1]//2+8}]="
+                              f"{ref_attn_out[0,ref_attn_out.shape[-1]//2:ref_attn_out.shape[-1]//2+8].tolist()}")
                 print(f"Ref result: {result[0, :8]} / {result[-1, -8:]}")
                 position_ids_gen += 1
                 continue
@@ -640,6 +720,12 @@ def _full_test_multi_gpu(
             f"{end - start} s, throughput: {throughput} Attn/s"
         )
         ref_output = torch.stack(ref_outputs, dim=0)
+        hook_handle.remove()
+
+        # Save ref pre-oproj for comparison in distributed ranks
+        ref_pre_oproj_tensor = ref_pre_oproj.get('value', None)
+        if ref_pre_oproj_tensor is not None:
+            print(f"[DEBUG] Rank {rank}: Saved REF pre-o_proj tensor, shape={ref_pre_oproj_tensor.shape}")
         ref_kv_cache_manager.shutdown()
     else:
         ref_output = torch.empty(
@@ -649,6 +735,7 @@ def _full_test_multi_gpu(
             dtype=scenario.dtype,
             device="cuda",
         )
+        ref_pre_oproj_tensor = None
 
     # Distributed mapping for helix
     mapping = Mapping(
@@ -664,6 +751,19 @@ def _full_test_multi_gpu(
     # Broadcast reference output from rank 0 to all ranks
     ref_output_all = cp_allgather(ref_output, mapping=mapping, dim=0)
     ref_output = ref_output_all.view(world_size, *ref_output.shape)[0]
+
+    # Broadcast ref pre-oproj tensor from rank 0 to all ranks
+    if ref_pre_oproj_tensor is None:
+        # Create placeholder on non-zero ranks
+        ref_pre_oproj_tensor = torch.empty(
+            scenario.batch, scenario.num_heads * scenario.head_dim,
+            dtype=scenario.dtype, device="cuda"
+        )
+    ref_pre_oproj_all = cp_allgather(ref_pre_oproj_tensor, mapping=mapping, dim=0)
+    ref_pre_oproj_tensor = ref_pre_oproj_all.view(world_size, *ref_pre_oproj_tensor.shape)[0]
+    print(f"[DEBUG] Rank {rank}: ref_pre_oproj_tensor shape={ref_pre_oproj_tensor.shape}, "
+          f"values[0,:8]={ref_pre_oproj_tensor[0,:8].tolist()}")
+
     test_params = (
         input_ctx,
         input_gen,
@@ -672,7 +772,8 @@ def _full_test_multi_gpu(
         pos_embd_params,
     )
     return _run_attention_distributed(
-        rank, world_size, scenario, mapping, test_params, ref_output, gen_steps
+        rank, world_size, scenario, mapping, test_params, ref_output, gen_steps,
+        ref_pre_oproj=ref_pre_oproj_tensor,
     )
 
 

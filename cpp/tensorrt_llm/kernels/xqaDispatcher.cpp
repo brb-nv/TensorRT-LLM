@@ -85,6 +85,13 @@ QKVPreprocessingParams<T, KVCacheBuffer> makeQKVPreprocessingParams(XQAParams co
     preprocessingParms.spec_decoding_position_offsets
         = params.cross_attention ? nullptr : params.spec_decoding_position_offsets;
     preprocessingParms.mrope_position_deltas = params.mrope_position_deltas;
+    preprocessingParms.helix_position_offsets = params.helix_position_offsets;
+    preprocessingParms.helix_is_inactive_rank = params.helix_is_inactive_rank;
+    if (preprocessingParms.helix_position_offsets || preprocessingParms.helix_is_inactive_rank)
+    {
+        TLLM_LOG_INFO("[Helix] makeQKVPreprocessingParams: helix_position_offsets=%p, helix_is_inactive_rank=%p",
+            preprocessingParms.helix_position_offsets, preprocessingParms.helix_is_inactive_rank);
+    }
     // Scalar parameters.
     preprocessingParms.batch_size = int(batch_beam_size);
     preprocessingParms.max_input_seq_len = params.generation_input_length;
@@ -505,6 +512,7 @@ void XqaDispatcher::runImpl(
         tllmRunnerParams.customMaskOffsetsPtr = params.spec_decoding_bl_tree_mask_offset;
         tllmRunnerParams.firstSparseMaskOffsetsKvPtr = params.spec_bl_tree_first_sparse_mask_offset_kv;
         tllmRunnerParams.mSkipSoftmaxThresholdScaleFactor = params.skip_softmax_threshold_scale_factor;
+        tllmRunnerParams.softmaxStatsPtr = params.softmax_stats;
         mTllmGenFMHARunner->run(tllmRunnerParams);
     }
     else

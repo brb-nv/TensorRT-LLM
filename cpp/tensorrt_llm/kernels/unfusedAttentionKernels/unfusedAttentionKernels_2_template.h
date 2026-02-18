@@ -428,12 +428,30 @@ __global__ void applyBiasRopeUpdateKVCache(QKVPreprocessingParams<T, KVCacheBuff
 
             // NOTE: only spec decoding needs the position offsets.
             // In the generation phase, we assume all sequences should have the same input length.
+            // Helix parallelism: use helix_position_offsets if available (absolute position).
             int const rotary_position
-                = (params.spec_decoding_position_offsets != nullptr ? (
-                       params.spec_decoding_position_offsets[local_token_idx + batch_idx * params.max_input_seq_len]
-                       + past_seq_len)
-                                                                    : token_idx_in_seq)
+                = (params.helix_position_offsets != nullptr
+                          ? params.helix_position_offsets[global_token_idx]
+                      : params.spec_decoding_position_offsets != nullptr
+                          ? (params.spec_decoding_position_offsets[local_token_idx
+                                 + batch_idx * params.max_input_seq_len]
+                              + past_seq_len)
+                          : token_idx_in_seq)
                 + (params.mrope_position_deltas != nullptr ? params.mrope_position_deltas[batch_idx] : 0);
+
+            // Helix parallelism: determine if this rank is inactive for this request.
+            bool const helix_inactive = params.helix_is_inactive_rank != nullptr
+                && params.helix_is_inactive_rank[batch_idx];
+
+            // Debug: print helix info from first thread of first block.
+            if (threadIdx.x == 0 && threadIdx.y == 0 && blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0
+                && (params.helix_position_offsets != nullptr || params.helix_is_inactive_rank != nullptr))
+            {
+                printf("[Helix] V2 kernel: batch_idx=%d, rotary_position=%d, token_idx_in_seq=%d, "
+                       "helix_inactive=%d, helix_pos_offsets=%p, helix_inactive_rank=%p\n",
+                    batch_idx, rotary_position, token_idx_in_seq,
+                    (int)helix_inactive, params.helix_position_offsets, params.helix_is_inactive_rank);
+            }
 
             if (!valid_token)
             {
@@ -606,7 +624,7 @@ __global__ void applyBiasRopeUpdateKVCache(QKVPreprocessingParams<T, KVCacheBuff
                         }
                     }
 
-                    if (valid_kv_cache_pos)
+                    if (valid_kv_cache_pos && !helix_inactive)
                     {
                         if constexpr (ENABLE_8BITS_CACHE)
                         {
@@ -844,10 +862,27 @@ __global__ void applyBiasRopeUpdateKVCacheV2(QKVPreprocessingParams<T, KVCacheBu
 
         // NOTE: only spec decoding needs the position offsets.
         // In the generation phase, we assume all sequences should have the same input length.
-        int const rotary_position = params.spec_decoding_position_offsets != nullptr
-            ? (params.spec_decoding_position_offsets[token_idx_in_seq + batch_idx * params.max_input_seq_len]
-                + cache_seq_len - actual_seq_len)
-            : token_idx_in_kv_cache;
+        // Helix parallelism: use helix_position_offsets if available (absolute position).
+        int const rotary_position = params.helix_position_offsets != nullptr
+            ? params.helix_position_offsets[bounded_global_token_idx]
+            : params.spec_decoding_position_offsets != nullptr
+                ? (params.spec_decoding_position_offsets[token_idx_in_seq + batch_idx * params.max_input_seq_len]
+                    + cache_seq_len - actual_seq_len)
+                : token_idx_in_kv_cache;
+
+        // Helix parallelism: determine if this rank is inactive for this request.
+        bool const helix_inactive = params.helix_is_inactive_rank != nullptr
+            && params.helix_is_inactive_rank[batch_idx];
+
+        // Debug: print helix info from first thread of first block.
+        if (threadIdx.x == 0 && threadIdx.y == 0 && blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0
+            && (params.helix_position_offsets != nullptr || params.helix_is_inactive_rank != nullptr))
+        {
+            printf("[Helix] V1 kernel: batch_idx=%d, rotary_position=%d, token_idx_in_kv_cache=%d, "
+                   "helix_inactive=%d, helix_pos_offsets=%p, helix_inactive_rank=%p\n",
+                batch_idx, rotary_position, token_idx_in_kv_cache,
+                (int)helix_inactive, params.helix_position_offsets, params.helix_is_inactive_rank);
+        }
 
         // head_num == kv_head_num:
         //   src QKV: [batch, time, 3, head_num, size_per_head]
@@ -1009,7 +1044,7 @@ __global__ void applyBiasRopeUpdateKVCacheV2(QKVPreprocessingParams<T, KVCacheBu
                     }
                 }
 
-                if (valid_kv_cache_pos)
+                if (valid_kv_cache_pos && !helix_inactive)
                 {
                     if constexpr (ENABLE_8BITS_CACHE)
                     {

@@ -510,7 +510,7 @@ class TrtllmAttentionWrapper:
 
         out_scale = self.out_scale_sf if self.use_nvfp4_output else self.out_scale
 
-        if _TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION and trtllm_gen.is_supported(
+        _trtllm_gen_supported, _trtllm_gen_reason = trtllm_gen.is_supported(
                 q=q,
                 num_heads=self.num_heads,
                 num_kv_heads=self.num_kv_heads,
@@ -533,7 +533,9 @@ class TrtllmAttentionWrapper:
                 has_cross_kv=False,
                 quant_config=self.quant_config,
                 kv_cache_manager=self.kv_cache_manager,
-        )[0]:
+        ) if _TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION else (False, "disabled")
+
+        if _TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION and _trtllm_gen_supported:
             trtllm_gen_attention(
                 q,
                 k,
@@ -617,6 +619,14 @@ class TrtllmAttentionWrapper:
                 self.kv_cache_manager,
             )
         else:
+            # KV cache update is expected to fall back to thop since
+            # trtllm-gen only reads from KV cache. Assert on other reasons.
+            assert not _TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION or (
+                "KV cache update" in _trtllm_gen_reason
+            ), (
+                f"TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION is set but trtllm-gen "
+                f"is not supported: {_trtllm_gen_reason}"
+            )
             thop.attention(
                 q,
                 k,
