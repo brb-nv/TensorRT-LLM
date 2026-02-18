@@ -20,12 +20,10 @@ from dataclasses import dataclass
 from functools import partial
 from typing import Optional
 
+import _torch.modules.helix_test_utils as helix_utils
 import cloudpickle
 import pytest
 import torch
-from mpi4py import MPI
-
-import _torch.modules.helix_test_utils as helix_utils
 from _torch.modules.helix_test_utils import (
     CACHE_TYPE_SELFKONLY,
     activate_all_ranks_for_context,
@@ -36,6 +34,7 @@ from _torch.modules.helix_test_utils import (
     setup_kv_and_metadata,
     split_inputs_for_rank,
 )
+from mpi4py import MPI
 
 from tensorrt_llm._torch.attention_backend.interface import (
     AttentionMetadata,
@@ -364,7 +363,8 @@ def _run_mla_distributed(
 
     # Set up KVCacheManager and attn_metadata for distributed.
     kv_cache_manager, attn_metadata = setup_kv_and_metadata(
-        scenario, mapping,
+        scenario,
+        mapping,
         cache_type=CACHE_TYPE_SELFKONLY,
         num_kv_heads=1,
         head_dim=scenario.kv_lora_rank + scenario.qk_rope_head_dim,
@@ -373,7 +373,8 @@ def _run_mla_distributed(
     ctx_len_per_gpu = scenario.ctx_len // world_size
 
     input_ctx_rank, position_ids_ctx_rank = split_inputs_for_rank(
-        input_ctx, position_ids_ctx, scenario, rank, world_size)
+        input_ctx, position_ids_ctx, scenario, rank, world_size
+    )
 
     # Context step — populate KV cache only; output is discarded.
     # We call forward_impl directly instead of mla.forward() because
@@ -381,10 +382,9 @@ def _run_mla_distributed(
     # crash on the full-width context attention output.
     activate_all_ranks_for_context(attn_metadata, position_ids_ctx_rank)
     ctx_output = input_ctx_rank.new_empty(
-        [input_ctx_rank.shape[0], mla.num_heads_tp * mla.v_head_dim],
-        dtype=input_ctx_rank.dtype)
-    mla.forward_impl(position_ids_ctx_rank, input_ctx_rank, attn_metadata,
-                     output=ctx_output)
+        [input_ctx_rank.shape[0], mla.num_heads_tp * mla.v_head_dim], dtype=input_ctx_rank.dtype
+    )
+    mla.forward_impl(position_ids_ctx_rank, input_ctx_rank, attn_metadata, output=ctx_output)
 
     # For non-last rank, generate the right latent cache for generation.
     input_ctx_bs = input_ctx.view(scenario.batch, scenario.ctx_len, scenario.hidden_size)
@@ -397,14 +397,16 @@ def _run_mla_distributed(
         kv_cache_manager.impl.add_token(req_id)
     helix_is_inactive_rank = [rank != world_size - 1] * scenario.batch
     attn_metadata = create_helix_gen_metadata(
-        scenario.batch, ctx_len_per_gpu, kv_cache_manager,
-        helix_is_inactive_rank, position_ids_gen,
-        enable_context_mla_with_cached_kv=True)
+        scenario.batch,
+        ctx_len_per_gpu,
+        kv_cache_manager,
+        helix_is_inactive_rank,
+        position_ids_gen,
+        enable_context_mla_with_cached_kv=True,
+    )
     extra_attrs["attention_metadata"] = weakref.ref(attn_metadata)
     with model_extra_attrs(extra_attrs):
-        output = mla(
-            position_ids_gen, input_gen, attn_metadata, latent_cache_gen=latent_cache_gen
-        )
+        output = mla(position_ids_gen, input_gen, attn_metadata, latent_cache_gen=latent_cache_gen)
     print(f"Rank {rank} {world_size}-GPU: result: {output[0, :8]} / {output[-1, -8:]}")
 
     kv_cache_manager.shutdown()
@@ -412,7 +414,8 @@ def _run_mla_distributed(
         ref_attn_metadata.kv_cache_manager.shutdown()
 
     return compute_mismatch_ratio(
-        output, ref_output, scenario.atol, scenario.rtol, rank, world_size)
+        output, ref_output, scenario.atol, scenario.rtol, rank, world_size
+    )
 
 
 @torch.inference_mode
@@ -491,7 +494,8 @@ def _full_test_multi_gpu(
     if rank == 0:
         ref_mapping = Mapping(world_size=1, tp_size=1, rank=0)
         ref_kv_cache_manager, ref_attn_metadata = setup_kv_and_metadata(
-            scenario, ref_mapping,
+            scenario,
+            ref_mapping,
             cache_type=CACHE_TYPE_SELFKONLY,
             num_kv_heads=1,
             head_dim=scenario.kv_lora_rank + scenario.qk_rope_head_dim,
@@ -551,9 +555,7 @@ def _full_test_multi_gpu(
         pos_embd_params,
         ref_attn_metadata,
     )
-    return _run_mla_distributed(
-        rank, world_size, scenario, mapping, test_params, ref_output
-    )
+    return _run_mla_distributed(rank, world_size, scenario, mapping, test_params, ref_output)
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 GPUs to run this test")

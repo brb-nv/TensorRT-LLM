@@ -22,9 +22,7 @@ from mpi4py.futures import MPIPoolExecutor
 import tensorrt_llm
 from tensorrt_llm._torch.attention_backend.interface import KVCacheParams
 from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
-from tensorrt_llm._torch.pyexecutor.llm_request import (LlmRequest,
-                                                         LlmRequestState,
-                                                         SamplingConfig)
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState, SamplingConfig
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import str_dtype_to_binding, torch_dtype_to_str
 from tensorrt_llm.bindings.executor import KvCacheConfig
@@ -32,15 +30,14 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.sampling_params import SamplingParams
 
 # Convenient aliases for the two KV-cache types used by MHA and MLA tests.
-CACHE_TYPE_SELF = (
-    tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF)
-CACHE_TYPE_SELFKONLY = (
-    tensorrt_llm.bindings.internal.batch_manager.CacheType.SELFKONLY)
+CACHE_TYPE_SELF = tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF
+CACHE_TYPE_SELFKONLY = tensorrt_llm.bindings.internal.batch_manager.CacheType.SELFKONLY
 
 
 # ---------------------------------------------------------------------------
 # Weight helpers
 # ---------------------------------------------------------------------------
+
 
 def copy_weights_for_cp(weights, param_name, dim, rank, world_size):
     """Slice a weight tensor along *dim* for context-parallel rank."""
@@ -56,28 +53,25 @@ def copy_weights_for_cp(weights, param_name, dim, rank, world_size):
 # Input splitting
 # ---------------------------------------------------------------------------
 
-def split_inputs_for_rank(input_ctx, position_ids_ctx, scenario, rank,
-                          world_size):
+
+def split_inputs_for_rank(input_ctx, position_ids_ctx, scenario, rank, world_size):
     """Split context inputs into per-rank chunks for CP.
 
     Returns ``(input_ctx_rank, position_ids_ctx_rank)``.
     """
     ctx_len_per_gpu = scenario.ctx_len // world_size
-    input_ctx_bs = input_ctx.view(scenario.batch, scenario.ctx_len,
-                                  scenario.hidden_size)
-    input_ctx_rank = input_ctx_bs[:,
-                                  rank * ctx_len_per_gpu:(rank + 1) *
-                                  ctx_len_per_gpu, :]
+    input_ctx_bs = input_ctx.view(scenario.batch, scenario.ctx_len, scenario.hidden_size)
+    input_ctx_rank = input_ctx_bs[:, rank * ctx_len_per_gpu : (rank + 1) * ctx_len_per_gpu, :]
     input_ctx_rank = input_ctx_rank.reshape(
-        scenario.batch * ctx_len_per_gpu, scenario.hidden_size).contiguous()
-    position_ids_ctx_bs = position_ids_ctx.view(scenario.batch,
-                                                scenario.ctx_len)
-    position_ids_ctx_rank = position_ids_ctx_bs[:,
-                                                rank *
-                                                ctx_len_per_gpu:(rank + 1) *
-                                                ctx_len_per_gpu]
+        scenario.batch * ctx_len_per_gpu, scenario.hidden_size
+    ).contiguous()
+    position_ids_ctx_bs = position_ids_ctx.view(scenario.batch, scenario.ctx_len)
+    position_ids_ctx_rank = position_ids_ctx_bs[
+        :, rank * ctx_len_per_gpu : (rank + 1) * ctx_len_per_gpu
+    ]
     position_ids_ctx_rank = position_ids_ctx_rank.reshape(
-        scenario.batch * ctx_len_per_gpu).contiguous()
+        scenario.batch * ctx_len_per_gpu
+    ).contiguous()
     return input_ctx_rank, position_ids_ctx_rank
 
 
@@ -85,14 +79,19 @@ def split_inputs_for_rank(input_ctx, position_ids_ctx, scenario, rank,
 # Helix metadata helpers
 # ---------------------------------------------------------------------------
 
+
 def activate_all_ranks_for_context(attn_metadata, position_ids):
     """Override helix metadata so all ranks participate in the context step."""
     attn_metadata.helix_position_offsets = position_ids
-    if (hasattr(attn_metadata, 'helix_is_inactive_rank')
-            and attn_metadata.helix_is_inactive_rank is not None):
+    if (
+        hasattr(attn_metadata, "helix_is_inactive_rank")
+        and attn_metadata.helix_is_inactive_rank is not None
+    ):
         attn_metadata.helix_is_inactive_rank.fill_(False)
-    if (hasattr(attn_metadata, 'helix_is_inactive_rank_cpu')
-            and attn_metadata.helix_is_inactive_rank_cpu is not None):
+    if (
+        hasattr(attn_metadata, "helix_is_inactive_rank_cpu")
+        and attn_metadata.helix_is_inactive_rank_cpu is not None
+    ):
         attn_metadata.helix_is_inactive_rank_cpu.fill_(False)
 
 
@@ -129,13 +128,17 @@ def create_helix_gen_metadata(
     )
     attn_metadata.enable_helix = True
     attn_metadata.helix_is_inactive_rank = torch.tensor(
-        helix_is_inactive_rank, dtype=torch.bool, device="cuda")
-    attn_metadata.helix_is_inactive_rank_cpu = (
-        attn_metadata.helix_is_inactive_rank.to(device="cpu").pin_memory())
+        helix_is_inactive_rank, dtype=torch.bool, device="cuda"
+    )
+    attn_metadata.helix_is_inactive_rank_cpu = attn_metadata.helix_is_inactive_rank.to(
+        device="cpu"
+    ).pin_memory()
     attn_metadata.helix_position_offsets = torch.tensor(
-        position_ids_gen, dtype=torch.int, device="cuda")
-    attn_metadata.helix_position_offsets_cpu = (
-        attn_metadata.helix_position_offsets.to(device="cpu").pin_memory())
+        position_ids_gen, dtype=torch.int, device="cuda"
+    )
+    attn_metadata.helix_position_offsets_cpu = attn_metadata.helix_position_offsets.to(
+        device="cpu"
+    ).pin_memory()
     attn_metadata.prepare()
     return attn_metadata
 
@@ -143,6 +146,7 @@ def create_helix_gen_metadata(
 # ---------------------------------------------------------------------------
 # KV-cache / metadata setup
 # ---------------------------------------------------------------------------
+
 
 def setup_kv_and_metadata(
     scenario,
@@ -190,21 +194,18 @@ def setup_kv_and_metadata(
             request_id=req_id,
             max_new_tokens=1,
             input_tokens=[1] * ctx_len_per_gpu,
-            sampling_config=SamplingConfig(
-                SamplingParams()._get_sampling_config()),
+            sampling_config=SamplingConfig(SamplingParams()._get_sampling_config()),
             is_streaming=False,
         )
         req.is_dummy_request = True
         req.paged_kv_block_ids = []
         beam_width = 1
-        kv_cache_manager.impl.add_sequence(req_id, ctx_len_per_gpu, beam_width,
-                                           req)
+        kv_cache_manager.impl.add_sequence(req_id, ctx_len_per_gpu, beam_width, req)
         req.state = LlmRequestState.GENERATION_IN_PROGRESS
         req.prompt_len = ctx_len_per_gpu
         req.py_prompt_len = req.prompt_len
     attn_metadata = get_attention_backend("TRTLLM").Metadata(
-        seq_lens=torch.tensor([ctx_len_per_gpu] * scenario.batch,
-                              dtype=torch.int),
+        seq_lens=torch.tensor([ctx_len_per_gpu] * scenario.batch, dtype=torch.int),
         request_ids=list(range(scenario.batch)),
         max_num_requests=scenario.batch,
         num_contexts=scenario.batch,
@@ -225,21 +226,19 @@ def setup_kv_and_metadata(
 # Error reporting / comparison
 # ---------------------------------------------------------------------------
 
+
 def error_report(output, ref_output, atol, rtol, prefix):
     """Print per-element error stats and return the number of mismatches."""
     err = torch.abs(output - ref_output)
     ref_abs = torch.abs(ref_output)
     ref_abs[ref_abs == 0] = torch.finfo(ref_abs.dtype).smallest_normal
     rel_err = err / ref_abs
-    max_err_idx = torch.unravel_index(
-        torch.argmax(err - atol - rtol * ref_abs), err.shape)
+    max_err_idx = torch.unravel_index(torch.argmax(err - atol - rtol * ref_abs), err.shape)
     values_err = (output[max_err_idx].item(), ref_output[max_err_idx].item())
     max_abs_err_idx = torch.unravel_index(torch.argmax(err), err.shape)
-    values_abs = (output[max_abs_err_idx].item(),
-                  ref_output[max_abs_err_idx].item())
+    values_abs = (output[max_abs_err_idx].item(), ref_output[max_abs_err_idx].item())
     max_rel_err_idx = torch.unravel_index(torch.argmax(rel_err), rel_err.shape)
-    values_rel = (output[max_rel_err_idx].item(),
-                  ref_output[max_rel_err_idx].item())
+    values_rel = (output[max_rel_err_idx].item(), ref_output[max_rel_err_idx].item())
     max_abs_err = err[max_abs_err_idx].item()
     max_rel_err = rel_err[max_rel_err_idx].item()
     max_err_idx = [x.item() for x in max_err_idx]
@@ -254,7 +253,8 @@ def error_report(output, ref_output, atol, rtol, prefix):
         f"(test/ref values: {values_abs}, err: {max_abs_err}), max rel error "
         f"index: {max_rel_err_idx} "
         f"(test/ref values: {values_rel}, err: {max_rel_err}), atol: {atol}, "
-        f"rtol: {rtol}")
+        f"rtol: {rtol}"
+    )
     return n_error
 
 
@@ -263,17 +263,20 @@ def compute_mismatch_ratio(output, ref_output, atol, rtol, rank, world_size):
     mismatch_count = 0
     for b in range(output.shape[0]):
         mismatch_count += error_report(
-            output[b], ref_output[b], atol, rtol,
-            f"Rank {rank} {world_size}-GPU batch {b}")
+            output[b], ref_output[b], atol, rtol, f"Rank {rank} {world_size}-GPU batch {b}"
+        )
     ratio_mismatch = mismatch_count / output.numel()
-    print(f"Rank {rank} {world_size}-GPU: "
-          f"{mismatch_count}/{output.numel()} mismatches: {ratio_mismatch}")
+    print(
+        f"Rank {rank} {world_size}-GPU: "
+        f"{mismatch_count}/{output.numel()} mismatches: {ratio_mismatch}"
+    )
     return ratio_mismatch
 
 
 # ---------------------------------------------------------------------------
 # MPI orchestration
 # ---------------------------------------------------------------------------
+
 
 def run_single_rank(func, *args, **kwargs):
     """Worker entry-point: set the CUDA device for *rank* and call *func*."""
@@ -324,7 +327,9 @@ def run_helix_test(
                         use_nccl_for_alltoall,
                         fifo_version,
                     )
-                ] * world_size),
+                ]
+                * world_size
+            ),
         )
         for ratio_mismatch in results:
             assert ratio_mismatch <= max_mismatch_ratio

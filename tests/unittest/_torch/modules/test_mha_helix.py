@@ -18,12 +18,10 @@ import sys
 import weakref
 from dataclasses import dataclass
 
+import _torch.modules.helix_test_utils as helix_utils
 import cloudpickle
 import pytest
 import torch
-from mpi4py import MPI
-
-import _torch.modules.helix_test_utils as helix_utils
 from _torch.modules.helix_test_utils import (
     CACHE_TYPE_SELF,
     activate_all_ranks_for_context,
@@ -34,6 +32,7 @@ from _torch.modules.helix_test_utils import (
     setup_kv_and_metadata,
     split_inputs_for_rank,
 )
+from mpi4py import MPI
 
 from tensorrt_llm._torch.attention_backend.interface import (
     KVCacheParams,
@@ -151,10 +150,10 @@ def _run_attention_distributed(
     test_params: tuple,
     ref_output: torch.Tensor,
 ):
-    input_ctx, input_gen, position_ids_ctx, weights, pos_embd_params = (
-        test_params)
+    input_ctx, input_gen, position_ids_ctx, weights, pos_embd_params = test_params
     position_ids_gen = torch.full(
-        (scenario.batch,), scenario.ctx_len, dtype=torch.int, device="cuda")
+        (scenario.batch,), scenario.ctx_len, dtype=torch.int, device="cuda"
+    )
 
     extra_attrs = dict()
     config = ModelConfig(mapping=mapping)
@@ -177,7 +176,8 @@ def _run_attention_distributed(
 
     # Set up KVCacheManager and attn_metadata for distributed.
     kv_cache_manager, attn_metadata = setup_kv_and_metadata(
-        scenario, mapping,
+        scenario,
+        mapping,
         cache_type=CACHE_TYPE_SELF,
         num_kv_heads=scenario.num_kv_heads,
         head_dim=scenario.head_dim,
@@ -186,7 +186,8 @@ def _run_attention_distributed(
     ctx_len_per_gpu = scenario.ctx_len // world_size
 
     input_ctx_rank, position_ids_ctx_rank = split_inputs_for_rank(
-        input_ctx, position_ids_ctx, scenario, rank, world_size)
+        input_ctx, position_ids_ctx, scenario, rank, world_size
+    )
 
     # Context step — populate KV cache only; output is discarded.
     # We call internal methods directly instead of attn.forward() because
@@ -197,25 +198,24 @@ def _run_attention_distributed(
     q, k, v = qkv, None, None
     q, k, v = attn.apply_rope(q, k, v, position_ids_ctx_rank)
     q, k, v = attn.convert_qkv(q, k, v)
-    attn.forward_impl(q, k, v, attn_metadata,
-                       PredefinedAttentionMask.CAUSAL, None, None, None)
+    attn.forward_impl(q, k, v, attn_metadata, PredefinedAttentionMask.CAUSAL, None, None, None)
 
     # Single generation step.
     for req_id in range(scenario.batch):
         kv_cache_manager.impl.add_token(req_id)
     helix_is_inactive_rank = [rank != world_size - 1] * scenario.batch
     attn_metadata = create_helix_gen_metadata(
-        scenario.batch, ctx_len_per_gpu, kv_cache_manager,
-        helix_is_inactive_rank, position_ids_gen)
+        scenario.batch, ctx_len_per_gpu, kv_cache_manager, helix_is_inactive_rank, position_ids_gen
+    )
     extra_attrs["attention_metadata"] = weakref.ref(attn_metadata)
     with model_extra_attrs(extra_attrs):
         output = attn(position_ids_gen, input_gen, attn_metadata)
-    print(f"Rank {rank} {world_size}-GPU: result: "
-          f"{output[0, :8]} / {output[-1, -8:]}")
+    print(f"Rank {rank} {world_size}-GPU: result: {output[0, :8]} / {output[-1, -8:]}")
 
     kv_cache_manager.shutdown()
     return compute_mismatch_ratio(
-        output, ref_output, scenario.atol, scenario.rtol, rank, world_size)
+        output, ref_output, scenario.atol, scenario.rtol, rank, world_size
+    )
 
 
 @torch.inference_mode
@@ -246,10 +246,12 @@ def _full_test_multi_gpu(
         dtype=scenario.dtype,
         device="cuda",
     ).uniform_(-1, 1)
-    position_ids_ctx = torch.arange(
-        scenario.ctx_len, dtype=torch.int, device="cuda").repeat(scenario.batch)
+    position_ids_ctx = torch.arange(scenario.ctx_len, dtype=torch.int, device="cuda").repeat(
+        scenario.batch
+    )
     position_ids_gen = torch.full(
-        (scenario.batch,), scenario.ctx_len, dtype=torch.int, device="cuda")
+        (scenario.batch,), scenario.ctx_len, dtype=torch.int, device="cuda"
+    )
 
     pos_embd_params = PositionalEmbeddingParams(
         type=PositionEmbeddingType.rope_gpt_neox,
@@ -276,7 +278,8 @@ def _full_test_multi_gpu(
     if rank == 0:
         ref_mapping = Mapping(world_size=1, tp_size=1, rank=0)
         ref_kv_cache_manager, ref_attn_metadata = setup_kv_and_metadata(
-            scenario, ref_mapping,
+            scenario,
+            ref_mapping,
             cache_type=CACHE_TYPE_SELF,
             num_kv_heads=scenario.num_kv_heads,
             head_dim=scenario.head_dim,
@@ -335,15 +338,11 @@ def _full_test_multi_gpu(
         weights,
         pos_embd_params,
     )
-    return _run_attention_distributed(
-        rank, world_size, scenario, mapping, test_params, ref_output)
+    return _run_attention_distributed(rank, world_size, scenario, mapping, test_params, ref_output)
 
 
-@pytest.mark.skipif(torch.cuda.device_count() < 2,
-                    reason="needs 2 GPUs to run this test")
-@pytest.mark.parametrize("scenario",
-                         test_scenarios,
-                         ids=lambda x: f"scenario: {x}")
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 GPUs to run this test")
+@pytest.mark.parametrize("scenario", test_scenarios, ids=lambda x: f"scenario: {x}")
 @pytest.mark.parametrize("comms_medium", ["nccl", "fifo_v1", "fifo_v2"])
 def test_mha_helix_distributed(
     scenario: Scenario,

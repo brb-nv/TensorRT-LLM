@@ -1493,11 +1493,11 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
         : (params.length_per_sample ? (params.length_per_sample[batch_beam_idx] - 1) : static_cast<int>(timestep));
     // Helix parallelism: determine if this rank is inactive and get the correct RoPE position.
     int const batch_idx_for_helix = batch_beam_idx / params.beam_width;
-    bool const helix_inactive = params.helix_is_inactive_rank != nullptr
-        && params.helix_is_inactive_rank[batch_idx_for_helix];
+    bool const helix_inactive
+        = params.helix_is_inactive_rank != nullptr && params.helix_is_inactive_rank[batch_idx_for_helix];
     // RoPE position: use helix_position_offsets if available, otherwise default to tlength.
-    int const rope_position = params.helix_position_offsets != nullptr
-        ? params.helix_position_offsets[batch_beam_idx] : tlength;
+    int const rope_position
+        = params.helix_position_offsets != nullptr ? params.helix_position_offsets[batch_beam_idx] : tlength;
     // When enable cyclic kv cache and one more block mode, we need to shift the index to the actual index in the
     // sequence. Otherwise, if the token is not the sink token, we need to add the bubblen length to the index.
     bool const enable_use_seq_idx_kv = kvCacheBuffer.mEnableOneMoreBlock && tlength > cyclic_kv_cache_len;

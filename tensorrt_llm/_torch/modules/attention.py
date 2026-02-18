@@ -464,12 +464,12 @@ class Attention(nn.Module):
             chunks = []
             for t in [partial_o, softmax_stats]:
                 t = t.transpose(1, 0).contiguous()
-                chunks.extend(
-                    torch.split(t, t.shape[0] // self.mapping.cp_size))
+                chunks.extend(torch.split(t,
+                                          t.shape[0] // self.mapping.cp_size))
             gathered = alltoall_helix(chunks, self.mapping.cp_group)
             gathered = [t.transpose(1, 2).contiguous() for t in gathered]
-            return torch.ops.trtllm.helix_post_process(
-                gathered[0], gathered[1], 1.0)
+            return torch.ops.trtllm.helix_post_process(gathered[0], gathered[1],
+                                                       1.0)
         else:
             # FIFO-based implementation using MNNVL workspace.
             helix = HelixAllToAllNative.get(self.mapping)
@@ -478,12 +478,14 @@ class Attention(nn.Module):
             fifo_version = self.mapping.cp_config.get("fifo_version", 2)
 
             if fifo_version == 1:
-                partial_o = partial_o.view(
-                    num_tokens, cp_size, self.num_heads_tp_cp,
-                    head_dim).transpose(1, 2).contiguous()
-                softmax_stats = softmax_stats.view(
-                    num_tokens, cp_size, self.num_heads_tp_cp,
-                    2).transpose(1, 2).contiguous()
+                partial_o = partial_o.view(num_tokens, cp_size,
+                                           self.num_heads_tp_cp,
+                                           head_dim).transpose(1,
+                                                               2).contiguous()
+                softmax_stats = softmax_stats.view(num_tokens, cp_size,
+                                                   self.num_heads_tp_cp,
+                                                   2).transpose(1,
+                                                                2).contiguous()
                 partial_o_out, softmax_stats_out = helix.alltoall_native(
                     partial_o, softmax_stats)
                 return torch.ops.trtllm.helix_post_process_native(
@@ -491,15 +493,14 @@ class Attention(nn.Module):
             else:
                 partial_o = partial_o.view(num_tokens, cp_size,
                                            self.num_heads_tp_cp * head_dim)
-                softmax_stats = softmax_stats.view(
-                    num_tokens, cp_size, self.num_heads_tp_cp * 2)
+                softmax_stats = softmax_stats.view(num_tokens, cp_size,
+                                                   self.num_heads_tp_cp * 2)
                 partial_o_out, softmax_stats_out = helix.alltoall_native(
                     partial_o, softmax_stats)
                 gathered_o = partial_o_out.view(num_tokens, cp_size,
-                                                self.num_heads_tp_cp,
-                                                head_dim)
-                gathered_stats = softmax_stats_out.view(
-                    num_tokens, cp_size, self.num_heads_tp_cp, 2)
+                                                self.num_heads_tp_cp, head_dim)
+                gathered_stats = softmax_stats_out.view(num_tokens, cp_size,
+                                                        self.num_heads_tp_cp, 2)
                 return torch.ops.trtllm.helix_post_process_native(
                     gathered_o, gathered_stats, 1.0, 1)
 

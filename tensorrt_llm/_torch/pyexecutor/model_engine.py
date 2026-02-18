@@ -2423,7 +2423,8 @@ class PyTorchModelEngine(ModelEngine):
                         past_seen_token_num = request.seqlen_this_rank_cp - 1
 
                     # Update helix-specific parameters.
-                    # helix_position_offsets is per-beam (indexed by batch_beam_idx in C++ kernels).
+                    helix_is_inactive_rank.append(
+                        request.py_helix_is_inactive_rank)
                     helix_position_offsets.append(position_id)
 
                 position_ids.append(position_id)
@@ -2457,12 +2458,6 @@ class PyTorchModelEngine(ModelEngine):
                                     "mrope_config.mrope_position_deltas"
                                 ])
                         multimodal_params_list.append(multimodal_params)
-
-            # helix_is_inactive_rank is per-request (indexed by batch_idx in C++ kernels),
-            # so append once outside the beam loop.
-            if self.mapping.has_cp_helix():
-                helix_is_inactive_rank.append(
-                    request.py_helix_is_inactive_rank)
 
             request.py_batch_idx = request.py_seq_slot
             # Do not add a gen_request_seq_slot for CUDA graph dummy requests

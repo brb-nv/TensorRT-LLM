@@ -435,9 +435,8 @@ __global__ void applyBiasRopeUpdateKVCache(QKVPreprocessingParams<T, KVCacheBuff
             // In the generation phase, we assume all sequences should have the same input length.
             // Helix parallelism: use helix_position_offsets if available (absolute position).
             int const rotary_position
-                = (params.helix_position_offsets != nullptr
-                          ? params.helix_position_offsets[global_token_idx]
-                      : params.spec_decoding_position_offsets != nullptr
+                = (params.helix_position_offsets != nullptr ? params.helix_position_offsets[global_token_idx]
+                          : params.spec_decoding_position_offsets != nullptr
                           ? (params.spec_decoding_position_offsets[local_token_idx
                                  + batch_idx * params.max_input_seq_len]
                               + past_seq_len)
@@ -445,8 +444,8 @@ __global__ void applyBiasRopeUpdateKVCache(QKVPreprocessingParams<T, KVCacheBuff
                 + (params.mrope_position_deltas != nullptr ? params.mrope_position_deltas[batch_idx] : 0);
 
             // Helix parallelism: determine if this rank is inactive for this request.
-            bool const helix_inactive = params.helix_is_inactive_rank != nullptr
-                && params.helix_is_inactive_rank[batch_idx];
+            bool const helix_inactive
+                = params.helix_is_inactive_rank != nullptr && params.helix_is_inactive_rank[batch_idx];
 
             // Is the token and head dim maksed.
             bool const valid_head_dim_idx = head_dim_idx < params.size_per_head;
@@ -856,13 +855,13 @@ __global__ void applyBiasRopeUpdateKVCacheV2(QKVPreprocessingParams<T, KVCacheBu
         int const rotary_position = params.helix_position_offsets != nullptr
             ? params.helix_position_offsets[bounded_global_token_idx]
             : params.spec_decoding_position_offsets != nullptr
-                ? (params.spec_decoding_position_offsets[token_idx_in_seq + batch_idx * params.max_input_seq_len]
-                    + cache_seq_len - actual_seq_len)
-                : token_idx_in_kv_cache;
+            ? (params.spec_decoding_position_offsets[token_idx_in_seq + batch_idx * params.max_input_seq_len]
+                + cache_seq_len - actual_seq_len)
+            : token_idx_in_kv_cache;
 
         // Helix parallelism: determine if this rank is inactive for this request.
-        bool const helix_inactive = params.helix_is_inactive_rank != nullptr
-            && params.helix_is_inactive_rank[batch_idx];
+        bool const helix_inactive
+            = params.helix_is_inactive_rank != nullptr && params.helix_is_inactive_rank[batch_idx];
 
         // head_num == kv_head_num:
         //   src QKV: [batch, time, 3, head_num, size_per_head]
