@@ -87,11 +87,6 @@ QKVPreprocessingParams<T, KVCacheBuffer> makeQKVPreprocessingParams(XQAParams co
     preprocessingParms.mrope_position_deltas = params.mrope_position_deltas;
     preprocessingParms.helix_position_offsets = params.helix_position_offsets;
     preprocessingParms.helix_is_inactive_rank = params.helix_is_inactive_rank;
-    if (preprocessingParms.helix_position_offsets || preprocessingParms.helix_is_inactive_rank)
-    {
-        TLLM_LOG_INFO("[Helix] makeQKVPreprocessingParams: helix_position_offsets=%p, helix_is_inactive_rank=%p",
-            preprocessingParms.helix_position_offsets, preprocessingParms.helix_is_inactive_rank);
-    }
     // Scalar parameters.
     preprocessingParms.batch_size = int(batch_beam_size);
     preprocessingParms.max_input_seq_len = params.generation_input_length;

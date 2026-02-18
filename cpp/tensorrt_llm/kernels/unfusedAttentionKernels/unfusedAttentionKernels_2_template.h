@@ -443,16 +443,6 @@ __global__ void applyBiasRopeUpdateKVCache(QKVPreprocessingParams<T, KVCacheBuff
             bool const helix_inactive = params.helix_is_inactive_rank != nullptr
                 && params.helix_is_inactive_rank[batch_idx];
 
-            // Debug: print helix info from first thread of first block.
-            if (threadIdx.x == 0 && threadIdx.y == 0 && blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0
-                && (params.helix_position_offsets != nullptr || params.helix_is_inactive_rank != nullptr))
-            {
-                printf("[Helix] V2 kernel: batch_idx=%d, rotary_position=%d, token_idx_in_seq=%d, "
-                       "helix_inactive=%d, helix_pos_offsets=%p, helix_inactive_rank=%p\n",
-                    batch_idx, rotary_position, token_idx_in_seq,
-                    (int)helix_inactive, params.helix_position_offsets, params.helix_is_inactive_rank);
-            }
-
             if (!valid_token)
             {
                 continue;
@@ -873,16 +863,6 @@ __global__ void applyBiasRopeUpdateKVCacheV2(QKVPreprocessingParams<T, KVCacheBu
         // Helix parallelism: determine if this rank is inactive for this request.
         bool const helix_inactive = params.helix_is_inactive_rank != nullptr
             && params.helix_is_inactive_rank[batch_idx];
-
-        // Debug: print helix info from first thread of first block.
-        if (threadIdx.x == 0 && threadIdx.y == 0 && blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0
-            && (params.helix_position_offsets != nullptr || params.helix_is_inactive_rank != nullptr))
-        {
-            printf("[Helix] V1 kernel: batch_idx=%d, rotary_position=%d, token_idx_in_kv_cache=%d, "
-                   "helix_inactive=%d, helix_pos_offsets=%p, helix_inactive_rank=%p\n",
-                batch_idx, rotary_position, token_idx_in_kv_cache,
-                (int)helix_inactive, params.helix_position_offsets, params.helix_is_inactive_rank);
-        }
 
         // head_num == kv_head_num:
         //   src QKV: [batch, time, 3, head_num, size_per_head]

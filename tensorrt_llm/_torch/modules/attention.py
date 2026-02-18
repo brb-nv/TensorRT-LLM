@@ -1,13 +1,9 @@
 import math
-import os
 import weakref
 from typing import List, Optional, Union, cast
 
 import torch
 from torch import nn
-
-_HELIX_DEBUG_DIR = "/home/bbuddharaju/scratch/TensorRT-LLM/helix_debug_logs"
-os.makedirs(_HELIX_DEBUG_DIR, exist_ok=True)
 
 import tensorrt_llm.quantization.utils.fp8_utils as fp8_utils
 from tensorrt_llm._utils import (get_sm_version, is_sm_100f, nvtx_range,
@@ -466,20 +462,6 @@ class Attention(nn.Module):
         attention outputs across CP ranks."""
         head_dim = self.head_dim
 
-        if self.enable_helix_test:
-            cp_rank = self.mapping.cp_rank
-            print(
-                f"[HELIX_DEBUG] rank={cp_rank} _helix_post_process input: "
-                f"partial_o.shape={partial_o.shape}, "
-                f"softmax_stats.shape={softmax_stats.shape}, "
-                f"partial_o[:1,:8]={partial_o[0,:8].tolist()}, "
-                f"softmax_stats[:1,:4]={softmax_stats[0,:4].tolist()}"
-            )
-            # Save tensors for offline analysis
-            os.makedirs(_HELIX_DEBUG_DIR, exist_ok=True)
-            torch.save(partial_o, f"{_HELIX_DEBUG_DIR}/rank{cp_rank}_partial_o.pt")
-            torch.save(softmax_stats, f"{_HELIX_DEBUG_DIR}/rank{cp_rank}_softmax_stats.pt")
-
         if self.mapping.cp_config.get("use_nccl_for_alltoall", True):
             # NCCL-based implementation using alltoall_helix.
             chunks = []
@@ -489,118 +471,8 @@ class Attention(nn.Module):
                     torch.split(t, t.shape[0] // self.mapping.cp_size))
             gathered = alltoall_helix(chunks, self.mapping.cp_group)
             gathered = [t.transpose(1, 2).contiguous() for t in gathered]
-            if self.enable_helix_test:
-                print(
-                    f"[HELIX_DEBUG] rank={cp_rank} after alltoall: "
-                    f"gathered[0].shape={gathered[0].shape}, "
-                    f"gathered[1].shape={gathered[1].shape}, "
-                    f"gathered[0][0,0,:8]={gathered[0][0,0,:8].tolist()}, "
-                    f"gathered[0][1,0,:8]={gathered[0][1,0,:8].tolist()}, "
-                    f"gathered[1][0,0,:4]={gathered[1][0,0,:4].tolist()}, "
-                    f"gathered[1][1,0,:4]={gathered[1][1,0,:4].tolist()}"
-                )
-                torch.save(gathered[0], f"{_HELIX_DEBUG_DIR}/rank{cp_rank}_gathered_o.pt")
-                torch.save(gathered[1], f"{_HELIX_DEBUG_DIR}/rank{cp_rank}_gathered_stats.pt")
-            result = torch.ops.trtllm.helix_post_process(
+            return torch.ops.trtllm.helix_post_process(
                 gathered[0], gathered[1], 1.0)
-            if self.enable_helix_test:
-                print(
-                    f"[HELIX_DEBUG] rank={cp_rank} helix_post_process output: "
-                    f"shape={result.shape}, "
-                    f"result[0,:8]={result[0,:8].tolist()}"
-                )
-                torch.save(result, f"{_HELIX_DEBUG_DIR}/rank{cp_rank}_helix_result.pt")
-
-                # ---- Python reference helix post-process for debugging ----
-                go = gathered[0]  # [cp_size, num_tokens, num_heads_tp_cp * head_dim]
-                gs = gathered[1]  # [cp_size, num_tokens, num_heads_tp_cp, 2]
-                cp_sz = go.shape[0]
-                n_tok = go.shape[1]
-                n_hd = gs.shape[2]
-                val_dim = go.shape[2] // n_hd
-
-                # Interpret stats as [M, L] (index 0 = max, index 1 = sum_exp)
-                M = gs[..., 0]  # [cp_size, num_tokens, num_heads_tp_cp]
-                L = gs[..., 1]  # [cp_size, num_tokens, num_heads_tp_cp]
-                M_global = M.max(dim=0, keepdim=True)[0]
-                corrected_exp = L * torch.exp(M - M_global)
-                global_sum = corrected_exp.sum(dim=0, keepdim=True)
-                correction = (corrected_exp / global_sum).unsqueeze(-1)  # [cp_size, n_tok, n_hd, 1]
-                go_fp32 = go.to(torch.float32).view(cp_sz, n_tok, n_hd, val_dim)
-                py_result_ML = (go_fp32 * correction).sum(dim=0).view(n_tok, -1).to(go.dtype)
-
-                # Interpret stats as [L, M] (SWAPPED: index 0 = sum_exp, index 1 = max)
-                M_swap = gs[..., 1]
-                L_swap = gs[..., 0]
-                M_global_swap = M_swap.max(dim=0, keepdim=True)[0]
-                corrected_exp_swap = L_swap * torch.exp(M_swap - M_global_swap)
-                global_sum_swap = corrected_exp_swap.sum(dim=0, keepdim=True)
-                correction_swap = (corrected_exp_swap / global_sum_swap).unsqueeze(-1)
-                py_result_LM = (go_fp32 * correction_swap).sum(dim=0).view(n_tok, -1).to(go.dtype)
-
-                print(
-                    f"[HELIX_DIAG] rank={cp_rank} Python [M,L] result[0,:8]={py_result_ML[0,:8].tolist()}"
-                )
-                print(
-                    f"[HELIX_DIAG] rank={cp_rank} Python [L,M] result[0,:8]={py_result_LM[0,:8].tolist()}"
-                )
-                diff_ML = (result.float() - py_result_ML.float()).abs()
-                diff_LM = (result.float() - py_result_LM.float()).abs()
-                print(
-                    f"[HELIX_DIAG] rank={cp_rank} C++ vs Python[M,L]: "
-                    f"max_diff={diff_ML.max().item():.6f}, mean_diff={diff_ML.mean().item():.6f}"
-                )
-                print(
-                    f"[HELIX_DIAG] rank={cp_rank} C++ vs Python[L,M]: "
-                    f"max_diff={diff_LM.max().item():.6f}, mean_diff={diff_LM.mean().item():.6f}"
-                )
-
-                # Print per-rank stats details
-                for r in range(cp_sz):
-                    for h in range(n_hd):
-                        print(
-                            f"[HELIX_DIAG] rank={cp_rank} stats[cp={r},head={h}]: "
-                            f"stat0={gs[r,0,h,0].item():.6f}, stat1={gs[r,0,h,1].item():.6f}, "
-                            f"partial_o_norm={go[r,0,h*val_dim:(h+1)*val_dim].float().norm().item():.6f}"
-                        )
-
-                # Print correction weights for both interpretations
-                for r in range(cp_sz):
-                    print(
-                        f"[HELIX_DIAG] rank={cp_rank} correction[cp={r}] [M,L]={correction[r,0,0,0].item():.6f}, "
-                        f"[L,M]={correction_swap[r,0,0,0].item():.6f}"
-                    )
-
-                # ---- Single-rank isolation sanity check ----
-                # Zero out each rank's contribution in turn, so the surviving rank's
-                # output should match its raw partial_o directly (scaled by its own correction=1.0).
-                for keep_rank in range(cp_sz):
-                    iso_stats = gs.clone()
-                    for r in range(cp_sz):
-                        if r != keep_rank:
-                            iso_stats[r, :, :, 0] = float('-inf')  # M = -inf
-                            iso_stats[r, :, :, 1] = 0.0            # L = 0
-                    iso_M = iso_stats[..., 0]
-                    iso_L = iso_stats[..., 1]
-                    iso_M_global = iso_M.max(dim=0, keepdim=True)[0]
-                    iso_corrected = iso_L * torch.exp(iso_M - iso_M_global)
-                    iso_sum = iso_corrected.sum(dim=0, keepdim=True).clamp(min=1e-30)
-                    iso_correction = (iso_corrected / iso_sum).unsqueeze(-1)
-                    iso_result = (go_fp32 * iso_correction).sum(dim=0).view(n_tok, -1).to(go.dtype)
-                    # Compare with the raw partial_o from that rank
-                    raw_partial = go[keep_rank]  # [n_tok, num_heads_tp_cp * head_dim]
-                    iso_diff = (iso_result.float() - raw_partial.float()).abs()
-                    print(
-                        f"[HELIX_DIAG] rank={cp_rank} ISOLATION keep_rank={keep_rank}: "
-                        f"iso_result[0,:8]={iso_result[0,:8].tolist()}, "
-                        f"raw_partial[0,:8]={raw_partial[0,:8].tolist()}, "
-                        f"max_diff={iso_diff.max().item():.6f}, "
-                        f"match={'YES' if iso_diff.max().item() < 1e-4 else 'NO'}"
-                    )
-                # ---- End single-rank isolation ----
-                # ---- End Python reference ----
-
-            return result
         else:
             # FIFO-based implementation using MNNVL workspace.
             helix = HelixAllToAllNative.get(self.mapping)
@@ -669,33 +541,9 @@ class Attention(nn.Module):
         # Helix CP generation path: get partial outputs with softmax stats,
         # then exchange and combine across CP ranks.
         if self.mapping.has_cp_helix() and attn_metadata.num_contexts == 0:
-            if self.enable_helix_test:
-                cp_rank = self.mapping.cp_rank
-                print(
-                    f"[HELIX_DEBUG] rank={cp_rank} _attn_impl HELIX GEN path: "
-                    f"num_tokens={num_tokens}, num_heads={self.num_heads}, "
-                    f"head_dim={self.head_dim}, num_heads_tp_cp={self.num_heads_tp_cp}, "
-                    f"q.shape={q.shape}, k={k is not None}, v={v is not None}, "
-                    f"rope_fusion={self.rope_fusion}, "
-                    f"helix_position_offsets={getattr(attn_metadata, 'helix_position_offsets', None)}, "
-                    f"helix_is_inactive_rank={getattr(attn_metadata, 'helix_is_inactive_rank', None)}"
-                )
-                # Save QKV input to attention backend
-                torch.save(q, f"{_HELIX_DEBUG_DIR}/rank{cp_rank}_q_input.pt")
             softmax_stats = torch.empty((num_tokens, self.num_heads, 2),
                                         device=q.device,
                                         dtype=torch.float32)
-            if self.enable_helix_test:
-                # Fill with sentinel to check if kernel writes to it
-                _SENTINEL = -999.0
-                softmax_stats.fill_(_SENTINEL)
-                # Print kv_lens from metadata
-                _kv_lens = getattr(attn_metadata, 'kv_lens_cuda', None)
-                if _kv_lens is not None:
-                    print(f"[HELIX_DIAG] rank={cp_rank} kv_lens_cuda={_kv_lens[:4].tolist()}")
-                _kv_lens_cpu = getattr(attn_metadata, 'kv_lens', None)
-                if _kv_lens_cpu is not None:
-                    print(f"[HELIX_DIAG] rank={cp_rank} kv_lens_cpu={_kv_lens_cpu[:4].tolist()}")
             attn_output = self.attn.forward(
                 q,
                 k,
@@ -709,146 +557,10 @@ class Attention(nn.Module):
                 attention_sinks=attention_sinks)
             if isinstance(attn_output, tuple):
                 attn_output = attn_output[0]
-            if self.enable_helix_test:
-                # Check if sentinel values remain (kernel didn't write)
-                _sentinel_remaining = (softmax_stats == _SENTINEL).sum().item()
-                _total_elements = softmax_stats.numel()
-                print(
-                    f"[HELIX_DEBUG] rank={cp_rank} attn backend output: "
-                    f"attn_output.shape={attn_output.shape}, "
-                    f"attn_output[0,:8]={attn_output[0,:8].tolist()}, "
-                    f"softmax_stats[0,:4]={softmax_stats[0,:4].tolist()}, "
-                    f"softmax_stats has nan={torch.isnan(softmax_stats).any()}, "
-                    f"softmax_stats has inf={torch.isinf(softmax_stats).any()}, "
-                    f"sentinel_remaining={_sentinel_remaining}/{_total_elements}"
-                )
-                torch.save(attn_output, f"{_HELIX_DEBUG_DIR}/rank{cp_rank}_attn_output_before_helix.pt")
-                torch.save(softmax_stats, f"{_HELIX_DEBUG_DIR}/rank{cp_rank}_softmax_stats_raw.pt")
-
-                # ---- SDPA reference check: verify FMHA partial output ----
-                # Read K, V from paged KV cache and compute SDPA independently
-                # to verify the FMHA kernel's partial attention output.
-                # NOTE: When rope_fusion=True, Q here is pre-RoPE but K in cache
-                # has RoPE from context. SDPA check is exact only with
-                # HELIX_DISABLE_ROPE=1. With RoPE enabled, expect a mismatch.
-                try:
-                    import torch.nn.functional as F
-                    _kv_mgr = attn_metadata.kv_cache_manager
-                    if _kv_mgr is not None:
-                        _req_ids = attn_metadata.request_ids
-                        _block_ids = _kv_mgr.get_batch_cache_indices(_req_ids)
-                        _kv_lens_list = getattr(attn_metadata, 'kv_lens', None)
-                        if _kv_lens_list is None:
-                            _kv_lens_list = getattr(attn_metadata, 'kv_lens_cuda', None)
-                            if _kv_lens_list is not None:
-                                _kv_lens_list = _kv_lens_list.tolist()
-
-                        if _kv_lens_list is not None and len(_block_ids) > 0:
-                            _bid = _block_ids[0]  # first request
-                            _kv_len = int(_kv_lens_list[0])
-                            _rope_disabled = os.environ.get("HELIX_DISABLE_ROPE", "0") == "1"
-                            _rope_note = "(RoPE disabled)" if _rope_disabled else "(RoPE active - Q pre-RoPE, expect mismatch)"
-
-                            # Try both KV cache layouts to find the correct one
-                            for _layout in ["HND", "NHD"]:
-                                _kv_buf = _kv_mgr.get_buffers(self.layer_idx, kv_layout=_layout)
-                                _bid_tensor = torch.tensor(_bid, dtype=torch.long, device=_kv_buf.device)
-                                _pages = _kv_buf[_bid_tensor]
-
-                                if _layout == "HND":
-                                    # _pages: [n_pages, kv_factor, num_kv_heads, page_size, head_dim]
-                                    # Permute to get tokens contiguous:
-                                    #   [n_pages, page_size, num_kv_heads, head_dim]
-                                    _k_cached = _pages[:, 0].permute(0, 2, 1, 3).contiguous()
-                                    _k_cached = _k_cached.reshape(-1, self.num_key_value_heads, self.head_dim)[:_kv_len]
-                                    _v_cached = _pages[:, 1].permute(0, 2, 1, 3).contiguous()
-                                    _v_cached = _v_cached.reshape(-1, self.num_key_value_heads, self.head_dim)[:_kv_len]
-                                else:
-                                    # _pages: [n_pages, kv_factor, page_size, num_kv_heads, head_dim]
-                                    _k_cached = _pages[:, 0].reshape(-1, self.num_key_value_heads, self.head_dim)[:_kv_len]
-                                    _v_cached = _pages[:, 1].reshape(-1, self.num_key_value_heads, self.head_dim)[:_kv_len]
-
-                                # Q: extract from fused QKV if needed
-                                _q_full = q[0:1]
-                                if self.support_fused_qkv:
-                                    _q_raw = _q_full[:, :self.q_size]
-                                else:
-                                    _q_raw = _q_full
-                                _n_heads_q = self.num_heads
-
-                                # Q: [1, num_heads, 1, head_dim]
-                                _q_heads = _q_raw.view(1, 1, _n_heads_q, self.head_dim).transpose(1, 2)
-
-                                # K, V: [1, num_kv_heads, kv_len, head_dim]
-                                _k_heads = _k_cached.unsqueeze(0).transpose(1, 2).to(_q_heads.dtype)
-                                _v_heads = _v_cached.unsqueeze(0).transpose(1, 2).to(_q_heads.dtype)
-
-                                # Repeat KV for GQA (num_heads > num_kv_heads)
-                                _n_rep = _n_heads_q // self.num_key_value_heads
-                                if _n_rep > 1:
-                                    _k_heads = _k_heads.repeat_interleave(_n_rep, dim=1)
-                                    _v_heads = _v_heads.repeat_interleave(_n_rep, dim=1)
-
-                                _sdpa_out = F.scaled_dot_product_attention(
-                                    _q_heads, _k_heads, _v_heads, is_causal=False
-                                )
-                                # [1, num_heads, 1, head_dim] → [1, num_heads * head_dim]
-                                _sdpa_flat = _sdpa_out.transpose(1, 2).reshape(1, -1)
-
-                                _fmha_first = attn_output[0:1].float()
-                                _sdpa_first = _sdpa_flat.float()
-                                _sdpa_diff = (_fmha_first - _sdpa_first).abs()
-                                _cos = F.cosine_similarity(_fmha_first, _sdpa_first).item()
-                                print(
-                                    f"[HELIX_SDPA] rank={cp_rank} layout={_layout} {_rope_note}: "
-                                    f"max_diff={_sdpa_diff.max().item():.6f}, "
-                                    f"mean_diff={_sdpa_diff.mean().item():.6f}, "
-                                    f"cos_sim={_cos:.6f}, "
-                                    f"kv_len={_kv_len}"
-                                )
-
-                                # Per-head comparison for the better layout
-                                if _cos > 0.9:
-                                    print(f"[HELIX_SDPA] rank={cp_rank} layout={_layout} MATCHES!")
-                                    torch.save(_sdpa_flat, f"{_HELIX_DEBUG_DIR}/rank{cp_rank}_sdpa_output.pt")
-                                    for _h in range(min(_n_heads_q, 4)):
-                                        _hs = _h * self.head_dim
-                                        _he = (_h + 1) * self.head_dim
-                                        _fh = _fmha_first[0, _hs:_he]
-                                        _sh = _sdpa_first[0, _hs:_he]
-                                        _hd = (_fh - _sh).abs()
-                                        print(
-                                            f"[HELIX_SDPA] rank={cp_rank} layout={_layout} head={_h}: "
-                                            f"max_diff={_hd.max().item():.6f}, "
-                                            f"cos_sim={F.cosine_similarity(_fh.unsqueeze(0), _sh.unsqueeze(0)).item():.6f}"
-                                        )
-                                    # Print first few K values for debugging
-                                    print(
-                                        f"[HELIX_SDPA] rank={cp_rank} layout={_layout} "
-                                        f"K[0,:4]={_k_cached[0,0,:4].tolist()}, "
-                                        f"K[-1,:4]={_k_cached[_kv_len-1,0,:4].tolist()}, "
-                                        f"fmha[0,:8]={attn_output[0,:8].tolist()}, "
-                                        f"sdpa[0,:8]={_sdpa_flat[0,:8].tolist()}"
-                                    )
-                except Exception as _e:
-                    import traceback
-                    print(f"[HELIX_SDPA] rank={cp_rank} SDPA check failed: {_e}")
-                    traceback.print_exc()
-                # ---- End SDPA reference check ----
-
             attn_output = self._helix_post_process(attn_output, softmax_stats)
             return attn_output, None
 
         # Normal (non-helix) path
-        if self.enable_helix_test:
-            cp_rank = self.mapping.cp_rank if self.mapping.cp_size > 1 else -1
-            print(
-                f"[HELIX_DEBUG] rank={cp_rank} _attn_impl NORMAL path: "
-                f"num_tokens={num_tokens}, q.shape={q.shape}, "
-                f"k={'None' if k is None else k.shape}, "
-                f"v={'None' if v is None else v.shape}, "
-                f"num_contexts={attn_metadata.num_contexts}"
-            )
         out_scale = None
         out_scale_sf = None
         # Don't set out_scale if o_proj has pre_quant_scale - this prevents FP8/FP4 output
@@ -881,14 +593,6 @@ class Attention(nn.Module):
             output=output[:num_tokens, :] if output is not None else None,
             output_sf=output_sf,
             attention_sinks=attention_sinks)
-        if self.enable_helix_test and attn_metadata.num_contexts == 0:
-            cp_rank = self.mapping.cp_rank if self.mapping.cp_size > 1 else -1
-            ao = attn_output[0] if isinstance(attn_output, tuple) else attn_output
-            print(
-                f"[HELIX_DEBUG] rank={cp_rank} NORMAL attn output: "
-                f"shape={ao.shape}, output[0,:8]={ao[0,:8].tolist()}"
-            )
-            torch.save(ao, f"{_HELIX_DEBUG_DIR}/rank{cp_rank}_normal_attn_output.pt")
         if isinstance(attn_output, tuple):
             assert len(
                 attn_output
@@ -1003,23 +707,6 @@ class Attention(nn.Module):
             if qkv_lora is not None:
                 qkv = qkv + qkv_lora
 
-        if self.enable_helix_test:
-            cp_rank = self.mapping.cp_rank if self.mapping.cp_size > 1 else -1
-            is_gen = attn_metadata.num_contexts == 0
-            print(
-                f"[HELIX_DEBUG] rank={cp_rank} forward: "
-                f"is_gen={is_gen}, "
-                f"hidden_states.shape={hidden_states.shape}, "
-                f"qkv.shape={qkv.shape}, "
-                f"position_ids={position_ids[:min(8, len(position_ids))].tolist() if position_ids is not None else None}, "
-                f"rope_fusion={self.rope_fusion}, "
-                f"support_fused_qkv={self.support_fused_qkv}, "
-                f"num_heads={self.num_heads}, num_kv_heads={self.num_key_value_heads}, "
-                f"q_size={self.q_size}, kv_size={self.kv_size}, "
-                f"cp_size={self.cp_size}, "
-                f"num_heads_tp_cp={self.num_heads_tp_cp}"
-            )
-
         if self.attn_output_gate:
             q_gate, k, v = qkv.split(
                 [self.q_size * 2, self.kv_size, self.kv_size], dim=-1)
@@ -1034,16 +721,6 @@ class Attention(nn.Module):
 
         q, k, v = self.apply_rope(q, k, v, position_ids)
         q, k, v = self.convert_qkv(q, k, v)
-
-        if self.enable_helix_test:
-            print(
-                f"[HELIX_DEBUG] rank={cp_rank} after rope+convert: "
-                f"q.shape={q.shape}, k={'None' if k is None else k.shape}, "
-                f"v={'None' if v is None else v.shape}, "
-                f"q[0,:8]={q[0,:8].tolist()}"
-            )
-            if is_gen:
-                torch.save(q, f"{_HELIX_DEBUG_DIR}/rank{cp_rank}_q_after_rope.pt")
 
         if attention_sinks is not None:
             assert self.attn_backend == "TRTLLM", "Attention sinks are only supported for TRTLLM backend."
@@ -1074,50 +751,21 @@ class Attention(nn.Module):
                                         attention_sinks=attention_sinks,
                                         has_lora=bool(lora_params))
 
-        if self.enable_helix_test:
-            print(
-                f"[HELIX_DEBUG] rank={cp_rank} forward_impl output: "
-                f"attn_output.shape={attn_output.shape}, "
-                f"attn_output[0,:8]={attn_output[0,:8].tolist()}"
-            )
-
         if self.attn_output_gate:
             gate = torch.sigmoid(gate)
             attn_output = attn_output * gate
 
         if self.enable_helix_test and self.mapping.has_cp_helix():
-            # note: for allowing testing Helix parallelism, we ensure that
-            # the output is compatible with o_proj even in the context phase,
-            # thus we cut it to num_heads_tp_cp * head_dim
+            # For testing Helix parallelism, ensure the output is compatible
+            # with o_proj even in the context phase by truncating to
+            # num_heads_tp_cp * head_dim.
             attn_output = attn_output[:, :self.num_heads_tp_cp *
                                       self.head_dim].contiguous()
-            if is_gen:
-                print(
-                    f"[HELIX_DEBUG] rank={cp_rank} after helix truncation: "
-                    f"attn_output.shape={attn_output.shape}, "
-                    f"attn_output[0,:8]={attn_output[0,:8].tolist()}"
-                )
-                torch.save(attn_output, f"{_HELIX_DEBUG_DIR}/rank{cp_rank}_attn_before_oproj.pt")
-
-        if self.enable_helix_test and is_gen:
-            print(
-                f"[HELIX_DEBUG] rank={cp_rank} o_proj weight shape: "
-                f"{self.o_proj.weight.shape}, "
-                f"o_proj input shape: {attn_output.shape}"
-            )
 
         attn_output = self.o_proj(attn_output,
                                   all_reduce_params=all_reduce_params,
                                   lora_params=lora_params,
                                   layer_idx=self.layer_idx)
-
-        if self.enable_helix_test and is_gen:
-            print(
-                f"[HELIX_DEBUG] rank={cp_rank} final output after o_proj: "
-                f"shape={attn_output.shape}, "
-                f"output[0,:8]={attn_output[0,:8].tolist()}"
-            )
-            torch.save(attn_output, f"{_HELIX_DEBUG_DIR}/rank{cp_rank}_final_output.pt")
 
         return attn_output
 
