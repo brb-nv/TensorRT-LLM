@@ -67,10 +67,10 @@ class Scenario:
     dtype: torch.dtype = torch.bfloat16
     kv_cache_dtype: torch.dtype = torch.bfloat16
     num_layers: int = 1
-    num_heads: int = 2
-    num_kv_heads: int = 2
+    num_heads: int = 16
+    num_kv_heads: int = 4
     head_dim: int = 128
-    hidden_size: int = 256  # num_heads * head_dim
+    hidden_size: int = 2048  # num_heads * head_dim
     rope_theta: float = 10000.0
     kv_cache_tokens_per_block: int = 32
     bias: bool = False
@@ -116,13 +116,13 @@ all_scenarios = [
 # Limit the number of test scenarios to avoid taking too long
 test_scenarios = [
     all_scenarios[0],
-    # all_scenarios[1],
-    # all_scenarios[4],
-    # all_scenarios[7],
-    # all_scenarios[10],
-    # all_scenarios[13],
-    # all_scenarios[17],
-    # all_scenarios[18],
+    all_scenarios[1],
+    all_scenarios[4],
+    all_scenarios[7],
+    all_scenarios[10],
+    all_scenarios[13],
+    all_scenarios[17],
+    all_scenarios[18],
 ]
 
 
