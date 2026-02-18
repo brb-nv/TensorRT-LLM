@@ -537,7 +537,14 @@ class Attention(nn.Module):
 
         # Helix CP generation path: get partial outputs with softmax stats,
         # then exchange and combine across CP ranks.
+        # NOTE: Quantized attention output (out_scale, out_scale_sf) and FP4
+        # KV cache scales are not yet supported with Helix CP. The post-process
+        # combine step requires unquantized (BF16/FP16) partial outputs and
+        # softmax stats from each rank.
         if self.mapping.has_cp_helix() and attn_metadata.num_contexts == 0:
+            assert not self._use_quantize_output(), (
+                "Quantized attention output is not supported with Helix CP. "
+                "Helix post-processing requires unquantized partial outputs.")
             softmax_stats = torch.empty((num_tokens, self.num_heads, 2),
                                         device=q.device,
                                         dtype=torch.float32)
