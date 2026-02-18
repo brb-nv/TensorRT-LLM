@@ -728,12 +728,13 @@ class Attention(nn.Module):
                 # ---- SDPA reference check: verify FMHA partial output ----
                 # Read K, V from paged KV cache and compute SDPA independently
                 # to verify the FMHA kernel's partial attention output.
+                # NOTE: When rope_fusion=True, Q here is pre-RoPE but K in cache
+                # has RoPE from context. SDPA check is exact only with
+                # HELIX_DISABLE_ROPE=1. With RoPE enabled, expect a mismatch.
                 try:
                     import torch.nn.functional as F
                     _kv_mgr = attn_metadata.kv_cache_manager
                     if _kv_mgr is not None:
-                        _kv_buf = _kv_mgr.get_buffers(self.layer_idx)
-                        # _kv_buf shape: [max_pages, kv_factor, page_size, num_kv_heads, head_dim]
                         _req_ids = attn_metadata.request_ids
                         _block_ids = _kv_mgr.get_batch_cache_indices(_req_ids)
                         _kv_lens_list = getattr(attn_metadata, 'kv_lens', None)
@@ -743,79 +744,96 @@ class Attention(nn.Module):
                                 _kv_lens_list = _kv_lens_list.tolist()
 
                         if _kv_lens_list is not None and len(_block_ids) > 0:
-                            # Only check first request for brevity
-                            _bid = _block_ids[0]
+                            _bid = _block_ids[0]  # first request
                             _kv_len = int(_kv_lens_list[0])
-                            _bid_tensor = torch.tensor(_bid, dtype=torch.long, device=_kv_buf.device)
-                            # Gather pages: [num_blocks, kv_factor, page_size, num_kv_heads, head_dim]
-                            _pages = _kv_buf[_bid_tensor]
-                            # K: [num_blocks, page_size, num_kv_heads, head_dim] → flatten
-                            _k_cached = _pages[:, 0].reshape(-1, self.num_key_value_heads, self.head_dim)[:_kv_len]
-                            _v_cached = _pages[:, 1].reshape(-1, self.num_key_value_heads, self.head_dim)[:_kv_len]
+                            _rope_disabled = os.environ.get("HELIX_DISABLE_ROPE", "0") == "1"
+                            _rope_note = "(RoPE disabled)" if _rope_disabled else "(RoPE active - Q pre-RoPE, expect mismatch)"
 
-                            # Q for first token: [1, num_heads_tp_cp * head_dim]
-                            # The FMHA kernel receives Q with shape [num_tokens, num_heads * head_dim]
-                            # For helix, num_heads refers to all heads but only num_heads_tp_cp are this rank's
-                            _q_first = q[0:1]  # [1, num_heads * head_dim]
-                            _n_heads_local = self.num_heads  # heads in Q input to FMHA
-                            _q_heads = _q_first.view(1, _n_heads_local, self.head_dim).unsqueeze(0)
-                            # [1, num_heads, 1, head_dim]
+                            # Try both KV cache layouts to find the correct one
+                            for _layout in ["HND", "NHD"]:
+                                _kv_buf = _kv_mgr.get_buffers(self.layer_idx, kv_layout=_layout)
+                                _bid_tensor = torch.tensor(_bid, dtype=torch.long, device=_kv_buf.device)
+                                _pages = _kv_buf[_bid_tensor]
 
-                            # K, V: [1, num_kv_heads, kv_len, head_dim]
-                            _k_heads = _k_cached.unsqueeze(0).transpose(1, 2).to(_q_heads.dtype)
-                            _v_heads = _v_cached.unsqueeze(0).transpose(1, 2).to(_q_heads.dtype)
+                                if _layout == "HND":
+                                    # _pages: [n_pages, kv_factor, num_kv_heads, page_size, head_dim]
+                                    # Permute to get tokens contiguous:
+                                    #   [n_pages, page_size, num_kv_heads, head_dim]
+                                    _k_cached = _pages[:, 0].permute(0, 2, 1, 3).contiguous()
+                                    _k_cached = _k_cached.reshape(-1, self.num_key_value_heads, self.head_dim)[:_kv_len]
+                                    _v_cached = _pages[:, 1].permute(0, 2, 1, 3).contiguous()
+                                    _v_cached = _v_cached.reshape(-1, self.num_key_value_heads, self.head_dim)[:_kv_len]
+                                else:
+                                    # _pages: [n_pages, kv_factor, page_size, num_kv_heads, head_dim]
+                                    _k_cached = _pages[:, 0].reshape(-1, self.num_key_value_heads, self.head_dim)[:_kv_len]
+                                    _v_cached = _pages[:, 1].reshape(-1, self.num_key_value_heads, self.head_dim)[:_kv_len]
 
-                            # Repeat KV for MHA/GQA
-                            _n_rep = _n_heads_local // self.num_key_value_heads
-                            if _n_rep > 1:
-                                _k_heads = _k_heads.repeat_interleave(_n_rep, dim=1)
-                                _v_heads = _v_heads.repeat_interleave(_n_rep, dim=1)
+                                # Q: extract from fused QKV if needed
+                                _q_full = q[0:1]
+                                if self.support_fused_qkv:
+                                    _q_raw = _q_full[:, :self.q_size]
+                                else:
+                                    _q_raw = _q_full
+                                _n_heads_q = self.num_heads
 
-                            # Note: if rope_fusion=True, the FMHA kernel applies RoPE
-                            # internally to Q but K in cache already has RoPE from
-                            # context. So this SDPA check is only exact when RoPE
-                            # is disabled (HELIX_DISABLE_ROPE=1). With RoPE enabled,
-                            # Q here is pre-RoPE while K has RoPE → expect mismatch.
-                            _sdpa_out = F.scaled_dot_product_attention(
-                                _q_heads, _k_heads, _v_heads, is_causal=False
-                            )
-                            _sdpa_flat = _sdpa_out.squeeze(0).transpose(0, 1).reshape(1, -1)
+                                # Q: [1, num_heads, 1, head_dim]
+                                _q_heads = _q_raw.view(1, 1, _n_heads_q, self.head_dim).transpose(1, 2)
 
-                            # Compare FMHA output vs SDPA output
-                            _fmha_first = attn_output[0:1].float()
-                            _sdpa_first = _sdpa_flat.float()
-                            _sdpa_diff = (_fmha_first - _sdpa_first).abs()
-                            _rope_note = "(RoPE disabled)" if self.rope_fusion and os.environ.get("HELIX_DISABLE_ROPE", "0") == "1" else "(RoPE active - Q is pre-RoPE, expect mismatch)" if self.rope_fusion else "(no rope_fusion)"
-                            print(
-                                f"[HELIX_SDPA] rank={cp_rank} FMHA vs SDPA {_rope_note}: "
-                                f"max_diff={_sdpa_diff.max().item():.6f}, "
-                                f"mean_diff={_sdpa_diff.mean().item():.6f}, "
-                                f"kv_len={_kv_len}, "
-                                f"num_heads={_n_heads_local}, "
-                                f"fmha[0,:8]={attn_output[0,:8].tolist()}, "
-                                f"sdpa[0,:8]={_sdpa_flat[0,:8].tolist()}"
-                            )
-                            # Also save SDPA output for offline analysis
-                            torch.save(_sdpa_flat, f"{_HELIX_DEBUG_DIR}/rank{cp_rank}_sdpa_output.pt")
+                                # K, V: [1, num_kv_heads, kv_len, head_dim]
+                                _k_heads = _k_cached.unsqueeze(0).transpose(1, 2).to(_q_heads.dtype)
+                                _v_heads = _v_cached.unsqueeze(0).transpose(1, 2).to(_q_heads.dtype)
 
-                            # Check softmax stats consistency:
-                            # For each head, L * exp(M) should approximate sum of exp(scores)
-                            # and the SDPA output should be consistent with partial_o
-                            for _h in range(min(_n_heads_local, 2)):
-                                _h_start = _h * self.head_dim
-                                _h_end = (_h + 1) * self.head_dim
-                                _fmha_h = _fmha_first[0, _h_start:_h_end]
-                                _sdpa_h = _sdpa_first[0, _h_start:_h_end]
-                                _h_diff = (_fmha_h - _sdpa_h).abs()
-                                print(
-                                    f"[HELIX_SDPA] rank={cp_rank} head={_h}: "
-                                    f"fmha_norm={_fmha_h.norm().item():.6f}, "
-                                    f"sdpa_norm={_sdpa_h.norm().item():.6f}, "
-                                    f"max_diff={_h_diff.max().item():.6f}, "
-                                    f"cos_sim={F.cosine_similarity(_fmha_h.unsqueeze(0), _sdpa_h.unsqueeze(0)).item():.6f}"
+                                # Repeat KV for GQA (num_heads > num_kv_heads)
+                                _n_rep = _n_heads_q // self.num_key_value_heads
+                                if _n_rep > 1:
+                                    _k_heads = _k_heads.repeat_interleave(_n_rep, dim=1)
+                                    _v_heads = _v_heads.repeat_interleave(_n_rep, dim=1)
+
+                                _sdpa_out = F.scaled_dot_product_attention(
+                                    _q_heads, _k_heads, _v_heads, is_causal=False
                                 )
+                                # [1, num_heads, 1, head_dim] → [1, num_heads * head_dim]
+                                _sdpa_flat = _sdpa_out.transpose(1, 2).reshape(1, -1)
+
+                                _fmha_first = attn_output[0:1].float()
+                                _sdpa_first = _sdpa_flat.float()
+                                _sdpa_diff = (_fmha_first - _sdpa_first).abs()
+                                _cos = F.cosine_similarity(_fmha_first, _sdpa_first).item()
+                                print(
+                                    f"[HELIX_SDPA] rank={cp_rank} layout={_layout} {_rope_note}: "
+                                    f"max_diff={_sdpa_diff.max().item():.6f}, "
+                                    f"mean_diff={_sdpa_diff.mean().item():.6f}, "
+                                    f"cos_sim={_cos:.6f}, "
+                                    f"kv_len={_kv_len}"
+                                )
+
+                                # Per-head comparison for the better layout
+                                if _cos > 0.9:
+                                    print(f"[HELIX_SDPA] rank={cp_rank} layout={_layout} MATCHES!")
+                                    torch.save(_sdpa_flat, f"{_HELIX_DEBUG_DIR}/rank{cp_rank}_sdpa_output.pt")
+                                    for _h in range(min(_n_heads_q, 4)):
+                                        _hs = _h * self.head_dim
+                                        _he = (_h + 1) * self.head_dim
+                                        _fh = _fmha_first[0, _hs:_he]
+                                        _sh = _sdpa_first[0, _hs:_he]
+                                        _hd = (_fh - _sh).abs()
+                                        print(
+                                            f"[HELIX_SDPA] rank={cp_rank} layout={_layout} head={_h}: "
+                                            f"max_diff={_hd.max().item():.6f}, "
+                                            f"cos_sim={F.cosine_similarity(_fh.unsqueeze(0), _sh.unsqueeze(0)).item():.6f}"
+                                        )
+                                    # Print first few K values for debugging
+                                    print(
+                                        f"[HELIX_SDPA] rank={cp_rank} layout={_layout} "
+                                        f"K[0,:4]={_k_cached[0,0,:4].tolist()}, "
+                                        f"K[-1,:4]={_k_cached[_kv_len-1,0,:4].tolist()}, "
+                                        f"fmha[0,:8]={attn_output[0,:8].tolist()}, "
+                                        f"sdpa[0,:8]={_sdpa_flat[0,:8].tolist()}"
+                                    )
                 except Exception as _e:
+                    import traceback
                     print(f"[HELIX_SDPA] rank={cp_rank} SDPA check failed: {_e}")
+                    traceback.print_exc()
                 # ---- End SDPA reference check ----
 
             attn_output = self._helix_post_process(attn_output, softmax_stats)
@@ -1032,10 +1050,18 @@ class Attention(nn.Module):
 
         if self.enable_helix_test and self.mapping.has_cp_helix():
             # For testing Helix parallelism, set helix_position_offsets in
-            # context phase so the attention backend can embed positions
-            # correctly.
+            # context phase so the QKV preprocessing kernel applies RoPE
+            # using correct global positions for each CP rank.
             if attn_metadata.num_contexts > 0:
                 attn_metadata.helix_position_offsets = position_ids
+                # During context, all ranks are active (they each write
+                # their own KV chunk).  Ensure helix_is_inactive_rank is
+                # all-False so the kernel doesn't skip KV-cache writes.
+                if hasattr(attn_metadata,
+                           'helix_is_inactive_rank') and getattr(
+                               attn_metadata, 'helix_is_inactive_rank',
+                               None) is not None:
+                    attn_metadata.helix_is_inactive_rank.fill_(False)
 
         attn_output = self.forward_impl(q,
                                         k,

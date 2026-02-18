@@ -471,6 +471,21 @@ public:
                 enqueue_params.mrope_rotary_cos_sin
                     = static_cast<float2 const*>(mrope_rotary_cos_sin.value().data_ptr());
             }
+            // Extract helix params for context phase.
+            if (mla_tensor_params.size() == 2)
+            {
+                auto& helix_position_offsets = mla_tensor_params[0];
+                auto& helix_is_inactive_rank = mla_tensor_params[1];
+                if (helix_position_offsets.has_value())
+                    enqueue_params.helix_position_offsets = helix_position_offsets->data_ptr<int32_t>();
+                if (helix_is_inactive_rank.has_value())
+                    enqueue_params.helix_is_inactive_rank = helix_is_inactive_rank->data_ptr<bool>();
+                if (enqueue_params.helix_position_offsets || enqueue_params.helix_is_inactive_rank)
+                {
+                    TLLM_LOG_INFO("[Helix] THOP context: helix_position_offsets=%p, helix_is_inactive_rank=%p",
+                        enqueue_params.helix_position_offsets, enqueue_params.helix_is_inactive_rank);
+                }
+            }
             op.enqueueContext<T, KVBlockArray>(enqueue_params, stream);
         }
         else // generation stage

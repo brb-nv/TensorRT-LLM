@@ -140,6 +140,10 @@ public:
         T const* k_ptr = nullptr;
         T const* v_ptr = nullptr;
 
+        // Helix parallelism params.
+        int32_t const* helix_position_offsets = nullptr;
+        bool const* helix_is_inactive_rank = nullptr;
+
         std::string enqueueContextParamsToString() const
         {
             // variables from the params coming from the runtime
