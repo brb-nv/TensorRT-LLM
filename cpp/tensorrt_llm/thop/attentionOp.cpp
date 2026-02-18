@@ -226,8 +226,8 @@ public:
                 mla_params.v_buf = v_ptr;
 
                 // For generation, helix position is in ropeOp
-                auto& helix_position_offsets = helix_tensor_params[0];
-                auto& helix_is_inactive_rank = helix_tensor_params[1];
+                auto const& helix_position_offsets = helix_tensor_params[0];
+                auto const& helix_is_inactive_rank = helix_tensor_params[1];
                 if (helix_position_offsets.has_value())
                 {
                     mla_params.helix_position_offsets = helix_position_offsets->data_ptr<int32_t>();
@@ -455,12 +455,12 @@ public:
         // Shared helper to extract helix params from helix_tensor_params into enqueue params.
         // Works for both EnqueueContextParams and EnqueueGenerationParams since both have
         // helix_position_offsets and helix_is_inactive_rank fields.
-        auto extractHelixParams = [&helix_tensor_params](auto& params)
+        auto const extractHelixParams = [&helix_tensor_params](auto& params)
         {
             if (helix_tensor_params.size() == 2)
             {
-                auto& helix_position_offsets = helix_tensor_params[0];
-                auto& helix_is_inactive_rank = helix_tensor_params[1];
+                auto const& helix_position_offsets = helix_tensor_params[0];
+                auto const& helix_is_inactive_rank = helix_tensor_params[1];
                 if (helix_position_offsets.has_value())
                 {
                     params.helix_position_offsets = helix_position_offsets->data_ptr<int32_t>();

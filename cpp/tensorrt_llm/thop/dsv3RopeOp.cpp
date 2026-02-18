@@ -155,8 +155,8 @@ void MLARopeGeneration(torch::Tensor fused_q, // [tokens, num_heads, (nope_dim +
     int32_t const num_generations = num_seqs - num_contexts;
     int32_t const num_gen_tokens = num_tokens;
     int32_t const seq_offset = num_contexts;
-    auto& helix_position_offsets = helix_tensor_params[0];
-    auto& helix_is_inactive_rank = helix_tensor_params[1];
+    auto const& helix_position_offsets = helix_tensor_params[0];
+    auto const& helix_is_inactive_rank = helix_tensor_params[1];
     int32_t const layer_num = host_kv_cache_pool_mapping.value().size(0);
 
     tk::MlaMetaParams mla_meta_params = {static_cast<int>(q_lora_rank), static_cast<int>(kv_lora_rank),
