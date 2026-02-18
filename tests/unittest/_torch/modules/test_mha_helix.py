@@ -58,8 +58,8 @@ MPI.pickle.__init__(
 )
 
 
-# Set this to True to disable RoPE for debugging
-DISABLE_ROPE_FOR_DEBUG = False
+# Set this to True (or set env HELIX_DISABLE_ROPE=1) to disable RoPE for debugging
+DISABLE_ROPE_FOR_DEBUG = os.environ.get("HELIX_DISABLE_ROPE", "0") == "1"
 
 # Values inspired by a small LLaMA-like model
 @dataclass(kw_only=True, frozen=True)
@@ -67,10 +67,10 @@ class Scenario:
     dtype: torch.dtype = torch.bfloat16
     kv_cache_dtype: torch.dtype = torch.bfloat16
     num_layers: int = 1
-    num_heads: int = 16
-    num_kv_heads: int = 4
+    num_heads: int = 2
+    num_kv_heads: int = 2
     head_dim: int = 128
-    hidden_size: int = 2048  # num_heads * head_dim
+    hidden_size: int = 256  # num_heads * head_dim
     rope_theta: float = 10000.0
     kv_cache_tokens_per_block: int = 32
     bias: bool = False
