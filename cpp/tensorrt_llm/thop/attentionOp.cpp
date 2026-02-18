@@ -452,6 +452,26 @@ public:
             common_enqueue_params.softmax_stats = static_cast<float2*>(softmax_stats_tensor.value().data_ptr());
         }
 
+        // Shared helper to extract helix params from helix_tensor_params into enqueue params.
+        // Works for both EnqueueContextParams and EnqueueGenerationParams since both have
+        // helix_position_offsets and helix_is_inactive_rank fields.
+        auto extractHelixParams = [&helix_tensor_params](auto& params)
+        {
+            if (helix_tensor_params.size() == 2)
+            {
+                auto& helix_position_offsets = helix_tensor_params[0];
+                auto& helix_is_inactive_rank = helix_tensor_params[1];
+                if (helix_position_offsets.has_value())
+                {
+                    params.helix_position_offsets = helix_position_offsets->data_ptr<int32_t>();
+                }
+                if (helix_is_inactive_rank.has_value())
+                {
+                    params.helix_is_inactive_rank = helix_is_inactive_rank->data_ptr<bool>();
+                }
+            }
+        };
+
         if (is_context) // context stage
         {
             common_enqueue_params.input_seq_length = max_context_q_len;
@@ -471,16 +491,7 @@ public:
                 enqueue_params.mrope_rotary_cos_sin
                     = static_cast<float2 const*>(mrope_rotary_cos_sin.value().data_ptr());
             }
-            // Extract helix params for context phase.
-            if (helix_tensor_params.size() == 2)
-            {
-                auto& helix_position_offsets = helix_tensor_params[0];
-                auto& helix_is_inactive_rank = helix_tensor_params[1];
-                if (helix_position_offsets.has_value())
-                    enqueue_params.helix_position_offsets = helix_position_offsets->data_ptr<int32_t>();
-                if (helix_is_inactive_rank.has_value())
-                    enqueue_params.helix_is_inactive_rank = helix_is_inactive_rank->data_ptr<bool>();
-            }
+            extractHelixParams(enqueue_params);
             op.enqueueContext<T, KVBlockArray>(enqueue_params, stream);
         }
         else // generation stage
@@ -573,16 +584,7 @@ public:
             }
             else
             {
-                // Extract helix params for non-MLA generation.
-                if (helix_tensor_params.size() == 2)
-                {
-                    auto& helix_position_offsets = helix_tensor_params[0];
-                    auto& helix_is_inactive_rank = helix_tensor_params[1];
-                    if (helix_position_offsets.has_value())
-                        enqueue_params.helix_position_offsets = helix_position_offsets->data_ptr<int32_t>();
-                    if (helix_is_inactive_rank.has_value())
-                        enqueue_params.helix_is_inactive_rank = helix_is_inactive_rank->data_ptr<bool>();
-                }
+                extractHelixParams(enqueue_params);
                 op.enqueueGeneration<T, KVBlockArray>(enqueue_params, stream);
             }
 
