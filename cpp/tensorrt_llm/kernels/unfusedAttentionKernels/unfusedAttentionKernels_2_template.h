@@ -426,6 +426,11 @@ __global__ void applyBiasRopeUpdateKVCache(QKVPreprocessingParams<T, KVCacheBuff
             int const token_idx_in_seq = past_seq_len + local_token_idx;
             bool const valid_token = token_idx_in_seq < cache_seq_len;
 
+            if (!valid_token)
+            {
+                continue;
+            }
+
             // NOTE: only spec decoding needs the position offsets.
             // In the generation phase, we assume all sequences should have the same input length.
             // Helix parallelism: use helix_position_offsets if available (absolute position).
@@ -442,11 +447,6 @@ __global__ void applyBiasRopeUpdateKVCache(QKVPreprocessingParams<T, KVCacheBuff
             // Helix parallelism: determine if this rank is inactive for this request.
             bool const helix_inactive = params.helix_is_inactive_rank != nullptr
                 && params.helix_is_inactive_rank[batch_idx];
-
-            if (!valid_token)
-            {
-                continue;
-            }
 
             // Is the token and head dim maksed.
             bool const valid_head_dim_idx = head_dim_idx < params.size_per_head;
