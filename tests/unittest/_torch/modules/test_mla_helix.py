@@ -60,7 +60,7 @@ MPI.pickle.__init__(
 )
 
 
-# values for deepseek_v3_lite
+# Values for deepseek_v3_lite.
 @dataclass(kw_only=True, frozen=True)
 class Scenario:
     dtype: torch.dtype = torch.bfloat16
@@ -91,13 +91,13 @@ class Scenario:
     batch: int = 8
     ctx_len: int = 1024
     # note: need to use fairly high tolerances because the softmax stats can lose
-    # a lot of precision and we're using bf16 here
+    # a lot of precision and we're using bf16 here.
     atol: float = 1e-1
     rtol: float = 5e-2
 
     @property
     def max_position_embeddings(self) -> int:
-        # ensure that max_position_embeddings is set large enough for every scenario
+        # Ensure that max_position_embeddings is set large enough for every scenario.
         return self.ctx_len + 1
 
 
@@ -132,7 +132,7 @@ all_scenarios = [
     Scenario(batch=16, ctx_len=65536),
 ]
 
-# limit the number of test scenarios to avoid taking too long
+# Limit the number of test scenarios to avoid taking too long.
 test_scenarios = [
     all_scenarios[0],
     all_scenarios[1],
@@ -145,7 +145,7 @@ test_scenarios = [
 ]
 
 
-# default values from deepseek_v3, but will be overwritten by scenario
+# Default values from deepseek_v3, but will be overwritten by scenario.
 @dataclass(kw_only=True, frozen=True)
 class RopeConfig:
     hidden_size: int = 7168
@@ -362,7 +362,7 @@ def _run_mla_distributed(
     copy_weights_for_cp(weights, "v_b_proj", 0, rank, world_size)
     mla.load_state_dict(weights)
 
-    # Set up KVCacheManager and attn_metadata for distributed
+    # Set up KVCacheManager and attn_metadata for distributed.
     kv_cache_manager, attn_metadata = setup_kv_and_metadata(
         scenario, mapping,
         cache_type=CACHE_TYPE_SELFKONLY,
@@ -386,13 +386,13 @@ def _run_mla_distributed(
     mla.forward_impl(position_ids_ctx_rank, input_ctx_rank, attn_metadata,
                      output=ctx_output)
 
-    # For non-last rank, generate the right latent cache for generation
+    # For non-last rank, generate the right latent cache for generation.
     input_ctx_bs = input_ctx.view(scenario.batch, scenario.ctx_len, scenario.hidden_size)
     latent_cache_gen = _make_latent_cache_gen(
         mla, rank, world_size, ctx_len_per_gpu, input_ctx_bs, ref_attn_metadata
     )
 
-    # Single generation step
+    # Single generation step.
     for req_id in range(scenario.batch):
         kv_cache_manager.impl.add_token(req_id)
     helix_is_inactive_rank = [rank != world_size - 1] * scenario.batch
@@ -496,10 +496,10 @@ def _full_test_multi_gpu(
             num_kv_heads=1,
             head_dim=scenario.kv_lora_rank + scenario.qk_rope_head_dim,
         )
-        # Context step
+        # Context step.
         mla(position_ids_ctx, input_ctx, ref_attn_metadata)
 
-        # Single generation step
+        # Single generation step.
         for req_id in range(scenario.batch):
             ref_kv_cache_manager.impl.add_token(req_id)
         ref_attn_metadata = get_attention_backend("TRTLLM").Metadata(
@@ -528,7 +528,7 @@ def _full_test_multi_gpu(
         )
         ref_attn_metadata = None
 
-    # Distributed mapping for helix
+    # Distributed mapping for helix.
     mapping = Mapping(
         world_size=world_size,
         rank=rank,
@@ -539,7 +539,7 @@ def _full_test_multi_gpu(
             "fifo_version": fifo_version,
         },
     )
-    # Broadcast reference output from rank 0 to all ranks
+    # Broadcast reference output from rank 0 to all ranks.
     ref_output_all = cp_allgather(ref_output, mapping=mapping, dim=0)
     ref_output = ref_output_all.view(world_size, *ref_output.shape)[0]
 

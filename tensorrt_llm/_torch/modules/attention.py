@@ -557,7 +557,7 @@ class Attention(nn.Module):
             attn_output = self._helix_post_process(attn_output, softmax_stats)
             return attn_output, None
 
-        # Normal (non-helix) path
+        # Normal (non-helix) path.
         out_scale = None
         out_scale_sf = None
         # Don't set out_scale if o_proj has pre_quant_scale - this prevents FP8/FP4 output

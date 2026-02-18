@@ -58,7 +58,7 @@ MPI.pickle.__init__(
 )
 
 
-# Values inspired by a small LLaMA-like model
+# Values inspired by a small LLaMA-like model.
 @dataclass(kw_only=True, frozen=True)
 class Scenario:
     dtype: torch.dtype = torch.bfloat16
@@ -74,7 +74,7 @@ class Scenario:
     batch: int = 8
     ctx_len: int = 1024
     # note: need to use fairly high tolerances because the softmax stats can
-    # lose a lot of precision and we're using bf16 here
+    # lose a lot of precision and we're using bf16 here.
     atol: float = 1e-1
     rtol: float = 5e-2
 
@@ -109,7 +109,7 @@ all_scenarios = [
     Scenario(batch=16, ctx_len=32768),
 ]
 
-# Limit the number of test scenarios to avoid taking too long
+# Limit the number of test scenarios to avoid taking too long.
 test_scenarios = [
     all_scenarios[0],
     all_scenarios[1],
@@ -171,11 +171,11 @@ def _run_attention_distributed(
         config=config,
     ).cuda()
 
-    # Split o_proj weight along input dimension for CP
+    # Split o_proj weight along input dimension for CP.
     copy_weights_for_cp(weights, "o_proj.weight", 1, rank, world_size)
     attn.load_state_dict(weights)
 
-    # Set up KVCacheManager and attn_metadata for distributed
+    # Set up KVCacheManager and attn_metadata for distributed.
     kv_cache_manager, attn_metadata = setup_kv_and_metadata(
         scenario, mapping,
         cache_type=CACHE_TYPE_SELF,
@@ -200,7 +200,7 @@ def _run_attention_distributed(
     attn.forward_impl(q, k, v, attn_metadata,
                        PredefinedAttentionMask.CAUSAL, None, None, None)
 
-    # Single generation step
+    # Single generation step.
     for req_id in range(scenario.batch):
         kv_cache_manager.impl.add_token(req_id)
     helix_is_inactive_rank = [rank != world_size - 1] * scenario.batch
@@ -282,10 +282,10 @@ def _full_test_multi_gpu(
             head_dim=scenario.head_dim,
         )
 
-        # Context step
+        # Context step.
         attn(position_ids_ctx, input_ctx, ref_attn_metadata)
 
-        # Single generation step
+        # Single generation step.
         for req_id in range(scenario.batch):
             ref_kv_cache_manager.impl.add_token(req_id)
         ref_attn_metadata = get_attention_backend("TRTLLM").Metadata(
@@ -313,7 +313,7 @@ def _full_test_multi_gpu(
             device="cuda",
         )
 
-    # Distributed mapping for helix
+    # Distributed mapping for helix.
     mapping = Mapping(
         world_size=world_size,
         rank=rank,
@@ -324,7 +324,7 @@ def _full_test_multi_gpu(
             "fifo_version": fifo_version,
         },
     )
-    # Broadcast reference output from rank 0 to all ranks
+    # Broadcast reference output from rank 0 to all ranks.
     ref_output_all = cp_allgather(ref_output, mapping=mapping, dim=0)
     ref_output = ref_output_all.view(world_size, *ref_output.shape)[0]
 
