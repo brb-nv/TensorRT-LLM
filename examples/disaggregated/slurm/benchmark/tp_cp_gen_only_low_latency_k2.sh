@@ -31,7 +31,7 @@ CONFIGS_DIR="${WORK_DIR}/saved_configs/${TIMESTAMP}_tp_cp_low_latency_k2"
 # =============================================================================
 # Format: "num_gpus,global_batch_size,isl,osl,gen_pp,gen_tp,gen_cp,gen_moe_ep,attn_dp"
 # attn_dp: 0=false (TEP), 1=true (DEP)
-# global_batch_size = concurrency
+# concurrency = global_batch_size * 4
 # PP is always 1 for this script (TP x CP only)
 # =============================================================================
 
@@ -94,27 +94,27 @@ GEN4_COMBINATIONS=(
 GEN8_COMBINATIONS=(
     # tep_8: TP=1, CP=8
     "8,2,252928,8192,1,1,8,8,0"
-    "8,4,252928,8192,1,1,8,8,0"
-    "8,8,252928,8192,1,1,8,8,0"
-    "8,16,252928,8192,1,1,8,8,0"
-    "8,32,252928,8192,1,1,8,8,0"
+    # "8,4,252928,8192,1,1,8,8,0"
+    # "8,8,252928,8192,1,1,8,8,0"
+    # "8,16,252928,8192,1,1,8,8,0"
+    # "8,32,252928,8192,1,1,8,8,0"
     # tep_8: TP=2, CP=4
     "8,2,252928,8192,1,2,4,8,0"
-    "8,4,252928,8192,1,2,4,8,0"
-    "8,8,252928,8192,1,2,4,8,0"
-    "8,16,252928,8192,1,2,4,8,0"
-    "8,32,252928,8192,1,2,4,8,0"
+    # "8,4,252928,8192,1,2,4,8,0"
+    # "8,8,252928,8192,1,2,4,8,0"
+    # "8,16,252928,8192,1,2,4,8,0"
+    # "8,32,252928,8192,1,2,4,8,0"
     # tep_8: TP=4, CP=2
     "8,2,252928,8192,1,4,2,8,0"
-    "8,4,252928,8192,1,4,2,8,0"
-    "8,8,252928,8192,1,4,2,8,0"
-    "8,16,252928,8192,1,4,2,8,0"
-    "8,32,252928,8192,1,4,2,8,0"
+    # "8,4,252928,8192,1,4,2,8,0"
+    # "8,8,252928,8192,1,4,2,8,0"
+    # "8,16,252928,8192,1,4,2,8,0"
+    # "8,32,252928,8192,1,4,2,8,0"
     # tep_8: TP=8, CP=1 (est. max_scheduled~20)
     "8,2,252928,8192,1,8,1,8,0"
-    "8,4,252928,8192,1,8,1,8,0"
-    "8,8,252928,8192,1,8,1,8,0"
-    "8,16,252928,8192,1,8,1,8,0"
+    # "8,4,252928,8192,1,8,1,8,0"
+    # "8,8,252928,8192,1,8,1,8,0"
+    # "8,16,252928,8192,1,8,1,8,0"
 )
 
 # =============================================================================
@@ -274,7 +274,7 @@ generate_pp_partition() {
 # Function to update config.yaml using sed
 update_config() {
     local num_gpus=$1
-    local global_batch_size=$2  # global_batch_size = concurrency
+    local global_batch_size=$2  # concurrency = global_batch_size * 4
     local isl=$3
     local osl=$4
     local pp=$5
@@ -284,8 +284,8 @@ update_config() {
     local attn_dp=$9
 
     # Calculate derived values
-    # global_batch_size = concurrency (directly from experiments)
-    local concurrency=$global_batch_size
+    # concurrency = global_batch_size * 4 (4x over-subscription to keep pipeline saturated)
+    local concurrency=$((global_batch_size * 4))
     local max_seq_len=$((isl / cp + osl + 512))  # isl/cp + osl + buffer for special tokens
     local moe_backend=$(get_moe_backend "$global_batch_size")
     local attn_dp_bool=$( [ "$attn_dp" -eq 1 ] && echo "true" || echo "false" )
@@ -320,7 +320,7 @@ update_config() {
     echo "  Mode: ${mode_str}_${num_gpus} (${mode_str} mode with ${num_gpus} GPUs)"
     echo "  NUM_GPUS=$num_gpus, PP=$pp, TP=$tp, CP=$cp, EP=$ep"
     echo "  ISL=$isl, OSL=$osl"
-    echo "  global_batch_size=$global_batch_size (= concurrency)"
+    echo "  global_batch_size=$global_batch_size, concurrency=$concurrency (= global_batch_size * 4)"
     echo "  enable_attention_dp=$attn_dp_bool"
     echo "  concurrency=$concurrency, max_seq_len=$max_seq_len (isl/cp + osl + 512 = $isl/$cp + $osl + 512)"
     echo "  moe_backend=$moe_backend (auto-selected for GB200 NVFP4)"
@@ -516,7 +516,7 @@ for combo in "${COMBINATIONS[@]}"; do
     submit_job
 
     # Optional: Add delay between submissions to avoid overwhelming the scheduler
-    sleep 5
+    sleep 2
 done
 
 echo ""
