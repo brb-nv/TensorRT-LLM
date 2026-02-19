@@ -99,40 +99,40 @@ BASELINE_128K_COMBINATIONS=(
 # =============================================================================
 HELIX_1M_COMBINATIONS=(
     # num_gpus, batch_size, isl, osl, gen_pp, gen_tp, gen_cp, gen_moe_ep, attn_dp
-    # ck-1_ctp32tp2 (Attn DP=FALSE)
-    "64,1,1048576,16384,1,2,32,1,0"
+    # ck-1_ctp32tp2 (Attn DP=FALSE) (Modified EP 1->8)
+    "64,1,1048576,16384,1,2,32,8,0"
     # ck-2_ctp8cep4tep2 (Attn DP=FALSE)
     "64,2,1048576,16384,1,2,32,8,0"
     # ck-2_ctp4cep8tep2 (Attn DP=FALSE)
     "64,2,1048576,16384,1,2,32,16,0"
-    # ck-2_ctp16tp2pp2 (Attn DP=FALSE)
-    "64,2,1048576,16384,2,2,16,1,0"
-    # ck-4_ctp64 (Attn DP=FALSE)
-    "64,4,1048576,16384,1,1,64,1,0"
+    # ck-2_ctp16tp2pp2 (Attn DP=FALSE) (Modified EP 1->8)
+    "64,2,1048576,16384,2,2,16,8,0"
+    # ck-4_ctp64 (Attn DP=FALSE) (Modified EP 1->8)
+    "64,4,1048576,16384,1,1,64,8,0"
     # ck-4_cep64 (Attn DP=FALSE)
     "64,4,1048576,16384,1,1,64,64,0"
-    # ck-4_ctp32pp2 (Attn DP=FALSE)
-    "64,4,1048576,16384,2,1,32,1,0"
-    # ck-8_ctp64 (Attn DP=FALSE)
-    "64,8,1048576,16384,1,1,64,1,0"
+    # ck-4_ctp32pp2 (Attn DP=FALSE) (Modified EP 1->8)
+    "64,4,1048576,16384,2,1,32,8,0"
+    # ck-8_ctp64 (Attn DP=FALSE) (Modified EP 1->8)
+    "64,8,1048576,16384,1,1,64,8,0"
     # ck-8_cep64 (Attn DP=FALSE)
     "64,8,1048576,16384,1,1,64,64,0"
     # ck-8_cep16pp4 (Attn DP=FALSE)
     "64,8,1048576,16384,4,1,16,16,0"
-    # ck-16_ctp64 (Attn DP=FALSE)
-    "64,16,1048576,16384,1,1,64,1,0"
+    # ck-16_ctp64 (Attn DP=FALSE) (Modified EP 1->8)
+    "64,16,1048576,16384,1,1,64,8,0"
     # ck-16_cep64 (Attn DP=FALSE)
     "64,16,1048576,16384,1,1,64,64,0"
     # ck-16_cep16pp4 (Attn DP=FALSE)
     "64,16,1048576,16384,4,1,16,16,0"
-    # ck-32_ctp64 (Attn DP=FALSE)
-    "64,32,1048576,16384,1,1,64,1,0"
+    # ck-32_ctp64 (Attn DP=FALSE) (Modified EP 1->8)
+    "64,32,1048576,16384,1,1,64,8,0"
     # ck-4_ctp8ep8 (Attn DP=TRUE) globalBS=4*8=32
     "64,32,1048576,16384,1,8,8,8,1"
     # ck-32_cep8pp8 (Attn DP=FALSE)
     "64,32,1048576,16384,8,1,8,8,0"
-    # ck-64_ctp64 (Attn DP=FALSE)
-    "64,64,1048576,16384,1,1,64,1,0"
+    # ck-64_ctp64 (Attn DP=FALSE) (Modified EP 1->8)
+    "64,64,1048576,16384,1,1,64,8,0"
     # ck-8_cep8ep8 (Attn DP=TRUE) globalBS=8*8=64
     "64,64,1048576,16384,1,8,8,64,1"
     # ck-2_ep64 (Attn DP=TRUE) globalBS=2*64=128
@@ -165,16 +165,16 @@ HELIX_1M_COMBINATIONS=(
 # =============================================================================
 BASELINE_1M_COMBINATIONS=(
     # num_gpus, batch_size, isl, osl, gen_pp, gen_tp, gen_cp, gen_moe_ep, attn_dp
-    # ck-1_tp64 (Attn DP=FALSE)
-    "64,1,1048576,16384,1,64,1,1,0"
-    # ck-2_tp32pp2 (Attn DP=FALSE)
-    "64,2,1048576,16384,2,32,1,1,0"
-    # ck-4_tp16pp4 (Attn DP=FALSE)
-    "64,4,1048576,16384,4,16,1,1,0"
+    # ck-1_tp64 (Attn DP=FALSE) (Modified EP 1->8)
+    "64,1,1048576,16384,1,64,1,8,0"
+    # ck-2_tp32pp2 (Attn DP=FALSE) (Modified EP 1->8)
+    "64,2,1048576,16384,2,32,1,8,0"
+    # ck-4_tp16pp4 (Attn DP=FALSE) (Modified EP 1->8)
+    "64,4,1048576,16384,4,16,1,8,0"
     # ck-8_tep8pp8 (Attn DP=FALSE)
     "64,8,1048576,16384,8,8,1,8,0"
-    # ck-16_tp2tep2pp16 (Attn DP=FALSE)
-    "64,16,1048576,16384,16,4,1,2,0"
+    # ck-16_tp2tep2pp16 (Attn DP=FALSE) (Modified EP 2->4)
+    "64,16,1048576,16384,16,4,1,4,0"
     # ck-16_tep4pp16 (Attn DP=FALSE)
     "64,16,1048576,16384,16,4,1,4,0"
     # ck-1_ep64 (Attn DP=TRUE) globalBS=1*64=64
@@ -256,7 +256,7 @@ update_config() {
 
     # Calculate derived values
     local concurrency=$(( batch_size * 2 ))
-    local max_seq_len=$((isl / cp + osl + 512))  # isl/cp + osl + buffer for special tokens
+    local max_seq_len=$((isl + osl + 512))  # isl + osl + buffer for special tokens
     local moe_backend=$(get_moe_backend "$batch_size")
     local attn_dp_bool=$( [ "$attn_dp" -eq 1 ] && echo "true" || echo "false" )
     # Worker max_batch_size calculation:
@@ -288,7 +288,7 @@ update_config() {
     echo "  NUM_GPUS=$num_gpus, PP=$pp, TP=$tp, CP=$cp, EP=$ep"
     echo "  ISL=$isl, OSL=$osl, batch_size=$batch_size"
     echo "  enable_attention_dp=$attn_dp_bool"
-    echo "  concurrency=$concurrency, max_seq_len=$max_seq_len (isl/cp + osl + 512 = $isl/$cp + $osl + 512)"
+    echo "  concurrency=$concurrency, max_seq_len=$max_seq_len (isl + osl + 512 = $isl + $osl + 512)"
     echo "  moe_backend=$moe_backend (auto-selected for GB200 NVFP4)"
     if [ "$attn_dp" -eq 1 ]; then
         echo "  worker max_batch_size=$worker_max_batch_size (= micro_batch_size = batch_size / (tp * pp))"
