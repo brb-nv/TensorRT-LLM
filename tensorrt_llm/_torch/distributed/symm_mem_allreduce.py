@@ -116,7 +116,17 @@ class SymmetricMemoryAllReduce(nn.Module):
                 return
             # Get actual TP group ranks from mapping (tp_group is a property, not a method)
             tp_group_ranks = mapping.tp_group
-            self.group = dist.new_group(tp_group_ranks) if len(tp_group_ranks) > 1 else None
+            if len(tp_group_ranks) > 1:
+                logger.info(
+                    f"[INIT_DIAG] SymmetricMemoryAllReduce: dist.new_group "
+                    f"(COLLECTIVE, ranks={tp_group_ranks})"
+                )
+                self.group = dist.new_group(tp_group_ranks)
+                logger.info(
+                    f"[INIT_DIAG] SymmetricMemoryAllReduce: dist.new_group complete"
+                )
+            else:
+                self.group = None
 
         # Enable symmetric memory for this group
         try:
@@ -149,7 +159,14 @@ class SymmetricMemoryAllReduce(nn.Module):
             )
             # Pass group name string
             group_name_str = str(self.group.group_name)
+            logger.info(
+                f"[INIT_DIAG] SymmetricMemoryAllReduce: rendezvous "
+                f"(COLLECTIVE, group={group_name_str})"
+            )
             handle = torch_symm_mem.rendezvous(self.buffer, group_name_str)
+            logger.info(
+                f"[INIT_DIAG] SymmetricMemoryAllReduce: rendezvous complete"
+            )
 
             if handle.multicast_ptr == 0:
                 logger.warning(

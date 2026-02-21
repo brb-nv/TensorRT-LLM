@@ -37,8 +37,11 @@ from torch import nn
 from tqdm import tqdm
 from transformers import PretrainedConfig
 
+import time as _time
+
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 from tensorrt_llm._ipc_utils import can_access_peer
+from tensorrt_llm.logger import logger
 from tensorrt_llm._torch.models.checkpoints.base_weight_loader import \
     ConsumableWeightsDict
 from tensorrt_llm._utils import get_sm_version
@@ -947,6 +950,9 @@ class Deepseekv3MoE(nn.Module):
                              fuse_routing_kernel=True,
                              apply_routing=False,
                              moe_backend=model_config.moe_backend)
+        logger.info(
+            f"[INIT_DIAG] Deepseekv3MoE: creating MoE backend (layer_idx={layer_idx})"
+        )
         self.experts = create_moe(
             num_experts=num_experts,
             routing_method=self.gate.routing_method,
@@ -954,19 +960,20 @@ class Deepseekv3MoE(nn.Module):
             intermediate_size=intermediate_size,
             dtype=dtype,
             reduce_results=
-            False,  # In both low‑latency and attention‑DP modes, FusedMoE skips the in‑op all‑reduce.
+            False,
             model_config=model_config,
             override_quant_config=override_quant_config,
             aux_stream_dict=aux_stream_dict,
             layer_idx=layer_idx,
-            # DS-R1 W4A8 is only supported through custom quantization script from
-            # examples/quantization/quantize_mixed_precision_moe.py
             weight_loading_mode=(
                 MoEWeightLoadingMode.W4A8_CUSTOM
                 if self._get_experts_quant_config(
                     model_config,
                     layer_idx).layer_quant_mode.is_int4_weight_only_per_group()
                 else MoEWeightLoadingMode.VANILLA),
+        )
+        logger.info(
+            f"[INIT_DIAG] Deepseekv3MoE: MoE backend created (layer_idx={layer_idx})"
         )
 
         self.mapping = model_config.mapping
@@ -1192,19 +1199,20 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         mapping = self.mapping
         self.enable_attention_dp = mapping.enable_attention_dp
         self.mlp_tp_size = mapping.tp_size
+        logger.info(
+            f"[INIT_DIAG] Layer {layer_idx}: calling can_access_peer (tp_group={mapping.tp_group})"
+        )
         self.is_p2p_supported = can_access_peer(mapping)
 
         layer_idx_for_attention = layer_idx
         if is_separate_draft_engine:
-            #KVCacheManager only support 1 layer for separate draft engine
             layer_idx_for_attention = layer_idx - model_config.pretrained_config.num_hidden_layers
 
-        # When enable_attention_dp is True, TP reduction is skipped since each DP rank
-        # works on different batch elements. However, with CP > 1, attention is split
-        # across CP ranks for the SAME batch element, so reduction is still needed
-        # within the CP group.
         needs_tp_reduce = not self.enable_attention_dp and self.mapping.tp_size > 1
         needs_cp_reduce = mapping_with_cp is not None and mapping_with_cp.has_cp_helix(
+        )
+        logger.debug(
+            f"[INIT_DIAG] Layer {layer_idx}: constructing attention module"
         )
         if config.model_type == "deepseek_v32":
             self.self_attn = DeepseekV32Attention(
@@ -1220,6 +1228,9 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                 aux_stream=aux_stream_dict[AuxStreamType.Attention],
                 mapping_with_cp=mapping_with_cp,
                 reduce_output=needs_tp_reduce or needs_cp_reduce)
+        logger.info(
+            f"[INIT_DIAG] Layer {layer_idx}: attention module constructed"
+        )
 
         self.fusion_config = EagerFusionConfig()
         self.enable_fusion = os.environ.get(
@@ -1237,10 +1248,19 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         self.allreduce = None
         self.moe_allreduce = None
         if not self.enable_attention_dp and self.mapping.tp_size > 1:
+            logger.info(
+                f"[INIT_DIAG] Layer {layer_idx}: constructing AllReduce (tp_size={self.mapping.tp_size})"
+            )
             self.allreduce = AllReduce(mapping=model_config.mapping,
                                        strategy=model_config.allreduce_strategy,
                                        dtype=config.torch_dtype)
+            logger.info(
+                f"[INIT_DIAG] Layer {layer_idx}: AllReduce constructed, constructing MoEAllReduce"
+            )
             self.moe_allreduce = MoEAllReduce(self.mapping)
+            logger.info(
+                f"[INIT_DIAG] Layer {layer_idx}: MoEAllReduce constructed"
+            )
 
         has_tp = mapping.has_tp()
         if (config.n_routed_experts is not None
@@ -1250,6 +1270,9 @@ class DeepseekV3DecoderLayer(DecoderLayer):
             self.fusion_config.PRE_MOE_FUSION = self.enable_fusion and has_tp
             self.fusion_config.POST_MOE_FUSION = self.fusion_config.PRE_MOE_FUSION
 
+            logger.info(
+                f"[INIT_DIAG] Layer {layer_idx}: constructing Deepseekv3MoE"
+            )
             self.mlp = Deepseekv3MoE(
                 num_experts=self.num_experts,
                 top_k=self.top_k,
@@ -1262,6 +1285,9 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                 override_quant_config=quant_config,
                 aux_stream_dict=aux_stream_dict,
                 layer_idx=layer_idx)
+            logger.info(
+                f"[INIT_DIAG] Layer {layer_idx}: Deepseekv3MoE constructed"
+            )
         else:
             block_size = 1
             if quant_config and quant_config.group_size is not None:
@@ -1718,13 +1744,19 @@ class DeepseekV3Model(DecoderModel):
             dtype=config.torch_dtype,
         )
 
-        self.layers = nn.ModuleList([
-            DeepseekV3DecoderLayer(model_config,
-                                   layer_idx,
-                                   self.aux_stream_dict,
-                                   mapping_with_cp=mapping_with_cp)
-            for layer_idx in range(config.num_hidden_layers)
-        ])
+        layers = []
+        for layer_idx in range(config.num_hidden_layers):
+            t0 = _time.monotonic()
+            layer = DeepseekV3DecoderLayer(model_config, layer_idx,
+                                           self.aux_stream_dict,
+                                           mapping_with_cp=mapping_with_cp)
+            dt = _time.monotonic() - t0
+            if layer_idx % 10 == 0 or layer_idx == config.num_hidden_layers - 1:
+                logger.info(
+                    f"[INIT_DIAG] Constructed layer {layer_idx}/{config.num_hidden_layers} in {dt:.3f}s"
+                )
+            layers.append(layer)
+        self.layers = nn.ModuleList(layers)
         self.norm = RMSNorm(hidden_size=config.hidden_size,
                             eps=config.rms_norm_eps,
                             dtype=config.torch_dtype)
@@ -1786,15 +1818,20 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
         # affected by CP. For other layers, CP ranks are repurposed to TP. This shall be undone
         # at the end of __init__.
         if model_config.mapping.has_cp_helix():
-            print(
-                f"[DeepseekV3ForCausalLM::__init__] Repurposing KVP ranks to TP while keeping other details the same."
+            logger.info(
+                f"[INIT_DIAG] DeepseekV3ForCausalLM: Repurposing KVP ranks to TP "
+                f"(orig tp={model_config.mapping.tp_size}, cp={model_config.mapping.cp_size})"
             )
             self.mapping_with_cp = copy.deepcopy(model_config.mapping)
-            # Repurpose KVP ranks to TP while keeping other details the same.
             model_config._frozen = False
             model_config.mapping = model_config.mapping.repurpose_helix_cp_to_tp(
             )
             model_config._frozen = True
+            logger.info(
+                f"[INIT_DIAG] DeepseekV3ForCausalLM: After repurpose "
+                f"(new tp={model_config.mapping.tp_size}, cp={model_config.mapping.cp_size}, "
+                f"tp_group={model_config.mapping.tp_group})"
+            )
 
         # Rename some keys of quant_config_dict to support legacy checkpoints
         if model_config.quant_config_dict is not None:

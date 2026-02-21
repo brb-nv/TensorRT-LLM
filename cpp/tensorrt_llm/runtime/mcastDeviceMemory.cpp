@@ -21,6 +21,7 @@
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/logger.h"
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cuda_runtime_api.h>
@@ -69,14 +70,13 @@ McastDeviceMemory::McastDeviceMemory(
     mSignalPadOffset = roundUp(mBufSize, kSignalPadAlignment);
     int const world_rank{tensorrt_llm::mpi::MpiComm::session().getRank()};
 
-    TLLM_LOG_DEBUG(
-        "[McastDeviceMemory] World Rank: %u, Group Rank: %u, Group size: %u, isMultiNode: %d, "
-        "device_idx: %d, Signal pad offset: %zu",
-        world_rank, mGroupRank, mGroupSize, mIsMNNvlink, mDeviceIdx, mSignalPadOffset);
+    TLLM_LOG_INFO(
+        "[INIT_DIAG] [McastDeviceMemory] World Rank: %u, Group Rank: %u, Group size: %u, isMultiNode: %d, "
+        "device_idx: %d, Signal pad offset: %zu, bufSize: %zu",
+        world_rank, mGroupRank, mGroupSize, mIsMNNvlink, mDeviceIdx, mSignalPadOffset, bufSize);
 
     if (mIsMNNvlink)
     {
-        // For multi-node, we also need to check if fabric handle is supported
         int fabric_handle_supported{0};
         TLLM_CU_CHECK(cuDeviceGetAttribute(
             &fabric_handle_supported, CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED, mDeviceIdx));
@@ -84,11 +84,15 @@ McastDeviceMemory::McastDeviceMemory(
         {
             TLLM_THROW("[McastDeviceMemory] Device does not support fabric handle.");
         }
+        TLLM_LOG_INFO("[INIT_DIAG] [McastDeviceMemory] World Rank: %u: entering allocMnMcastMem", world_rank);
         allocMnMcastMem(mBufSize);
+        TLLM_LOG_INFO("[INIT_DIAG] [McastDeviceMemory] World Rank: %u: allocMnMcastMem complete", world_rank);
     }
     else
     {
+        TLLM_LOG_INFO("[INIT_DIAG] [McastDeviceMemory] World Rank: %u: entering allocNvlsMcastMem", world_rank);
         allocNvlsMcastMem(mSignalPadOffset + kSIGNAL_PAD_SIZE);
+        TLLM_LOG_INFO("[INIT_DIAG] [McastDeviceMemory] World Rank: %u: allocNvlsMcastMem complete", world_rank);
     }
     // Initialize signal pads
     mSignalPads.resize(mGroupSize);
@@ -135,6 +139,13 @@ McastDeviceMemory::~McastDeviceMemory()
 
 void McastDeviceMemory::allocMnMcastMem(size_t bufSize)
 {
+    int const world_rank{tensorrt_llm::mpi::MpiComm::session().getRank()};
+    auto const t0 = std::chrono::steady_clock::now();
+    auto elapsed_ms = [&t0]()
+    {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+    };
+
     CUmemAllocationHandleType const handle_type = CU_MEM_HANDLE_TYPE_FABRIC;
     CUmemAllocationProp prop = {};
     prop.requestedHandleTypes = handle_type;
@@ -145,43 +156,65 @@ void McastDeviceMemory::allocMnMcastMem(size_t bufSize)
 
     size_t alloc_granularity{0}, mc_granularity{0};
     TLLM_CU_CHECK(cuMemGetAllocationGranularity(&alloc_granularity, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM));
-    // Round up the buffer size for grnularity
     mAllocationSize = roundUp(bufSize + kSIGNAL_PAD_SIZE, alloc_granularity);
     CUmulticastObjectProp mcProp = {.numDevices = mGroupSize, .size = mAllocationSize, .handleTypes = handle_type};
     TLLM_CU_CHECK(cuMulticastGetGranularity(&mc_granularity, &mcProp, CU_MULTICAST_GRANULARITY_RECOMMENDED));
     mAllocationSize = roundUp(mAllocationSize, mc_granularity);
     mUcHandles.resize(mGroupSize);
-    // Allocates local gpu memory
+
+    TLLM_LOG_INFO("[INIT_DIAG] [McastMnAlloc] WorldRank %d, GroupRank %u/%u: step 1 - cuMemCreate (+%lldms)",
+        world_rank, mGroupRank, mGroupSize, elapsed_ms());
     TLLM_CU_CHECK(cuMemCreate(&(mUcHandles[mGroupRank]), mAllocationSize, &prop, 0));
 
-    // Connect peer UC handles
+    TLLM_LOG_INFO("[INIT_DIAG] [McastMnAlloc] WorldRank %d, GroupRank %u/%u: step 2 - cuMemExportToShareableHandle (IMEX) (+%lldms)",
+        world_rank, mGroupRank, mGroupSize, elapsed_ms());
     CUmemFabricHandle* exphndl{nullptr};
     CUmemFabricHandle myhndl;
     TLLM_CU_CHECK(cuMemExportToShareableHandle(&myhndl, mUcHandles[mGroupRank], CU_MEM_HANDLE_TYPE_FABRIC, 0));
-    // All gather
+
+    TLLM_LOG_INFO("[INIT_DIAG] [McastMnAlloc] WorldRank %d, GroupRank %u/%u: step 3 - MPI allgather UC handles (+%lldms)",
+        world_rank, mGroupRank, mGroupSize, elapsed_ms());
     cudaMallocHost(&exphndl, mGroupSize * sizeof(CUmemFabricHandle));
     memcpy(exphndl + mGroupRank * sizeof(CUmemFabricHandle), &myhndl, sizeof(CUmemFabricHandle));
     mGroupComm.allgather(
         exphndl + mGroupRank * sizeof(CUmemFabricHandle), exphndl, sizeof(CUmemFabricHandle), mpi::MpiType::kCHAR);
     cudaDeviceSynchronize();
 
+    TLLM_LOG_INFO("[INIT_DIAG] [McastMnAlloc] WorldRank %d, GroupRank %u/%u: step 4 - cuMemImportFromShareableHandle (+%lldms)",
+        world_rank, mGroupRank, mGroupSize, elapsed_ms());
     for (uint32_t p = 0; p < mGroupSize; p++)
+    {
         if (p != mGroupRank)
+        {
+            TLLM_LOG_INFO("[INIT_DIAG] [McastMnAlloc] WorldRank %d: importing handle from peer %u/%u (+%lldms)",
+                world_rank, p, mGroupSize, elapsed_ms());
             TLLM_CU_CHECK(cuMemImportFromShareableHandle(
                 &mUcHandles[p], reinterpret_cast<void*>(&exphndl[p]), CU_MEM_HANDLE_TYPE_FABRIC));
+        }
+    }
     cudaFreeHost(exphndl);
 
-    // Initialize multicasting
+    TLLM_LOG_INFO("[INIT_DIAG] [McastMnAlloc] WorldRank %d, GroupRank %u/%u: step 5 - cuMulticastCreate (rank 0) + export (+%lldms)",
+        world_rank, mGroupRank, mGroupSize, elapsed_ms());
     CUmemFabricHandle* fabric_handle;
     cudaMallocHost(&fabric_handle, sizeof(CUmemFabricHandle));
     if (mGroupRank == 0)
     {
+        TLLM_LOG_INFO("[INIT_DIAG] [McastMnAlloc] WorldRank %d: I am rank 0, calling cuMulticastCreate (+%lldms)",
+            world_rank, elapsed_ms());
         TLLM_CU_CHECK(cuMulticastCreate(&mMcHandle, &mcProp));
+        TLLM_LOG_INFO("[INIT_DIAG] [McastMnAlloc] WorldRank %d: cuMulticastCreate done, exporting fabric handle (+%lldms)",
+            world_rank, elapsed_ms());
         TLLM_CU_CHECK(cuMemExportToShareableHandle((void*) fabric_handle, mMcHandle, CU_MEM_HANDLE_TYPE_FABRIC, 0));
     }
-    // Broadcast
+
+    TLLM_LOG_INFO("[INIT_DIAG] [McastMnAlloc] WorldRank %d, GroupRank %u/%u: step 6 - MPI bcast MC handle (+%lldms)",
+        world_rank, mGroupRank, mGroupSize, elapsed_ms());
     mGroupComm.bcast(fabric_handle, sizeof(CUmemFabricHandle), mpi::MpiType::kCHAR, 0);
     cudaDeviceSynchronize();
+
+    TLLM_LOG_INFO("[INIT_DIAG] [McastMnAlloc] WorldRank %d, GroupRank %u/%u: step 7 - cuMemImportFromShareableHandle MC + cuMulticastAddDevice (+%lldms)",
+        world_rank, mGroupRank, mGroupSize, elapsed_ms());
     if (mGroupRank != 0)
     {
         TLLM_CU_CHECK(cuMemImportFromShareableHandle(&mMcHandle, (void*) fabric_handle, CU_MEM_HANDLE_TYPE_FABRIC));
@@ -189,7 +222,8 @@ void McastDeviceMemory::allocMnMcastMem(size_t bufSize)
     TLLM_CU_CHECK(cuMulticastAddDevice(mMcHandle, mDeviceIdx));
     cudaFreeHost(fabric_handle);
 
-    // Bind memory addresses
+    TLLM_LOG_INFO("[INIT_DIAG] [McastMnAlloc] WorldRank %d, GroupRank %u/%u: step 8 - cuMemAddressReserve + cuMemMap UC (+%lldms)",
+        world_rank, mGroupRank, mGroupSize, elapsed_ms());
     mUcPtrs.resize(mGroupSize);
     CUdeviceptr ptr;
     TLLM_CU_CHECK(cuMemAddressReserve(&ptr, mAllocationSize * mGroupSize, mc_granularity, 0ULL, 0));
@@ -205,12 +239,22 @@ void McastDeviceMemory::allocMnMcastMem(size_t bufSize)
     }
     TLLM_CU_CHECK(cuMemSetAccess(ptr, mAllocationSize * mGroupSize, &accessDesc, 1));
 
-    // Bind MC Pointers
+    TLLM_LOG_INFO("[INIT_DIAG] [McastMnAlloc] WorldRank %d, GroupRank %u/%u: step 9a - cuMemAddressReserve MC (+%lldms)",
+        world_rank, mGroupRank, mGroupSize, elapsed_ms());
     TLLM_CU_CHECK(cuMemAddressReserve(&mMcPtr, mAllocationSize, mc_granularity, 0ULL, 0));
+    TLLM_LOG_INFO("[INIT_DIAG] [McastMnAlloc] WorldRank %d, GroupRank %u/%u: step 9b - cuMemMap MC (+%lldms)",
+        world_rank, mGroupRank, mGroupSize, elapsed_ms());
     TLLM_CU_CHECK(cuMemMap(mMcPtr, mAllocationSize, 0, mMcHandle, 0));
+    TLLM_LOG_INFO("[INIT_DIAG] [McastMnAlloc] WorldRank %d, GroupRank %u/%u: step 9c - cuMemSetAccess MC (+%lldms)",
+        world_rank, mGroupRank, mGroupSize, elapsed_ms());
     TLLM_CU_CHECK(cuMemSetAccess(mMcPtr, mAllocationSize, &accessDesc, 1));
 
+    TLLM_LOG_INFO("[INIT_DIAG] [McastMnAlloc] WorldRank %d, GroupRank %u/%u: step 10 - cuMulticastBindMem (+%lldms)",
+        world_rank, mGroupRank, mGroupSize, elapsed_ms());
     TLLM_CU_CHECK(cuMulticastBindMem(mMcHandle, 0, mUcHandles[mGroupRank], 0 /*memOffset*/, mAllocationSize, 0));
+
+    TLLM_LOG_INFO("[INIT_DIAG] [McastMnAlloc] WorldRank %d, GroupRank %u/%u: complete (total %lldms)",
+        world_rank, mGroupRank, mGroupSize, elapsed_ms());
 }
 
 void McastDeviceMemory::allocNvlsMcastMem(size_t bufSize)

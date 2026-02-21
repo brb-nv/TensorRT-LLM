@@ -585,33 +585,46 @@ class TorchDist(Distributed):
 
         from tensorrt_llm._utils import set_torch_comm
         set_torch_comm(self)  # Set as global instance
+        logger.info(
+            f"[INIT_DIAG] TorchDist.__init__: calling build_mesh "
+            f"(tp={mapping.tp_size}, pp={mapping.pp_size}, cp={mapping.cp_size})"
+        )
         mapping.build_mesh()
+        logger.info(f"[INIT_DIAG] TorchDist.__init__: build_mesh complete")
 
         self.setup_local_comm()
         self.default_store = torch.distributed.distributed_c10d._get_default_store(
         )
 
+        logger.info(f"[INIT_DIAG] TorchDist.__init__: calling init_pg")
         init_pg(torch.distributed.group.WORLD, self.local_comm,
                 torch_pybind11_abi())
+        logger.info(f"[INIT_DIAG] TorchDist.__init__: init_pg complete")
 
     def setup_local_comm(self):
         self._get_cluster_info()
 
-        # node IP -> list of ranks
         ip_to_ranks = {}
         for rank, (node_ip, _) in enumerate(self.cluster_info):
             ip_to_ranks.setdefault(node_ip, []).append(int(rank))
 
+        logger.info(
+            f"[INIT_DIAG] setup_local_comm: creating {len(ip_to_ranks)} node-local process groups (COLLECTIVE)"
+        )
         self.local_comm = None
-        for ranks in ip_to_ranks.values():
-            # All global ranks from the default process group to participate in the call,
-            # even if some ranks are not part of the new process group being created
+        for i, ranks in enumerate(ip_to_ranks.values()):
+            logger.debug(
+                f"[INIT_DIAG] setup_local_comm: dist.new_group #{i} ranks={ranks}"
+            )
             pg = dist.new_group(ranks=ranks, backend='cuda:nccl,cpu:gloo')
             if int(self.rank) in ranks:
                 logger.debug(
                     f"[Rank {self.rank}] Done setting local comm. ip_to_ranks: {ip_to_ranks}"
                 )
                 self.local_comm = pg
+        logger.info(
+            f"[INIT_DIAG] setup_local_comm: all process groups created"
+        )
 
     def _get_cluster_info(self):
         if self.cluster_info is not None:
@@ -626,19 +639,21 @@ class TorchDist(Distributed):
 
         assert len(gpu_index) == 1
 
-        # Gather node ip
+        logger.info(
+            f"[INIT_DIAG] _get_cluster_info: starting all_gather_object calls (COLLECTIVE x3)"
+        )
         node_list = [None] * torch.distributed.get_world_size()
-
         torch.distributed.all_gather_object(node_list, node_ip)
 
-        # Gather gpu index
         gpu_list = [None] * torch.distributed.get_world_size()
         torch.distributed.all_gather_object(gpu_list, gpu_index[0])
 
-        # Gather rank
         rank_list = [None] * torch.distributed.get_world_size()
         torch.distributed.all_gather_object(rank_list,
                                             torch.distributed.get_rank())
+        logger.info(
+            f"[INIT_DIAG] _get_cluster_info: all_gather_object calls complete"
+        )
 
         rank_info_list = [None] * torch.distributed.get_world_size()
         for i in range(len(rank_list)):
@@ -1004,9 +1019,19 @@ def init_pp_comm(mapping):
     """Initialize PPComm once at startup"""
     global _pp_comm
     if mpi_disabled():
+        logger.info(
+            f"[INIT_DIAG] init_pp_comm: creating PPCommTorch"
+        )
         _pp_comm = PPCommTorch(mapping)
     else:
+        logger.info(
+            f"[INIT_DIAG] init_pp_comm: creating PPCommNCCL "
+            f"(COLLECTIVE - ncclCommInitRank via MPI, world_size={mapping.world_size})"
+        )
         _pp_comm = PPCommNCCL(mapping)
+        logger.info(
+            f"[INIT_DIAG] init_pp_comm: PPCommNCCL created"
+        )
     init_helix_cp_comm(mapping)
 
 

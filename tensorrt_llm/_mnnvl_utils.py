@@ -120,10 +120,16 @@ class MnnvlMemory:
         """Get TP-based communicator (ranks grouped by PP+CP+MOE_TP, ordered by TP rank)."""
         if cls.comm is not None:
             return cls.comm
-        comm = mpi_comm().Split(
-            (mapping.pp_rank * mapping.cp_size + mapping.cp_rank) * mapping.moe_tp_size
-            + mapping.moe_tp_rank,
-            mapping.tp_rank,
+        color = (mapping.pp_rank * mapping.cp_size + mapping.cp_rank) * mapping.moe_tp_size + mapping.moe_tp_rank
+        logger.info(
+            f"[INIT_DIAG] {cls.__name__}.get_comm: entering MPI Split "
+            f"(COLLECTIVE, color={color}, key={mapping.tp_rank}, "
+            f"pp_rank={mapping.pp_rank}, cp_rank={mapping.cp_rank}, "
+            f"moe_tp_rank={mapping.moe_tp_rank})"
+        )
+        comm = mpi_comm().Split(color, mapping.tp_rank)
+        logger.info(
+            f"[INIT_DIAG] {cls.__name__}.get_comm: MPI Split completed"
         )
         cls.comm = comm
         return comm
@@ -393,7 +399,13 @@ def init_helix_cp_comm(mapping: Mapping) -> None:
         mapping: The mapping object containing parallelism configuration.
     """
     if mapping.has_cp_helix() and not mapping.cp_config.get("use_nccl_for_alltoall", True):
+        logger.info(
+            f"[INIT_DIAG] init_helix_cp_comm: calling HelixCpMnnvlMemory.get_comm"
+        )
         HelixCpMnnvlMemory.get_comm(mapping)
+        logger.info(
+            f"[INIT_DIAG] init_helix_cp_comm: HelixCpMnnvlMemory.get_comm complete"
+        )
 
 
 @dataclass

@@ -236,8 +236,14 @@ class ModelLoader:
             try:
                 # config will be modified in-place for some models, like Qwen2
                 config_copy = copy.deepcopy(config)
+                logger.info(
+                    f"[INIT_DIAG] Starting MetaInitMode model construction"
+                )
                 with MetaInitMode():
                     model = AutoModelForCausalLM.from_config(config_copy)
+                logger.info(
+                    f"[INIT_DIAG] MetaInitMode model construction complete"
+                )
 
                 memo = dict()
 
@@ -248,24 +254,37 @@ class ModelLoader:
                         memo[t] = torch.empty_like(t, device='cuda')
                     return memo[t]
 
+                logger.info(
+                    f"[INIT_DIAG] Starting model._apply(init_meta_tensor)")
                 model._apply(init_meta_tensor)
+                logger.info(
+                    f"[INIT_DIAG] model._apply(init_meta_tensor) complete")
                 config = config_copy
 
             except Exception:
                 logger.info(
                     f"Fallback to regular model init: {traceback.format_exc(limit=10)}\n"
                 )
+                logger.info(
+                    f"[INIT_DIAG] Starting fallback (non-meta) model construction"
+                )
                 model = AutoModelForCausalLM.from_config(config)
+                logger.info(
+                    f"[INIT_DIAG] Fallback model construction complete"
+                )
             finally:
                 if 'memo' in locals():
                     del memo
 
+            logger.info(f"[INIT_DIAG] Starting model.to('cuda')")
             model.to("cuda")
+            logger.info(f"[INIT_DIAG] model.to('cuda') complete")
             rank_model_storage = get_rank_model_storage(model)
             logger.info(
                 f"Use {rank_model_storage / (1024**3):.2f} GB for model weights."
             )
             if load_format == LoadFormat.AUTO:
+                logger.info(f"[INIT_DIAG] Starting checkpoint weight loading")
                 if hasattr(model, 'llm_checkpoint_dir'):
                     weights = checkpoint_loader.load_weights(
                         model.llm_checkpoint_dir, mapping=self.mapping)
@@ -277,6 +296,8 @@ class ModelLoader:
                     model, config)
                 self._call_load_weights(model.load_weights, weights,
                                         self.weight_mapper)
+                logger.info(
+                    f"[INIT_DIAG] Checkpoint weight loading complete")
 
                 if self.spec_config is not None and self.spec_config.spec_dec_mode.need_load_draft_weights(
                 ):

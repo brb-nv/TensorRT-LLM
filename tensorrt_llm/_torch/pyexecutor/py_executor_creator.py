@@ -300,7 +300,15 @@ def create_py_executor(
             "when only processing vision encoder inputs.")
 
     mapping = _get_mapping(llm_args.parallel_config.to_mapping())
+    logger.info(
+        f"[INIT_DIAG] create_py_executor: calling Distributed.get "
+        f"(tp={mapping.tp_size}, pp={mapping.pp_size}, cp={mapping.cp_size}, "
+        f"ep={mapping.moe_ep_size})"
+    )
     dist = Distributed.get(mapping)
+    logger.info(
+        f"[INIT_DIAG] create_py_executor: Distributed.get complete"
+    )
 
     vm_pools = {}
     enable_sleep = llm_args.enable_sleep
@@ -343,6 +351,7 @@ def create_py_executor(
                     vm_pools[stage] = memory_pool
                     yield
 
+    logger.info(f"[INIT_DIAG] create_py_executor: creating PyTorchModelEngine")
     with allocation_scope(ExecutorMemoryType.MODEL_ENGINE_MAIN,
                           RestoreMode.PINNED):
         model_engine = PyTorchModelEngine(
@@ -353,6 +362,9 @@ def create_py_executor(
             dist=dist,
             spec_config=spec_config,
         )
+    logger.info(
+        f"[INIT_DIAG] create_py_executor: PyTorchModelEngine created"
+    )
 
     validate_feature_combination(llm_args, model_engine, llm_args.sampler_type)
 

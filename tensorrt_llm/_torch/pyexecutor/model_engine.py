@@ -163,7 +163,13 @@ class PyTorchModelEngine(ModelEngine):
 
         self.mapping = mapping
         if mapping.has_pp():
+            logger.info(
+                f"[INIT_DIAG] PyTorchModelEngine: creating PPComm (COLLECTIVE - NCCL init via MPI)"
+            )
             init_pp_comm(mapping)
+            logger.info(
+                f"[INIT_DIAG] PyTorchModelEngine: init_pp_comm complete"
+            )
         self.dist = dist
         if dist is not None:
             ExpertStatistic.create(self.dist.rank)

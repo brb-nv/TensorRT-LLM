@@ -29,12 +29,18 @@ def get_allreduce_workspace(mapping: Mapping) -> torch.LongTensor:
     allreduce_workspaces = getattr(_thread_local,
                                    f'allreduce_workspaces_{mapping.pp_rank}')
     if mapping not in allreduce_workspaces:
+        logger.info(
+            f"[INIT_DIAG] Allocating allreduce workspace (tp_size={mapping.tp_size}, pp_rank={mapping.pp_rank})"
+        )
         ipc_buffers, workspace = CustomAllReduceHelper.allocate_allreduce_fusion_workspace(
             mapping,
             CustomAllReduceHelper.max_workspace_size_auto(
                 mapping.tp_size, support_deterministic=False),
         )
         allreduce_workspaces[mapping] = (ipc_buffers, workspace)
+        logger.info(
+            f"[INIT_DIAG] Allreduce workspace allocated"
+        )
     return allreduce_workspaces[mapping][1]
 
 
@@ -81,11 +87,16 @@ def get_or_scale_allreduce_mnnvl_workspace(
                                      or 0)
         # Creating the workspace if it doesn't exist
         if mapping not in allreduce_mnnvl_workspaces:
-            # Do the communicator split if there is no communicator in the workspace
-            comm = mpi_comm().Split(
-                int(mapping.pp_rank * mapping.cp_size + mapping.cp_rank),
-                mapping.tp_rank)
-            # Use the predefined buffer size if no buffer size is provided
+            color = int(mapping.pp_rank * mapping.cp_size + mapping.cp_rank)
+            logger.info(
+                f"[INIT_DIAG] MNNVL workspace: entering MPI Split "
+                f"(COLLECTIVE, color={color}, key={mapping.tp_rank}, "
+                f"pp_rank={mapping.pp_rank}, tp_size={mapping.tp_size})"
+            )
+            comm = mpi_comm().Split(color, mapping.tp_rank)
+            logger.info(
+                f"[INIT_DIAG] MNNVL workspace: MPI Split completed"
+            )
             buffer_size_bytes = buffer_size_bytes or init_buffer_size_bytes
             if mapping.tp_rank == 0:
                 logger.debug(
@@ -104,25 +115,38 @@ def get_or_scale_allreduce_mnnvl_workspace(
             )
         # Each workspace contains NUM_LAMPORT_BUFFERS buffers.
         workspace_size_bytes = NUM_LAMPORT_BUFFERS * buffer_size_bytes
-        # Pass the pre-split MPI communicator's Fortran handle to avoid redundant splitting in C++
+        logger.info(
+            f"[INIT_DIAG] MNNVL workspace: creating McastGPUBuffer "
+            f"(tp_size={mapping.tp_size}, tp_rank={mapping.tp_rank}, "
+            f"local_rank={mapping.local_rank}, use_fabric={use_fabric_handle}, "
+            f"size={workspace_size_bytes})"
+        )
         mcast_buf_handle = McastGPUBuffer(
             workspace_size_bytes,
             mapping.tp_size,
             mapping.tp_rank,
             mapping.local_rank,
-            use_fabric_handle,  # whether to use fabric handle or POSIX FD ipc
-            comm.py2f(),  # Fortran handle for the MPI communicator
+            use_fabric_handle,
+            comm.py2f(),
+        )
+        logger.info(
+            f"[INIT_DIAG] MNNVL workspace: McastGPUBuffer created, "
+            f"filling buffer and synchronizing"
         )
 
-        # We use per FP32 element in the buffer for lamport sync
         buffer = mcast_buf_handle.get_uc_buffer(mapping.tp_rank,
                                                 (workspace_size_bytes //
                                                  (torch.float32.itemsize), ),
                                                 torch.float32, 0)
         buffer.fill_(-0.0)
-        # Wait until the initialization is done
         torch.cuda.synchronize()
+        logger.info(
+            f"[INIT_DIAG] MNNVL workspace: entering comm.Barrier"
+        )
         comm.Barrier()
+        logger.info(
+            f"[INIT_DIAG] MNNVL workspace: comm.Barrier complete"
+        )
 
         # This is a buffer to maintain the state of this allreduce Op
         # Should have the same lifetime with self._buffer
@@ -692,8 +716,10 @@ class AllReduce(nn.Module):
 
         self.all_reduce_op = torch.ops.trtllm.allreduce_pg if self._disable_mpi else torch.ops.trtllm.allreduce
         if self.mapping.tp_size > 1:
-            # Initialize Symmetric Memory AllReduce if needed (before workspace allocation)
             if self.strategy == AllReduceStrategy.SYMM_MEM:
+                logger.info(
+                    f"[INIT_DIAG] AllReduce: attempting SymmetricMemoryAllReduce init"
+                )
                 try:
                     symm_mem = SymmetricMemoryAllReduce(
                         self.mapping,
@@ -704,24 +730,18 @@ class AllReduce(nn.Module):
                         logger.info(
                             f"SymmetricMemoryAllReduce (MULTIMEM) is enabled with fallback support for world_size={self.mapping.tp_size}"
                         )
-                        # Keep SYMM_MEM strategy but allocate workspace for fallback to regular allreduce
                     else:
                         logger.info(
                             f"SymmetricMemoryAllReduce is disabled (not supported or unavailable), falling back to AUTO strategy"
                         )
-                        # Fall back to AUTO if SYMM_MEM can't be enabled
                         self.strategy = AllReduceStrategy.AUTO
                 except Exception as e:
                     logger.info(
                         f"Symmetric Memory AllReduce can't be enabled due to {e}, falling back to AUTO strategy"
                     )
                     self.symm_mem_allreduce = None
-                    # Fall back to AUTO if SYMM_MEM initialization fails
                     self.strategy = AllReduceStrategy.AUTO
 
-            # Allocate workspace for strategies that need it
-            # Note: SYMM_MEM now also needs workspace for fallback scenarios (fused ops, etc.)
-            # Only UB doesn't need workspace
             if self.strategy != AllReduceStrategy.UB:
                 if self.strategy == AllReduceStrategy.LOWPRECISION:
                     allocate_low_presicion_allreduce_workspace(self.mapping)
@@ -730,18 +750,28 @@ class AllReduce(nn.Module):
                                          AllReduceStrategy.NCCL_SYMMETRIC):
                     self.workspace = get_allreduce_workspace(self.mapping)
 
-            # Initialize MNNVL if using AUTO or MNNVL strategy
             if self.strategy in (AllReduceStrategy.AUTO,
                                  AllReduceStrategy.MNNVL):
-                # Try to initialize MNNVL
-                if MNNVLAllReduce.is_mnnvl(self.mapping, dtype):
-                    # ALWAYS capture the exception when creating this instance
+                is_mnnvl = MNNVLAllReduce.is_mnnvl(self.mapping, dtype)
+                logger.info(
+                    f"[INIT_DIAG] AllReduce: MNNVL check result={is_mnnvl} "
+                    f"(has_cp={self.mapping.has_cp()}, multi_node={self.mapping.is_multi_node()}, "
+                    f"tp_size={self.mapping.tp_size})"
+                )
+                if is_mnnvl:
                     try:
+                        logger.info(
+                            f"[INIT_DIAG] AllReduce: creating MNNVLAllReduce (COLLECTIVE - MPI Split)"
+                        )
                         self.mnnvl_allreduce = MNNVLAllReduce(
                             self.mapping, dtype) if dtype else None
+                        logger.info(
+                            f"[INIT_DIAG] AllReduce: MNNVLAllReduce created successfully"
+                        )
                     except Exception as e:
-                        logger.debug(
-                            f"MNNVL AllReduce can't be enabled due to {e}.")
+                        logger.info(
+                            f"[INIT_DIAG] AllReduce: MNNVLAllReduce failed: {e}"
+                        )
                         self.mnnvl_allreduce = None
                 else:
                     logger.debug(

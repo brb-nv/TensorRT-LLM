@@ -65,6 +65,7 @@ class Logger(metaclass=Singleton):
         handler.setFormatter(
             logging.Formatter(fmt="[%(asctime)s] %(message)s", datefmt="%m/%d/%Y-%H:%M:%S")
         )
+        handler.formatter.default_msec_format = '%s.%03d'
         self._logger.addHandler(handler)
         self._logger.setLevel(severity_map[min_severity][1])
         self._polygraphy_logger = G_LOGGER
