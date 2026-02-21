@@ -239,19 +239,15 @@ void McastDeviceMemory::allocMnMcastMem(size_t bufSize)
     }
     TLLM_CU_CHECK(cuMemSetAccess(ptr, mAllocationSize * mGroupSize, &accessDesc, 1));
 
-    TLLM_LOG_INFO("[INIT_DIAG] [McastMnAlloc] WorldRank %d, GroupRank %u/%u: step 9a - cuMemAddressReserve MC (+%lldms)",
-        world_rank, mGroupRank, mGroupSize, elapsed_ms());
-    TLLM_CU_CHECK(cuMemAddressReserve(&mMcPtr, mAllocationSize, mc_granularity, 0ULL, 0));
-    TLLM_LOG_INFO("[INIT_DIAG] [McastMnAlloc] WorldRank %d, GroupRank %u/%u: step 9b - cuMemMap MC (+%lldms)",
-        world_rank, mGroupRank, mGroupSize, elapsed_ms());
-    TLLM_CU_CHECK(cuMemMap(mMcPtr, mAllocationSize, 0, mMcHandle, 0));
-    TLLM_LOG_INFO("[INIT_DIAG] [McastMnAlloc] WorldRank %d, GroupRank %u/%u: step 9c - cuMemSetAccess MC (+%lldms)",
-        world_rank, mGroupRank, mGroupSize, elapsed_ms());
-    TLLM_CU_CHECK(cuMemSetAccess(mMcPtr, mAllocationSize, &accessDesc, 1));
-
-    TLLM_LOG_INFO("[INIT_DIAG] [McastMnAlloc] WorldRank %d, GroupRank %u/%u: step 10 - cuMulticastBindMem (+%lldms)",
+    TLLM_LOG_INFO("[INIT_DIAG] [McastMnAlloc] WorldRank %d, GroupRank %u/%u: step 9 - cuMulticastBindMem (barrier) (+%lldms)",
         world_rank, mGroupRank, mGroupSize, elapsed_ms());
     TLLM_CU_CHECK(cuMulticastBindMem(mMcHandle, 0, mUcHandles[mGroupRank], 0 /*memOffset*/, mAllocationSize, 0));
+
+    TLLM_LOG_INFO("[INIT_DIAG] [McastMnAlloc] WorldRank %d, GroupRank %u/%u: step 10 - cuMemMap MC (+%lldms)",
+        world_rank, mGroupRank, mGroupSize, elapsed_ms());
+    TLLM_CU_CHECK(cuMemAddressReserve(&mMcPtr, mAllocationSize, mc_granularity, 0ULL, 0));
+    TLLM_CU_CHECK(cuMemMap(mMcPtr, mAllocationSize, 0, mMcHandle, 0));
+    TLLM_CU_CHECK(cuMemSetAccess(mMcPtr, mAllocationSize, &accessDesc, 1));
 
     TLLM_LOG_INFO("[INIT_DIAG] [McastMnAlloc] WorldRank %d, GroupRank %u/%u: complete (total %lldms)",
         world_rank, mGroupRank, mGroupSize, elapsed_ms());
