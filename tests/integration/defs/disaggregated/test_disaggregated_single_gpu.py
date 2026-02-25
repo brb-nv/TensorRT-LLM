@@ -510,5 +510,115 @@ def test_disaggregated_spec_dec_batch_slot_limit(model, spec_dec_model_path,
             print("All workers terminated.")
 
 
+@pytest.mark.parametrize("model", ["TinyLlama-1.1B-Chat-v1.0"])
+@pytest.mark.parametrize("generation_overlap", [False, True])
+def test_disaggregated_logprobs(model, generation_overlap):
+    """Verify that logprobs propagate correctly from prefill to decode.
+
+    Without the fix, this fails in one of two ways:
+      1. AttributeError: 'LogProbStorage' has no attribute 'cum_log_probs'
+         (generation_only worker crashes accessing uninitialised storage).
+      2. The first generated token's logprob is missing because
+         first_gen_log_probs was not carried in DisaggregatedParams.
+    """
+    worker_pytorch_configs = [
+        dict(disable_overlap_scheduler=True),
+        dict(disable_overlap_scheduler=not generation_overlap),
+    ]
+
+    kv_cache_configs = [KvCacheConfig(max_tokens=2048 * 8) for _ in range(2)]
+    cache_transceiver_configs = [
+        CacheTransceiverConfig(backend="DEFAULT") for _ in range(2)
+    ]
+    model_names = [model_path(model) for _ in range(2)]
+    ranks = [0, 1]
+    worker_args = list(
+        zip(kv_cache_configs, cache_transceiver_configs, worker_pytorch_configs,
+            model_names, ranks))
+
+    port_name = mpi_publish_name()
+    max_tokens = 10
+    prompt = "What is the capital of Germany?"
+
+    with MPIPoolExecutor(max_workers=2,
+                         env={
+                             "UCX_TLS": "^ib,gdr_copy",
+                             "UCX_MM_ERROR_HANDLING": "y"
+                         }) as executor:
+        futures = []
+        try:
+            for worker_arg in worker_args:
+                future = executor.submit(worker_entry_point, *worker_arg)
+                futures.append(future)
+        except Exception as e:
+            print(f"Error in worker {worker_arg}: {e}")
+            raise e
+
+        intercomm = None
+        try:
+            intercomm = mpi_initialize_intercomm(port_name)
+            for _ in range(2):
+                intercomm.recv(tag=MPI_READY)
+
+            # --- Context-only phase (prefill) with logprobs ---
+            ctx_requests = [(prompt,
+                             SamplingParams(max_tokens=max_tokens,
+                                           ignore_eos=True,
+                                           logprobs=1),
+                             DisaggregatedParams(request_type="context_only"))]
+
+            ctx_responses = send_requests_to_worker(ctx_requests, 0, intercomm)
+            ctx_output = ctx_responses[0][0]
+
+            assert ctx_output.disaggregated_params is not None
+            assert ctx_output.disaggregated_params.request_type == "context_only"
+            assert len(ctx_output.token_ids) == 1
+
+            # The fix populates first_gen_log_probs in disaggregated_params.
+            dp = ctx_output.disaggregated_params
+            assert dp.first_gen_log_probs is not None, (
+                "first_gen_log_probs should be populated by the context phase")
+            assert len(dp.first_gen_log_probs) >= 1
+            for lp_entry in dp.first_gen_log_probs:
+                assert isinstance(lp_entry, dict)
+                for token_id, logprob_obj in lp_entry.items():
+                    assert isinstance(token_id, int)
+                    assert logprob_obj.logprob <= 0.0, (
+                        "Log probabilities must be non-positive")
+
+            # --- Generation-only phase (decode) with logprobs ---
+            dp.request_type = "generation_only"
+            gen_requests = [(prompt,
+                             SamplingParams(max_tokens=max_tokens,
+                                           ignore_eos=True,
+                                           logprobs=1), dp)]
+
+            gen_responses = send_requests_to_worker(gen_requests, 1, intercomm)
+            gen_output = gen_responses[0][0]
+
+            # Without the fix this either crashes (AttributeError) or returns
+            # fewer logprobs than tokens (missing first token).
+            assert gen_output.logprobs is not None, (
+                "Generation phase should return logprobs")
+            assert len(gen_output.logprobs) == len(gen_output.token_ids), (
+                f"Expected one logprob per token: got {len(gen_output.logprobs)}"
+                f" logprobs for {len(gen_output.token_ids)} tokens")
+
+            for pos_idx, lp_entry in enumerate(gen_output.logprobs):
+                assert isinstance(lp_entry, dict), (
+                    f"logprobs[{pos_idx}] should be a dict")
+                for token_id, logprob_obj in lp_entry.items():
+                    assert isinstance(token_id, int)
+                    assert logprob_obj.logprob <= 0.0
+
+        except Exception as e:
+            print(f"Exception encountered: {e}", flush=True)
+            raise e
+        finally:
+            mpi_send_termination_request(intercomm)
+            for future in futures:
+                future.result()
+
+
 if __name__ == "__main__":
     pytest.main()
