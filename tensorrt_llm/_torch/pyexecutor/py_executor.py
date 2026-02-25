@@ -2746,6 +2746,11 @@ class PyExecutor:
                 if (disagg_params is not None
                         and getattr(disagg_params, 'first_gen_log_probs', None)
                         is not None):
+                    if beam_width != 1:
+                        raise ValueError(
+                            "first_gen_log_probs transfer currently assumes "
+                            "beam_width == 1; beam search is not supported "
+                            "with disaggregated logprobs propagation.")
                     req.py_result.append_log_probs(
                         [disagg_params.first_gen_log_probs])
 

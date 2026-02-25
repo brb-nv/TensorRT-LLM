@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 """
 TRT-LLM logprob repro — disaggregated serving bug reproduction.
 
@@ -9,6 +11,7 @@ This file serves dual purpose:
 
 import argparse
 import base64
+import os
 import threading
 from dataclasses import dataclass, field
 
@@ -23,6 +26,9 @@ from tensorrt_llm.disaggregated_params import DisaggregatedParams
 PROMPT = "<|user|>\nWhat is the capital of Poland?</s>\n<|assistant|>\n"
 PREFILL_URL = "http://localhost:8000/prefill"
 CACHE_TRANSCEIVER = {"backend": "UCX", "max_tokens_in_buffer": 2048}
+MODEL_PATH = os.getenv(
+    "TRTLLM_MODEL_PATH",
+    "/home/scratch.bbuddharaju_gpu/random/hf_models/TinyLlama-1.1B-Chat-v1.0")
 
 
 # ---------------------------------------------------------------------------
@@ -48,7 +54,7 @@ class PrefillResponse(BaseModel):
     first_gen_tokens: list[int]
     ctx_request_id: int
     opaque_state: str  # base64-encoded bytes
-    first_gen_log_probs: list[SerializedLogprob] | None = None
+    first_gen_log_probs: list[list[SerializedLogprob]] | None = None
 
 
 class PrefillEngine:
@@ -61,7 +67,7 @@ class PrefillEngine:
     def start(self):
         self._start_http_server()
         self.llm = LLM(
-            model="/home/scratch.bbuddharaju_gpu/random/hf_models/TinyLlama-1.1B-Chat-v1.0",
+            model=MODEL_PATH,
             disable_overlap_scheduler=True,
             cache_transceiver_config=CACHE_TRANSCEIVER,
         )
@@ -78,6 +84,8 @@ class PrefillEngine:
 
         @app.post("/prefill")
         async def prefill(req: PrefillRequest) -> PrefillResponse:
+            if not self.ready or self.llm is None:
+                return JSONResponse({"status": "not ready"}, status_code=503)
             return await self._generate_local_prefill(req)
 
         thread = threading.Thread(
@@ -106,11 +114,10 @@ class PrefillEngine:
         logits_info = f"shape={tuple(logits.shape)}" if logits is not None else "None"
         serialized_lp = None
         if dp.first_gen_log_probs:
-            serialized_lp = [
+            serialized_lp = [[
                 SerializedLogprob(token_id=tid, logprob=lp.logprob, rank=lp.rank)
-                for entry in dp.first_gen_log_probs
                 for tid, lp in entry.items()
-            ]
+            ] for entry in dp.first_gen_log_probs]
         print(f"  [prefill] tokens={len(out.token_ids)}, logits={logits_info}, "
               f"logprobs={out.logprobs}, first_gen_log_probs={serialized_lp}, text={out.text!r}")
         return PrefillResponse(
@@ -132,7 +139,7 @@ class Engine:
     llm: LLM = field(default=None, init=False)
 
     def start(self):
-        self.llm = LLM(model="/home/scratch.bbuddharaju_gpu/random/hf_models/TinyLlama-1.1B-Chat-v1.0", cache_transceiver_config=CACHE_TRANSCEIVER)
+        self.llm = LLM(model=MODEL_PATH, cache_transceiver_config=CACHE_TRANSCEIVER)
 
     def shutdown(self):
         self.llm.shutdown()
@@ -175,10 +182,11 @@ class Engine:
 
         first_gen_log_probs = None
         if data.get("first_gen_log_probs"):
-            first_gen_log_probs = [
-                {entry["token_id"]: Logprob(logprob=entry["logprob"], rank=entry.get("rank"))}
-                for entry in data["first_gen_log_probs"]
-            ]
+            first_gen_log_probs = [{
+                entry["token_id"]:
+                Logprob(logprob=entry["logprob"], rank=entry.get("rank"))
+                for entry in token_topk
+            } for token_topk in data["first_gen_log_probs"]]
 
         return DisaggregatedParams(
             request_type="generation_only",

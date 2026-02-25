@@ -297,31 +297,32 @@ class GenerationResultBase:
                     # Therefore, we treat extra logprobs/logits as expected and only consume what's needed.
                     output.logprobs = output.logprobs[:output.length]
 
-            # In disaggregated generation_only mode, the first token comes from
-            # the prefill phase without a logprob, so expect one fewer entry.
-            is_generation_only = (
-                self.disaggregated_params is not None
-                and self.disaggregated_params.request_type
-                == "generation_only")
-            if is_generation_only:
-                assert len(output.logprobs) >= output.length - 1, (
-                    f"logprobs length: {len(output.logprobs)} < "
-                    f"output.length - 1: {output.length - 1}")
-                if len(output.logprobs) < output.length:
-                    logger.warning(
-                        "Disaggregated serving: logprobs for the first "
-                        "generated token were not transferred from the "
-                        "context server. The response will contain %d "
-                        "logprob entries instead of %d. Ensure "
-                        "first_gen_log_probs is propagated in "
-                        "DisaggregatedParams to avoid incomplete results.",
-                        len(output.logprobs), output.length)
-            else:
-                assert len(
-                    output.logprobs
-                ) == output.length, (
-                    f"logprobs length: {len(output.logprobs)} != "
-                    f"output.length: {output.length}")
+            if finish_reasons[
+                    src_idx] != tllm.FinishReason.CANCELLED:
+                is_generation_only = (
+                    self.disaggregated_params is not None
+                    and self.disaggregated_params.request_type
+                    == "generation_only")
+                if is_generation_only:
+                    assert len(output.logprobs) >= output.length - 1, (
+                        f"logprobs length: {len(output.logprobs)} < "
+                        f"output.length - 1: {output.length - 1}")
+                    if len(output.logprobs) < output.length:
+                        logger.warning(
+                            "Disaggregated serving: logprobs for the first "
+                            "generated token were not transferred from the "
+                            "context server. The response will contain %d "
+                            "logprob entries instead of %d. Ensure "
+                            "first_gen_log_probs is propagated in "
+                            "DisaggregatedParams to avoid incomplete "
+                            "results.",
+                            len(output.logprobs), output.length)
+                else:
+                    assert len(
+                        output.logprobs
+                    ) == output.length, (
+                        f"logprobs length: {len(output.logprobs)} != "
+                        f"output.length: {output.length}")
 
         if response_tensors.generation_logits is not None:
             output.generation_logits = response_tensors.generation_logits[
@@ -476,10 +477,13 @@ class GenerationResultBase:
             # For context_only responses, carry the first gen token's logprobs
             # so the generation_only side can prepend them.
             if (context_phase_params is not None
-                    and self._disaggregated_params is not None
-                    and self._outputs[0].logprobs):
-                self._disaggregated_params.first_gen_log_probs = list(
-                    self._outputs[0].logprobs)
+                    and self._disaggregated_params is not None):
+                first_gen_lp = [
+                    out.logprobs[0] for out in self._outputs if out.logprobs
+                ]
+                if first_gen_lp:
+                    self._disaggregated_params.first_gen_log_probs = \
+                        first_gen_lp
 
             if response_result.context_logits is not None:
                 self._context_logits = response_result.context_logits

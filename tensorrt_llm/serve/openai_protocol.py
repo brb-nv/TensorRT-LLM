@@ -1091,27 +1091,48 @@ def _serialize_first_gen_log_probs(
     first_gen_log_probs: Optional[list],
 ) -> Optional[List]:
     """Serialize list[dict[int, Logprob]] to JSON-safe list[list[dict]]."""
-    if not first_gen_log_probs:
+    if first_gen_log_probs is None:
         return None
-    return [[{
-        "token_id": tid,
-        "logprob": lp.logprob,
-        "rank": lp.rank
-    } for tid, lp in pos.items()] for pos in first_gen_log_probs]
+    if not isinstance(first_gen_log_probs, list):
+        raise ValueError("first_gen_log_probs must be a list")
+    result = []
+    for i, pos in enumerate(first_gen_log_probs):
+        if not isinstance(pos, dict):
+            raise ValueError(
+                f"first_gen_log_probs[{i}] must be a dict, got {type(pos)}")
+        result.append([{
+            "token_id": tid,
+            "logprob": lp.logprob,
+            "rank": lp.rank
+        } for tid, lp in pos.items()])
+    return result
 
 
 def _deserialize_first_gen_log_probs(
     serialized: Optional[List],
 ) -> Optional[list]:
     """Deserialize JSON list[list[dict]] back to list[dict[int, Logprob]]."""
-    if not serialized:
+    if serialized is None:
         return None
     from tensorrt_llm.executor.result import Logprob
-    return [{
-        item["token_id"]: Logprob(logprob=item["logprob"],
-                                  rank=item.get("rank"))
-        for item in pos
-    } for pos in serialized]
+    result = []
+    for i, pos in enumerate(serialized):
+        if not isinstance(pos, list):
+            raise ValueError(
+                f"first_gen_log_probs[{i}] must be a list, got {type(pos)}")
+        token_map = {}
+        for j, item in enumerate(pos):
+            if not isinstance(item, dict):
+                raise ValueError(
+                    f"first_gen_log_probs[{i}][{j}] must be a dict")
+            if "token_id" not in item or "logprob" not in item:
+                raise ValueError(
+                    f"first_gen_log_probs[{i}][{j}] missing required keys "
+                    "'token_id' and/or 'logprob'")
+            token_map[item["token_id"]] = Logprob(
+                logprob=item["logprob"], rank=item.get("rank"))
+        result.append(token_map)
+    return result
 
 
 def to_disaggregated_params(
