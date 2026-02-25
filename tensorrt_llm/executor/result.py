@@ -290,15 +290,28 @@ class GenerationResultBase:
 
             # overcome some WAR in the cpp executor
             if finish_reasons[
-                    src_idx] != tllm.FinishReason.CANCELLED and self.use_trtllm_sampler:
-                # Check if logprobs is a list (not a dict or other structure)
+                    src_idx] != tllm.FinishReason.CANCELLED:
                 if len(output.logprobs) > output.length:
                     # LlmResult holds a reference to LogProbStorage, which may be updated by the worker before the result is serialized.
                     # Therefore, we treat extra logprobs/logits as expected and only consume what's needed.
                     output.logprobs = output.logprobs[:output.length]
-            assert len(
-                output.logprobs
-            ) == output.length, f"logprobs length: {len(output.logprobs)} != output.length: {output.length}"
+
+            # In disaggregated generation_only mode, the first token comes from
+            # the prefill phase without a logprob, so expect one fewer entry.
+            is_generation_only = (
+                self.disaggregated_params is not None
+                and self.disaggregated_params.request_type
+                == "generation_only")
+            if is_generation_only:
+                assert len(output.logprobs) >= output.length - 1, (
+                    f"logprobs length: {len(output.logprobs)} < "
+                    f"output.length - 1: {output.length - 1}")
+            else:
+                assert len(
+                    output.logprobs
+                ) == output.length, (
+                    f"logprobs length: {len(output.logprobs)} != "
+                    f"output.length: {output.length}")
 
         if response_tensors.generation_logits is not None:
             output.generation_logits = response_tensors.generation_logits[
