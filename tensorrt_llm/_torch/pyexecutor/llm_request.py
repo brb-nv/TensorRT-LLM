@@ -472,8 +472,7 @@ class PyResult:
 
     @property
     def cum_log_probs(self) -> list[float] | None:
-        if not self._log_probs or not hasattr(self._log_probs,
-                                              'cum_log_probs'):
+        if not self._log_probs or not hasattr(self._log_probs, 'cum_log_probs'):
             return None
         return self._log_probs.cum_log_probs
 

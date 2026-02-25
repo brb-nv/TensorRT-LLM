@@ -1,7 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""
-TRT-LLM logprob repro — disaggregated serving bug reproduction.
+"""TRT-LLM logprob repro — disaggregated serving bug reproduction.
 
 This file serves dual purpose:
   - `python repro.py prefill`  — starts a FastAPI prefill server (context_only)
@@ -20,6 +19,7 @@ import uvicorn
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
+
 from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm.disaggregated_params import DisaggregatedParams
 
@@ -27,13 +27,14 @@ PROMPT = "<|user|>\nWhat is the capital of Poland?</s>\n<|assistant|>\n"
 PREFILL_URL = "http://localhost:8000/prefill"
 CACHE_TRANSCEIVER = {"backend": "UCX", "max_tokens_in_buffer": 2048}
 MODEL_PATH = os.getenv(
-    "TRTLLM_MODEL_PATH",
-    "/home/scratch.bbuddharaju_gpu/random/hf_models/TinyLlama-1.1B-Chat-v1.0")
+    "TRTLLM_MODEL_PATH", "/home/scratch.bbuddharaju_gpu/random/hf_models/TinyLlama-1.1B-Chat-v1.0"
+)
 
 
 # ---------------------------------------------------------------------------
 # Prefill server (runs in the prefill container)
 # ---------------------------------------------------------------------------
+
 
 class PrefillRequest(BaseModel):
     prompt: str
@@ -50,10 +51,11 @@ class SerializedLogprob(BaseModel):
 
 class PrefillResponse(BaseModel):
     """Serialized DisaggregatedParams from TRT-LLM context_only result."""
+
     request_type: str
     first_gen_tokens: list[int]
     ctx_request_id: int
-    opaque_state: str  # base64-encoded bytes
+    opaque_state: str  # Base64-encoded bytes.
     first_gen_log_probs: list[list[SerializedLogprob]] | None = None
 
 
@@ -89,7 +91,8 @@ class PrefillEngine:
             return await self._generate_local_prefill(req)
 
         thread = threading.Thread(
-            target=uvicorn.run, args=(app,),
+            target=uvicorn.run,
+            args=(app,),
             kwargs={"host": "0.0.0.0", "port": 8000, "log_level": "info"},
             daemon=True,
         )
@@ -114,12 +117,17 @@ class PrefillEngine:
         logits_info = f"shape={tuple(logits.shape)}" if logits is not None else "None"
         serialized_lp = None
         if dp.first_gen_log_probs:
-            serialized_lp = [[
-                SerializedLogprob(token_id=tid, logprob=lp.logprob, rank=lp.rank)
-                for tid, lp in entry.items()
-            ] for entry in dp.first_gen_log_probs]
-        print(f"  [prefill] tokens={len(out.token_ids)}, logits={logits_info}, "
-              f"logprobs={out.logprobs}, first_gen_log_probs={serialized_lp}, text={out.text!r}")
+            serialized_lp = [
+                [
+                    SerializedLogprob(token_id=tid, logprob=lp.logprob, rank=lp.rank)
+                    for tid, lp in entry.items()
+                ]
+                for entry in dp.first_gen_log_probs
+            ]
+        print(
+            f"  [prefill] tokens={len(out.token_ids)}, logits={logits_info}, "
+            f"logprobs={out.logprobs}, first_gen_log_probs={serialized_lp}, text={out.text!r}"
+        )
         return PrefillResponse(
             request_type="context_only",
             first_gen_tokens=dp.first_gen_tokens,
@@ -133,9 +141,11 @@ class PrefillEngine:
 # Decode engine (runs in the decode container)
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class Engine:
     """Wraps TRT-LLM LLM for decode. Supports local (agg) and remote prefill (disagg)."""
+
     llm: LLM = field(default=None, init=False)
 
     def start(self):
@@ -159,10 +169,15 @@ class Engine:
 
     async def _generate_with_remote_prefill(self, sp: SamplingParams):
         dp = await self._remote_prefill(sp)
-        print(f"  remote prefill returned: request_type={dp.request_type}, "
-              f"first_gen_tokens={dp.first_gen_tokens}, ctx_request_id={dp.ctx_request_id}")
+        print(
+            f"  remote prefill returned: request_type={dp.request_type}, "
+            f"first_gen_tokens={dp.first_gen_tokens}, ctx_request_id={dp.ctx_request_id}"
+        )
         result = self.llm.generate_async(
-            PROMPT, sampling_params=sp, streaming=True, disaggregated_params=dp,
+            PROMPT,
+            sampling_params=sp,
+            streaming=True,
+            disaggregated_params=dp,
         )
         async for _ in result:
             yield result.outputs[0]
@@ -171,22 +186,27 @@ class Engine:
         from tensorrt_llm.executor.result import Logprob
 
         async with httpx.AsyncClient(timeout=120) as client:
-            resp = await client.post(PREFILL_URL, json={
-                "prompt": PROMPT,
-                "max_tokens": sp.max_tokens,
-                "logprobs": sp.logprobs,
-                "return_generation_logits": sp.return_generation_logits,
-            })
+            resp = await client.post(
+                PREFILL_URL,
+                json={
+                    "prompt": PROMPT,
+                    "max_tokens": sp.max_tokens,
+                    "logprobs": sp.logprobs,
+                    "return_generation_logits": sp.return_generation_logits,
+                },
+            )
             resp.raise_for_status()
             data = resp.json()
 
         first_gen_log_probs = None
         if data.get("first_gen_log_probs"):
-            first_gen_log_probs = [{
-                entry["token_id"]:
-                Logprob(logprob=entry["logprob"], rank=entry.get("rank"))
-                for entry in token_topk
-            } for token_topk in data["first_gen_log_probs"]]
+            first_gen_log_probs = [
+                {
+                    entry["token_id"]: Logprob(logprob=entry["logprob"], rank=entry.get("rank"))
+                    for entry in token_topk
+                }
+                for token_topk in data["first_gen_log_probs"]
+            ]
 
         return DisaggregatedParams(
             request_type="generation_only",
@@ -213,23 +233,29 @@ def engine():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("tag,remote_prefill,sp", [
-    # TEHSE SUCCEED
-    ("agg_logits",      False, SamplingParams(max_tokens=20, return_generation_logits=True)),
-    ("disagg_logits",   True,  SamplingParams(max_tokens=20, return_generation_logits=True)),
-    ("agg_logprobs",    False, SamplingParams(max_tokens=20, logprobs=1)),
-
-    # THE ONE BELOW FAILS WITH " AttributeError: 'LogProbStorage' object has no attribute 'cum_log_probs'" !!
-    ("disagg_logprobs", True,  SamplingParams(max_tokens=20, logprobs=1)),
-], ids=["agg_logits", "disagg_logits", "agg_logprobs", "disagg_logprobs"])
+@pytest.mark.parametrize(
+    "tag,remote_prefill,sp",
+    [
+        # These succeed.
+        ("agg_logits", False, SamplingParams(max_tokens=20, return_generation_logits=True)),
+        ("disagg_logits", True, SamplingParams(max_tokens=20, return_generation_logits=True)),
+        ("agg_logprobs", False, SamplingParams(max_tokens=20, logprobs=1)),
+        # Without the fix, this fails with:
+        # AttributeError: 'LogProbStorage' object has no attribute 'cum_log_probs'.
+        ("disagg_logprobs", True, SamplingParams(max_tokens=20, logprobs=1)),
+    ],
+    ids=["agg_logits", "disagg_logits", "agg_logprobs", "disagg_logprobs"],
+)
 async def test_streaming(engine, tag, remote_prefill, sp):
     chunk_count = 0
     async for out in engine.generate_async(sp, remote_prefill=remote_prefill):
         chunk_count += 1
         logits = out.generation_logits
         logits_info = f"shape={tuple(logits.shape)}" if logits is not None else "None"
-        print(f"  [{tag}] tokens={len(out.token_ids)}, logits={logits_info}, "
-              f"logprobs={out.logprobs}, text={out.text!r}")
+        print(
+            f"  [{tag}] tokens={len(out.token_ids)}, logits={logits_info}, "
+            f"logprobs={out.logprobs}, text={out.text!r}"
+        )
     assert chunk_count > 0, "Expected at least one streaming chunk"
 
 
@@ -249,7 +275,17 @@ if __name__ == "__main__":
         threading.Event().wait()
     else:
         import sys
-        sys.exit(pytest.main([__file__, "-v", "-s",
-                              "-W", "ignore::DeprecationWarning",
-                              "-W", "ignore::pydantic.warnings.PydanticDeprecatedSince20"]))
 
+        sys.exit(
+            pytest.main(
+                [
+                    __file__,
+                    "-v",
+                    "-s",
+                    "-W",
+                    "ignore::DeprecationWarning",
+                    "-W",
+                    "ignore::pydantic.warnings.PydanticDeprecatedSince20",
+                ]
+            )
+        )

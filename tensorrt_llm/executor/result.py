@@ -290,19 +290,16 @@ class GenerationResultBase:
                 output.logprobs += response_tensors.log_probs[src_idx]
 
             # overcome some WAR in the cpp executor
-            if finish_reasons[
-                    src_idx] != tllm.FinishReason.CANCELLED:
+            if finish_reasons[src_idx] != tllm.FinishReason.CANCELLED:
                 if len(output.logprobs) > output.length:
                     # LlmResult holds a reference to LogProbStorage, which may be updated by the worker before the result is serialized.
                     # Therefore, we treat extra logprobs/logits as expected and only consume what's needed.
                     output.logprobs = output.logprobs[:output.length]
 
-            if finish_reasons[
-                    src_idx] != tllm.FinishReason.CANCELLED:
-                is_generation_only = (
-                    self.disaggregated_params is not None
-                    and self.disaggregated_params.request_type
-                    == "generation_only")
+            if finish_reasons[src_idx] != tllm.FinishReason.CANCELLED:
+                is_generation_only = (self.disaggregated_params is not None
+                                      and self.disaggregated_params.request_type
+                                      == "generation_only")
                 if is_generation_only:
                     assert len(output.logprobs) >= output.length - 1, (
                         f"logprobs length: {len(output.logprobs)} < "
@@ -315,12 +312,9 @@ class GenerationResultBase:
                             "logprob entries instead of %d. Ensure "
                             "first_gen_log_probs is propagated in "
                             "DisaggregatedParams to avoid incomplete "
-                            "results.",
-                            len(output.logprobs), output.length)
+                            "results.", len(output.logprobs), output.length)
                 else:
-                    assert len(
-                        output.logprobs
-                    ) == output.length, (
+                    assert len(output.logprobs) == output.length, (
                         f"logprobs length: {len(output.logprobs)} != "
                         f"output.length: {output.length}")
 

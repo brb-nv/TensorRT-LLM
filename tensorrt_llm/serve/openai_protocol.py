@@ -1088,8 +1088,7 @@ def decode_opaque_state(encoded_opaque_state: Optional[str]) -> Optional[bytes]:
 
 
 def _serialize_first_gen_log_probs(
-    first_gen_log_probs: Optional[list],
-) -> Optional[List]:
+    first_gen_log_probs: Optional[list], ) -> Optional[List]:
     """Serialize list[dict[int, Logprob]] to JSON-safe list[list[dict]]."""
     if first_gen_log_probs is None:
         return None
@@ -1109,8 +1108,7 @@ def _serialize_first_gen_log_probs(
 
 
 def _deserialize_first_gen_log_probs(
-    serialized: Optional[List],
-) -> Optional[list]:
+    serialized: Optional[List], ) -> Optional[list]:
     """Deserialize JSON list[list[dict]] back to list[dict[int, Logprob]]."""
     if serialized is None:
         return None
@@ -1129,8 +1127,8 @@ def _deserialize_first_gen_log_probs(
                 raise ValueError(
                     f"first_gen_log_probs[{i}][{j}] missing required keys "
                     "'token_id' and/or 'logprob'")
-            token_map[item["token_id"]] = Logprob(
-                logprob=item["logprob"], rank=item.get("rank"))
+            token_map[item["token_id"]] = Logprob(logprob=item["logprob"],
+                                                  rank=item.get("rank"))
         result.append(token_map)
     return result
 
