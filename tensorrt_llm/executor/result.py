@@ -24,6 +24,7 @@ from ..bindings import executor as tllm
 from ..disaggregated_params import DisaggregatedParams
 from ..llmapi.tracer import global_tracer
 from ..llmapi.utils import AsyncQueue, print_traceback_on_error
+from ..logger import logger
 from ..metrics import MetricNames, MetricsCollector, RequestEventTiming
 from ..sampling_params import LogprobParams, SamplingParams
 from .utils import ErrorResponse, has_event_loop, is_llm_response
@@ -306,6 +307,15 @@ class GenerationResultBase:
                 assert len(output.logprobs) >= output.length - 1, (
                     f"logprobs length: {len(output.logprobs)} < "
                     f"output.length - 1: {output.length - 1}")
+                if len(output.logprobs) < output.length:
+                    logger.warning(
+                        "Disaggregated serving: logprobs for the first "
+                        "generated token were not transferred from the "
+                        "context server. The response will contain %d "
+                        "logprob entries instead of %d. Ensure "
+                        "first_gen_log_probs is propagated in "
+                        "DisaggregatedParams to avoid incomplete results.",
+                        len(output.logprobs), output.length)
             else:
                 assert len(
                     output.logprobs

@@ -118,6 +118,7 @@ class ResponseFormat(OpenAIBaseModel):
 class DisaggregatedParams(OpenAIBaseModel):
     request_type: str
     first_gen_tokens: Optional[List[int]] = None
+    first_gen_log_probs: Optional[List] = None
     ctx_request_id: Optional[int] = None
     encoded_opaque_state: Optional[str] = None
     draft_tokens: Optional[List[int]] = None
@@ -1086,6 +1087,33 @@ def decode_opaque_state(encoded_opaque_state: Optional[str]) -> Optional[bytes]:
     return base64.b64decode(encoded_opaque_state)
 
 
+def _serialize_first_gen_log_probs(
+    first_gen_log_probs: Optional[list],
+) -> Optional[List]:
+    """Serialize list[dict[int, Logprob]] to JSON-safe list[list[dict]]."""
+    if not first_gen_log_probs:
+        return None
+    return [[{
+        "token_id": tid,
+        "logprob": lp.logprob,
+        "rank": lp.rank
+    } for tid, lp in pos.items()] for pos in first_gen_log_probs]
+
+
+def _deserialize_first_gen_log_probs(
+    serialized: Optional[List],
+) -> Optional[list]:
+    """Deserialize JSON list[list[dict]] back to list[dict[int, Logprob]]."""
+    if not serialized:
+        return None
+    from tensorrt_llm.executor.result import Logprob
+    return [{
+        item["token_id"]: Logprob(logprob=item["logprob"],
+                                  rank=item.get("rank"))
+        for item in pos
+    } for pos in serialized]
+
+
 def to_disaggregated_params(
         tllm_disagg_params: LlmDisaggregatedParams) -> DisaggregatedParams:
     if tllm_disagg_params is None:
@@ -1093,6 +1121,8 @@ def to_disaggregated_params(
     return DisaggregatedParams(
         request_type=tllm_disagg_params.request_type,
         first_gen_tokens=tllm_disagg_params.first_gen_tokens,
+        first_gen_log_probs=_serialize_first_gen_log_probs(
+            tllm_disagg_params.first_gen_log_probs),
         ctx_request_id=tllm_disagg_params.ctx_request_id,
         encoded_opaque_state=encode_opaque_state(
             tllm_disagg_params.opaque_state),
@@ -1111,6 +1141,8 @@ def to_llm_disaggregated_params(
     return LlmDisaggregatedParams(
         request_type=disaggregated_params.request_type,
         first_gen_tokens=disaggregated_params.first_gen_tokens,
+        first_gen_log_probs=_deserialize_first_gen_log_probs(
+            disaggregated_params.first_gen_log_probs),
         ctx_request_id=disaggregated_params.ctx_request_id,
         opaque_state=decode_opaque_state(
             disaggregated_params.encoded_opaque_state),
