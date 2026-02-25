@@ -463,6 +463,14 @@ class GenerationResultBase:
                                       response_result.sequence_index,
                                       logprobs_result, req_perf_metrics_dict)
 
+            # For context_only responses, carry the first gen token's logprobs
+            # so the generation_only side can prepend them.
+            if (context_phase_params is not None
+                    and self._disaggregated_params is not None
+                    and self._outputs[0].logprobs):
+                self._disaggregated_params.first_gen_log_probs = list(
+                    self._outputs[0].logprobs)
+
             if response_result.context_logits is not None:
                 self._context_logits = response_result.context_logits
 
