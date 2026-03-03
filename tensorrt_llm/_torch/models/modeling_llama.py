@@ -20,6 +20,7 @@ from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_manager import HfLoraLoader
+from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.convert_utils import split_matrix_tp
 
 from ...inputs import (BaseMultimodalDummyInputsBuilder,
@@ -232,6 +233,8 @@ class LlamaAttention(Attention):
         model_config: ModelConfig[LlamaConfig],
         layer_idx: Optional[int] = None,
         use_custom_cublas_mm: bool = False,
+        reduce_output: bool = True,
+        mapping_with_cp: Optional[Mapping] = None,
     ):
         config = model_config.pretrained_config
         super().__init__(
@@ -248,6 +251,8 @@ class LlamaAttention(Attention):
             dtype=config.torch_dtype,
             config=model_config,
             use_custom_cublas_mm=use_custom_cublas_mm,
+            reduce_output=reduce_output,
+            mapping_with_cp=mapping_with_cp,
         )
 
 
@@ -622,6 +627,7 @@ class LlamaDecoderLayer(DecoderLayer):
         model_config: ModelConfig[LlamaConfig],
         layer_idx: int,
         use_custom_cublas_mm: bool = False,
+        mapping_with_cp: Optional[Mapping] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         super().__init__()
         config = model_config.pretrained_config
@@ -635,11 +641,16 @@ class LlamaDecoderLayer(DecoderLayer):
         )
         self.is_nvfp4 = self.is_quanted and model_config.quant_config.quant_mode.has_nvfp4(
         )
-        # Self Attention
+
+        needs_tp_reduce = not self.enable_attention_dp and self.mapping.tp_size > 1
+        needs_cp_reduce = mapping_with_cp is not None and mapping_with_cp.has_cp_helix(
+        )
         self.self_attn = LlamaAttention(
             model_config,
             layer_idx=layer_idx,
             use_custom_cublas_mm=use_custom_cublas_mm,
+            reduce_output=needs_tp_reduce or needs_cp_reduce,
+            mapping_with_cp=mapping_with_cp,
         )
 
         self.mlp = GatedMLP(
@@ -747,9 +758,14 @@ class LlamaDecoderLayer(DecoderLayer):
             self.pre_mlp_fusion_op = AllReduceFusionOp.RESIDUAL_RMS_NORM
             self.post_mlp_fusion_op = AllReduceFusionOp.RESIDUAL_RMS_NORM
 
+        # With helix CP, attention is split across CP ranks for the SAME batch
+        # element, so all-reduce across CP ranks is still required even when
+        # enable_attention_dp is True.
+        has_cp = mapping_with_cp is not None and mapping_with_cp.cp_size > 1
+        can_skip_attn_for_dp = self.enable_attention_dp and not has_cp
         self.disable_attn_allreduce = (self.PRE_MLP_FUSION
                                        or self.mapping.tp_size == 1
-                                       or self.enable_attention_dp)
+                                       or can_skip_attn_for_dp)
         self.disable_mlp_allreduce = (self.POST_MLP_FUSION
                                       or self.mapping.tp_size == 1
                                       or self.enable_attention_dp)
@@ -974,7 +990,9 @@ class Llama4Model(DecoderModel):
 
 class LlamaModel(DecoderModel):
 
-    def __init__(self, model_config: ModelConfig[LlamaConfig]):
+    def __init__(self,
+                 model_config: ModelConfig[LlamaConfig],
+                 mapping_with_cp: Optional[Mapping] = None):
         super().__init__(model_config)
         config = self.model_config.pretrained_config
         self.num_hidden_layers = config.num_hidden_layers
@@ -1026,8 +1044,10 @@ class LlamaModel(DecoderModel):
                 self.embed_tokens.weight.data.copy_(x)
 
         self.layers = nn.ModuleList([
-            LlamaDecoderLayer(model_config, layer_idx,
-                              self.use_custom_cublas_mm)
+            LlamaDecoderLayer(model_config,
+                              layer_idx,
+                              self.use_custom_cublas_mm,
+                              mapping_with_cp=mapping_with_cp)
             for layer_idx in range(config.num_hidden_layers)
         ])
         self.norm = RMSNorm(hidden_size=config.hidden_size,
@@ -1075,7 +1095,28 @@ class LlamaForCausalLM(SpecDecOneEngineForCausalLM[LlamaModel, LlamaConfig]):
         self,
         model_config: ModelConfig[LlamaConfig],
     ):
-        super().__init__(LlamaModel(model_config), model_config)
+        self.mapping_with_cp = None
+        # When helix CP is enabled, CP is relevant only for the attention layer.
+        # For other layers (e.g., MLP), CP ranks are repurposed to TP. We save
+        # the original mapping with CP, repurpose CP to TP for model construction,
+        # and restore the original mapping afterward.
+        if model_config.mapping.has_cp_helix():
+            self.mapping_with_cp = copy.deepcopy(model_config.mapping)
+            model_config._frozen = False
+            model_config.mapping = model_config.mapping.repurpose_helix_cp_to_tp(
+            )
+            model_config._frozen = True
+
+        super().__init__(
+            LlamaModel(model_config, mapping_with_cp=self.mapping_with_cp),
+            model_config,
+        )
+
+        # Restore the original mapping with CP after model construction.
+        if self.mapping_with_cp is not None:
+            model_config._frozen = False
+            model_config.mapping = self.mapping_with_cp
+            model_config._frozen = True
 
     def post_load_weights(self):
         for idx, layer in enumerate(
