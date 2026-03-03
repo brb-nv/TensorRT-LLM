@@ -551,9 +551,9 @@ def create_py_executor(
         cpp_num_chunks = llm_args.cpp_num_chunks
         if enable_cpp:
             logger.info(
-                "Chunked Pipeline Parallelism enabled: using pipeline-aware "
-                "chunking with pp_size=%d, cpp_num_chunks=%s", mapping.pp_size,
-                cpp_num_chunks)
+                f"Chunked Pipeline Parallelism enabled: "
+                f"pp_size={mapping.pp_size}, cpp_num_chunks={cpp_num_chunks}"
+            )
         assert chunk_unit_size is not None, "chunk_unit_size must be set"
         ctx_chunk_config: tuple = (chunking_policy, chunk_unit_size,
                                    mapping.pp_size, enable_cpp,

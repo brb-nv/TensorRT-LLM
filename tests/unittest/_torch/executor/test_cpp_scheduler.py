@@ -206,8 +206,8 @@ class TestPipelineAwareChunkingPolicy:
         assert len(ctx_reqs) == 1
         assert ctx_reqs[0].context_chunk_size <= max_tokens
 
-    def test_small_context_single_chunk(self):
-        """A context smaller than target chunk size should be scheduled in one chunk."""
+    def test_small_context_chunked(self):
+        """A short context is still split into pipeline chunks."""
         pp_size = 4
         unit_size = 64
         config = ContextChunkingConfig(
@@ -224,10 +224,16 @@ class TestPipelineAwareChunkingPolicy:
         req = _make_context_request(1, 100)
         inflight = set()
 
-        ctx_reqs, _ = scheduler.schedule([req], inflight)
-        assert len(ctx_reqs) == 1
-        assert ctx_reqs[0].context_chunk_size == 100
-        assert ctx_reqs[0].is_last_context_chunk
+        chunks = []
+        while req.context_remaining_length > 0:
+            ctx_reqs, _ = scheduler.schedule([req], inflight)
+            assert len(ctx_reqs) == 1
+            chunks.append(ctx_reqs[0].context_chunk_size)
+            req.move_to_next_context_chunk()
+
+        assert sum(chunks) == 100
+        assert chunks[0] == 64
+        assert chunks[0] % unit_size == 0
 
     def test_multiple_requests_pipeline_aware(self):
         """Multiple context requests should each get pipeline-aware chunks."""

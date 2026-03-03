@@ -494,6 +494,7 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
         if max_num_tokens is not None and num_chunked_tokens > (max_num_tokens - batch_num_tokens):
             all_context_requests_fit = False
 
+        # Chunking is proactive for pipeline-aware. Split regardless of full context fitting in token budget.
         if (
             ctx_chunk_config is not None
             and ctx_chunk_config.chunking_policy == ChunkingPolicy.PIPELINE_AWARE
@@ -649,51 +650,48 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
             if capacity is not None:
                 current_capacity -= req.context_chunk_size
 
+    @staticmethod
+    def _ceil_div(a: int, b: int) -> int:
+        return (a + b - 1) // b
+
     def _chunk_pipeline_aware(self, requests: RequestList, capacity: Optional[int], unit_size: int):
         """Chunk context requests for pipeline-parallel overlap.
 
-        Splits each request's remaining context into roughly num_chunks equal
-        chunks (aligned to unit_size) so that successive chunks can be
-        pipelined across PP stages. When cpp_num_chunks is set, it overrides
-        pp_size as the target chunk count, enabling finer-grained pipelining
-        (more chunks than stages for better overlap). The chunk scheduled in
-        this iteration is the first un-consumed portion up to the target size.
-
-        When the total prompt is too short to fill the target number of
-        unit-aligned chunks, the effective chunk count is reduced so that
-        very small contexts are not split unnecessarily.
+        Each request's context is divided into num_chunks pieces (defaulting
+        to cpp_num_chunks or pp_size). Non-final chunk sizes are rounded up
+        to the nearest unit_size (KV cache block boundary); the last chunk
+        absorbs the remainder.
         """
-        target_num_chunks = self.ctx_chunk_config.cpp_num_chunks or max(
+        num_chunks = self.ctx_chunk_config.cpp_num_chunks or max(
             self.ctx_chunk_config.pp_size, 1)
-        current_capacity = capacity if capacity is not None else float("inf")
+        # Pre-align constraints to block boundaries so non-final chunks
+        # are naturally block-aligned without post-hoc re-alignment.
+        budget = (capacity // unit_size) * unit_size if capacity is not None else float("inf")
+        max_ctx = (self.max_context_length // unit_size) * unit_size if self.max_context_length is not None else None
 
         for req in requests:
-            total_prompt_length = req.context_current_position + req.context_remaining_length
-            max_possible_chunks = max(total_prompt_length // unit_size, 1)
-            num_chunks = min(target_num_chunks, max_possible_chunks)
+            total = req.context_current_position + req.context_remaining_length
 
-            if num_chunks <= 1:
-                target_chunk_size = req.context_remaining_length
-            else:
-                target_chunk_size = total_prompt_length // num_chunks
-                target_chunk_size = max(
-                    (target_chunk_size // unit_size) * unit_size, unit_size)
+            # Distribute blocks across pipeline chunks
+            num_blocks = self._ceil_div(total, unit_size)
+            blocks_per_chunk = self._ceil_div(num_blocks, num_chunks)
+            chunk_size = blocks_per_chunk * unit_size
 
-            actual_size = min(target_chunk_size, req.context_remaining_length)
+            # Clamp to remaining tokens and budget; last chunk absorbs remainder
+            chunk_size = min(chunk_size, req.context_remaining_length, budget)
+            if max_ctx is not None:
+                chunk_size = min(chunk_size, max_ctx)
 
-            if current_capacity < actual_size:
-                actual_size = current_capacity
-
-            if self.max_context_length is not None:
-                actual_size = min(self.max_context_length, actual_size)
-
-            if actual_size < req.context_remaining_length:
-                actual_size = (int(actual_size) // unit_size) * unit_size
-
-            req.context_chunk_size = int(actual_size)
+            req.context_chunk_size = chunk_size
+            remaining = req.context_remaining_length - chunk_size
+            logger.info(
+                f"CPP chunk: req_id={req.request_id}, "
+                f"total_prompt={total}, num_chunks={num_chunks}, "
+                f"chunk_size={chunk_size}, "
+                f"remaining={remaining}, is_last={remaining <= 0}")
 
             if capacity is not None:
-                current_capacity -= req.context_chunk_size
+                budget -= chunk_size
 
     def _fit_draft_tokens(self, requests: RequestList, capacity: Optional[int], unit_size: int):
         # Calculate tokens already taken by the batch so far
@@ -1410,6 +1408,10 @@ class SimpleUnifiedScheduler(RequestScheduler):
 
             if enable_cpp:
                 policy_enum = ChunkingPolicy.PIPELINE_AWARE
+                logger.info(
+                    f"Chunked Pipeline Parallelism scheduler active: "
+                    f"pp_size={pp_size}, cpp_num_chunks={cpp_num_chunks}"
+                )
             elif "EQUAL_PROGRESS" in str(input_policy):
                 policy_enum = ChunkingPolicy.EQUAL_PROGRESS
             else:
