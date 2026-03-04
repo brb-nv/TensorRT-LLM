@@ -11,7 +11,8 @@ from transformers.modeling_utils import load_sharded_checkpoint
 from transformers.models.llama4.modeling_llama4 import Llama4MultiModalProjector
 
 from tensorrt_llm._torch.distributed import (AllReduce, AllReduceFusionOp,
-                                             AllReduceParams, MoEAllReduce)
+                                             AllReduceParams, MoEAllReduce,
+                                             cp_allgather)
 from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
     BaseWeightMapper
 from tensorrt_llm._utils import get_sm_version, mpi_disabled
@@ -783,13 +784,14 @@ class LlamaDecoderLayer(DecoderLayer):
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
 
-        hidden_states = self.self_attn(
+        hidden_states, residual = self.self_attn(
             position_ids=position_ids,
             hidden_states=hidden_states,
             attn_metadata=attn_metadata,
             attention_mask=self.attention_mask,
             all_reduce_params=AllReduceParams(
                 enable_allreduce=not self.disable_attn_allreduce),
+            residual=residual,
             **kwargs,
         )
         # Fully Connected
@@ -996,6 +998,7 @@ class LlamaModel(DecoderModel):
         super().__init__(model_config)
         config = self.model_config.pretrained_config
         self.num_hidden_layers = config.num_hidden_layers
+        self.mapping_with_cp = mapping_with_cp
 
         self.use_custom_cublas_mm = get_sm_version() == 121
 
@@ -1084,6 +1087,14 @@ class LlamaModel(DecoderModel):
                 spec_metadata=spec_metadata,
                 lora_params=lora_params,
             )
+
+        if (self.mapping_with_cp is not None
+                and self.mapping_with_cp.has_cp_helix()
+                and self.mapping_with_cp.enable_attention_dp):
+            hidden_states = cp_allgather(hidden_states,
+                                         self.mapping_with_cp,
+                                         dim=0)
+            hidden_states = hidden_states[:attn_metadata.num_tokens]
 
         return hidden_states
 
