@@ -1268,13 +1268,22 @@ class PyExecutor:
         return can_queue
 
     def _prepare_and_schedule_batch(self):
-        new_requests = self._fetch_and_activate_new_requests()
+        _sub = {}
+        def _st(name, func, *args, **kwargs):
+            t0 = time.time()
+            result = func(*args, **kwargs)
+            _sub[name] = time.time() - t0
+            return result
+
+        _t0 = time.time()
+
+        new_requests = _st("fetch_activate", self._fetch_and_activate_new_requests)
         if self.should_stop_processing:
             return None, None
 
         if self.kv_cache_transceiver:
-            self._check_disagg_gen_transfer_status()
-            self._check_kv_transfer_timeout()
+            _st("check_gen_transfer", self._check_disagg_gen_transfer_status)
+            _st("check_kv_timeout", self._check_kv_transfer_timeout)
 
         iter_stats = None
         if self.enable_iter_perf_stats:
@@ -1283,7 +1292,7 @@ class PyExecutor:
                 self.executor_request_queue.
                 get_new_active_requests_queue_latency())
 
-        self._pad_attention_dp_dummy_request()
+        _st("pad_adp_dummy", self._pad_attention_dp_dummy_request)
 
         if self.drafter is not None:
             # Honor permanent disable flag based on rolling acceptance first
@@ -1327,22 +1336,35 @@ class PyExecutor:
             # that speculation is about to happen.
             self._prepare_draft_requests()
 
-        scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs = self._schedule(
-        )
+        scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs = _st(
+            "schedule", self._schedule)
 
         if self.drafter is not None and not self.use_spec_decode:
             for request in scheduled_batch.all_requests():
                 request.py_disable_speculative_decoding = True
 
         if self.kv_cache_transceiver:
-            # For requests that are fitting disagg gen init, also prepare resources for KV cache manager
-            self._prepare_disagg_gen_init(fitting_disagg_gen_init_requests)
+            _st("prepare_disagg_gen_init",
+                self._prepare_disagg_gen_init, fitting_disagg_gen_init_requests)
 
             if num_fitting_reqs == 0 and not fitting_disagg_gen_init_requests:
                 logger.warning(
                     "num_fitting_reqs=0 and fitting_disagg_gen_init_requests is empty, may not have enough kvCache"
                 )
-                self._check_disagg_ctx_cache_transfer_status(1)
+                _st("check_ctx_transfer_status",
+                    self._check_disagg_ctx_cache_transfer_status, 1)
+
+        _t_total = time.time() - _t0
+        PHASE_LOG_THRESHOLD_S = float(os.environ.get("TRTLLM_PHASE_LOG_THRESHOLD_MS", "1000")) / 1000.0
+        if _t_total > PHASE_LOG_THRESHOLD_S:
+            sub_str = ", ".join(f"{k}={v*1000:.1f}ms" for k, v in _sub.items())
+            logger.warning(
+                f"SLOW prepare_and_schedule iter {self.iter_counter} rank {self.dist.rank}: "
+                f"total={_t_total*1000:.1f}ms, "
+                f"num_active={len(self.active_requests)}, "
+                f"new_reqs={len(new_requests)}, "
+                f"scheduled={scheduled_batch.batch_size}, "
+                f"sub-phases: [{sub_str}]")
 
         self.num_scheduled_requests = scheduled_batch.batch_size
         logger.debug(
@@ -1584,6 +1606,7 @@ class PyExecutor:
         torch.cuda.set_device(self.device_id)
         # ensure the context is created, otherwise, some MPI calls will fail.
         CUASSERT(cudart.cudaSetDevice(self.device_id))
+        PHASE_LOG_THRESHOLD_S = float(os.environ.get("TRTLLM_PHASE_LOG_THRESHOLD_MS", "1000")) / 1000.0
         with self._profiler() as profile_step, self.hang_detector:
             iter_start_time = time.time()
             iter_stats = None
@@ -1596,8 +1619,18 @@ class PyExecutor:
                 if self.enable_iter_perf_stats:
                     iter_start_time = time.time()
 
-                scheduled_batch, iter_stats = self._prepare_and_schedule_batch()
-                self._handle_control_request()
+                _phase_times = {}
+                def _timed(name, func, *args, **kwargs):
+                    t0 = time.time()
+                    result = func(*args, **kwargs)
+                    _phase_times[name] = time.time() - t0
+                    return result
+
+                _t_iter_start = time.time()
+
+                scheduled_batch, iter_stats = _timed(
+                    "prepare_and_schedule", self._prepare_and_schedule_batch)
+                _timed("handle_control_request", self._handle_control_request)
 
                 if scheduled_batch is None:
                     break
@@ -1632,14 +1665,15 @@ class PyExecutor:
                         else:
                             can_forward = True
 
-                self._pause_requests(scheduled_batch.paused_requests)
+                _timed("pause_requests", self._pause_requests,
+                       scheduled_batch.paused_requests)
 
                 can_queue = self._can_queue(scheduled_batch)
                 if can_queue:
                     if self.kv_cache_transceiver:
-                        # For generation requests which have completed KV cache transfer
-                        self._prepare_disagg_gen_transmission_complete(
-                            scheduled_batch)
+                        _timed("disagg_gen_trans_complete",
+                               self._prepare_disagg_gen_transmission_complete,
+                               scheduled_batch)
 
                     has_draft_batch = self.drafter is not None and self.previous_batch is not None and self.use_spec_decode and self.drafter.should_forward_draft_model(
                         scheduled_batch)
@@ -1658,9 +1692,12 @@ class PyExecutor:
                             for request in scheduled_batch.all_requests():
                                 request.py_draft_tokens = []
 
-                    self.resource_manager.prepare_resources(scheduled_batch)
+                    _timed("prepare_resources",
+                           self.resource_manager.prepare_resources,
+                           scheduled_batch)
 
-                    self._kv_connector_start_batch(scheduled_batch)
+                    _timed("kv_connector_start",
+                           self._kv_connector_start_batch, scheduled_batch)
 
                 # if using a kv connector, we need to call can_queue again since scheduled_batch might have changed
                 if self.kv_connector_manager:
@@ -1679,8 +1716,9 @@ class PyExecutor:
                     )
 
                     if self.kv_cache_transceiver:
-                        # Return the first token to the client
-                        self._handle_first_token_response(scheduled_batch)
+                        _timed("first_token_response",
+                               self._handle_first_token_response,
+                               scheduled_batch)
 
                     # init_disagg_gen_requests must be before engine forward, where the prev_seq_slot is updated.
                     if self.guided_decoder is not None and self.kv_cache_transceiver:
@@ -1711,12 +1749,16 @@ class PyExecutor:
                     else:
                         previous_tensors_device = self.previous_batch and self.previous_batch.sample_state and self.previous_batch.sample_state.device
 
-                    batch_outputs = self._forward_step(
-                        scheduled_batch, previous_tensors_device,
-                        num_accepted_tokens_device)
+                    batch_outputs = _timed("forward_step",
+                                           self._forward_step,
+                                           scheduled_batch,
+                                           previous_tensors_device,
+                                           num_accepted_tokens_device)
 
                 if self.previous_batch is not None:
-                    self._update_requests(self.previous_batch.sample_state)
+                    _timed("update_requests_prev",
+                           self._update_requests,
+                           self.previous_batch.sample_state)
 
                     if self.block_reuse_enabled and not self.kv_cache_manager.is_vswa and self.kv_cache_transceiver:
                         for req in self.previous_batch.sample_state.scheduled_requests.context_requests:
@@ -1743,8 +1785,9 @@ class PyExecutor:
                         guided_decoder_failed_requests = self.guided_decoder.execute(
                             batch_outputs['logits'])
 
-                    sample_state = self._sample_async(scheduled_batch,
-                                                      batch_outputs)
+                    sample_state = _timed("sample_async",
+                                          self._sample_async,
+                                          scheduled_batch, batch_outputs)
                     assert sample_state is not None, "Sampling failed"
 
                     # Handle guided decoder errors after _sample_async to avoid state conflicts.
@@ -1753,14 +1796,20 @@ class PyExecutor:
                     self._handle_guided_decoder_errors(
                         scheduled_batch, guided_decoder_failed_requests)
 
-                    self._update_request_states(scheduled_batch)
+                    _timed("update_request_states",
+                           self._update_request_states, scheduled_batch)
 
-                    ctx_transmission_reqs = self._send_disagg_ctx_cache(
-                        scheduled_batch.context_requests
-                    ) if self.kv_cache_transceiver else []
+                    if self.kv_cache_transceiver:
+                        ctx_transmission_reqs = _timed(
+                            "send_disagg_ctx_cache",
+                            self._send_disagg_ctx_cache,
+                            scheduled_batch.context_requests)
+                    else:
+                        ctx_transmission_reqs = []
 
                 if self.previous_batch is not None:
-                    self._process_previous_batch()
+                    _timed("process_previous_batch",
+                           self._process_previous_batch)
 
                 if can_queue:
                     if self.enable_iter_perf_stats:
@@ -1774,10 +1823,23 @@ class PyExecutor:
                         ctx_transmission_reqs=ctx_transmission_reqs)
 
                 if self.kv_cache_transceiver and self.ctx_in_transmission_requests:
-                    self._check_kv_transfer_timeout()
-                    self._terminate_disagg_ctx_finished_requests()
+                    _timed("check_kv_timeout",
+                           self._check_kv_transfer_timeout)
+                    _timed("terminate_ctx_finished",
+                           self._terminate_disagg_ctx_finished_requests)
 
-                self._kv_connector_terminate_requests()
+                _timed("kv_connector_terminate",
+                       self._kv_connector_terminate_requests)
+
+                _t_iter_total = time.time() - _t_iter_start
+                if _t_iter_total > PHASE_LOG_THRESHOLD_S:
+                    phase_str = ", ".join(
+                        f"{k}={v*1000:.1f}ms" for k, v in _phase_times.items())
+                    logger.warning(
+                        f"SLOW ITER {self.iter_counter} rank {self.dist.rank}: "
+                        f"total={_t_iter_total*1000:.1f}ms, "
+                        f"num_active={len(self.active_requests)}, "
+                        f"phases: [{phase_str}]")
 
                 self.iter_counter += 1
 

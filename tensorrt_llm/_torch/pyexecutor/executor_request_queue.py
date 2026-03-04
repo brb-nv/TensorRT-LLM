@@ -370,13 +370,20 @@ class ExecutorRequestQueue:
     def _fetch_new_requests_attention_dp(
             self, activate_requests: List[LlmRequest]) -> List[LlmRequest]:
         """Handle attention DP request fetching with load balancing."""
+        _FETCH_THRESHOLD_S = float(os.environ.get("TRTLLM_PHASE_LOG_THRESHOLD_MS", "1000")) / 1000.0
+        _t0 = time.time()
+
         # Get active request counts across all ranks
         all_ranks_num_active_requests = []
         all_ranks_num_active_tokens = []
         num_active_tokens = sum(
             [req.py_orig_prompt_len for req in activate_requests])
+
+        _t_pre_allgather = time.time()
         responses_list = self.dist.tp_allgather(
             [len(activate_requests), num_active_tokens])
+        _t_allgather = time.time() - _t_pre_allgather
+
         for num_active_requests, num_active_tokens in responses_list:
             all_ranks_num_active_requests.append(num_active_requests)
             all_ranks_num_active_tokens.append(num_active_tokens)
@@ -385,16 +392,20 @@ class ExecutorRequestQueue:
         total_max_num_active_requests = self.dist.tp_size * self.max_num_active_requests
 
         # fetch and process requests into waiting queue
+        _t_pre_fetch = time.time()
         new_requests = self._fetch_and_process_requests(
             total_num_active_requests,
             total_max_num_active_requests,
             enable_attention_dp=True,
             all_ranks_num_active_requests=all_ranks_num_active_requests)
+        _t_fetch = time.time() - _t_pre_fetch
 
         # Schedule attention dp requests
+        _t_pre_sched = time.time()
         all_ranks_new_requests = self._schedule_attention_dp_requests(
             new_requests, all_ranks_num_active_requests,
             all_ranks_num_active_tokens)
+        _t_sched = time.time() - _t_pre_sched
         new_requests_cur_rank = all_ranks_new_requests[self.dist.tp_rank]
 
         # Update performance metrics
@@ -405,6 +416,20 @@ class ExecutorRequestQueue:
         # Update counters
         self.num_fetch_requests += len(new_requests)
         self.num_fetch_requests_cur_rank += len(new_requests_cur_rank)
+
+        _t_total = time.time() - _t0
+        if _t_total > _FETCH_THRESHOLD_S:
+            print(
+                f"[SLOW fetch_adp] rank={self.dist.rank}, "
+                f"total={_t_total*1000:.1f}ms, "
+                f"allgather={_t_allgather*1000:.1f}ms, "
+                f"fetch_process={_t_fetch*1000:.1f}ms, "
+                f"schedule_dp={_t_sched*1000:.1f}ms, "
+                f"local_active={len(activate_requests)}, "
+                f"all_active={all_ranks_num_active_requests}, "
+                f"new_reqs={len(new_requests)}, "
+                f"idle={total_num_active_requests == 0}",
+                flush=True)
 
         # Merge requests and add to active list
         new_requests_cur_rank = self._merge_requests(new_requests_cur_rank)

@@ -34,15 +34,16 @@ environment:
   trtllm_repo: "/lustre/fsw/coreai_comparch_trtllm/bbuddharaju/TensorRT_LLM_1.2"
   build_wheel: true
   cuda_architectures: "103-real"
+  # trtllm_wheel_path: "/lustre/fsw/coreai_comparch_trtllm/bbuddharaju/TensorRT_LLM_1.2/build/tensorrt_llm-1.2.0-cp312-cp312-linux_aarch64.whl"
   trtllm_wheel_path: ""
   work_dir: "/lustre/fsw/coreai_comparch_trtllm/bbuddharaju/TensorRT_LLM_1.2/examples/disaggregated/slurm/benchmark"
-  worker_env_var: "TLLM_LOG_LEVEL=INFO TRTLLM_SERVER_DISABLE_GC=1 TRTLLM_WORKER_DISABLE_GC=1 TRTLLM_ENABLE_PDL=1 ENROOT_ALLOW_DEV=yes"
+  worker_env_var: "TLLM_LOG_LEVEL=INFO TRTLLM_SERVER_DISABLE_GC=1 TRTLLM_WORKER_DISABLE_GC=1 TRTLLM_ENABLE_PDL=1 ENROOT_ALLOW_DEV=yes TRTLLM_KVCACHE_TIME_OUTPUT_PATH=/lustre/fsw/coreai_comparch_trtllm/bbuddharaju/kvcache_perf"
   server_env_var: "TRTLLM_SERVER_DISABLE_GC=1"
 
 profiling:
-  nsys_on: false
+  nsys_on: true
   ctx_profile_range: "10-30"
-  gen_profile_range: "200-250"
+  gen_profile_range: "1000-1100"
 
 accuracy:
   enable_accuracy_test: false
@@ -58,8 +59,8 @@ worker_config:
     enable_attention_dp: true
     enable_lm_head_tp_in_adp: true
     pipeline_parallel_size: 1
-    max_batch_size: 1024
-    max_num_tokens: 1024
+    max_batch_size: 256
+    max_num_tokens: 256
     max_seq_len: 2176
     cuda_graph_config:
       enable_padding: true
@@ -73,10 +74,6 @@ worker_config:
       - 64
       - 128
       - 256
-      - 512
-      - 768
-      - 1024
-      - 2048
     print_iter_log: true
     kv_cache_config:
       enable_block_reuse: false
@@ -89,7 +86,7 @@ worker_config:
         layer_updates_per_iter: 1
     cache_transceiver_config:
       max_tokens_in_buffer: 8320
-      backend: DEFAULT
+      backend: UCX
     stream_interval: 20
   ctx:
     enable_layerwise_nvtx_marker: true
@@ -109,4 +106,4 @@ worker_config:
       dtype: fp8
     cache_transceiver_config:
       max_tokens_in_buffer: 8320
-      backend: DEFAULT
+      backend: UCX
