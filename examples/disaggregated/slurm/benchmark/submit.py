@@ -211,7 +211,7 @@ def submit_job(config, log_dir, dry_run):
 
     if log_dir is None:
         # Create base log directory path
-        date_prefix = datetime.now().strftime("%Y%m%d")
+        date_prefix = datetime.now().strftime("%Y%m%d_%H%M%S")
         log_base = os.path.join(env_config['work_dir'],
                                 f"{date_prefix}/{isl}-{osl}")
 

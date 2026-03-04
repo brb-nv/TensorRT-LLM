@@ -1,73 +1,66 @@
-# SLURM Configuration
+# Repro config for nvbug 5948878
+# Based on: deepseek-r1-fp4_1k1k_ctx2_gen1_dep48_bs16_eplb288_mtp3_ccb-DEFAULT-temp.yaml
+
 slurm:
   script_file: "disaggr_torch.slurm"
-  partition: "<partition>"
-  account: "<account>"
+  partition: "gb300"
+  account: "coreai_comparch_trtllm"
   job_time: "02:00:00"
-  job_name: "<job_name>"
-  extra_args: "" # Cluster specific arguments, e.g. "--gres=gpu:4 --exclude=node1,node2"
-  set_segment: true # Optional: whether to set the segment for the job
-  numa_bind: true # Only enable for GB200/GB300 NVL72
+  job_name: "coreai_comparch_trtllm-connection_reset.reset"
+  extra_args: ""
+  set_segment: true
+  numa_bind: true
 
-# Benchmark Mode
 benchmark:
-  mode: "e2e"  # Options: e2e, gen_only, gen_only_no_context
-  use_nv_sa_benchmark: false  # Whether to use NVIDIA SA benchmark script
-  multi_round: 8  # Number of benchmark rounds
-  benchmark_ratio: 0.8  # Benchmark ratio
-  streaming: true  # Enable streaming mode
-  concurrency_list: "16"
-  input_length: 1024  # Input sequence length
-  output_length: 1024  # Output sequence length
-  dataset_file: "<dataset_file>"
+  mode: "gen_only"
+  use_nv_sa_benchmark: false
+  multi_round: 8
+  benchmark_ratio: 0.8
+  streaming: true
+  concurrency_list: "12288"
+  input_length: 1024
+  output_length: 1024
+  dataset_file: "/lustre/fsw/coreai_comparch_trtllm/common/disagg_datasets/deepseek-r1-1024-1024-100000-ratio-1_for_serve.json"
 
-# Hardware Configuration
 hardware:
-  gpus_per_node: 4  # Modify this with your hardware configuration
-  num_ctx_servers: 1  # Number of context servers
-  num_gen_servers: 1  # Number of generation servers
+  gpus_per_node: 4
+  num_ctx_servers: 2
+  num_gen_servers: 1
 
-# Environment Configuration
 environment:
-  container_mount: "<container_mount>"  # Format: path1:path1,path2:path2
-  container_image: "<container_image>"
-  model_path: "<model_path>"
-  trtllm_repo: "<trtllm_repo>"
-  build_wheel: false  # Don't build the wheel when launching multiple jobs
-  cuda_architectures: ""  # Optional CUDA architectures to build for (e.g. "90-real;100-real"). If empty, builds for all architectures
-  trtllm_wheel_path: ""  # Path to pre-built TensorRT-LLM wheel. If provided, install from this wheel instead
-  work_dir: "<full_path_to_work_dir>"
+  container_mount: "/lustre/fsw/coreai_comparch_trtllm:/lustre/fsw/coreai_comparch_trtllm"
+  container_image: "/lustre/fsw/coreai_comparch_trtllm/common/tensorrt-llm-202602261110-1170.sqsh"
+  model_path: "/lustre/fsw/coreai_comparch_trtllm/common/DeepSeek-R1-0528-FP4-v2"
+  trtllm_repo: "/lustre/fsw/coreai_comparch_trtllm/bbuddharaju/TensorRT_LLM_1.2"
+  build_wheel: true
+  cuda_architectures: "103-real"
+  trtllm_wheel_path: ""
+  work_dir: "/lustre/fsw/coreai_comparch_trtllm/bbuddharaju/TensorRT_LLM_1.2/examples/disaggregated/slurm/benchmark"
   worker_env_var: "TLLM_LOG_LEVEL=INFO TRTLLM_SERVER_DISABLE_GC=1 TRTLLM_WORKER_DISABLE_GC=1 TRTLLM_ENABLE_PDL=1 ENROOT_ALLOW_DEV=yes"
   server_env_var: "TRTLLM_SERVER_DISABLE_GC=1"
 
-# Profiling Configuration
 profiling:
-  nsys_on: false  # Set to true to enable profiling
-  ctx_profile_range: "10-30"  # Set TLLM_PROFILE_START_STOP for ctx workers
-  gen_profile_range: "200-250"  # Set TLLM_PROFILE_START_STOP for gen workers
+  nsys_on: false
+  ctx_profile_range: "10-30"
+  gen_profile_range: "200-250"
 
-# Accuracy Configuration
 accuracy:
-  enable_accuracy_test: false  # Set to true to enable accuracy evaluation
-  model: "local-completions"  # Model type for lm_eval
-  tasks: "gsm8k"  # Evaluation tasks (comma-separated)
-  model_args_extra: "num_concurrent=512,max_retries=3,tokenized_requests=false,timeout=1200,max_gen_toks=256,max_length=4096"  # Extra model arguments for lm_eval
+  enable_accuracy_test: false
+  model: "local-completions"
+  tasks: "gsm8k"
+  model_args_extra: "num_concurrent=512,max_retries=3,tokenized_requests=false,timeout=1200,max_gen_toks=256,max_length=4096"
 
 worker_config:
   gen:
-    tensor_parallel_size: 8
-    moe_expert_parallel_size: 8
+    enable_layerwise_nvtx_marker: true
+    tensor_parallel_size: 48
+    moe_expert_parallel_size: 48
     enable_attention_dp: true
     enable_lm_head_tp_in_adp: true
     pipeline_parallel_size: 1
-    context_parallel_size: 1
-    # Uncomment this section to enable context parallelism.
-    # cp_config:
-    #   cp_type: "HELIX"
-    #   tokens_per_block: 32  # must match kv_config.tokens_per_block.
-    max_batch_size: 256
-    max_num_tokens: 512
-    max_seq_len: 2251
+    max_batch_size: 1024
+    max_num_tokens: 1024
+    max_seq_len: 2176
     cuda_graph_config:
       enable_padding: true
       batch_sizes:
@@ -84,38 +77,30 @@ worker_config:
       - 768
       - 1024
       - 2048
-      - 256
     print_iter_log: true
-    trust_remote_code: true
     kv_cache_config:
       enable_block_reuse: false
-      tokens_per_block: 32
-      free_gpu_memory_fraction: 0.8
+      free_gpu_memory_fraction: 0.7
       dtype: fp8
     moe_config:
-      backend: CUTLASS
-      use_low_precision_moe_combine: true
+      backend: WIDEEP
       load_balancer:
-        num_slots: 0
+        num_slots: 288
+        layer_updates_per_iter: 1
     cache_transceiver_config:
-      max_tokens_in_buffer: 4608
+      max_tokens_in_buffer: 8320
       backend: DEFAULT
     stream_interval: 20
-    num_postprocess_workers: 4
-    speculative_config: # when mtp_size is 0, remove this section.
-      decoding_type: MTP
-      num_nextn_predict_layers: 1
   ctx:
+    enable_layerwise_nvtx_marker: true
     max_batch_size: 4
-    max_num_tokens: 4608
-    max_seq_len: 1227
+    max_num_tokens: 4480
+    max_seq_len: 2176
     tensor_parallel_size: 4
-    context_parallel_size: 1
     moe_expert_parallel_size: 4
     enable_attention_dp: true
     pipeline_parallel_size: 1
     print_iter_log: true
-    trust_remote_code: true
     cuda_graph_config: null
     disable_overlap_scheduler: true
     kv_cache_config:
@@ -123,8 +108,5 @@ worker_config:
       free_gpu_memory_fraction: 0.85
       dtype: fp8
     cache_transceiver_config:
-      max_tokens_in_buffer: 4608
+      max_tokens_in_buffer: 8320
       backend: DEFAULT
-    speculative_config: # when mtp_size is 0, remove this section.
-      decoding_type: MTP
-      num_nextn_predict_layers: 1
