@@ -132,6 +132,7 @@ def convert_allocations_to_server_config(allocations, server_port=8333):
         'backend': 'pytorch',
         'hostname': server_hostname,
         'port': server_port,
+        'max_retries': 5,
         'context_servers': context_servers,
         'generation_servers': generation_servers
     }

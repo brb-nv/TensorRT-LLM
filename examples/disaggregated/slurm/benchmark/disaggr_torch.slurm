@@ -69,6 +69,11 @@ replace_placeholder() {
 
 env > ${full_logdir}/environment.txt
 
+# Increase TCP backlog limit (best-effort, needs privileges)
+srun --overlap -N $SLURM_NNODES --ntasks-per-node=1 \
+    bash -c "sysctl -w net.core.somaxconn=65535 2>/dev/null || true; echo somaxconn=\$(cat /proc/sys/net/core/somaxconn)" \
+    &>> ${full_logdir}/environment.txt
+
 # Start container
 echo "Starting container..."
 if ! srun -l --container-image=${container_image} \

@@ -1135,5 +1135,6 @@ class OpenAIServer:
                                 host=host,
                                 port=port,
                                 log_level="info",
-                                timeout_keep_alive=TIMEOUT_KEEP_ALIVE)
+                                timeout_keep_alive=TIMEOUT_KEEP_ALIVE,
+                                backlog=16384)
         await uvicorn.Server(config).serve(sockets=sockets)

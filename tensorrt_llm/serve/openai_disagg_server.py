@@ -208,7 +208,8 @@ class OpenAIDisaggServer:
                                 host=host,
                                 port=port,
                                 log_level=logger.level,
-                                timeout_keep_alive=TIMEOUT_KEEP_ALIVE)
+                                timeout_keep_alive=TIMEOUT_KEEP_ALIVE,
+                                backlog=16384)
         await uvicorn.Server(config).serve(sockets=sockets)
 
     async def _sync_server_clock(self, server: str):

@@ -15,6 +15,7 @@
 import asyncio
 import copy
 import os
+import time
 from typing import Any, Callable, Dict, Optional
 
 from tensorrt_llm.llmapi.disagg_utils import (
@@ -102,35 +103,66 @@ class OpenAIDisaggregatedService(OpenAIService):
             raise RuntimeError("Cluster is not ready")
         return await self._send_disagg_request(request, hooks)
 
+    _disagg_req_counter = 0
+    _disagg_last_gen_dispatch_time = 0.0
+    _DISAGG_LOG_THRESHOLD_S = float(os.environ.get("TRTLLM_ORCH_LOG_THRESHOLD_MS", "2000")) / 1000.0
+
     async def _send_disagg_request(
         self, request: UCompletionRequest, hooks: Optional[ResponseHooks] = None
     ) -> UCompletionResponseOrGenerator:
+        _t0 = time.monotonic()
+        _req_id = OpenAIDisaggregatedService._disagg_req_counter
+        OpenAIDisaggregatedService._disagg_req_counter += 1
+
         if hooks:
             hooks.on_req_begin(request)
         # empty server means client decides which server to use
         reserved_gen_server = None
         reserved_ctx_server = None
         # reserve a gen_server if conditional disagg is needed
+        _t_cond = time.monotonic()
         reserved_gen_server, need_ctx = await self._check_conditional_disagg(request)
         need_ctx = need_ctx and not await self._check_gen_only_disagg(request)
+        _dt_cond = time.monotonic() - _t_cond
+
         ctx_response = None
         gen_req = request
+        _dt_ctx = 0.0
         if need_ctx:
             ctx_req = self._get_ctx_request(request)
-            # ctx generator is empty
+            _t_ctx = time.monotonic()
             ctx_response = await self._ctx_client.send_request(
                 ctx_req, server=reserved_ctx_server, hooks=hooks
             )
+            _dt_ctx = time.monotonic() - _t_ctx
             await self._verify_ctx_response(ctx_response)
             gen_req = self._get_gen_request(request, ctx_response)
+
+        _dt_gen_dispatch = 0.0
         if ctx_response is None or self._need_gen(ctx_response):
-            return await self._gen_client.send_request(
+            _t_gen = time.monotonic()
+            result = await self._gen_client.send_request(
                 gen_req, server=reserved_gen_server, hooks=hooks
             )
+            _dt_gen_dispatch = time.monotonic() - _t_gen
+
+            _dt_total = time.monotonic() - _t0
+            _gap = _t0 - OpenAIDisaggregatedService._disagg_last_gen_dispatch_time \
+                if OpenAIDisaggregatedService._disagg_last_gen_dispatch_time > 0 else 0.0
+            OpenAIDisaggregatedService._disagg_last_gen_dispatch_time = time.monotonic()
+
+            if _dt_total > self._DISAGG_LOG_THRESHOLD_S or _gap > 5.0:
+                logger.warning(
+                    f"[ORCH TIMING] req={_req_id}, "
+                    f"total={_dt_total*1000:.1f}ms, "
+                    f"cond_check={_dt_cond*1000:.1f}ms, "
+                    f"ctx_send={_dt_ctx*1000:.1f}ms, "
+                    f"gen_dispatch={_dt_gen_dispatch*1000:.1f}ms, "
+                    f"gap_since_last_gen={_gap*1000:.1f}ms")
+
+            return result
         else:
             if request.stream:
-                # ctx client will never return a generator when streaming is requested
-                # make up for this by returning a done generator
                 return done_generator()
             return ctx_response
 

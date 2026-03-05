@@ -14,6 +14,8 @@
 
 # yapf: disable
 import asyncio
+import os
+import time
 import traceback
 from abc import ABC, abstractmethod
 from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple, Type
@@ -110,6 +112,8 @@ class OpenAIHttpClient(OpenAIClient):
         self._max_retries = max_retries
         self._retry_interval_sec = retry_interval_sec
 
+    _CLIENT_LOG_THRESHOLD_S = float(os.environ.get("TRTLLM_ORCH_LOG_THRESHOLD_MS", "2000")) / 1000.0
+
     async def _send_request(
         self,
         endpoint: str,
@@ -118,8 +122,10 @@ class OpenAIHttpClient(OpenAIClient):
         server: Optional[str] = None,
         hooks: Optional[ResponseHooks] = None,
     ) -> UCompletionResponseOrGenerator:
+        _t0 = time.monotonic()
         if server is None:
             server, _ = await self._router.get_next_server(request)
+        _dt_router = time.monotonic() - _t0
         url = f"http://{server}/{endpoint}"
         logger.debug(
             f"Sending {self._role} request {request.disaggregated_params.ctx_request_id} to {url}"
@@ -128,10 +134,9 @@ class OpenAIHttpClient(OpenAIClient):
             self._metrics_collector.total_requests.inc()
             resp_generator = self._post_with_retry(server, url, request, hooks)
             if request.stream:
-                # return the response generator, the request is not done yet
                 return resp_generator
             else:
-                # consume the generator to get the response and return it directly when it's not streaming
+                _t_consume = time.monotonic()
                 response = None
                 async for resp_json in resp_generator:
                     response = response_type(**resp_json)
@@ -141,10 +146,17 @@ class OpenAIHttpClient(OpenAIClient):
                         else:
                             hooks.on_first_token(server, request)
                             hooks.on_resp_done(server, request, response)
+                _dt_consume = time.monotonic() - _t_consume
+                _dt_total = time.monotonic() - _t0
+                if _dt_total > self._CLIENT_LOG_THRESHOLD_S:
+                    logger.warning(
+                        f"[CLIENT TIMING] role={self._role}, server={server}, "
+                        f"total={_dt_total*1000:.1f}ms, "
+                        f"router={_dt_router*1000:.1f}ms, "
+                        f"http_response={_dt_consume*1000:.1f}ms")
                 return response
         except Exception:
             self._metrics_collector.error_requests.inc()
-            # finish the request upon error
             await self._finish_request(request)
             raise
 
@@ -157,31 +169,34 @@ class OpenAIHttpClient(OpenAIClient):
     ) -> AsyncGenerator[Any, None]:
         json_data = request.model_dump(exclude_unset=True)
         is_stream = request.stream
+        _POST_LOG_THRESHOLD_S = float(os.environ.get("TRTLLM_ORCH_LOG_THRESHOLD_MS", "2000")) / 1000.0
         for attempt in range(self._max_retries + 1):
             try:
                 lines_yielded = 0
                 start_time = get_steady_clock_now_in_seconds()
+                _t_post_start = time.monotonic()
                 async with self._session.post(url, json=json_data) as http_response:
+                    _dt_connect = time.monotonic() - _t_post_start
+                    if _dt_connect > _POST_LOG_THRESHOLD_S:
+                        logger.warning(
+                            f"[HTTP POST] role={self._role}, server={server}, "
+                            f"connect_time={_dt_connect*1000:.1f}ms, "
+                            f"status={http_response.status}")
                     content_type = http_response.headers.get("Content-Type", "")
                     if not is_stream and "text/event-stream" in content_type:
                         raise ValueError(
                             "Received an event-stream although request stream was False"
                         )
                     if is_stream:
-                        # do NOT return generator directly here or the response will go
-                        # out of scope and get destroyed
                         async for line in self._response_generator(
                             request, http_response, start_time, server, hooks
                         ):
                             lines_yielded += 1
                             yield line
-                        # don't finish the request here since the response generator is not done yet
                     else:
                         http_response.raise_for_status()
                         response_dict = await http_response.json()
-                        # yield here since python forbids return statements in async generators
                         yield response_dict
-                        # finish the request after the successful response
                         await self._finish_request(request)
                         self._metrics_collector.complete_latency_seconds.observe(
                             get_steady_clock_now_in_seconds() - start_time
