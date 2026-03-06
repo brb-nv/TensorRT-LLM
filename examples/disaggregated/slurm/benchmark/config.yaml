@@ -14,7 +14,7 @@ slurm:
 benchmark:
   mode: "gen_only"
   use_nv_sa_benchmark: false
-  multi_round: 8
+  multi_round: 1
   benchmark_ratio: 0.8
   streaming: true
   concurrency_list: "12288"
@@ -42,7 +42,7 @@ environment:
 profiling:
   nsys_on: false
   ctx_profile_range: "10-30"
-  gen_profile_range: "200-250"
+  gen_profile_range: "1000-1100"
 
 accuracy:
   enable_accuracy_test: false
@@ -91,6 +91,8 @@ worker_config:
       max_tokens_in_buffer: 8320
       backend: DEFAULT
     stream_interval: 20
+    num_postprocess_workers: 4
+    trust_remote_code: true
   ctx:
     enable_layerwise_nvtx_marker: true
     max_batch_size: 4
@@ -110,3 +112,4 @@ worker_config:
     cache_transceiver_config:
       max_tokens_in_buffer: 8320
       backend: DEFAULT
+    trust_remote_code: true
