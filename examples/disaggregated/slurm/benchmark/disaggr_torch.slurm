@@ -69,11 +69,6 @@ replace_placeholder() {
 
 env > ${full_logdir}/environment.txt
 
-# Increase TCP backlog limit (best-effort, needs privileges)
-srun --overlap -N $SLURM_NNODES --ntasks-per-node=1 \
-    bash -c "sysctl -w net.core.somaxconn=65535 2>/dev/null || true; echo somaxconn=\$(cat /proc/sys/net/core/somaxconn)" \
-    &>> ${full_logdir}/environment.txt
-
 # Start container
 echo "Starting container..."
 if ! srun -l --container-image=${container_image} \
@@ -83,6 +78,13 @@ if ! srun -l --container-image=${container_image} \
         echo "Container up." &> ${full_logdir}/1_container_launch.log; then
     cleanup_on_failure "Failed to start container. Check ${full_logdir}/1_container_launch.log"
 fi
+
+# Increase TCP backlog limit inside the container (needs NET_ADMIN capability)
+ENROOT_CAP_ADD=CAP_NET_ADMIN srun --container-name=${container_name} \
+    --container-mounts=${container_mount} --no-container-mount-home \
+    --mpi=pmix --overlap -N $SLURM_NNODES --ntasks-per-node=1 \
+    bash -c "sysctl -w net.core.somaxconn=65535 2>&1; echo somaxconn=\$(cat /proc/sys/net/core/somaxconn)" \
+    &>> ${full_logdir}/environment.txt || true
 
 # Install TensorRT-LLM
 if [ -n "${trtllm_wheel_path}" ]; then
@@ -161,6 +163,14 @@ cat ${start_server_cmds_file} | while read cmd; do
 done
 echo "Server is ready!"
 
+# Sample TCP listen overflow counters before benchmark
+echo "=== TCP Listen Counters BEFORE benchmark ===" >> ${full_logdir}/tcp_listen_stats.log
+srun --container-name=${container_name} \
+    --container-mounts=${container_mount} --no-container-mount-home \
+    --mpi=pmix --overlap -N $SLURM_NNODES --ntasks-per-node=1 \
+    bash -c 'H=$(cat /proc/net/netstat | grep "^TcpExt:" | head -1); V=$(cat /proc/net/netstat | grep "^TcpExt:" | tail -1); paste <(echo "$H" | tr " " "\n") <(echo "$V" | tr " " "\n") | grep -E "ListenOverflows|ListenDrops" | while read n v; do printf "%s=%s " "$n" "$v"; done | xargs -I{} echo "$(hostname): {}"' \
+    >> ${full_logdir}/tcp_listen_stats.log 2>&1 || true
+
 # Start client commands
 client_cmds_file=${full_logdir}/client_cmds.sh
 echo "Starting client commands from ${client_cmds_file}..."
@@ -171,6 +181,14 @@ while read -r cmd <&3; do
         cleanup_on_failure "Command failed: ${cmd}."
     fi
 done 3< "${client_cmds_file}"
+
+# Sample TCP listen overflow counters after benchmark
+echo "=== TCP Listen Counters AFTER benchmark ===" >> ${full_logdir}/tcp_listen_stats.log
+srun --container-name=${container_name} \
+    --container-mounts=${container_mount} --no-container-mount-home \
+    --mpi=pmix --overlap -N $SLURM_NNODES --ntasks-per-node=1 \
+    bash -c 'H=$(cat /proc/net/netstat | grep "^TcpExt:" | head -1); V=$(cat /proc/net/netstat | grep "^TcpExt:" | tail -1); paste <(echo "$H" | tr " " "\n") <(echo "$V" | tr " " "\n") | grep -E "ListenOverflows|ListenDrops" | while read n v; do printf "%s=%s " "$n" "$v"; done | xargs -I{} echo "$(hostname): {}"' \
+    >> ${full_logdir}/tcp_listen_stats.log 2>&1 || true
 
 echo "Job completed successfully, total runtime: $SECONDS seconds"
 

@@ -164,8 +164,21 @@ class OpenAIServer:
         self.disagg_cluster_storage = None
         self.disagg_cluster_worker = None
 
+        async def _event_loop_lag_monitor():
+            interval = 0.1
+            threshold_ms = float(os.environ.get("TRTLLM_EVLOOP_LAG_THRESHOLD_MS", "200"))
+            while True:
+                t0 = asyncio.get_event_loop().time()
+                await asyncio.sleep(interval)
+                lag_ms = (asyncio.get_event_loop().time() - t0 - interval) * 1000
+                if lag_ms > threshold_ms:
+                    logger.warning(
+                        f"[EVENT LOOP LAG] {lag_ms:.0f}ms "
+                        f"(requested {interval*1000:.0f}ms sleep)")
+
         @asynccontextmanager
         async def lifespan(app: FastAPI):
+            lag_task = asyncio.create_task(_event_loop_lag_monitor())
             if self.metadata_server is not None:
                 metadata = {
                     "model": self.model,
@@ -184,9 +197,9 @@ class OpenAIServer:
                 self.disagg_cluster_worker= DisaggClusterWorker(self.server_role, self.host, self.port, self.disagg_cluster_config, self.disagg_cluster_storage)
                 await self.disagg_cluster_worker.register_worker()
 
-            # terminate rank0 worker
             yield
 
+            lag_task.cancel()
             if self.metadata_server is not None:
                 self.metadata_server.remove(f"trtllm/{self.llm.llm_id}")
                 logger.info(f"trtllm/{self.llm.llm_id} is unregistered")

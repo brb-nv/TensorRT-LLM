@@ -88,6 +88,8 @@ worker_config:
       max_tokens_in_buffer: 8320
       backend: UCX
     stream_interval: 20
+    num_postprocess_workers: 4
+    trust_remote_code: true
   ctx:
     enable_layerwise_nvtx_marker: true
     max_batch_size: 4
@@ -99,6 +101,7 @@ worker_config:
     pipeline_parallel_size: 1
     print_iter_log: true
     cuda_graph_config: null
+    trust_remote_code: true
     disable_overlap_scheduler: true
     kv_cache_config:
       enable_block_reuse: false
