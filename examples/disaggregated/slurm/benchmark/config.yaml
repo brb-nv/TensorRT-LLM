@@ -4,7 +4,7 @@ slurm:
   partition: "gb200"
   account: "coreai_comparch_trtllm"
   job_time: "02:00:00"
-  job_name: "nvbug5844149-con1-tep8-mtp3"
+  job_name: "nvbug5844149-con256-dep32-mtp3"
   extra_args: "" # Cluster specific arguments, e.g. "--gres=gpu:4 --exclude=node1,node2"
   set_segment: true # Optional: whether to set the segment for the job
   numa_bind: true # Only enable for GB200/GB300 NVL72
@@ -16,7 +16,7 @@ benchmark:
   multi_round: 1  # Number of benchmark rounds
   benchmark_ratio: 1.0  # Benchmark ratio
   streaming: true  # Enable streaming mode
-  concurrency_list: "1"
+  concurrency_list: "256"
   input_length: 32768  # Input sequence length
   output_length: 4096  # Output sequence length
   dataset_file: "/lustre/fsw/coreai_comparch_trtllm/common/disagg_datasets/deepseek-v32-32768-4096-50000-ratio-1_for_serve.json"
@@ -58,28 +58,26 @@ accuracy:
 worker_config:
   gen:
     print_iter_log: true
-    max_batch_size: 1
-    max_num_tokens: 8
-    max_input_len: 32784
-    max_seq_len: 40960
-    tensor_parallel_size: 8
-    moe_expert_parallel_size: 8
-    enable_attention_dp: false
-    enable_lm_head_tp_in_adp: false
+    max_batch_size: 8
+    max_num_tokens: 64
+    tensor_parallel_size: 32
+    moe_expert_parallel_size: 32
+    enable_attention_dp: true
+    enable_lm_head_tp_in_adp: true
     pipeline_parallel_size: 1
     context_parallel_size: 1
     cuda_graph_config:
       enable_padding: true
-      max_batch_size: 1
+      max_batch_size: 8
     kv_cache_config:
       enable_block_reuse: false
-      free_gpu_memory_fraction: 0.25
+      free_gpu_memory_fraction: 0.85
       dtype: fp8
       tokens_per_block: 64
     moe_config:
-      backend: TRTLLM
+      backend: CUTEDSL
     cache_transceiver_config:
-      max_tokens_in_buffer: 32832
+      max_tokens_in_buffer: 32768
       backend: UCX
     disable_overlap_scheduler: true
     speculative_config:
@@ -93,13 +91,10 @@ worker_config:
         - cublaslt
         - cutedsl
         - cuda_core
-    allreduce_strategy: MNNVL
   ctx:
     print_iter_log: true
     max_batch_size: 1
     max_num_tokens: 32784
-    max_input_len: 32784
-    max_seq_len: 32832
     tensor_parallel_size: 4
     moe_expert_parallel_size: 4
     pipeline_parallel_size: 1
@@ -109,13 +104,13 @@ worker_config:
     cuda_graph_config: null
     kv_cache_config:
       enable_block_reuse: false
-      free_gpu_memory_fraction: 0.4
+      free_gpu_memory_fraction: 0.6
       dtype: fp8
       tokens_per_block: 64
     moe_config:
       backend: CUTEDSL
     cache_transceiver_config:
-      max_tokens_in_buffer: 32832
+      max_tokens_in_buffer: 32768
       backend: UCX
     disable_overlap_scheduler: true
     speculative_config:
