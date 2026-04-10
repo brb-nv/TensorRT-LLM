@@ -1969,6 +1969,10 @@ class PyExecutor:
             if not can_forward:
                 time.sleep(0.1)
                 return can_forward, True
+            # Fill phase complete - disable the benchmark disagg guard so
+            # that downstream helpers (e.g. _should_skip_dummy_for_benchmark_disagg)
+            # revert to normal behaviour during taper-down.
+            self.is_benchmark_disagg = False
         return can_forward, False
 
     def _executor_loop(self):
