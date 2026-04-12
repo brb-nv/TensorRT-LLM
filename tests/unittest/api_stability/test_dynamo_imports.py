@@ -97,19 +97,27 @@ DYNAMO_IMPORTS = [
     ("tensorrt_llm._torch.pyexecutor.kv_cache_connector",
      "KvCacheConnectorWorker"),
     ("tensorrt_llm._torch.pyexecutor.kv_cache_connector", "SchedulerOutput"),
+    # -- bare module imports (import tensorrt_llm.X.Y) --
+    ("tensorrt_llm._torch.visual_gen", None),
 ]
 
 
 @pytest.mark.parametrize(
     "module_path, symbol",
     DYNAMO_IMPORTS,
-    ids=[f"{m}-{s}" for m, s in DYNAMO_IMPORTS],
+    ids=[f"{m}-{s}" if s else f"{m}" for m, s in DYNAMO_IMPORTS],
 )
 def test_dynamo_import(module_path: str, symbol: str):
-    """Verify that *module_path* exposes *symbol* (the way Dynamo imports it)."""
+    """Verify that *module_path* exposes *symbol* (the way Dynamo imports it).
+
+    When *symbol* is ``None`` the entry represents a bare
+    ``import tensorrt_llm.X.Y`` and we only check that the module is
+    importable.
+    """
     mod = importlib.import_module(module_path)
-    assert hasattr(mod, symbol), (
-        f"'{symbol}' is no longer importable from '{module_path}'. "
-        f"This import is used by the Dynamo codebase — renaming or removing "
-        f"it will break the next Dynamo upgrade of TRT-LLM."
-    )
+    if symbol is not None:
+        assert hasattr(mod, symbol), (
+            f"'{symbol}' is no longer importable from '{module_path}'. "
+            f"This import is used by the Dynamo codebase — renaming or removing "
+            f"it will break the next Dynamo upgrade of TRT-LLM."
+        )
