@@ -1,0 +1,26 @@
+# Aggregate (colocated prefill+decode) config for
+# nvidia/Qwen3-Coder-480B-A35B-Instruct-NVFP4 on 4 GPUs.
+# Mirrors the Dynamo recipe at:
+#   https://github.com/ai-dynamo/dynamo/blob/ziqif/k8s-kvbm-metrics/recipes/qwen3-coder-480b-a35b-instruct/trtllm/agg/deploy.yaml
+
+trust_remote_code: true
+tensor_parallel_size: 4
+moe_expert_parallel_size: 4
+moe_tensor_parallel_size: 1
+enable_attention_dp: false
+enable_chunked_prefill: true
+
+max_batch_size: 128
+max_num_tokens: 8192
+max_seq_len: 8192
+
+kv_cache_config:
+  enable_block_reuse: true
+  free_gpu_memory_fraction: 0.8
+
+cuda_graph_config:
+  enable_padding: true
+  max_batch_size: 128
+
+disable_overlap_scheduler: false
+print_iter_log: false
