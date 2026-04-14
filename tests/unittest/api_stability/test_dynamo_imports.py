@@ -21,10 +21,13 @@ the next TRT-LLM upgrade.
 
 To regenerate this list, scan the Dynamo repo for ``tensorrt_llm`` imports:
 
-    grep -rh "from tensorrt_llm" --include="*.py" <dynamo-repo> | sort -u
+    grep -rn -e "from tensorrt_llm" -e "import tensorrt_llm" --include="*.py" <dynamo-repo> | sort -u
 
 Changes to this file should be reviewed carefully — removing an entry means
-accepting that the corresponding import may break downstream.
+accepting that the corresponding import may break downstream.  If a breaking
+change has to be made, inform people from ``trt-llm-dynamo-devs`` by posting a
+message in the Slack channel ``swdl-dynamo-trtllm-dev`` so that Dynamo people
+are aware of the change.
 """
 
 import importlib
@@ -101,7 +104,7 @@ DYNAMO_IMPORTS = [
     DYNAMO_IMPORTS,
     ids=[f"{m}-{s}" if s else f"{m}" for m, s in DYNAMO_IMPORTS],
 )
-def test_dynamo_import(module_path: str, symbol: str):
+def test_dynamo_import(module_path: str, symbol: str) -> None:
     """Verify that *module_path* exposes *symbol* (the way Dynamo imports it).
 
     When *symbol* is ``None`` the entry represents a bare
