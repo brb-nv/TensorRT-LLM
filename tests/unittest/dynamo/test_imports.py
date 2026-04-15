@@ -49,7 +49,7 @@ DYNAMO_IMPORTS = [
     ("tensorrt_llm.llmapi", "DisaggregatedParams"),
     ("tensorrt_llm.llmapi.llm", "BaseLLM"),
     ("tensorrt_llm.llmapi.llm", "SamplingParams"),
-    ("tensorrt_llm.llmapi.llm_args", "TOKENIZER_ALIASES"),
+    ("tensorrt_llm.tokenizer", "TOKENIZER_ALIASES"),
     ("tensorrt_llm.llmapi.llm_args", "KvCacheConnectorConfig"),
     ("tensorrt_llm.llmapi.llm_args", "TorchLlmArgs"),
     ("tensorrt_llm.llmapi.llm_utils", "update_llm_args_with_extra_options"),
@@ -91,9 +91,9 @@ DYNAMO_IMPORTS = [
     ("tensorrt_llm._torch.shared_tensor.shared_tensor", "SharedTensorContainer"),
     ("tensorrt_llm._torch.shared_tensor.shared_tensor", "_SharedTensorRebuildMethodRegistry"),
     # -- _torch / pyexecutor --
-    ("tensorrt_llm._torch.pyexecutor.kv_cache_connector", "KvCacheConnectorScheduler"),
-    ("tensorrt_llm._torch.pyexecutor.kv_cache_connector", "KvCacheConnectorWorker"),
-    ("tensorrt_llm._torch.pyexecutor.kv_cache_connector", "SchedulerOutput"),
+    ("tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector", "KvCacheConnectorScheduler"),
+    ("tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector", "KvCacheConnectorWorker"),
+    ("tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector", "SchedulerOutput"),
     # -- bare module imports (import tensorrt_llm.X.Y) --
     ("tensorrt_llm._torch.visual_gen", None),
 ]
