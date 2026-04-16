@@ -1,0 +1,25 @@
+# Dynamo recipe: DeepSeek-V3.2-NVFP4 disaggregated KV-router (prefill worker)
+# Source: https://github.com/ai-dynamo/dynamo/blob/main/recipes/deepseek-v32-fp4/trtllm/disagg-kv-router/deploy.yaml
+# GPU topology: 2x prefill (2 nodes × 4 GPUs each) + 2x decode (2 nodes × 4 GPUs each) = 32 GB200
+cache_transceiver_config:
+  backend: UCX
+  max_tokens_in_buffer: 120000
+max_num_tokens: 8192
+enable_chunked_prefill: true
+cuda_graph_config:
+  max_batch_size: 32
+  enable_padding: true
+disable_overlap_scheduler: true
+enable_attention_dp: true
+kv_cache_config:
+  dtype: fp8
+  enable_block_reuse: true
+  free_gpu_memory_fraction: 0.9
+  tokens_per_block: 64
+max_batch_size: 32
+max_seq_len: 121000
+moe_config:
+  backend: TRTLLM
+moe_expert_parallel_size: 8
+print_iter_log: true
+tensor_parallel_size: 8

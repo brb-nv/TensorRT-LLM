@@ -1,0 +1,12 @@
+# Dynamo recipe: GPT-OSS-120B aggregated
+# Source: https://github.com/ai-dynamo/dynamo/blob/main/recipes/gpt-oss-120b/trtllm/agg/deploy.yaml
+# GPU topology: 4x GB200 (Blackwell-only, WideEP)
+enable_attention_dp: true
+cuda_graph_config:
+  max_batch_size: 800
+  enable_padding: true
+kv_cache_config:
+  enable_block_reuse: false
+stream_interval: 20
+moe_config:
+  backend: CUTLASS

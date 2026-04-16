@@ -1,0 +1,25 @@
+# Dynamo recipe: Nemotron-3-Super-FP8 disaggregated (prefill worker)
+# Source: https://github.com/ai-dynamo/dynamo/blob/main/recipes/nemotron-3-super-fp8/trtllm/disagg/deploy.yaml
+# GPU topology: 1x prefill (2 GPUs, TP2) + 1x decode (2 GPUs, TP2) = 4x H100/H200
+#
+# UCX is required for hybrid Mamba+Attention models.
+# NIXL/MOONCAKE do not support Mamba SSM state transfer.
+backend: pytorch
+tensor_parallel_size: 2
+moe_expert_parallel_size: 1
+enable_attention_dp: false
+enable_chunked_prefill: true
+max_batch_size: 16
+max_num_tokens: 8192
+trust_remote_code: true
+kv_cache_config:
+  free_gpu_memory_fraction: 0.85
+  enable_block_reuse: false
+moe_config:
+  backend: TRTLLM
+cache_transceiver_config:
+  backend: UCX
+cuda_graph_config:
+  enable_padding: true
+  max_batch_size: 16
+disable_overlap_scheduler: true

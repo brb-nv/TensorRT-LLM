@@ -1,0 +1,20 @@
+# Dynamo recipe: DeepSeek-R1 disaggregated WideEP (prefill worker)
+# Source: https://github.com/ai-dynamo/dynamo/blob/main/recipes/deepseek-r1/trtllm/disagg/wide_ep/gb200/deploy.yaml
+# GPU topology: 1x prefill node (4 GPUs, DEP4) + 8x decode nodes (4 GPUs each, DEP32) = 36 GB200 GPUs
+max_batch_size: 4
+max_num_tokens: 4608
+max_seq_len: 1227
+tensor_parallel_size: 4
+moe_expert_parallel_size: 4
+enable_attention_dp: true
+pipeline_parallel_size: 1
+cuda_graph_config: null
+print_iter_log: true
+disable_overlap_scheduler: true
+kv_cache_config:
+  enable_block_reuse: false
+  free_gpu_memory_fraction: 0.85
+  dtype: fp8
+cache_transceiver_config:
+  max_tokens_in_buffer: 4608
+  backend: DEFAULT
