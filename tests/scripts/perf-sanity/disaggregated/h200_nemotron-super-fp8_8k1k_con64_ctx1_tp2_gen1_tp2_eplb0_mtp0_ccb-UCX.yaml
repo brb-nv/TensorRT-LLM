@@ -3,21 +3,23 @@ metadata:
   precision: fp8
   model_dir_name: NVIDIA-Nemotron-3-Super-120B-A12B-FP8
   supported_gpus:
-  - GB200
+  - H200
   script_file: disaggr_torch.slurm
   benchmark_type: 8k1k
-  # Mirror of the Dynamo Nemotron-3-Super-FP8 TRT-LLM disagg deployment recipe:
+  # Native-target (Hopper) mirror of the Dynamo Nemotron-3-Super-FP8 TRT-LLM
+  # disagg deployment recipe:
   # https://github.com/ai-dynamo/dynamo/tree/main/recipes/nemotron-3-super-fp8/trtllm/disagg
-  # Topology: 1 prefill worker on 2 GPUs (TP2) + 1 decode worker on 2 GPUs (TP2).
+  # Topology: 1 prefill worker on 2 GPUs (TP2) + 1 decode worker on 2 GPUs (TP2),
+  # co-located on a single DGX H200 node (8 GPUs/node, we use 4).
   # Nemotron-H is a Mamba + Attention hybrid model, so the KV cache includes
   # both attention K/V and Mamba SSM state. Only UCX cache transceiver backend
   # supports hybrid SSM-state transfer; NIXL / MOONCAKE are rejected for this
   # model. Block reuse must remain disabled (TRT-LLM still forbids it for
   # Mamba hybrid caches).
-  # Goal: catch TRT-LLM regressions in (a) Nemotron-H PyTorch backend,
-  # (b) UCX-based Mamba SSM state transfer across disagg workers, and
-  # (c) FP8 + chunked-prefill + overlap-scheduler code paths that only show
-  # up in the production Dynamo deployment.
+  # Goal: catch TRT-LLM regressions in (a) Nemotron-H PyTorch backend on the
+  # recipe's native Hopper (H100/H200) architecture, (b) UCX-based Mamba SSM
+  # state transfer across disagg workers, and (c) FP8 + chunked-prefill +
+  # overlap-scheduler code paths (H100/H200 FP8 tensor-core + Hopper TMA).
   #
   # Deviations from the upstream Dynamo recipe (intentional, revisit if the
   # recipe itself changes or if perf-sanity grows to support these knobs):
@@ -26,11 +28,11 @@ metadata:
   #     recipe's token budget and keep a realistic long-context prefill load.
   #   TODO(dynamo-replica): concurrency_list='64' is a perf-sanity choice
   #     (no concurrency is specified in deploy.yaml). Picked to saturate the
-  #     per-worker `max_batch_size=16` (≈4x oversubscription) without creating
+  #     per-worker `max_batch_size=16` (~4x oversubscription) without creating
   #     an excessive backlog.
   #   TODO(dynamo-replica): `gen_only` benchmark_mode only. Matches the
   #     convention used by every disagg entry in perf-sanity; the `e2e`
-  #     variant is left commented-out for easy re-enable.
+  #     variant is left commented-out in the test-list for easy re-enable.
   #   TODO(dynamo-replica): `nemotron_super-8k1k-*` perf-ci dataset must exist
   #     for this test to be runnable. The other perf-ci datasets follow the
   #     `<model>-<isl><osl>-20480-ratio-1_for_serve.json` pattern; the dataset
@@ -52,7 +54,7 @@ slurm:
   account: <account>
   job_time: 02:00:00
   job_name: unified-benchmark
-  extra_args: "--gres=gpu:4"
+  extra_args: "--gres=gpu:8"
   numa_bind: true
 benchmark:
   mode: e2e
@@ -65,7 +67,7 @@ benchmark:
   output_length: 1024
   dataset_file: datasets/perf-ci/nemotron_super-8k1k-20480-ratio-1_for_serve.json
 hardware:
-  gpus_per_node: 2
+  gpus_per_node: 8
   num_ctx_servers: 1
   num_gen_servers: 1
 environment:

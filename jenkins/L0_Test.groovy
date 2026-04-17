@@ -3273,6 +3273,14 @@ def launchTestJobs(pipeline, testFilter)
         "DGX_B200-8_GPUs-PyTorch-PerfSanity-Post-Merge-2": ["auto:dgx-b200-flex", "l0_b200_multi_gpus_perf_sanity", 2, 4, 8, 1, true],
         "DGX_B200-8_GPUs-PyTorch-PerfSanity-Post-Merge-3": ["auto:dgx-b200-flex", "l0_b200_multi_gpus_perf_sanity", 3, 4, 8, 1, true],
         "DGX_B200-8_GPUs-PyTorch-PerfSanity-Post-Merge-4": ["auto:dgx-b200-flex", "l0_b200_multi_gpus_perf_sanity", 4, 4, 8, 1, true],
+        // Native-target (Hopper) mirrors of the Dynamo TRT-LLM disagg recipes for
+        // Nemotron-3-Super-FP8 / Qwen3-235B-A22B-FP8 / Qwen3-32B-FP8. All three
+        // fit on a single DGX H200 node (ctx+gen co-located); see
+        // tests/integration/test_lists/test-db/l0_dgx_h200_perf_sanity.yml.
+        // NOTE: agent label `auto:dgx-h200-x8` follows the DGX H100 SLURM naming
+        // convention (`auto:dgx-h100-x{1,2,4}`); confirm with infra that the
+        // label exists before enabling this stage.
+        "DGX_H200-8_GPUs-PyTorch-PerfSanity-Post-Merge-1": ["auto:dgx-h200-x8", "l0_dgx_h200_perf_sanity", 1, 1, 8, 1, true],
     ]
     fullSet += x86SlurmTestConfigs.keySet()
 
@@ -3352,22 +3360,6 @@ def launchTestJobs(pipeline, testFilter)
         "auto:gb200-flex",
         "l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu1_gen1_node1_gpu4",
         4,
-        8,
-        2
-    )
-    multiNodesSBSAConfigs += buildStageConfigs(
-        "GB200-8_GPUs-2_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU2-GEN1-NODE1-GPU2-Post-Merge",
-        "auto:gb200-flex",
-        "l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu2_gen1_node1_gpu2",
-        1,
-        8,
-        2
-    )
-    multiNodesSBSAConfigs += buildStageConfigs(
-        "GB200-8_GPUs-2_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU2-GEN1-NODE1-GPU4-Post-Merge",
-        "auto:gb200-flex",
-        "l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu2_gen1_node1_gpu4",
-        1,
         8,
         2
     )

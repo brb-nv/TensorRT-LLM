@@ -3,19 +3,22 @@ metadata:
   precision: fp8
   model_dir_name: Qwen3-32B-FP8
   supported_gpus:
-  - GB200
+  - H200
   script_file: disaggr_torch.slurm
   benchmark_type: 4k1k
-  # Mirror of the Dynamo Qwen3-32B-FP8 TRT-LLM disagg deployment recipe:
+  # Native-target (Hopper) mirror of the Dynamo Qwen3-32B-FP8 TRT-LLM disagg
+  # deployment recipe:
   # https://github.com/ai-dynamo/dynamo/tree/main/recipes/qwen3-32b-fp8/trtllm/disagg
-  # Topology: 1 prefill worker on 1 GPU (TP=1) + 1 decode worker on 2 GPUs (TP=2).
+  # Topology: 1 prefill worker on 1 GPU (TP=1) + 1 decode worker on 2 GPUs (TP=2),
+  # co-located on a single DGX H200 node (8 GPUs/node, we use 3).
   # Qwen3-32B is a dense (non-MoE) FP8 model. Cache transceiver is DEFAULT,
   # KV cache dtype is fp8, block reuse disabled, overlap scheduler on decode /
   # off on prefill. CUDA graphs enabled on both workers with dense batch-size
   # sweeps (prefill 1..256, decode 1..128).
-  # Goal: catch TRT-LLM regressions that would only surface in the production
-  # Dynamo Qwen3-32B-FP8 disagg deployment (TP1 prefill + TP2 decode dense,
-  # FP8 KV, PDL-enabled paths).
+  # Goal: catch TRT-LLM regressions on the recipe's native Hopper (H100/H200/
+  # A100) architecture for the production Dynamo Qwen3-32B-FP8 disagg
+  # deployment (TP1 prefill + TP2 decode dense, FP8 KV, PDL-enabled paths,
+  # `TRT_LLM_DISABLE_LOAD_WEIGHTS_IN_PARALLEL=True`).
   #
   # Deviations from the upstream Dynamo recipe (intentional, revisit if the
   # recipe itself changes or if perf-sanity grows to support these knobs):
@@ -59,7 +62,7 @@ slurm:
   account: <account>
   job_time: 02:00:00
   job_name: unified-benchmark
-  extra_args: "--gres=gpu:4"
+  extra_args: "--gres=gpu:8"
   numa_bind: true
 benchmark:
   mode: e2e
@@ -72,7 +75,7 @@ benchmark:
   output_length: 1024
   dataset_file: datasets/perf-ci/qwen3_32b-4k1k-20480-ratio-1_for_serve.json
 hardware:
-  gpus_per_node: 4
+  gpus_per_node: 8
   num_ctx_servers: 1
   num_gen_servers: 1
 environment:

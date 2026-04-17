@@ -17,10 +17,6 @@ l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu1_gen1_node1_gpu2:
   - perf/test_perf_sanity.py::test_e2e[disagg_upload-gen_only-gb200_gpt-oss-120b-fp4_1k1k_con2048_ctx1_tp1_gen1_dep2_eplb0_mtp0_ccb-UCX] TIMEOUT (120)
   - perf/test_perf_sanity.py::test_e2e[disagg_upload-gen_only-gb200_gpt-oss-120b-fp4_1k1k_con512_ctx1_tp1_gen1_dep2_eplb0_mtp0_ccb-UCX] TIMEOUT (120)
   - perf/test_perf_sanity.py::test_e2e[disagg_upload-gen_only-gb200_gpt-oss-120b-fp4_8k1k_con512_ctx1_tp1_gen1_dep2_eplb0_mtp0_ccb-UCX] TIMEOUT (120)
-  # Dynamo Qwen3-32B-FP8 TRT-LLM disagg recipe replica (TP1 prefill + TP2 decode, dense FP8)
-  # Mirrors https://github.com/ai-dynamo/dynamo/tree/main/recipes/qwen3-32b-fp8/trtllm/disagg
-  - perf/test_perf_sanity.py::test_e2e[disagg_upload-gen_only-gb200_qwen3-32b-fp8_4k1k_con128_ctx1_tp1_gen1_tp2_eplb0_mtp0_ccb-DEFAULT] TIMEOUT (120)
   # - perf/test_perf_sanity.py::test_e2e[disagg_upload-e2e-gb200_gpt-oss-120b-fp4_1k1k_con2048_ctx1_tp1_gen1_dep2_eplb0_mtp0_ccb-UCX] TIMEOUT (120)
   # - perf/test_perf_sanity.py::test_e2e[disagg_upload-e2e-gb200_gpt-oss-120b-fp4_1k1k_con512_ctx1_tp1_gen1_dep2_eplb0_mtp0_ccb-UCX] TIMEOUT (120)
   # - perf/test_perf_sanity.py::test_e2e[disagg_upload-e2e-gb200_gpt-oss-120b-fp4_8k1k_con512_ctx1_tp1_gen1_dep2_eplb0_mtp0_ccb-UCX] TIMEOUT (120)
-  # - perf/test_perf_sanity.py::test_e2e[disagg_upload-e2e-gb200_qwen3-32b-fp8_4k1k_con128_ctx1_tp1_gen1_tp2_eplb0_mtp0_ccb-DEFAULT] TIMEOUT (120)
