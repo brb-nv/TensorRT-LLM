@@ -1,0 +1,24 @@
+# Dynamo recipe: Qwen3-235B-A22B-FP8 aggregated
+# Source: https://github.com/ai-dynamo/dynamo/blob/main/recipes/qwen3-235b-a22b-fp8/trtllm/agg/deploy.yaml
+# GPU topology: 4x replicas of 4 GPUs each (TP4×EP4) = 16 GPUs total
+backend: pytorch
+trust_remote_code: true
+tensor_parallel_size: 4
+moe_expert_parallel_size: 4
+moe_tensor_parallel_size: 1
+enable_attention_dp: false
+enable_chunked_prefill: true
+kv_cache_config:
+  enable_block_reuse: true
+  free_gpu_memory_fraction: 0.8
+dtype: auto
+cache_transceiver_config:
+  backend: DEFAULT
+cuda_graph_config:
+  enable_padding: true
+max_batch_size: 128
+disable_overlap_scheduler: false
+print_iter_log: false
+moe_config:
+  backend: DEEPGEMM
+max_num_tokens: 8192

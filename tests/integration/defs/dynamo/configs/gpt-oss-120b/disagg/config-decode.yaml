@@ -1,0 +1,30 @@
+# Dynamo recipe: GPT-OSS-120B disaggregated (decode worker)
+# Source: https://github.com/ai-dynamo/dynamo/blob/main/recipes/gpt-oss-120b/trtllm/disagg/deploy.yaml
+# GPU topology: 1x prefill (1 GPU) + 1x decode (4 GPUs) = 5 Blackwell GPUs
+allreduce_strategy: AUTO
+attention_dp_config:
+  enable_balance: true
+cache_transceiver_config:
+  backend: UCX
+  max_tokens_in_buffer: 9216
+cuda_graph_config:
+  enable_padding: true
+  max_batch_size: 1280
+disable_overlap_scheduler: false
+enable_attention_dp: false
+kv_cache_config:
+  dtype: fp8
+  enable_block_reuse: false
+  free_gpu_memory_fraction: 0.85
+max_batch_size: 1280
+max_num_tokens: 20000
+max_seq_len: 11000
+moe_config:
+  backend: TRTLLM
+moe_expert_parallel_size: 1
+num_postprocess_workers: 4
+pipeline_parallel_size: 1
+print_iter_log: true
+stream_interval: 20
+tensor_parallel_size: 4
+trust_remote_code: true

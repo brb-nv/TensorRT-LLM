@@ -1,0 +1,34 @@
+# Perf-sanity wrapper for the Dynamo TRTLLM kimi-k2.5 aggregated recipe.
+# Engine-side knobs come from the referenced Dynamo recipe config via
+# ``extra_llm_api_config_path``; this file only provides (a) the topology
+# fields consumed by ServerConfig at CLI-construction time and (b) the
+# client-side workload definition.
+#
+# Dynamo recipe source:
+#   tests/integration/defs/dynamo/configs/kimi-k2.5/agg/config.yaml
+#   (originally https://github.com/ai-dynamo/dynamo/blob/main/recipes/kimi-k2.5/trtllm/agg/nvidia/deploy.yaml)
+metadata:
+  model_name: k25_thinking_fp4
+  supported_gpus:
+  - B200
+hardware:
+  gpus_per_node: 8
+server_configs:
+  - name: "dynamo_k25_tep8_agg_8k1k"
+    model_name: "k25_thinking_fp4"
+    tensor_parallel_size: 8
+    moe_expert_parallel_size: 8
+    pipeline_parallel_size: 1
+    max_batch_size: 128
+    max_num_tokens: 8448
+    max_seq_len: 8212
+    enable_attention_dp: true
+    trust_remote_code: true
+    extra_llm_api_config_path: "tests/integration/defs/dynamo/configs/kimi-k2.5/agg/config.yaml"
+    client_configs:
+      - name: "con128_iter5_8k1k"
+        concurrency: 128
+        iterations: 5
+        isl: 8192
+        osl: 1024
+        backend: "openai"

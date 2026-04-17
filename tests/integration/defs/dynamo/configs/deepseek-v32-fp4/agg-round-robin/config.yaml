@@ -1,0 +1,29 @@
+# Dynamo recipe: DeepSeek-V3.2-NVFP4 aggregated (round-robin routing)
+# Source: https://github.com/ai-dynamo/dynamo/blob/main/recipes/deepseek-v32-fp4/trtllm/agg-round-robin/deploy.yaml
+# GPU topology: 4x replicas of 2 nodes × 4 GPUs (TP8×EP8) = 32 GB200
+allreduce_strategy: MNNVL
+cache_transceiver_config:
+  backend: UCX
+  max_tokens_in_buffer: 120000
+max_num_tokens: 8192
+enable_chunked_prefill: true
+disable_overlap_scheduler: true
+cuda_graph_config:
+  max_batch_size: 8
+  enable_padding: true
+enable_attention_dp: true
+kv_cache_config:
+  dtype: fp8
+  enable_block_reuse: false
+  free_gpu_memory_fraction: 0.9
+  tokens_per_block: 64
+max_batch_size: 8
+max_seq_len: 121000
+moe_config:
+  backend: TRTLLM
+  use_low_precision_moe_combine: true
+moe_expert_parallel_size: 8
+num_postprocess_workers: 8
+print_iter_log: true
+stream_interval: 10
+tensor_parallel_size: 8

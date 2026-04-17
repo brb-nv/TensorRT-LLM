@@ -1,0 +1,20 @@
+# Dynamo recipe: Kimi-K2.5 aggregated
+# Source (baseten): https://github.com/ai-dynamo/dynamo/blob/main/recipes/kimi-k2.5/trtllm/agg/baseten/deploy.yaml
+# Source (nvidia):  https://github.com/ai-dynamo/dynamo/blob/main/recipes/kimi-k2.5/trtllm/agg/nvidia/deploy.yaml
+# GPU topology: 8x B200 (MoE, TP8×EP8)
+# Note: baseten and nvidia variants share the same engine config; they differ only in model path.
+max_batch_size: 128
+max_num_tokens: 8448
+max_seq_len: 8212
+tensor_parallel_size: 8
+moe_expert_parallel_size: 8
+enable_attention_dp: true
+pipeline_parallel_size: 1
+print_iter_log: true
+kv_cache_config:
+  free_gpu_memory_fraction: 0.75
+  dtype: fp8
+cache_transceiver_config:
+  backend: UCX
+  max_tokens_in_buffer: 8448
+trust_remote_code: true

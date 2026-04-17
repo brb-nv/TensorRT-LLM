@@ -1,0 +1,30 @@
+# Perf-sanity wrapper for the Dynamo TRTLLM gpt-oss-120b aggregated recipe.
+# Engine-side knobs come from the referenced Dynamo recipe config via
+# ``extra_llm_api_config_path``; this file only provides (a) the topology
+# fields consumed by ServerConfig at CLI-construction time and (b) the
+# client-side workload definition.
+#
+# Dynamo recipe source:
+#   tests/integration/defs/dynamo/configs/gpt-oss-120b/agg/config.yaml
+#   (originally https://github.com/ai-dynamo/dynamo/blob/main/recipes/gpt-oss-120b/trtllm/agg/deploy.yaml)
+metadata:
+  model_name: gpt_oss_120b_fp4
+  supported_gpus:
+  - GB200
+hardware:
+  gpus_per_node: 4
+server_configs:
+  - name: "dynamo_gpt_oss_fp4_dep4_agg_1k1k"
+    model_name: "gpt_oss_120b_fp4"
+    tensor_parallel_size: 4
+    moe_expert_parallel_size: 4
+    pipeline_parallel_size: 1
+    extra_llm_api_config_path: "tests/integration/defs/dynamo/configs/gpt-oss-120b/agg/config.yaml"
+    client_configs:
+      - name: "con512_iter5_1k1k"
+        concurrency: 512
+        iterations: 5
+        isl: 1024
+        osl: 1024
+        backend: "openai"
+        dataset_file: datasets/perf-ci/gpt_oss_120b-1k1k-20480-ratio-1_for_serve.json
