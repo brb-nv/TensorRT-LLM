@@ -1,0 +1,133 @@
+metadata:
+  model_name: qwen3_32b_fp8
+  precision: fp8
+  model_dir_name: Qwen3-32B-FP8
+  supported_gpus:
+  - GB200
+  script_file: disaggr_torch.slurm
+  benchmark_type: 4k1k
+  # Mirror of the Dynamo Qwen3-32B-FP8 TRT-LLM disagg deployment recipe:
+  # https://github.com/ai-dynamo/dynamo/tree/main/recipes/qwen3-32b-fp8/trtllm/disagg
+  # Topology: 1 prefill worker on 1 GPU (TP=1) + 1 decode worker on 2 GPUs (TP=2).
+  # Qwen3-32B is a dense (non-MoE) FP8 model. Cache transceiver is DEFAULT,
+  # KV cache dtype is fp8, block reuse disabled, overlap scheduler on decode /
+  # off on prefill. CUDA graphs enabled on both workers with dense batch-size
+  # sweeps (prefill 1..256, decode 1..128).
+  # Goal: catch TRT-LLM regressions that would only surface in the production
+  # Dynamo Qwen3-32B-FP8 disagg deployment (TP1 prefill + TP2 decode dense,
+  # FP8 KV, PDL-enabled paths).
+  #
+  # Deviations from the upstream Dynamo recipe (intentional, revisit if the
+  # recipe itself changes or if perf-sanity grows to support these knobs):
+  #   TODO(dynamo-replica): ISL/OSL not pinned by the recipe. The recipe sets
+  #     `max_seq_len=7808` and `max_num_tokens=7808` on both workers. We use
+  #     4096/1024 (`4k1k`) to stay well within the 7808-token budget and to
+  #     exercise a meaningful long-context prefill + 1k decode. Bump to a
+  #     `6k1k` or `7k1k` workload if a matching dataset lands.
+  #   TODO(dynamo-replica): concurrency_list='128' is a perf-sanity choice
+  #     (no concurrency is specified in deploy.yaml). Picked to saturate the
+  #     decode `max_batch_size=128` at 1x with no backlog.
+  #   TODO(dynamo-replica): `gen_only` benchmark_mode only. Matches the
+  #     convention used by every disagg entry in perf-sanity; the `e2e`
+  #     variant is left commented-out in the test-list for easy re-enable.
+  #   TODO(dynamo-replica): Upstream recipe runs 4 prefill + 2 decode replicas
+  #     behind a round-robin router. Perf-sanity does not model multi-replica
+  #     fan-out, so we run 1 ctx + 1 gen. Sufficient for per-worker regression
+  #     detection; will NOT catch router / load-balancing regressions.
+  #   TODO(dynamo-replica): Recipe CUDA-graph `batch_sizes` list is a dense
+  #     sweep (prefill 1..256, decode 1..128). We collapse to
+  #     `enable_padding: true` with `max_batch_size` equal to the engine's
+  #     `max_batch_size`, which captures the same graphs after padding. If
+  #     perf-sanity gains full `batch_sizes` support, restore the explicit
+  #     list for bit-for-bit fidelity.
+  #   TODO(dynamo-replica): The recipe's prefill CLI adds
+  #     `--free-gpu-memory-fraction 0.9` (overrides yaml's 0.7). We reflect
+  #     the CLI-effective value (0.9) in `kv_cache_config.free_gpu_memory_fraction`.
+  #     Same for decode (CLI 0.9 overrides yaml 0.7).
+  #   TODO(dynamo-replica): Kubernetes-only recipe env vars (`HF_HOME`,
+  #     `MODEL_PATH`, `ENGINE_ARGS`) are omitted - they don't apply to
+  #     SLURM/enroot. The recipe's TRT-LLM env vars (`TRTLLM_ENABLE_PDL=1`,
+  #     `TRT_LLM_DISABLE_LOAD_WEIGHTS_IN_PARALLEL=True`) are preserved.
+  #   TODO(dynamo-replica): `qwen3_32b-4k1k-*` perf-ci dataset must exist for
+  #     this test to be runnable. Existing perf-ci datasets follow
+  #     `<model>-<isl><osl>-20480-ratio-1_for_serve.json`; this dataset may
+  #     need to be synced before the test goes green. Flagged here rather
+  #     than silently failing at runtime.
+slurm:
+  script_file: disaggr_torch.slurm
+  partition: <partition>
+  account: <account>
+  job_time: 02:00:00
+  job_name: unified-benchmark
+  extra_args: "--gres=gpu:4"
+  numa_bind: true
+benchmark:
+  mode: e2e
+  use_nv_sa_benchmark: false
+  multi_round: 10
+  benchmark_ratio: 0.0
+  streaming: true
+  concurrency_list: '128'
+  input_length: 4096
+  output_length: 1024
+  dataset_file: datasets/perf-ci/qwen3_32b-4k1k-20480-ratio-1_for_serve.json
+hardware:
+  gpus_per_node: 4
+  num_ctx_servers: 1
+  num_gen_servers: 1
+environment:
+  container_mount: <container_mount>
+  container_image: <container_image>
+  model_path: <model_path>
+  trtllm_repo: ''
+  build_wheel: false
+  work_dir: <full_path_to_work_dir>
+  worker_env_var: "TLLM_LOG_LEVEL=INFO TRTLLM_SERVER_DISABLE_GC=1 TRTLLM_WORKER_DISABLE_GC=1 TRTLLM_ENABLE_PDL=1 ENROOT_ALLOW_DEV=yes TRT_LLM_DISABLE_LOAD_WEIGHTS_IN_PARALLEL=True"
+  server_env_var: "TRTLLM_SERVER_DISABLE_GC=1"
+profiling:
+  nsys_on: false
+accuracy:
+  enable_accuracy_test: false
+worker_config:
+  gen:
+    print_iter_log: true
+    tensor_parallel_size: 2
+    pipeline_parallel_size: 1
+    context_parallel_size: 1
+    enable_attention_dp: false
+    enable_chunked_prefill: false
+    trust_remote_code: true
+    max_batch_size: 128
+    max_num_tokens: 7808
+    max_seq_len: 7808
+    cuda_graph_config:
+      enable_padding: true
+      max_batch_size: 128
+    kv_cache_config:
+      enable_block_reuse: false
+      free_gpu_memory_fraction: 0.9
+      dtype: fp8
+    cache_transceiver_config:
+      backend: DEFAULT
+    disable_overlap_scheduler: false
+  ctx:
+    print_iter_log: true
+    tensor_parallel_size: 1
+    pipeline_parallel_size: 1
+    context_parallel_size: 1
+    enable_attention_dp: false
+    enable_chunked_prefill: false
+    trust_remote_code: true
+    max_batch_size: 1
+    max_num_tokens: 7808
+    max_seq_len: 7808
+    cuda_graph_config:
+      enable_padding: true
+      max_batch_size: 256
+    kv_cache_config:
+      enable_block_reuse: false
+      free_gpu_memory_fraction: 0.9
+      dtype: fp8
+    cache_transceiver_config:
+      backend: DEFAULT
+    disable_overlap_scheduler: true

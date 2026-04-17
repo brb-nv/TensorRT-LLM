@@ -1,0 +1,128 @@
+metadata:
+  model_name: super_fp8
+  precision: fp8
+  model_dir_name: NVIDIA-Nemotron-3-Super-120B-A12B-FP8
+  supported_gpus:
+  - GB200
+  script_file: disaggr_torch.slurm
+  benchmark_type: 8k1k
+  # Mirror of the Dynamo Nemotron-3-Super-FP8 TRT-LLM disagg deployment recipe:
+  # https://github.com/ai-dynamo/dynamo/tree/main/recipes/nemotron-3-super-fp8/trtllm/disagg
+  # Topology: 1 prefill worker on 2 GPUs (TP2) + 1 decode worker on 2 GPUs (TP2).
+  # Nemotron-H is a Mamba + Attention hybrid model, so the KV cache includes
+  # both attention K/V and Mamba SSM state. Only UCX cache transceiver backend
+  # supports hybrid SSM-state transfer; NIXL / MOONCAKE are rejected for this
+  # model. Block reuse must remain disabled (TRT-LLM still forbids it for
+  # Mamba hybrid caches).
+  # Goal: catch TRT-LLM regressions in (a) Nemotron-H PyTorch backend,
+  # (b) UCX-based Mamba SSM state transfer across disagg workers, and
+  # (c) FP8 + chunked-prefill + overlap-scheduler code paths that only show
+  # up in the production Dynamo deployment.
+  #
+  # Deviations from the upstream Dynamo recipe (intentional, revisit if the
+  # recipe itself changes or if perf-sanity grows to support these knobs):
+  #   TODO(dynamo-replica): ISL/OSL not pinned by the recipe; recipe only sets
+  #     `max_num_tokens=8192` on both workers. We use 8192/1024 to match the
+  #     recipe's token budget and keep a realistic long-context prefill load.
+  #   TODO(dynamo-replica): concurrency_list='64' is a perf-sanity choice
+  #     (no concurrency is specified in deploy.yaml). Picked to saturate the
+  #     per-worker `max_batch_size=16` (≈4x oversubscription) without creating
+  #     an excessive backlog.
+  #   TODO(dynamo-replica): `gen_only` benchmark_mode only. Matches the
+  #     convention used by every disagg entry in perf-sanity; the `e2e`
+  #     variant is left commented-out for easy re-enable.
+  #   TODO(dynamo-replica): `nemotron_super-8k1k-*` perf-ci dataset must exist
+  #     for this test to be runnable. The other perf-ci datasets follow the
+  #     `<model>-<isl><osl>-20480-ratio-1_for_serve.json` pattern; the dataset
+  #     may need to be synced to the perf-ci data root before this test goes
+  #     green. Flagged here rather than silently failing at runtime.
+  #   TODO(dynamo-replica): Kubernetes-only recipe env vars (`HF_HOME`,
+  #     `ENGINE_ARGS`, `MODEL_PATH`) are omitted - they don't apply to
+  #     SLURM/enroot. The recipe does not set any TRT-LLM-specific env vars
+  #     beyond the config file, so the perf-sanity env var block uses only
+  #     the standard knobs (`TRTLLM_ENABLE_PDL`, GC disable, etc.).
+  #   TODO(dynamo-replica): Recipe uses
+  #     `--dyn-tool-call-parser nemotron_nano` /
+  #     `--dyn-reasoning-parser nemotron_nano` on the Dynamo frontend.
+  #     These are Dynamo-router-side parsers and do not affect TRT-LLM's
+  #     engine behavior, so they are not mapped into the perf-sanity config.
+slurm:
+  script_file: disaggr_torch.slurm
+  partition: <partition>
+  account: <account>
+  job_time: 02:00:00
+  job_name: unified-benchmark
+  extra_args: "--gres=gpu:4"
+  numa_bind: true
+benchmark:
+  mode: e2e
+  use_nv_sa_benchmark: false
+  multi_round: 10
+  benchmark_ratio: 0.0
+  streaming: true
+  concurrency_list: '64'
+  input_length: 8192
+  output_length: 1024
+  dataset_file: datasets/perf-ci/nemotron_super-8k1k-20480-ratio-1_for_serve.json
+hardware:
+  gpus_per_node: 2
+  num_ctx_servers: 1
+  num_gen_servers: 1
+environment:
+  container_mount: <container_mount>
+  container_image: <container_image>
+  model_path: <model_path>
+  trtllm_repo: ''
+  build_wheel: false
+  work_dir: <full_path_to_work_dir>
+  worker_env_var: "TLLM_LOG_LEVEL=INFO TRTLLM_SERVER_DISABLE_GC=1 TRTLLM_WORKER_DISABLE_GC=1 TRTLLM_ENABLE_PDL=1 ENROOT_ALLOW_DEV=yes"
+  server_env_var: "TRTLLM_SERVER_DISABLE_GC=1"
+profiling:
+  nsys_on: false
+accuracy:
+  enable_accuracy_test: false
+worker_config:
+  gen:
+    print_iter_log: true
+    tensor_parallel_size: 2
+    moe_expert_parallel_size: 1
+    pipeline_parallel_size: 1
+    context_parallel_size: 1
+    enable_attention_dp: false
+    enable_chunked_prefill: true
+    max_batch_size: 16
+    max_num_tokens: 8192
+    trust_remote_code: true
+    cuda_graph_config:
+      enable_padding: true
+      max_batch_size: 16
+    kv_cache_config:
+      enable_block_reuse: false
+      free_gpu_memory_fraction: 0.85
+    moe_config:
+      backend: TRTLLM
+    cache_transceiver_config:
+      backend: UCX
+    disable_overlap_scheduler: false
+  ctx:
+    print_iter_log: true
+    tensor_parallel_size: 2
+    moe_expert_parallel_size: 1
+    pipeline_parallel_size: 1
+    context_parallel_size: 1
+    enable_attention_dp: false
+    enable_chunked_prefill: true
+    max_batch_size: 16
+    max_num_tokens: 8192
+    trust_remote_code: true
+    cuda_graph_config:
+      enable_padding: true
+      max_batch_size: 16
+    kv_cache_config:
+      enable_block_reuse: false
+      free_gpu_memory_fraction: 0.85
+    moe_config:
+      backend: TRTLLM
+    cache_transceiver_config:
+      backend: UCX
+    disable_overlap_scheduler: true
