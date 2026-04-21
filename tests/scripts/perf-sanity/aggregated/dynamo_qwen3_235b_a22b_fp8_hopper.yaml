@@ -10,7 +10,7 @@ metadata:
 hardware:
   gpus_per_node: 8
 server_configs:
-  - name: "qwen3_235b_a22b_fp8_tp4_ep4_deepgemm_8k1k"
+  - name: "qwen3_235b_a22b_fp8_tp4_ep4_cutlass_8k1k"
     model_name: "qwen3_235b_a22b_fp8"
     trust_remote_code: true
     tensor_parallel_size: 4
@@ -26,7 +26,7 @@ server_configs:
     disable_overlap_scheduler: false
     print_iter_log: false
     moe_config:
-      backend: 'DEEPGEMM'
+      backend: 'CUTLASS'
     cuda_graph_config:
       enable_padding: true
       max_batch_size: 128

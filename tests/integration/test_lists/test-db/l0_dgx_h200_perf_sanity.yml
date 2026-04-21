@@ -17,7 +17,7 @@ l0_dgx_h200_perf_sanity:
   - perf/test_perf_sanity.py::test_e2e[disagg_upload-gen_only-h200_nemotron-super-fp8_8k1k_con64_ctx1_tp2_gen1_tp2_eplb0_mtp0_ccb-UCX]
   - perf/test_perf_sanity.py::test_e2e[disagg_upload-gen_only-h200_qwen3-235b-a22b-fp8_8k1k_con512_ctx1_tp2_gen1_tep4_eplb0_mtp0_ccb-DEFAULT]
   - perf/test_perf_sanity.py::test_e2e[disagg_upload-gen_only-h200_qwen3-32b-fp8_4k1k_con128_ctx1_tp1_gen1_tp2_eplb0_mtp0_ccb-DEFAULT]
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-dynamo_qwen3_235b_a22b_fp8_hopper-qwen3_235b_a22b_fp8_tp4_ep4_deepgemm_8k1k]
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-dynamo_qwen3_235b_a22b_fp8_hopper-qwen3_235b_a22b_fp8_tp4_ep4_cutlass_8k1k]
   - perf/test_perf_sanity.py::test_e2e[aggr_upload-dynamo_qwen3_32b_fp8_hopper-qwen3_32b_fp8_tp2_6k1k]
   # - perf/test_perf_sanity.py::test_e2e[disagg_upload-e2e-h200_nemotron-super-fp8_8k1k_con64_ctx1_tp2_gen1_tp2_eplb0_mtp0_ccb-UCX]
   # - perf/test_perf_sanity.py::test_e2e[disagg_upload-e2e-h200_qwen3-235b-a22b-fp8_8k1k_con512_ctx1_tp2_gen1_tep4_eplb0_mtp0_ccb-DEFAULT]
