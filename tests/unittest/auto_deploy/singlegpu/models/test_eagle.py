@@ -21,6 +21,7 @@ import pytest
 import torch
 from _model_test_utils import get_small_model_config
 from build_and_run_ad import ExperimentConfig, main
+from test_common.llm_data import hf_id_to_local_model_dir
 
 from tensorrt_llm._torch.auto_deploy.models.custom.modeling_eagle import (
     Eagle3DraftOutput,
@@ -29,7 +30,6 @@ from tensorrt_llm._torch.auto_deploy.models.custom.modeling_eagle import (
 )
 from tensorrt_llm._torch.auto_deploy.models.eagle import EagleDrafterFactory
 from tensorrt_llm._torch.auto_deploy.models.factory import ModelFactoryRegistry
-from tests.test_common.llm_data import hf_id_to_local_model_dir
 
 EAGLE_MODEL_HUB_ID = "yuhuili/EAGLE3-LLaMA3.1-Instruct-8B"
 

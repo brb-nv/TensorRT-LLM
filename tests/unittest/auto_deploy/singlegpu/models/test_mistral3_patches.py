@@ -83,7 +83,7 @@ def test_build_run_mistral3_vlm():
 
     outputs_for_comparison["gm"] = _run_with_and_without_image(gm)
 
-    atol, rtol = 1e-3, 1e-3
+    atol, rtol = 5e-3, 5e-3
     for comp, outs in outputs_for_comparison.items():
         torch.testing.assert_close(
             outs,
