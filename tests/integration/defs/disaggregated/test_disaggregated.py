@@ -641,8 +641,7 @@ def run_disaggregated_test(example_dir,
         # tmpdir capture and CI artifact bundlers pick them up.
         try:
             artifact_dir = cwd if cwd else os.getcwd()
-            log_dst_dir = os.path.join(
-                artifact_dir, f"disagg_logs_{test_desc}")
+            log_dst_dir = os.path.join(artifact_dir, f"disagg_logs_{test_desc}")
             os.makedirs(log_dst_dir, exist_ok=True)
             for fname in os.listdir(work_dir):
                 if fname.endswith('.log'):
@@ -650,11 +649,9 @@ def run_disaggregated_test(example_dir,
                     dst = os.path.join(log_dst_dir, fname)
                     try:
                         shutil.copy2(src, dst)
-                        print_info(
-                            f"[disagg] preserved log: {dst}")
+                        print_info(f"[disagg] preserved log: {dst}")
                     except OSError as e:
-                        print_info(
-                            f"[disagg] failed to copy {src}: {e}")
+                        print_info(f"[disagg] failed to copy {src}: {e}")
         except OSError as e:
             print_info(f"[disagg] log preservation failed: {e}")
         terminate(*ctx_workers, *gen_workers, disagg_server)

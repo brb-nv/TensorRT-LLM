@@ -193,13 +193,15 @@ class BindKvCacheTransceiver(KvCacheTransceiver):
     def request_and_receive_sync(self, req: LlmRequest):
         # DEBUG harmony-hang
         logger.info(
-            f"[transceiver] request_and_receive_sync req_id={req.py_request_id}")
+            f"[transceiver] request_and_receive_sync req_id={req.py_request_id}"
+        )
         return self.impl.request_and_receive_sync(req)
 
     def request_and_receive_async(self, req: LlmRequest):
         # DEBUG harmony-hang
         logger.info(
-            f"[transceiver] request_and_receive_async req_id={req.py_request_id}")
+            f"[transceiver] request_and_receive_async req_id={req.py_request_id}"
+        )
         return self.impl.request_and_receive_async(req)
 
     def check_context_transfer_status(self, at_least_request_num: int):
@@ -233,8 +235,7 @@ class BindKvCacheTransceiver(KvCacheTransceiver):
 
     def cancel_request(self, req: LlmRequest):
         # DEBUG harmony-hang
-        logger.info(
-            f"[transceiver] cancel_request req_id={req.py_request_id}")
+        logger.info(f"[transceiver] cancel_request req_id={req.py_request_id}")
         return self.impl.cancel_request(req)
 
     def prepare_context_requests(self, requests: List[LlmRequest]):

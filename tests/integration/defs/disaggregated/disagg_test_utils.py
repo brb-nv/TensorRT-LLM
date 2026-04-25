@@ -105,8 +105,7 @@ def _run_worker(
     # DEBUG harmony-hang: allow tests/CI to force per-worker log files via env,
     # without changing each call site. Each worker's stdout+stderr will be
     # captured into work_dir/worker_<role>_<port>.log.
-    if not save_log and (env or os.environ).get(
-            "TLLM_DISAGG_SAVE_WORKER_LOGS", "0") == "1":
+    if not save_log and (env or os.environ).get("TLLM_DISAGG_SAVE_WORKER_LOGS", "0") == "1":
         save_log = True
     worker_config_path = os.path.join(work_dir, f"{role}_{port}_config.yaml")
     with open(worker_config_path, "w+") as f:
@@ -180,8 +179,7 @@ def run_disagg_server(disagg_cluster_config, work_dir, port=0, save_log=False, e
         ProcessWrapper: Wrapped subprocess
     """
     # DEBUG harmony-hang: same env-controlled log capture for the disagg server.
-    if not save_log and (env or os.environ).get(
-            "TLLM_DISAGG_SAVE_WORKER_LOGS", "0") == "1":
+    if not save_log and (env or os.environ).get("TLLM_DISAGG_SAVE_WORKER_LOGS", "0") == "1":
         save_log = True
     disagg_server_config_path = os.path.join(work_dir, "disagg_server_config.yaml")
     disagg_cluster_config["port"] = port

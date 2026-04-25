@@ -3276,12 +3276,11 @@ class PyExecutor:
                 r.py_request_id for r in non_gen_first_active
                 if r.is_disagg_generation_transmission_in_progress
             ]
-            logger.info(
-                f"[disagg-gen] check_gen_transfer_status ENTER "
-                f"atLeastNum={1 if block_transfer else 0} "
-                f"block_transfer={block_transfer} "
-                f"non_gen_first_active={len(non_gen_first_active)} "
-                f"in_progress_ids={in_progress_ids}")
+            logger.info(f"[disagg-gen] check_gen_transfer_status ENTER "
+                        f"atLeastNum={1 if block_transfer else 0} "
+                        f"block_transfer={block_transfer} "
+                        f"non_gen_first_active={len(non_gen_first_active)} "
+                        f"in_progress_ids={in_progress_ids}")
         _t0 = time.time()
         self._check_disagg_gen_cache_transfer_status(1 if block_transfer else 0)
         if block_transfer or new_gen_reqs:
@@ -3290,10 +3289,9 @@ class PyExecutor:
                 r.py_request_id for r in self.active_requests
                 if r.is_disagg_generation_transmission_in_progress
             ]
-            logger.info(
-                f"[disagg-gen] check_gen_transfer_status EXIT "
-                f"elapsed_ms={elapsed_ms:.1f} "
-                f"still_in_progress_ids={still_in_progress}")
+            logger.info(f"[disagg-gen] check_gen_transfer_status EXIT "
+                        f"elapsed_ms={elapsed_ms:.1f} "
+                        f"still_in_progress_ids={still_in_progress}")
 
         return
 
@@ -3324,7 +3322,8 @@ class PyExecutor:
                     logger.info(
                         f"[disagg-ctx] respond_and_send_async req_id={req.py_request_id} "
                         f"ctx_finished={req.is_context_finished} "
-                        f"finished_due_to_length={req.is_finished_due_to_length}")
+                        f"finished_due_to_length={req.is_finished_due_to_length}"
+                    )
                     self.kv_cache_transceiver.respond_and_send_async(req)
 
                     if self.kv_cache_transceiver.kv_transfer_timeout_ms is not None:

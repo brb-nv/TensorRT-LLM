@@ -32,14 +32,12 @@ class HangDetector:
         # DEBUG harmony-hang: periodic soft stack dumps at fractions of the timeout,
         # so we observe how the stall evolves rather than getting one snapshot at +timeout.
         # Disable by setting TLLM_HANG_DETECTOR_SOFT_DUMPS=0.
-        self._soft_dumps_enabled = os.environ.get(
-            "TLLM_HANG_DETECTOR_SOFT_DUMPS", "1") != "0"
+        self._soft_dumps_enabled = os.environ.get("TLLM_HANG_DETECTOR_SOFT_DUMPS", "1") != "0"
         # DEBUG harmony-hang: comma-separated seconds list, e.g. "30,60,90,120,180,240".
         soft_dump_env = os.environ.get("TLLM_HANG_DETECTOR_SOFT_DUMP_AT", "")
         if soft_dump_env:
             try:
-                self._soft_dump_at = sorted(
-                    {int(s) for s in soft_dump_env.split(",") if s.strip()})
+                self._soft_dump_at = sorted({int(s) for s in soft_dump_env.split(",") if s.strip()})
             except ValueError:
                 self._soft_dump_at = []
         else:
@@ -72,7 +70,8 @@ class HangDetector:
                 elapsed = stop
                 logger.warning(
                     f"[hang_detector] No checkpoint for {elapsed}s "
-                    f"(soft dump, kill at {self.timeout}s):")
+                    f"(soft dump, kill at {self.timeout}s):"
+                )
                 print_all_stacks()
             await asyncio.sleep(max(0, self.timeout - elapsed))
         else:
