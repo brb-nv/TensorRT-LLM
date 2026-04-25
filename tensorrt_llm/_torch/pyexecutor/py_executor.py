@@ -3236,6 +3236,12 @@ class PyExecutor:
     @nvtx_range("_recv_disagg_gen_cache")
     def _recv_disagg_gen_cache(self, new_gen_reqs):
 
+        # DEBUG harmony-hang: log every disagg gen-init batch.
+        if new_gen_reqs:
+            logger.info(
+                f"[disagg-gen] _recv_disagg_gen_cache: {len(new_gen_reqs)} new gen reqs, "
+                f"ids={[r.py_request_id for r in new_gen_reqs]}")
+
         # For gen-only benchmarking, mark new gen request as transmission complete right away
         if os.getenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY") == "1":
             for req in new_gen_reqs:
@@ -3262,7 +3268,32 @@ class PyExecutor:
         block_transfer = bool(non_gen_first_active) and all(
             req.is_disagg_generation_transmission_in_progress
             for req in non_gen_first_active)
+        # DEBUG harmony-hang: this is the synchronous wait that hung in nvbug 6011317.
+        # Log entry/exit so we can see (a) when it started, (b) how long it ran, and
+        # (c) the in-flight state at the time of the call.
+        if block_transfer or new_gen_reqs:
+            in_progress_ids = [
+                r.py_request_id for r in non_gen_first_active
+                if r.is_disagg_generation_transmission_in_progress
+            ]
+            logger.info(
+                f"[disagg-gen] check_gen_transfer_status ENTER "
+                f"atLeastNum={1 if block_transfer else 0} "
+                f"block_transfer={block_transfer} "
+                f"non_gen_first_active={len(non_gen_first_active)} "
+                f"in_progress_ids={in_progress_ids}")
+        _t0 = time.time()
         self._check_disagg_gen_cache_transfer_status(1 if block_transfer else 0)
+        if block_transfer or new_gen_reqs:
+            elapsed_ms = (time.time() - _t0) * 1000.0
+            still_in_progress = [
+                r.py_request_id for r in self.active_requests
+                if r.is_disagg_generation_transmission_in_progress
+            ]
+            logger.info(
+                f"[disagg-gen] check_gen_transfer_status EXIT "
+                f"elapsed_ms={elapsed_ms:.1f} "
+                f"still_in_progress_ids={still_in_progress}")
 
         return
 
@@ -3289,6 +3320,11 @@ class PyExecutor:
                     # Order is important here: we need to start the transfer before responding
                     # to make sure the blocks are stored for reuse before they are sent.
                     self.async_transfer_manager.start_transfer(req)
+                    # DEBUG harmony-hang: log every ctx->gen send.
+                    logger.info(
+                        f"[disagg-ctx] respond_and_send_async req_id={req.py_request_id} "
+                        f"ctx_finished={req.is_context_finished} "
+                        f"finished_due_to_length={req.is_finished_due_to_length}")
                     self.kv_cache_transceiver.respond_and_send_async(req)
 
                     if self.kv_cache_transceiver.kv_transfer_timeout_ms is not None:

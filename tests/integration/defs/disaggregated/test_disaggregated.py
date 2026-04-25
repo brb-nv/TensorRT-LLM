@@ -636,6 +636,27 @@ def run_disaggregated_test(example_dir,
             disagg_server.process,
             use_ray=True)
     finally:
+        # DEBUG harmony-hang: preserve any worker/server logs as test artifacts
+        # before nuking work_dir. Files are copied into the test cwd so pytest's
+        # tmpdir capture and CI artifact bundlers pick them up.
+        try:
+            artifact_dir = cwd if cwd else os.getcwd()
+            log_dst_dir = os.path.join(
+                artifact_dir, f"disagg_logs_{test_desc}")
+            os.makedirs(log_dst_dir, exist_ok=True)
+            for fname in os.listdir(work_dir):
+                if fname.endswith('.log'):
+                    src = os.path.join(work_dir, fname)
+                    dst = os.path.join(log_dst_dir, fname)
+                    try:
+                        shutil.copy2(src, dst)
+                        print_info(
+                            f"[disagg] preserved log: {dst}")
+                    except OSError as e:
+                        print_info(
+                            f"[disagg] failed to copy {src}: {e}")
+        except OSError as e:
+            print_info(f"[disagg] log preservation failed: {e}")
         terminate(*ctx_workers, *gen_workers, disagg_server)
         shutil.rmtree(work_dir, ignore_errors=True)
 
@@ -2001,9 +2022,24 @@ def test_disaggregated_gpt_oss_120b_harmony(disaggregated_test_root,
     model_dir = f"{llm_models_root()}/{model_path}"
     setup_model_symlink(llm_venv, model_dir, model_path)
 
+    # DEBUG harmony-hang (nvbug 6011317): maximize diagnostic logs in CI.
+    # - Per-worker stdout/stderr captured to dedicated log files (preserved
+    #   as test artifacts by run_disaggregated_test's finally block).
+    # - INFO-level TRT-LLM logs so disagg lifecycle messages emit.
+    # - Verbose NCCL/UCX/NIXL traces from the cache transceiver path.
+    # - Hang detector trips at 90s with periodic soft stack dumps along the way.
+    env = llm_venv._new_env.copy()
+    env['TLLM_DISAGG_SAVE_WORKER_LOGS'] = '1'
+    env.setdefault('TLLM_LOG_LEVEL', 'INFO')
+    env.setdefault('NCCL_DEBUG', 'INFO')
+    env.setdefault('UCX_LOG_LEVEL', 'info')
+    env.setdefault('NIXL_LOG_LEVEL', 'info')
+    env.setdefault('TLLM_HANG_DETECTION_TIMEOUT', '90')
+    env.setdefault('TLLM_HANG_DETECTOR_SOFT_DUMP_AT', '20,40,60,75')
+
     run_disaggregated_test(disaggregated_example_root,
                            "gpt_oss_120b_harmony",
-                           env=llm_venv._new_env,
+                           env=env,
                            model_path=model_dir,
                            cwd=llm_venv.get_working_directory())
 

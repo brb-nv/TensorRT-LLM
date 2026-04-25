@@ -185,24 +185,56 @@ class BindKvCacheTransceiver(KvCacheTransceiver):
             rnn_layer_num_per_pp_rank)
 
     def respond_and_send_async(self, req: LlmRequest):
+        # DEBUG harmony-hang
+        logger.info(
+            f"[transceiver] respond_and_send_async req_id={req.py_request_id}")
         return self.impl.respond_and_send_async(req)
 
     def request_and_receive_sync(self, req: LlmRequest):
+        # DEBUG harmony-hang
+        logger.info(
+            f"[transceiver] request_and_receive_sync req_id={req.py_request_id}")
         return self.impl.request_and_receive_sync(req)
 
     def request_and_receive_async(self, req: LlmRequest):
+        # DEBUG harmony-hang
+        logger.info(
+            f"[transceiver] request_and_receive_async req_id={req.py_request_id}")
         return self.impl.request_and_receive_async(req)
 
     def check_context_transfer_status(self, at_least_request_num: int):
-        return self.impl.check_context_transfer_status(at_least_request_num)
+        # DEBUG harmony-hang: only log on blocking calls (atLeast>0) to avoid spam.
+        if at_least_request_num > 0:
+            logger.info(
+                f"[transceiver] check_context_transfer_status atLeast={at_least_request_num} ENTER"
+            )
+        result = self.impl.check_context_transfer_status(at_least_request_num)
+        if at_least_request_num > 0:
+            logger.info(
+                f"[transceiver] check_context_transfer_status atLeast={at_least_request_num} EXIT"
+            )
+        return result
 
     def check_gen_transfer_status(self, at_least_request_num: int):
-        return self.impl.check_gen_transfer_status(at_least_request_num)
+        # DEBUG harmony-hang: only log on blocking calls (atLeast>0) to avoid spam.
+        if at_least_request_num > 0:
+            logger.info(
+                f"[transceiver] check_gen_transfer_status atLeast={at_least_request_num} ENTER"
+            )
+        result = self.impl.check_gen_transfer_status(at_least_request_num)
+        if at_least_request_num > 0:
+            logger.info(
+                f"[transceiver] check_gen_transfer_status atLeast={at_least_request_num} EXIT"
+            )
+        return result
 
     def check_gen_transfer_complete(self):
         return self.impl.check_gen_transfer_complete()
 
     def cancel_request(self, req: LlmRequest):
+        # DEBUG harmony-hang
+        logger.info(
+            f"[transceiver] cancel_request req_id={req.py_request_id}")
         return self.impl.cancel_request(req)
 
     def prepare_context_requests(self, requests: List[LlmRequest]):
