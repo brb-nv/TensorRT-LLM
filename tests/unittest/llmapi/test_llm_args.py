@@ -724,8 +724,7 @@ class TestTorchLlmArgsCudaGraphSettings:
 
 
 class TestPiecewiseCudaGraphCaptureDefaults:
-    """Tests for the piecewise CUDA graph capture-set defaults and the
-    model-engine filter that prunes entries the runtime can never reach.
+    """Piecewise CUDA graph capture-set defaults and reachable-ceiling filter.
 
     Two invariants are exercised:
 
@@ -740,17 +739,19 @@ class TestPiecewiseCudaGraphCaptureDefaults:
     """
 
     def test_torch_compile_config_capture_num_tokens_defaults_to_none(self):
-        """`capture_num_tokens` is unset by default so the documented
-        fallback to `cuda_graph_config.batch_sizes` in the model engine
-        remains reachable. A non-None default here would silently shadow
-        the user's `cuda_graph_config.batch_sizes` choice.
+        """`capture_num_tokens` is unset by default.
+
+        Keeps the documented fallback to `cuda_graph_config.batch_sizes`
+        in the model engine reachable; a non-None default here would
+        silently shadow the user's `cuda_graph_config.batch_sizes` choice.
         """
         config = TorchCompileConfig(enable_piecewise_cuda_graph=True)
         assert config.capture_num_tokens is None
 
     def test_torch_llm_args_capture_num_tokens_defaults_to_none(self):
-        """Same invariant when the config is built through `TorchLlmArgs`
-        (the path real users hit via `trtllm-serve` YAML).
+        """Same invariant when reached through `TorchLlmArgs` construction.
+
+        This is the path real users hit via `trtllm-serve` YAML.
         """
         args = TorchLlmArgs(
             model=llama_model_path,
@@ -766,14 +767,15 @@ class TestPiecewiseCudaGraphCaptureDefaults:
         assert args.torch_compile_config.capture_num_tokens is None
 
     def test_piecewise_filter_drops_entries_above_reachable_ceiling(self):
-        """When the candidate list contains an entry above the reachable
-        ceiling `max_batch_size * (max_seq_len - 1)`, the filter must drop
-        it from `kept` and surface it in `unrecordable`. Otherwise the
-        warmup loop would silently skip it and the outer padding logic
-        would pad to a target with no captured graph.
+        """Drop candidates above `max_batch_size * (max_seq_len - 1)`.
+
+        Without the cap, the warmup loop would silently skip these entries
+        and the outer padding logic would pad to a target with no captured
+        graph. They must be removed from `kept` and surfaced in
+        `unrecordable` so the warning fires.
         """
-        from tensorrt_llm._torch.pyexecutor.model_engine import (
-            _filter_piecewise_capture_num_tokens)
+        from tensorrt_llm._torch.pyexecutor.model_engine import \
+            _filter_piecewise_capture_num_tokens
 
         candidates = CudaGraphConfig._generate_cuda_graph_batch_sizes(
             128, enable_padding=True)
@@ -798,12 +800,14 @@ class TestPiecewiseCudaGraphCaptureDefaults:
         assert unrecordable == [128]
 
     def test_piecewise_filter_keeps_all_entries_when_within_ceiling(self):
-        """Symmetric case: when the ceiling
-        `max_batch_size * (max_seq_len - 1)` is at least as large as the
-        biggest candidate, nothing is dropped and `unrecordable` is empty.
+        """Keep all candidates when the largest fits within the ceiling.
+
+        Symmetric case: when `max_batch_size * (max_seq_len - 1)` is at
+        least as large as the biggest candidate, nothing is dropped and
+        `unrecordable` is empty.
         """
-        from tensorrt_llm._torch.pyexecutor.model_engine import (
-            _filter_piecewise_capture_num_tokens)
+        from tensorrt_llm._torch.pyexecutor.model_engine import \
+            _filter_piecewise_capture_num_tokens
 
         candidates = CudaGraphConfig._generate_cuda_graph_batch_sizes(
             128, enable_padding=True)
@@ -818,13 +822,14 @@ class TestPiecewiseCudaGraphCaptureDefaults:
         assert unrecordable == []
 
     def test_piecewise_filter_subtracts_extra_decoding_steps(self):
-        """Drafting loops consume extra decode steps. The filter must
-        subtract `num_extra_decoding_steps` from the ceiling, mirroring
+        """Subtract `num_extra_decoding_steps` from the ceiling.
+
+        Drafting loops consume extra decode steps; the filter must mirror
         the `max_seq_len - 1 - num_extra_decoding_steps` constraint
         applied when warmup requests are built.
         """
-        from tensorrt_llm._torch.pyexecutor.model_engine import (
-            _filter_piecewise_capture_num_tokens)
+        from tensorrt_llm._torch.pyexecutor.model_engine import \
+            _filter_piecewise_capture_num_tokens
 
         candidates = [1, 2, 4, 8, 16, 32, 64, 100, 120]
         # max_seq_len=128, batch=1, 5 extra decoding steps -> ceiling 122.
@@ -1482,7 +1487,6 @@ def _get_all_llm_args_classes():
 
 def _get_all_pydantic_models_from_llm_args():
     """Get all Pydantic models referenced by BaseLlmArgs and its subclasses."""
-
     visited = set()
     models = []
 
@@ -1535,8 +1539,7 @@ def _get_qualified_name(cls: type) -> str:
 
 
 class TestPydanticBestPractices:
-    """
-    Ensure that the user-facing LlmArgs and its subfields follow Pydantic best practices.
+    """Ensure that the user-facing LlmArgs and its subfields follow Pydantic best practices.
     """
 
     # Fields exempt from Pydantic compatibility checks due to typing limitations or other edge cases.
@@ -1570,8 +1573,7 @@ class TestPydanticBestPractices:
 
     def _is_allowed_type(self, annotation, model_cls: type,
                          field_name: str) -> tuple[bool, str]:
-        """
-        Check if a type annotation is allowed for user-facing config fields.
+        """Check if a type annotation is allowed for user-facing config fields.
 
         Allowed:
         - Pydantic models (must inherit from StrictBaseModel)
@@ -1583,7 +1585,6 @@ class TestPydanticBestPractices:
 
         Returns (is_allowed, reason) tuple.
         """
-
         # Check if this field is exempt (check class and all parent classes)
         for cls in model_cls.__mro__:
             if field_name in self._COMPATIBILITY_EXEMPT_FIELDS.get(cls, []):
@@ -1669,7 +1670,7 @@ class TestPydanticBestPractices:
 
         if violations:
             pytest.fail(
-                f"The following fields are missing descriptions:\n" +
+                "The following fields are missing descriptions:\n" +
                 "\n".join(violations) +
                 "\n\nPlease add a description to each by using Field(description=\"...\")."
             )
@@ -1695,7 +1696,7 @@ class TestPydanticBestPractices:
 
         if violations:
             pytest.fail(
-                f"The following user-facing fields have types that are not allowed:\n"
+                "The following user-facing fields have types that are not allowed:\n"
                 + "\n".join(violations) +
                 "\n\nPlease use Pydantic-compatible types (primitives, Pydantic models that inherit from StrictBaseModel, "
                 "or other compatible types). If this is intentional, add the field "
@@ -1738,7 +1739,7 @@ class TestPydanticBestPractices:
 
         if violations:
             pytest.fail(
-                f"The following models define forbidden methods:\n" +
+                "The following models define forbidden methods:\n" +
                 "\n".join(violations) +
                 "\n\nPydantic models should follow the recommendations above instead."
             )
@@ -1761,7 +1762,7 @@ class TestPydanticBestPractices:
 
         if violations:
             pytest.fail(
-                f"The following fields use mutable default values:\n" +
+                "The following fields use mutable default values:\n" +
                 "\n".join(violations) +
                 "\n\nMutable defaults are shared across instances and cause bugs. "
                 "Use Field(default_factory=...) instead.")
@@ -1788,7 +1789,7 @@ class TestPydanticBestPractices:
 
         if violations:
             pytest.fail(
-                f"The following Pydantic models define custom __init__ methods:\n"
+                "The following Pydantic models define custom __init__ methods:\n"
                 + "\n".join(violations) +
                 "\n\nThese should be replaced with alternatives like validators, model_post_init, or classmethods. See this test's docstring for more details."
             )

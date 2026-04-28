@@ -105,27 +105,13 @@ def _filter_piecewise_capture_num_tokens(
     max_seq_len: int,
     num_extra_decoding_steps: int = 0,
 ) -> Tuple[list[int], list[int]]:
-    """Cap a piecewise CUDA graph capture-set at the largest forward-pass
-    `num_tokens` value the engine can ever construct.
+    """Cap piecewise CUDA graph capture candidates at the engine's reachable
+    `num_tokens` ceiling `max_batch_size * (max_seq_len - 1 - num_extra_decoding_steps)`
+    (each in-flight request must leave room for one decode token).
 
-    A piecewise CUDA graph for `num_tokens = N` is only useful if a real
-    forward pass can ever flow N tokens through the model. Every in-flight
-    request must leave room for at least one decode token in its KV cache,
-    so the largest forward-pass num_tokens reachable at runtime (and the
-    largest the warmup builder can construct) is
-    `max_batch_size * (max_seq_len - 1 - num_extra_decoding_steps)`.
-    Without this cap, candidate entries above this bound would be advertised
-    in `_torch_compile_backend.capture_num_tokens` but silently fail warmup
-    in `_create_warmup_request`, making the outer padding logic pad to a
-    target that has no captured graph and fall back to eager (NVBug 5615248).
-
-    Returns:
-        kept: candidate entries that are <= min(max_num_tokens,
-            max_batch_size * (max_seq_len - 1 - num_extra_decoding_steps)),
-            preserving input order.
-        unrecordable: sorted unique candidate entries that are <=
-            max_num_tokens but exceed the engine's reachable ceiling. These
-            are the entries that would have been silently skipped by warmup.
+    Returns `(kept, unrecordable)` where `kept` preserves input order and
+    `unrecordable` is the sorted unique set of entries above the ceiling
+    but within `max_num_tokens` (i.e. would silently fail warmup).
     """
     max_capturable_num_tokens = max(
         0, max_batch_size * (max_seq_len - 1 - num_extra_decoding_steps))
