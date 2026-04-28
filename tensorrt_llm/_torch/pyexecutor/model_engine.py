@@ -107,16 +107,29 @@ def _filter_piecewise_capture_num_tokens(
 ) -> Tuple[list[int], list[int]]:
     """Cap piecewise CUDA graph capture candidates at the engine's reachable
     `num_tokens` ceiling `max_batch_size * (max_seq_len - 1 - num_extra_decoding_steps)`
-    (each in-flight request must leave room for one decode token).
+    and ensure the ceiling itself is captured.
 
-    Returns `(kept, unrecordable)` where `kept` preserves input order and
-    `unrecordable` is the sorted unique set of entries above the ceiling
-    but within `max_num_tokens` (i.e. would silently fail warmup).
+    Each in-flight request must leave room for at least one decode token,
+    so the ceiling is the largest forward-pass `num_tokens` the warmup
+    builder can construct. Including it in the capture set closes the
+    runtime padding gap between the next-largest candidate and the ceiling
+    (otherwise ISLs in that gap have no graph >= them and fall back to
+    eager).
+
+    Returns `(kept, unrecordable)` where `kept` is sorted ascending,
+    deduped, and contains the ceiling whenever it is positive.
+    `unrecordable` is the sorted unique set of input entries above the
+    ceiling but within `max_num_tokens`.
     """
     max_capturable_num_tokens = max(
         0, max_batch_size * (max_seq_len - 1 - num_extra_decoding_steps))
     piecewise_capacity_limit = min(max_num_tokens, max_capturable_num_tokens)
-    kept = [i for i in candidate_num_tokens if i <= piecewise_capacity_limit]
+    kept = sorted(
+        {i
+         for i in candidate_num_tokens if 0 < i <= piecewise_capacity_limit})
+    if piecewise_capacity_limit > 0 and (not kept or kept[-1]
+                                         < piecewise_capacity_limit):
+        kept.append(piecewise_capacity_limit)
     unrecordable = sorted({
         i
         for i in candidate_num_tokens
@@ -327,7 +340,8 @@ class PyTorchModelEngine(ModelEngine):
                 f"{unrecordable}: exceeds reachable ceiling "
                 f"max_batch_size*(max_seq_len-1-num_extra_decoding_steps)="
                 f"{max(0, self.batch_size * (self.max_seq_len - 1 - num_extra_decoding_steps))}. "
-                f"Raise max_seq_len to capture larger graphs.")
+                f"Capturing the ceiling itself; raise max_seq_len for larger graphs."
+            )
 
         try:
             use_ub_for_nccl = (

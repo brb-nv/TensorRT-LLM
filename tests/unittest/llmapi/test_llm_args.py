@@ -726,7 +726,7 @@ class TestTorchLlmArgsCudaGraphSettings:
 class TestPiecewiseCudaGraphCaptureDefaults:
     """Piecewise CUDA graph capture-set defaults and reachable-ceiling filter.
 
-    Two invariants are exercised:
+    Three invariants are exercised:
 
     1. `TorchCompileConfig.capture_num_tokens` defaults to `None`, so the
        model engine can fall back to `cuda_graph_config.batch_sizes` (the
@@ -736,6 +736,10 @@ class TestPiecewiseCudaGraphCaptureDefaults:
        the largest forward-pass `num_tokens` the warmup builder can
        construct, since every in-flight request must leave room for at
        least one decode token.
+    3. The reachable ceiling itself is always present in the returned
+       capture set (when positive), so runtime ISLs in the gap between
+       the next-largest candidate and the ceiling get a graph rather
+       than falling back to eager.
     """
 
     def test_torch_compile_config_capture_num_tokens_defaults_to_none(self):
@@ -772,7 +776,8 @@ class TestPiecewiseCudaGraphCaptureDefaults:
         Without the cap, the warmup loop would silently skip these entries
         and the outer padding logic would pad to a target with no captured
         graph. They must be removed from `kept` and surfaced in
-        `unrecordable` so the warning fires.
+        `unrecordable` so the warning fires. The ceiling itself is then
+        appended so ISLs in the gap still get a graph.
         """
         from tensorrt_llm._torch.pyexecutor.model_engine import \
             _filter_piecewise_capture_num_tokens
@@ -795,7 +800,8 @@ class TestPiecewiseCudaGraphCaptureDefaults:
             max_seq_len=128,
         )
 
-        assert max(kept) == 120
+        assert kept[-1] == max_capturable  # ceiling appended
+        assert 120 in kept  # densely-packed entries below ceiling preserved
         assert 128 not in kept
         assert unrecordable == [128]
 
@@ -804,7 +810,8 @@ class TestPiecewiseCudaGraphCaptureDefaults:
 
         Symmetric case: when `max_batch_size * (max_seq_len - 1)` is at
         least as large as the biggest candidate, nothing is dropped and
-        `unrecordable` is empty.
+        `unrecordable` is empty. The ceiling (128 here) coincides with the
+        largest candidate so no extra entry is appended.
         """
         from tensorrt_llm._torch.pyexecutor.model_engine import \
             _filter_piecewise_capture_num_tokens
@@ -817,8 +824,10 @@ class TestPiecewiseCudaGraphCaptureDefaults:
             max_batch_size=1,
             max_seq_len=129,
         )
-        assert max(kept) == 128
+        assert kept[-1] == 128
         assert 128 in kept
+        # Ceiling (128) was already in candidates, must not be duplicated.
+        assert kept.count(128) == 1
         assert unrecordable == []
 
     def test_piecewise_filter_subtracts_extra_decoding_steps(self):
@@ -826,7 +835,9 @@ class TestPiecewiseCudaGraphCaptureDefaults:
 
         Drafting loops consume extra decode steps; the filter must mirror
         the `max_seq_len - 1 - num_extra_decoding_steps` constraint
-        applied when warmup requests are built.
+        applied when warmup requests are built. The ceiling is appended
+        whenever it is strictly greater than the largest surviving
+        candidate.
         """
         from tensorrt_llm._torch.pyexecutor.model_engine import \
             _filter_piecewise_capture_num_tokens
@@ -840,7 +851,8 @@ class TestPiecewiseCudaGraphCaptureDefaults:
             max_seq_len=128,
             num_extra_decoding_steps=5,
         )
-        assert max(kept) == 120
+        assert kept[-1] == 122
+        assert 120 in kept
         assert unrecordable == []
         # Same setup with 9 extra decoding steps -> ceiling 118; 120 drops.
         kept, unrecordable = _filter_piecewise_capture_num_tokens(
@@ -850,8 +862,57 @@ class TestPiecewiseCudaGraphCaptureDefaults:
             max_seq_len=128,
             num_extra_decoding_steps=9,
         )
-        assert max(kept) == 100
+        assert kept[-1] == 118
+        assert 100 in kept
+        assert 120 not in kept
         assert unrecordable == [120]
+
+    def test_piecewise_filter_does_not_double_append_ceiling(self):
+        """Ceiling already present in candidates -> not duplicated."""
+        from tensorrt_llm._torch.pyexecutor.model_engine import \
+            _filter_piecewise_capture_num_tokens
+
+        kept, _ = _filter_piecewise_capture_num_tokens(
+            [1, 64, 128],
+            max_num_tokens=129,
+            max_batch_size=1,
+            max_seq_len=129,
+        )
+        assert kept == [1, 64, 128]
+
+    def test_piecewise_filter_returns_empty_when_ceiling_is_zero(self):
+        """`max_seq_len=1` -> ceiling 0 -> nothing captured.
+
+        With ceiling 0 every positive candidate is unrecordable and the
+        ceiling itself is not appended, so the warning "exceeds reachable
+        ceiling 0; raise max_seq_len" fires for the full candidate list.
+        """
+        from tensorrt_llm._torch.pyexecutor.model_engine import \
+            _filter_piecewise_capture_num_tokens
+
+        kept, unrecordable = _filter_piecewise_capture_num_tokens(
+            [1, 2, 4],
+            max_num_tokens=8,
+            max_batch_size=1,
+            max_seq_len=1,
+        )
+        assert kept == []
+        assert unrecordable == [1, 2, 4]
+
+    def test_piecewise_filter_appends_ceiling_when_only_smaller_candidates(
+            self):
+        """No candidate near the ceiling -> ceiling still appended."""
+        from tensorrt_llm._torch.pyexecutor.model_engine import \
+            _filter_piecewise_capture_num_tokens
+
+        kept, _ = _filter_piecewise_capture_num_tokens(
+            [1, 2, 4, 8],
+            max_num_tokens=1024,
+            max_batch_size=8,
+            max_seq_len=128,
+        )
+        # Ceiling: 8 * (128 - 1) = 1016.
+        assert kept == [1, 2, 4, 8, 1016]
 
 
 class TestTrtLlmArgs:
