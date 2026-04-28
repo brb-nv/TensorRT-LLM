@@ -227,6 +227,7 @@ def build_worker_environment(worker_config, env_config, role, benchmark_mode,
         upsert_env_config(env_config, 'worker_env_var',
                           'TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP',
                           'TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP=1')
+    if benchmark_mode in ("gen_only", "gen_only_no_context"):
         if role == "GEN":
             gen_config = worker_config.get('gen', {})
             concurrency_int = int(concurrency)
