@@ -723,6 +723,132 @@ class TestTorchLlmArgsCudaGraphSettings:
         assert max_batch_size in batch_sizes
 
 
+class TestPiecewiseCudaGraphCaptureDefaults:
+    """Tests for the piecewise CUDA graph capture-set defaults and the
+    model-engine filter that prunes entries the runtime can never reach.
+
+    Two invariants are exercised:
+
+    1. `TorchCompileConfig.capture_num_tokens` defaults to `None`, so the
+       model engine can fall back to `cuda_graph_config.batch_sizes` (the
+       behavior documented on the field).
+    2. `_filter_piecewise_capture_num_tokens` caps the candidate list at
+       `max_batch_size * (max_seq_len - 1 - num_extra_decoding_steps)` --
+       the largest forward-pass `num_tokens` the warmup builder can
+       construct, since every in-flight request must leave room for at
+       least one decode token.
+    """
+
+    def test_torch_compile_config_capture_num_tokens_defaults_to_none(self):
+        """`capture_num_tokens` is unset by default so the documented
+        fallback to `cuda_graph_config.batch_sizes` in the model engine
+        remains reachable. A non-None default here would silently shadow
+        the user's `cuda_graph_config.batch_sizes` choice.
+        """
+        config = TorchCompileConfig(enable_piecewise_cuda_graph=True)
+        assert config.capture_num_tokens is None
+
+    def test_torch_llm_args_capture_num_tokens_defaults_to_none(self):
+        """Same invariant when the config is built through `TorchLlmArgs`
+        (the path real users hit via `trtllm-serve` YAML).
+        """
+        args = TorchLlmArgs(
+            model=llama_model_path,
+            max_batch_size=1,
+            max_seq_len=128,
+            max_beam_width=10,
+            enable_chunked_prefill=True,
+            cuda_graph_config=CudaGraphConfig(max_batch_size=128,
+                                              enable_padding=True),
+            torch_compile_config=TorchCompileConfig(
+                enable_piecewise_cuda_graph=True),
+        )
+        assert args.torch_compile_config.capture_num_tokens is None
+
+    def test_piecewise_filter_drops_entries_above_reachable_ceiling(self):
+        """When the candidate list contains an entry above the reachable
+        ceiling `max_batch_size * (max_seq_len - 1)`, the filter must drop
+        it from `kept` and surface it in `unrecordable`. Otherwise the
+        warmup loop would silently skip it and the outer padding logic
+        would pad to a target with no captured graph.
+        """
+        from tensorrt_llm._torch.pyexecutor.model_engine import (
+            _filter_piecewise_capture_num_tokens)
+
+        candidates = CudaGraphConfig._generate_cuda_graph_batch_sizes(
+            128, enable_padding=True)
+        max_capturable = 1 * (128 - 1)
+        # Precondition: candidate list contains at least one entry above
+        # the reachable ceiling, otherwise the assertions below are vacuous.
+        assert any(i > max_capturable for i in candidates), (
+            "Test precondition no longer holds: cuda_graph_batch_sizes "
+            f"for max_batch_size=128 no longer contains entries above "
+            f"{max_capturable}. Update this test if CudaGraphConfig "
+            "behavior changed.")
+
+        kept, unrecordable = _filter_piecewise_capture_num_tokens(
+            candidates,
+            max_num_tokens=128,
+            max_batch_size=1,
+            max_seq_len=128,
+        )
+
+        assert max(kept) == 120
+        assert 128 not in kept
+        assert unrecordable == [128]
+
+    def test_piecewise_filter_keeps_all_entries_when_within_ceiling(self):
+        """Symmetric case: when the ceiling
+        `max_batch_size * (max_seq_len - 1)` is at least as large as the
+        biggest candidate, nothing is dropped and `unrecordable` is empty.
+        """
+        from tensorrt_llm._torch.pyexecutor.model_engine import (
+            _filter_piecewise_capture_num_tokens)
+
+        candidates = CudaGraphConfig._generate_cuda_graph_batch_sizes(
+            128, enable_padding=True)
+        kept, unrecordable = _filter_piecewise_capture_num_tokens(
+            candidates,
+            max_num_tokens=129,
+            max_batch_size=1,
+            max_seq_len=129,
+        )
+        assert max(kept) == 128
+        assert 128 in kept
+        assert unrecordable == []
+
+    def test_piecewise_filter_subtracts_extra_decoding_steps(self):
+        """Drafting loops consume extra decode steps. The filter must
+        subtract `num_extra_decoding_steps` from the ceiling, mirroring
+        the `max_seq_len - 1 - num_extra_decoding_steps` constraint
+        applied when warmup requests are built.
+        """
+        from tensorrt_llm._torch.pyexecutor.model_engine import (
+            _filter_piecewise_capture_num_tokens)
+
+        candidates = [1, 2, 4, 8, 16, 32, 64, 100, 120]
+        # max_seq_len=128, batch=1, 5 extra decoding steps -> ceiling 122.
+        kept, unrecordable = _filter_piecewise_capture_num_tokens(
+            candidates,
+            max_num_tokens=128,
+            max_batch_size=1,
+            max_seq_len=128,
+            num_extra_decoding_steps=5,
+        )
+        assert max(kept) == 120
+        assert unrecordable == []
+        # Same setup with 9 extra decoding steps -> ceiling 118; 120 drops.
+        kept, unrecordable = _filter_piecewise_capture_num_tokens(
+            candidates,
+            max_num_tokens=128,
+            max_batch_size=1,
+            max_seq_len=128,
+            num_extra_decoding_steps=9,
+        )
+        assert max(kept) == 100
+        assert unrecordable == [120]
+
+
 class TestTrtLlmArgs:
 
     def test_dynamic_setattr(self):

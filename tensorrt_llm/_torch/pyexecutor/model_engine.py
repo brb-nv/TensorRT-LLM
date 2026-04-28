@@ -98,6 +98,47 @@ class ModelEngine(ABC):
         return
 
 
+def _filter_piecewise_capture_num_tokens(
+    candidate_num_tokens: list[int],
+    max_num_tokens: int,
+    max_batch_size: int,
+    max_seq_len: int,
+    num_extra_decoding_steps: int = 0,
+) -> Tuple[list[int], list[int]]:
+    """Cap a piecewise CUDA graph capture-set at the largest forward-pass
+    `num_tokens` value the engine can ever construct.
+
+    A piecewise CUDA graph for `num_tokens = N` is only useful if a real
+    forward pass can ever flow N tokens through the model. Every in-flight
+    request must leave room for at least one decode token in its KV cache,
+    so the largest forward-pass num_tokens reachable at runtime (and the
+    largest the warmup builder can construct) is
+    `max_batch_size * (max_seq_len - 1 - num_extra_decoding_steps)`.
+    Without this cap, candidate entries above this bound would be advertised
+    in `_torch_compile_backend.capture_num_tokens` but silently fail warmup
+    in `_create_warmup_request`, making the outer padding logic pad to a
+    target that has no captured graph and fall back to eager (NVBug 5615248).
+
+    Returns:
+        kept: candidate entries that are <= min(max_num_tokens,
+            max_batch_size * (max_seq_len - 1 - num_extra_decoding_steps)),
+            preserving input order.
+        unrecordable: sorted unique candidate entries that are <=
+            max_num_tokens but exceed the engine's reachable ceiling. These
+            are the entries that would have been silently skipped by warmup.
+    """
+    max_capturable_num_tokens = max(
+        0, max_batch_size * (max_seq_len - 1 - num_extra_decoding_steps))
+    piecewise_capacity_limit = min(max_num_tokens, max_capturable_num_tokens)
+    kept = [i for i in candidate_num_tokens if i <= piecewise_capacity_limit]
+    unrecordable = sorted({
+        i
+        for i in candidate_num_tokens
+        if max_capturable_num_tokens < i <= max_num_tokens
+    })
+    return kept, unrecordable
+
+
 def _filter_cuda_graph_batch_sizes(cuda_graph_batch_sizes: list[int],
                                    max_batch_size: int, max_num_tokens: int,
                                    max_total_draft_tokens: int,
@@ -285,10 +326,22 @@ class PyTorchModelEngine(ModelEngine):
             torch_compile_piecewise_cuda_graph_num_tokens
             or cuda_graph_batch_sizes or [])
 
-        self._piecewise_cuda_graph_num_tokens = [
-            i for i in piecewise_cuda_graph_num_tokens
-            if i <= self.max_num_tokens
-        ]
+        num_extra_decoding_steps = self._get_num_extra_decoding_steps()
+        self._piecewise_cuda_graph_num_tokens, unrecordable = (
+            _filter_piecewise_capture_num_tokens(
+                piecewise_cuda_graph_num_tokens,
+                max_num_tokens=self.max_num_tokens,
+                max_batch_size=self.batch_size,
+                max_seq_len=self.max_seq_len,
+                num_extra_decoding_steps=num_extra_decoding_steps,
+            ))
+        if unrecordable:
+            logger.warning(
+                f"Skipping piecewise CUDA graph capture for num_tokens="
+                f"{unrecordable}: exceeds reachable ceiling "
+                f"max_batch_size*(max_seq_len-1-num_extra_decoding_steps)="
+                f"{max(0, self.batch_size * (self.max_seq_len - 1 - num_extra_decoding_steps))}. "
+                f"Raise max_seq_len to capture larger graphs.")
 
         try:
             use_ub_for_nccl = (
