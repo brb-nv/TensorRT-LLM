@@ -1,0 +1,38 @@
+# NVBug 5615248 - profiling config: overlap scheduler OFF.
+#
+# Identical to profile_overlap_on.yaml except for disable_overlap_scheduler.
+# This is the hypothesis test for comment #14: if the "two-step" gap is
+# caused by the overlap scheduler, this config should match TRT TTFT
+# (~6-7 ms for TinyLlama / ISL=107 / max_beam_width=10) instead of the
+# overlap-on TTFT (~12-13 ms).
+
+backend: pytorch
+
+tensor_parallel_size: 1
+pipeline_parallel_size: 1
+
+max_beam_width: 10
+max_batch_size: 1
+max_seq_len: 129  # workaround for the piecewise capture bug
+
+enable_chunked_prefill: true
+
+cuda_graph_config:
+  # See profile_overlap_on.yaml for rationale.
+  batch_sizes: [1]
+  enable_padding: true
+
+kv_cache_config:
+  enable_block_reuse: true
+
+torch_compile_config:
+  enable_piecewise_cuda_graph: true
+
+# The knob under test: forces _executor_loop (non-overlap) instead of
+# _executor_loop_overlap. First-token response is dispatched in the
+# same iteration as prefill+sample.
+disable_overlap_scheduler: true
+
+# Diagnostics.
+print_iter_log: true
+enable_iter_perf_stats: true

@@ -1,0 +1,43 @@
+# NVBug 5615248 - profiling config: overlap scheduler ON (default).
+#
+# Mirrors the customer's "Steps to Reproduce" YAML, with two adjustments
+# so that the profile isolates the overlap-scheduler effect:
+#   1. max_seq_len = 129 (workaround from comment #18 / REPRO.md step 2)
+#      ensures the piecewise CUDA graph for num_tokens=128 IS captured,
+#      so prefill does NOT silently fall back to eager.
+#   2. print_iter_log + enable_iter_perf_stats so we can correlate the
+#      nsys timeline with engine iteration counts.
+#
+# Compared with profile_overlap_off.yaml, the ONLY difference is the
+# absence of disable_overlap_scheduler. With this YAML the executor
+# uses _executor_loop_overlap, which delays first-token delivery by
+# one iteration (see py_executor.py:502-514).
+
+backend: pytorch
+
+tensor_parallel_size: 1
+pipeline_parallel_size: 1
+
+max_beam_width: 10
+max_batch_size: 1
+max_seq_len: 129  # workaround for the piecewise capture bug
+
+enable_chunked_prefill: true
+
+cuda_graph_config:
+  # Runtime max_batch_size is 1, so only the bs=1 gen graph is ever
+  # exercised. Restricting capture here saves several minutes of
+  # warmup vs the customer's max_batch_size: 128 (which captures
+  # graphs for bs=1,2,4,...,128 × beam_width=10).
+  batch_sizes: [1]
+  enable_padding: true
+
+kv_cache_config:
+  enable_block_reuse: true
+
+torch_compile_config:
+  enable_piecewise_cuda_graph: true
+
+# Diagnostics.
+print_iter_log: true
+enable_iter_perf_stats: true
