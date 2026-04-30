@@ -2766,6 +2766,17 @@ class PyExecutor:
                     self._send_kv_async(
                         self.previous_batch.scheduled_requests.all_requests())
 
+                    # Emit first-token responses early to keep TTFT off
+                    # the sample-kernel critical path. Order matters:
+                    # after `_update_requests` (py_decoding_iter current)
+                    # and after `_send_kv_async` (disagg ctx state advanced).
+                    self._emit_first_token_responses(
+                        self.previous_batch.scheduled_requests)
+                else:
+                    # Symmetric collective for the attention-DP response
+                    # gather; pairs with the call inside the if-branch.
+                    self._enqueue_responses([])
+
                 # Flush outside the conditional so that all DP ranks
                 # participate in the tp_gather collective even when
                 # should_process_previous_batch differs between ranks.
@@ -4187,6 +4198,65 @@ class PyExecutor:
 
         self._enqueue_responses(new_responses)
 
+    @nvtx_range("_emit_first_token_responses")
+    def _emit_first_token_responses(self, prev_scheduled_requests):
+        """Emit first-token responses ahead of `_sample_async` to keep
+        them off the TTFT critical path. Termination, cleanup and perf
+        stats remain in `_handle_responses`, which skips the duplicate
+        `create_response` via `py_first_token_response_sent`.
+        """
+        new_responses = []
+        for request in prev_scheduled_requests.all_requests():
+            if request.py_decoding_iter != 1:
+                continue
+            if request.is_attention_dp_dummy or request.is_cuda_graph_dummy:
+                continue
+            if request.py_kv_transfer_timed_out:
+                continue
+            # Disagg gen-only requests are emitted by `_handle_first_token_response`. Skip here.
+            if request.is_generation_only_request() and not request.is_finished:
+                continue
+            # Let `_handle_responses` issue the terminal response so the
+            # post-step perf snapshot lands on it; this also keeps the
+            # invariant that an early-emitted response is never final, which
+            # `_handle_responses` relies on to detect a cancel-after-emit
+            # race.
+            if request.is_finished:
+                continue
+            # Defensive guard against state recycling.
+            if request.py_first_token_response_sent:
+                continue
+
+            logger.debug(
+                f'Send first token response for request {request.py_request_id}'
+            )
+
+            request.draft_tokens = request.py_draft_tokens if get_draft_token_length(
+                request) > 0 else []
+            request.decoding_iter = request.py_decoding_iter
+
+            # Snapshot first-token generation logits before creating the
+            # response. With overlap scheduling, `exclude_last_generation_logits`
+            # is True, but only the first logits chunk has been appended at
+            # this point (the next `_sample_async` for the current batch has
+            # not run yet). Mirroring what's done in `_handle_first_token_response`.
+            logits_snapshot = None
+            if (self.should_exclude_last_generation_logits
+                    and request.py_return_generation_logits):
+                logits_snapshot = request.py_result.get_latest_logits_unexcluded(
+                )
+
+            response = request.create_response(False, self.dist.rank)
+            if response is None:
+                continue
+            response.result.cached_tokens = request.cached_tokens
+            if logits_snapshot is not None:
+                response.result.generation_logits = logits_snapshot
+            new_responses.append((request.py_request_id, response))
+            request.py_first_token_response_sent = True
+
+        self._enqueue_responses(new_responses)
+
     @nvtx_range("_handle_responses")
     def _handle_responses(self):
         new_responses = []
@@ -4246,7 +4316,20 @@ class PyExecutor:
                 request.update_perf_metrics(self.iter_counter)
 
             request_done = False
-            if request.py_decoding_iter == 1 or request.is_finished or \
+            # `_emit_first_token_responses` only enqueues non-terminal
+            # streaming responses. If the request became finished after
+            # that emit (e.g. cancelled by `_handle_canceled_requests`),
+            # issue a fresh terminal response here; otherwise skip the
+            # duplicate `create_response`.
+            if request.py_first_token_response_sent:
+                request.py_first_token_response_sent = False
+                if request.is_finished:
+                    response = request.create_response(False, self.dist.rank)
+                    if response:
+                        response.result.cached_tokens = request.cached_tokens
+                        new_responses.append((req_id, response))
+                    request_done = True
+            elif request.py_decoding_iter == 1 or request.is_finished or \
                     request.py_decoding_iter % self.stream_interval == 0:
                 response = request.create_response(False, self.dist.rank)
                 if response:
