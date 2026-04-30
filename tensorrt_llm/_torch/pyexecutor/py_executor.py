@@ -2523,6 +2523,26 @@ class PyExecutor:
                     self._send_kv_async(
                         self.previous_batch.scheduled_requests.all_requests())
 
+                    # Hoist first-token responses ahead of `_sample_async` so
+                    # the iter's sample-kernel host push (and any draft-model
+                    # enqueue inside the sampling block) does not sit on the
+                    # TTFT critical path. Must run after `_update_requests`
+                    # so `py_decoding_iter` reflects the just-consumed token,
+                    # and after `_send_kv_async` to preserve the original
+                    # `_handle_responses` payload semantics for disagg
+                    # context-only requests (their `req.state` transitions
+                    # to DISAGG_CONTEXT_TRANS_IN_PROGRESS inside
+                    # `_send_kv_async`).
+                    self._emit_first_token_responses(
+                        self.previous_batch.scheduled_requests)
+                else:
+                    # Keep the attention-DP response-gather collective in
+                    # `_enqueue_responses` symmetric across ranks: the
+                    # if-branch above invokes it via
+                    # `_emit_first_token_responses`, so every rank must
+                    # invoke it here too.
+                    self._enqueue_responses([])
+
                 if self.drafter is not None and self.use_spec_decode and should_process_previous_batch:
                     # Cleanup previous draft resources used in the draft model
                     self.drafter.cleanup_previous_draft_resources()
@@ -3808,6 +3828,69 @@ class PyExecutor:
 
         self._enqueue_responses(new_responses)
 
+    @nvtx_range("_emit_first_token_responses")
+    def _emit_first_token_responses(self, prev_scheduled_requests):
+        """Enqueue first-token streaming responses ahead of `_sample_async`.
+
+        Without this hoist, the first generated token of every request is
+        only enqueued at the end of the iteration that consumes it, inside
+        `_process_previous_batch -> _handle_responses`. Under the overlap
+        scheduler that puts the iteration's `_sample_async` host enqueue
+        (and the speculative-decoding draft enqueue, when present) on the
+        TTFT critical path. Hoisting just the response-creation portion to
+        right after `_send_kv_async` removes that exposure while leaving
+        termination, resource cleanup, and perf-stat bookkeeping in
+        `_handle_responses` so they continue to overlap with the GPU sample
+        kernels.
+
+        Safety contract:
+        - Only inspects requests in `prev_scheduled_requests`; never mutates
+          `self.active_requests`.
+        - Does not call `_terminate_request` or free any KV/seq-slot resources.
+        - Skips disagg generation-only requests, attention-DP dummies, and
+          requests pending KV-transfer cleanup, mirroring `_handle_responses`.
+        - Marks every emitted request with `py_first_token_response_sent` so
+          the later `_handle_responses` call in the same iteration skips
+          duplicate `create_response` invocations (each call consumes the
+          serialized result, so calling twice would either duplicate or lose
+          state).
+        - Caller must invoke `_enqueue_responses([])` on the symmetric
+          else-branch to keep the attention-DP response-gather collective in
+          `_enqueue_responses` in lockstep across ranks.
+        """
+        new_responses = []
+        for request in prev_scheduled_requests.all_requests():
+            if request.py_decoding_iter != 1:
+                continue
+            if request.is_attention_dp_dummy:
+                continue
+            if request.py_kv_transfer_timed_out:
+                continue
+            # Disagg gen-only requests get their first token emitted by
+            # `_handle_first_token_response` (which fires before the
+            # forward step); skip them here to avoid double-emit.
+            if request.is_generation_only_request(
+            ) and not request.is_finished:
+                continue
+            # Defensive: `py_decoding_iter == 1` is true at most once per
+            # request lifetime, so this should never fire under normal
+            # flow, but guard explicitly in case of state recycling.
+            if getattr(request, 'py_first_token_response_sent', False):
+                continue
+
+            request.draft_tokens = request.py_draft_tokens if get_draft_token_length(
+                request) > 0 else []
+            request.decoding_iter = request.py_decoding_iter
+
+            response = request.create_response(False, self.dist.rank)
+            if response is None:
+                continue
+            response.result.cached_tokens = request.cached_tokens
+            new_responses.append((request.py_request_id, response))
+            request.py_first_token_response_sent = True
+
+        self._enqueue_responses(new_responses)
+
     @nvtx_range("_handle_responses")
     def _handle_responses(self):
         new_responses = []
@@ -3866,7 +3949,17 @@ class PyExecutor:
                 request.update_perf_metrics(self.iter_counter)
 
             request_done = False
-            if request.py_decoding_iter == 1 or request.is_finished or \
+            # If `_emit_first_token_responses` already enqueued the
+            # first-token streaming response earlier this iteration, skip
+            # the duplicate `create_response` here. We still fall through to
+            # the termination handling below so that requests finishing on
+            # their first token are cleaned up correctly.
+            already_emitted_first_token = getattr(
+                request, 'py_first_token_response_sent', False)
+            if already_emitted_first_token:
+                request.py_first_token_response_sent = False
+                request_done = request.is_finished
+            elif request.py_decoding_iter == 1 or request.is_finished or \
                     request.py_decoding_iter % self.stream_interval == 0:
                 response = request.create_response(False, self.dist.rank)
                 if response:
