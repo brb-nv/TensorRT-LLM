@@ -10,6 +10,7 @@ from enum import IntEnum
 from queue import Queue
 from typing import Callable, Dict, Iterable, List, Optional, Tuple, Union
 
+import nvtx
 import torch
 
 from tensorrt_llm.llmapi import DisaggScheduleStyle
@@ -1842,6 +1843,7 @@ class PyExecutor:
             send_handles[microbatch_id].wait()
             send_handles[microbatch_id] = None
 
+    @nvtx_range("_handle_dynamic_draft_len")
     def _handle_dynamic_draft_len(self,
                                   scheduled_batch: ScheduledRequests) -> None:
         """Handle dynamic draft length for the current batch.
@@ -1891,6 +1893,7 @@ class PyExecutor:
         else:
             self.model_engine.runtime_draft_len = self.model_engine.max_total_draft_tokens
 
+    @nvtx_range("_can_queue")
     def _can_queue(self, scheduled_batch):
 
         # can_queue_this_rank is for case that the batch is not empty on this rank, but empty on other ranks
@@ -1905,6 +1908,7 @@ class PyExecutor:
 
         return can_queue, can_queue_this_rank
 
+    @nvtx_range("_revert_gen_alloc")
     def _revert_gen_alloc(self, scheduled_batch):
         """Revert KV cache capacity growth when the batch is skipped.
 
@@ -1923,6 +1927,7 @@ class PyExecutor:
             for req in scheduled_batch.generation_requests:
                 self.kv_cache_manager.revert_allocate_generation(req)
 
+    @nvtx_range("_prepare_and_schedule_batch")
     def _prepare_and_schedule_batch(self):
         new_requests = self._fetch_and_activate_new_requests()
         if self.should_stop_processing:
@@ -2049,6 +2054,7 @@ class PyExecutor:
             f'{scheduled_batch.num_generation_requests} generation requests')
         return scheduled_batch, iter_stats
 
+    @nvtx_range("_kv_connector_start_batch")
     def _kv_connector_start_batch(self, scheduled_batch):
         if self.kv_connector_manager:
             self.kv_connector_manager.take_scheduled_requests_pending_load(
@@ -2057,6 +2063,7 @@ class PyExecutor:
             self.kv_connector_manager.worker.start_load_kv(
                 torch.cuda.current_stream())
 
+    @nvtx_range("_kv_connector_terminate_requests")
     def _kv_connector_terminate_requests(self):
         if self.kv_connector_manager:
             reqs_to_terminate = self.kv_connector_manager.get_finished()
@@ -2339,6 +2346,7 @@ class PyExecutor:
             logger.error(f"Encountered an error in decode: {error_msg}")
             self._handle_errors(error_msg)
 
+    @nvtx_range("_handle_control_request")
     def _handle_control_request(self):
         if len(self.active_requests) == 0 and \
             len(self.waiting_queue) == 0 and \
@@ -2391,6 +2399,16 @@ class PyExecutor:
             previous_tensors_device = None
             can_forward = not self.is_benchmark_disagg
             while True:
+                # Push a per-iteration NVTX range so iteration boundaries and
+                # any inter-iter gaps are visible in nsys traces. Use the
+                # imperative push/pop API so we do not have to reindent the
+                # entire loop body. Pops are sprinkled at every iter exit
+                # point (`break`, `continue`, end of body); on an unhandled
+                # exception the range is left open until trace end which is
+                # acceptable for profiling-only instrumentation.
+                nvtx.push_range(f"[Executor] iter {self.iter_counter}",
+                                color="blue",
+                                domain="TensorRT-LLM")
                 self.hang_detector.checkpoint()
                 profile_step()
                 if self.enable_iter_perf_stats:
@@ -2400,11 +2418,13 @@ class PyExecutor:
                 self._handle_control_request()
 
                 if scheduled_batch is None:
+                    nvtx.pop_range()
                     break
 
                 can_forward, should_retry = self._check_benchmark_disagg_gate(
                     scheduled_batch, can_forward)
                 if should_retry:
+                    nvtx.pop_range()
                     continue
 
                 if not self._scheduler_manages_kv_suspend:
@@ -2517,31 +2537,47 @@ class PyExecutor:
                             scheduled_batch, previous_tensors_device,
                             num_accepted_tokens_device)
 
+                # Phase: consume previous iter's sample output (host-side
+                # token append + KV async send + streaming response emit).
+                # On non-DP setups iters with no work here are essentially
+                # free; the wrapper still appears (very narrow) so
+                # iter-to-iter alignment in nsys remains uniform.
+                nvtx.push_range("previous_batch_update",
+                                color="cyan",
+                                domain="TensorRT-LLM")
                 if self.previous_batch is not None and should_process_previous_batch:
                     self._update_requests(self.previous_batch.sample_state)
 
                     self._send_kv_async(
                         self.previous_batch.scheduled_requests.all_requests())
 
-                    # Hoist first-token responses ahead of `_sample_async` so
+                    # Hoist streaming responses ahead of `_sample_async` so
                     # the iter's sample-kernel host push (and any draft-model
                     # enqueue inside the sampling block) does not sit on the
-                    # TTFT critical path. Must run after `_update_requests`
-                    # so `py_decoding_iter` reflects the just-consumed token,
-                    # and after `_send_kv_async` to preserve the original
+                    # response-emit critical path. Must run after
+                    # `_update_requests` so `py_decoding_iter` and
+                    # `is_finished` reflect the just-consumed token, and
+                    # after `_send_kv_async` to preserve the original
                     # `_handle_responses` payload semantics for disagg
                     # context-only requests (their `req.state` transitions
                     # to DISAGG_CONTEXT_TRANS_IN_PROGRESS inside
-                    # `_send_kv_async`).
-                    self._emit_first_token_responses(
+                    # `_send_kv_async`). Originally first-token-only;
+                    # broadened here to cover every streaming-eligible iter
+                    # so we can empirically measure throughput impact (see
+                    # `_emit_streaming_responses` docstring).
+                    self._emit_streaming_responses(
                         self.previous_batch.scheduled_requests)
-                else:
-                    # Keep the attention-DP response-gather collective in
-                    # `_enqueue_responses` symmetric across ranks: the
+                elif self.enable_attention_dp and self.dist.world_size != 1:
+                    # Attention DP requires the response-gather collective
+                    # in `_enqueue_responses` to fire on every rank. The
                     # if-branch above invokes it via
-                    # `_emit_first_token_responses`, so every rank must
-                    # invoke it here too.
+                    # `_emit_streaming_responses`; mirror that with an
+                    # empty enqueue here so collectives stay symmetric. In
+                    # non-DP setups there is no collective and no need to
+                    # pay the response-cv lock+notify_all cost on iters
+                    # where nothing is being emitted.
                     self._enqueue_responses([])
+                nvtx.pop_range()
 
                 if self.drafter is not None and self.use_spec_decode and should_process_previous_batch:
                     # Cleanup previous draft resources used in the draft model
@@ -2579,6 +2615,13 @@ class PyExecutor:
                 else:
                     self._enqueue_responses([])
 
+                # Phase: per-iteration bookkeeping after current-batch sample
+                # is launched and previous-batch state is committed. Captures
+                # perf-metric save, BatchState handoff, KV-cache timeout
+                # polling, and connector-managed termination.
+                nvtx.push_range("post_iter_finalize",
+                                color="orange",
+                                domain="TensorRT-LLM")
                 # Call set_exclude_last_generation_logits after _process_previous_batch.
                 # If set before, the response of a request may be incorrect, as it will
                 # use the wrong indices for generation logits when streaming is enabled.
@@ -2610,8 +2653,10 @@ class PyExecutor:
                     self._check_kv_transfer_timeout()
 
                 self._kv_connector_terminate_requests()
+                nvtx.pop_range()
 
                 self.iter_counter += 1
+                nvtx.pop_range()
 
     @nvtx_range("_accept_draft_tokens")
     def _accept_draft_tokens(
@@ -2702,6 +2747,7 @@ class PyExecutor:
 
         return result_tensors, num_accepted_tokens
 
+    @nvtx_range("_process_previous_batch")
     def _process_previous_batch(self):
         self._handle_canceled_requests()
         finished_requests = self._handle_responses()
@@ -2935,6 +2981,7 @@ class PyExecutor:
     def _should_exclude_last_generation_logits(self) -> bool:
         return self.should_exclude_last_generation_logits
 
+    @nvtx_range("_fetch_and_activate_new_requests")
     def _fetch_and_activate_new_requests(self) -> List[LlmRequest]:
 
         def _respond_if_invalid(request: LlmRequest) -> bool:
@@ -3487,6 +3534,7 @@ class PyExecutor:
         self.kv_cache_transceiver.check_gen_transfer_status(atLeastNum)
         self._check_cache_transfer_errors("generation requests")
 
+    @nvtx_range("_forward_step")
     def _forward_step(
             self,
             scheduled_requests: ScheduledRequests,
@@ -3828,68 +3876,105 @@ class PyExecutor:
 
         self._enqueue_responses(new_responses)
 
-    @nvtx_range("_emit_first_token_responses")
-    def _emit_first_token_responses(self, prev_scheduled_requests):
-        """Enqueue first-token streaming responses ahead of `_sample_async`.
+    @nvtx_range("_emit_streaming_responses")
+    def _emit_streaming_responses(self, prev_scheduled_requests):
+        """Enqueue all streaming-eligible responses ahead of `_sample_async`.
 
-        Without this hoist, the first generated token of every request is
-        only enqueued at the end of the iteration that consumes it, inside
-        `_process_previous_batch -> _handle_responses`. Under the overlap
-        scheduler that puts the iteration's `_sample_async` host enqueue
-        (and the speculative-decoding draft enqueue, when present) on the
-        TTFT critical path. Hoisting just the response-creation portion to
-        right after `_send_kv_async` removes that exposure while leaving
-        termination, resource cleanup, and perf-stat bookkeeping in
-        `_handle_responses` so they continue to overlap with the GPU sample
-        kernels.
+        Originally introduced as a first-token-only hoist (`_emit_first_token_responses`)
+        to remove the iteration's `_sample_async` host enqueue (plus any
+        draft-model enqueue) from the TTFT critical path. Generalized here
+        to fire for every iteration that would otherwise enqueue a streaming
+        response inside `_process_previous_batch -> _handle_responses`,
+        i.e. for every request whose `py_decoding_iter == 1`, `is_finished`,
+        or `py_decoding_iter % stream_interval == 0`.
+
+        Why generalize:
+        - The first-token hoist saved ~Δ = `_sample_async` host time from
+          TTFT only on iter 1 of each request. Doing the same hoist on
+          every streaming iter cannot reduce the per-iter wall-clock (it
+          just shifts where in the iter the response goes out), so TPOT and
+          high-concurrency throughput are unaffected. Per-request E2E
+          (and concurrency=1 throughput) shifts earlier by ~Δ once.
+        - This method exists primarily as the experimental knob for
+          confirming that empirically. Reverting to first-token only is a
+          one-line predicate change.
 
         Safety contract:
         - Only inspects requests in `prev_scheduled_requests`; never mutates
           `self.active_requests`.
         - Does not call `_terminate_request` or free any KV/seq-slot resources.
-        - Skips disagg generation-only requests, attention-DP dummies, and
-          requests pending KV-transfer cleanup, mirroring `_handle_responses`.
-        - Marks every emitted request with `py_first_token_response_sent` so
-          the later `_handle_responses` call in the same iteration skips
-          duplicate `create_response` invocations (each call consumes the
-          serialized result, so calling twice would either duplicate or lose
-          state).
+          `_handle_responses` continues to own all termination, resource
+          cleanup, and perf-stat bookkeeping (it just skips the duplicate
+          `create_response` call when the per-iter flag is set).
+        - Skips attention-DP dummies and KV-transfer-timed-out requests
+          unconditionally (they have no streaming response to send).
+        - On the first-token branch (`py_decoding_iter == 1`) only, also
+          skips disagg gen-only requests — their first token is emitted by
+          `_handle_first_token_response` before the forward step, and
+          re-emitting here would duplicate. For their second-and-later
+          tokens this skip does not apply, so they go through the normal
+          streaming path.
+        - Marks every emitted request with `py_response_emitted_this_iter`
+          so the later `_handle_responses` call skips the duplicate
+          `create_response` (each call consumes the serialized result;
+          calling twice would either duplicate or lose state). The flag is
+          per-iter and reset by `_handle_responses` after consumption.
         - Caller must invoke `_enqueue_responses([])` on the symmetric
-          else-branch to keep the attention-DP response-gather collective in
-          `_enqueue_responses` in lockstep across ranks.
+          else-branch under attention DP to keep the response-gather
+          collective in `_enqueue_responses` in lockstep across ranks.
+        - In single-rank / non-attention-DP setups, skips
+          `_enqueue_responses` entirely when no responses were produced
+          this iter, to avoid the response-cv lock+notify_all cost on the
+          common decode-only path.
         """
+        stream_interval = self.stream_interval
         new_responses = []
         for request in prev_scheduled_requests.all_requests():
-            if request.py_decoding_iter != 1:
+            decoding_iter = request.py_decoding_iter
+            is_first_token = decoding_iter == 1
+            # Mirror the predicate in `_handle_responses`: the only iters
+            # that actually enqueue a streaming response are the first-token,
+            # the final token (`is_finished`), and every `stream_interval`-th
+            # iter in between.
+            if not (is_first_token or request.is_finished
+                    or decoding_iter % stream_interval == 0):
                 continue
             if request.is_attention_dp_dummy:
                 continue
             if request.py_kv_transfer_timed_out:
                 continue
-            # Disagg gen-only requests get their first token emitted by
-            # `_handle_first_token_response` (which fires before the
-            # forward step); skip them here to avoid double-emit.
-            if request.is_generation_only_request(
+            # Disagg gen-only requests have their first token emitted by
+            # `_handle_first_token_response`, so we must not double-emit on
+            # iter 1. Their subsequent streaming tokens go through here
+            # normally, mirroring `_handle_responses`'s gen-only branch
+            # which only short-circuits when `py_decoding_iter <= 1`.
+            if is_first_token and request.is_generation_only_request(
             ) and not request.is_finished:
                 continue
-            # Defensive: `py_decoding_iter == 1` is true at most once per
-            # request lifetime, so this should never fire under normal
-            # flow, but guard explicitly in case of state recycling.
-            if getattr(request, 'py_first_token_response_sent', False):
+            # Defensive guard against state recycling; under normal flow the
+            # flag is reset in `_handle_responses` after consumption.
+            if getattr(request, 'py_response_emitted_this_iter', False):
                 continue
 
             request.draft_tokens = request.py_draft_tokens if get_draft_token_length(
                 request) > 0 else []
-            request.decoding_iter = request.py_decoding_iter
+            request.decoding_iter = decoding_iter
 
             response = request.create_response(False, self.dist.rank)
             if response is None:
                 continue
             response.result.cached_tokens = request.cached_tokens
             new_responses.append((request.py_request_id, response))
-            request.py_first_token_response_sent = True
+            request.py_response_emitted_this_iter = True
 
-        self._enqueue_responses(new_responses)
+        # Avoid the empty `_enqueue_responses` (response_cv lock + notify_all
+        # broadcast) on iterations with no streaming response to emit, except
+        # under attention DP where every rank must enter the response-gather
+        # collective. See the elif branch in `_executor_loop_overlap` for
+        # the symmetric empty-call needed when this method does not run.
+        if new_responses or (self.enable_attention_dp
+                             and self.dist.world_size != 1):
+            self._enqueue_responses(new_responses)
 
     @nvtx_range("_handle_responses")
     def _handle_responses(self):
@@ -3949,15 +4034,16 @@ class PyExecutor:
                 request.update_perf_metrics(self.iter_counter)
 
             request_done = False
-            # If `_emit_first_token_responses` already enqueued the
-            # first-token streaming response earlier this iteration, skip
-            # the duplicate `create_response` here. We still fall through to
-            # the termination handling below so that requests finishing on
-            # their first token are cleaned up correctly.
-            already_emitted_first_token = getattr(
-                request, 'py_first_token_response_sent', False)
-            if already_emitted_first_token:
-                request.py_first_token_response_sent = False
+            # If `_emit_streaming_responses` already enqueued this iter's
+            # streaming response earlier in the loop, skip the duplicate
+            # `create_response` here. We still fall through to the
+            # termination handling below so that requests finishing this
+            # iter are cleaned up correctly. The flag is per-iter and reset
+            # on consumption.
+            already_emitted_this_iter = getattr(
+                request, 'py_response_emitted_this_iter', False)
+            if already_emitted_this_iter:
+                request.py_response_emitted_this_iter = False
                 request_done = request.is_finished
             elif request.py_decoding_iter == 1 or request.is_finished or \
                     request.py_decoding_iter % self.stream_interval == 0:
@@ -4049,12 +4135,14 @@ class PyExecutor:
             self.responses.pop(id)
             return response
 
+    @nvtx_range("_terminate_requests")
     def _terminate_requests(self, requests_to_terminate):
         # todo: support work with self.inflight_req_ids.
         #       Currently, self.inflight_req_ids is not updated.
         for req in requests_to_terminate:
             self._terminate_request(req)
 
+    @nvtx_range("_pause_requests")
     def _pause_requests(self, requests_to_pause):
         for req in requests_to_pause:
             req.pause(self.max_input_len)
@@ -4092,6 +4180,7 @@ class PyExecutor:
             )
             self.inflight_req_ids.erase(req.request_id)
 
+    @nvtx_range("_handle_speculative_decoding")
     def _handle_speculative_decoding(
         self, scheduled_batch, previous_tensors, target_inputs
     ) -> Tuple[Optional[SampleStateTensorsSpec], Optional[torch.Tensor]]:
