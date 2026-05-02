@@ -2774,54 +2774,24 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         """Prepare the beam search buffers for the requests
 
         If the last context chunk is being processed,
-        initialize/reset the buffers for the request
+        initialize/reset the buffers for the request. Each buffer is
+        reset via ``Tensor.index_fill_`` (one fused kernel) instead of
+        indexed-assignment from a device-resident RHS (three kernels);
+        ``index_fill_`` requires int64 indices, so cast ``seq_slots``
+        (int32) once. ``FinishReason.NOT_FINISHED`` is 0.
         """
-        cache_indirection = beam_search_store.cache_indirection
-        cache_indirection[seq_slots, :, :max_prompt_len] = torch.zeros(
-            (1),
-            dtype=cache_indirection.dtype,
-            device=cache_indirection.device,
+        seq_slots_long = seq_slots.long()
+        beam_search_store.cache_indirection.narrow(
+            2, 0, max_prompt_len
+        ).index_fill_(0, seq_slots_long, 0)
+        beam_search_store.cum_log_probs.index_fill_(0, seq_slots_long, 0)
+        log_probs_store.sampled_log_probs.index_fill_(0, seq_slots_long, 0)
+        log_probs_store.sampled_log_prob_ranks.index_fill_(0, seq_slots_long, 0)
+        beam_search_store.predecessor_beams.index_fill_(0, seq_slots_long, 0)
+        beam_search_store.first_finish_reasons.index_fill_(
+            0, seq_slots_long, FinishReason.NOT_FINISHED.value
         )
-        cum_log_probs = beam_search_store.cum_log_probs
-        cum_log_probs[seq_slots] = torch.zeros(
-            (1,),
-            dtype=cum_log_probs.dtype,
-            device=cum_log_probs.device,
-        )
-        sampled_log_probs = log_probs_store.sampled_log_probs
-        sampled_log_probs[seq_slots] = torch.zeros(
-            (1,),
-            dtype=sampled_log_probs.dtype,
-            device=sampled_log_probs.device,
-        )
-        sampled_log_prob_ranks = log_probs_store.sampled_log_prob_ranks
-        sampled_log_prob_ranks[seq_slots] = torch.zeros(
-            (1,),
-            dtype=sampled_log_prob_ranks.dtype,
-            device=sampled_log_prob_ranks.device,
-        )
-        predecessor_beams = beam_search_store.predecessor_beams
-        predecessor_beams[seq_slots] = torch.zeros(
-            (1,),
-            dtype=predecessor_beams.dtype,
-            device=predecessor_beams.device,
-        )
-        first_finish_reasons = beam_search_store.first_finish_reasons
-        first_finish_reasons[seq_slots] = (
-            torch.tensor(
-                FinishReason.NOT_FINISHED.value,
-                pin_memory=prefer_pinned(),
-                dtype=first_finish_reasons.dtype,
-            )
-            .to(first_finish_reasons.device, non_blocking=True)
-            .unsqueeze(0)
-        )
-        original_tokens = beam_search_store.original_tokens
-        original_tokens[seq_slots] = torch.zeros(
-            (1,),
-            dtype=original_tokens.dtype,
-            device=original_tokens.device,
-        )
+        beam_search_store.original_tokens.index_fill_(0, seq_slots_long, 0)
 
     @torch.inference_mode()
     def _process_draft_tokens_rejection_sampling(
