@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025-2026, NVIDIA CORPORATION. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -26,7 +26,7 @@ from typing import Generic, Literal, Optional, Type, TypeAlias, TypeVar, cast
 
 import torch
 
-from tensorrt_llm._utils import prefer_pinned
+from tensorrt_llm._utils import nvtx_range, prefer_pinned
 from tensorrt_llm.bindings.executor import FinishReason
 from tensorrt_llm.sampling_params import SamplingParams
 
@@ -64,6 +64,13 @@ class BeamSearchMetadata(StrategyMetadata):
     seq_lens: torch.Tensor
     finished_beams: torch.Tensor
     predecessor_beams: torch.Tensor
+    # Pre-computed per-step constants. Sliced (not allocated) per call.
+    # ``seq_offsets[i] = i * max_beam_width`` (int64), shape ``(max_num_sequences,)``.
+    # ``beam_idx_arange[j] = j``        (int32), shape ``(max_beam_width,)``.
+    # Caching them eliminates two ``torch.arange`` allocations and the associated
+    # multiply / modulo kernel per beam-search step (~4 kernel launches saved).
+    seq_offsets: torch.Tensor
+    beam_idx_arange: torch.Tensor
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -300,129 +307,144 @@ def beam_search_sampling_batch(
     batch_size, vocab_size = logits.size()
     batch_size = batch_size // beam_width_in
 
-    # compute probability distribution
-    logits = logits.view(batch_size, beam_width_in, vocab_size)
-    if temperature is not None and temperature != 0:
-        logits = logits / max(temperature, 1e-5)
-    softmax: Optional[torch.Tensor] = None
-    if return_probs:
-        softmax = torch.softmax(logits, dim=-1)
-    # update the "input" cache indirection
-    update_cache_indirection_buffer(
-        beam_search_args.cache_indirection_buffer,
-        beam_search_args.cache_indirection,
-        beam_search_args.seq_slots,
-    )
+    with nvtx_range("bss.preamble"):
+        # compute probability distribution
+        logits = logits.view(batch_size, beam_width_in, vocab_size)
+        if temperature is not None and temperature != 0:
+            logits = logits / max(temperature, 1e-5)
+        softmax: Optional[torch.Tensor] = None
+        if return_probs:
+            softmax = torch.softmax(logits, dim=-1)
+
+    with nvtx_range("bss.update_cache_indir_buffer"):
+        # update the "input" cache indirection
+        update_cache_indirection_buffer(
+            beam_search_args.cache_indirection_buffer,
+            beam_search_args.cache_indirection,
+            beam_search_args.seq_slots,
+        )
     assert batch_size == beam_search_args.seq_slots.size(0), (
         f"batch_size {batch_size} must be equal to seq_slots.size(0) {beam_search_args.seq_slots.size(0)}"
     )
 
-    # get logprobs of each beam
-    logprobs = torch.log_softmax(logits, dim=-1)
+    with nvtx_range("bss.logprobs_prep"):
+        # get logprobs of each beam
+        logprobs = torch.log_softmax(logits, dim=-1)
 
-    # handle finished beams
-    # Guarantee that finished beams will only sample their end_id token, with logprob 0.
-    # This implies that a finished beam will not alter its score
+        # handle finished beams
+        # Guarantee that finished beams will only sample their end_id token, with logprob 0.
+        # This implies that a finished beam will not alter its score
 
-    # mask showing which beams in the batch are finished: Shape: (batch_size, beam_width)
-    finished_beams_mask = (
-        beam_search_args.finished_beams[beam_search_args.seq_slots, :beam_width_in]
-        != FinishReason.NOT_FINISHED.value
-    )
-    # expand the mask in the vocabulary dimension
-    finished_beams_mask_expanded = finished_beams_mask.unsqueeze(-1).expand(
-        -1, -1, logprobs.size(-1)
-    )
-
-    # we can now use torch.where to fill the logprobs of the finished beams with -inf asynchronously
-    logprobs = torch.where(finished_beams_mask_expanded, float("-inf"), logprobs)
-    # set the first token to 0 for finished beams. We will overwrite sampling with a padding token later.
-    logprobs[..., 0] = torch.where(finished_beams_mask, 0, logprobs[..., 0])
-
-    # Add the current cum_log_probs to the logprobs of each beam
-    logprobs += beam_search_args.cum_log_probs.unsqueeze(-1)[
-        beam_search_args.seq_slots, :beam_width_in
-    ]
-
-    # get the top <beam_width> logprobs across all beams
-    logprobs = logprobs.view(batch_size, beam_width_in * vocab_size)
-    sorted_logprobs, sorted_indices = torch.topk(logprobs, k=beam_width_out, sorted=True, dim=-1)
-
-    next_tokens = sorted_indices.to(torch.int32)
-
-    # Rework the past cache indirection
-    # get the beam idx from which the tokens were sampled (optimal predecessor)
-    predecessor_beam = next_tokens // vocab_size
-    beam_search_args.predecessor_beams[beam_search_args.seq_slots, :beam_width_out] = (
-        predecessor_beam
-    )
-
-    # update finished states of each beam
-    max_beam_width = beam_search_args.finished_beams.size(1)
-    finished_beams = beam_search_args.finished_beams[beam_search_args.seq_slots].view(-1)
-
-    offset_predecessor_beam = predecessor_beam + (
-        torch.arange(predecessor_beam.size(0), device=predecessor_beam.device).unsqueeze(1)
-        * max_beam_width
-    )
-    finished_beams = finished_beams[offset_predecessor_beam]
-    beam_search_args.finished_beams[beam_search_args.seq_slots] = finished_beams.view(
-        batch_size, max_beam_width
-    )
-
-    # Update the cache indirection
-    cache_indirection = beam_search_args.cache_indirection[
-        beam_search_args.seq_slots, :beam_width_out
-    ]
-    cache_indirection_buffer = beam_search_args.cache_indirection_buffer[
-        beam_search_args.seq_slots, :beam_width_in
-    ]
-    # Perform the swap of the cache indirections between beams
-    torch.gather(
-        cache_indirection_buffer,
-        dim=1,
-        index=predecessor_beam.unsqueeze(2).expand(-1, -1, cache_indirection.size(2)),
-        out=cache_indirection,
-    )
-
-    # Prepare target values
-    target_values = (
-        torch.arange(
-            beam_width_out * batch_size, device=cache_indirection.device, dtype=torch.int32
+        # mask showing which beams in the batch are finished: Shape: (batch_size, beam_width)
+        finished_beams_mask = (
+            beam_search_args.finished_beams[beam_search_args.seq_slots, :beam_width_in]
+            != FinishReason.NOT_FINISHED.value
         )
-        % beam_width_out
-    )
+        # expand the mask in the vocabulary dimension
+        finished_beams_mask_expanded = finished_beams_mask.unsqueeze(-1).expand(
+            -1, -1, logprobs.size(-1)
+        )
 
-    # seq lens is of shape (batch_size), we assume all beams have the same seq len
-    # therefore we can use expand
-    index = beam_search_args.seq_lens.view(-1, 1, 1).expand(-1, beam_width_out, 1)
-    # index is of shape (batch_size, beam_width, 1)
-    src = target_values.view(batch_size, beam_width_out, 1)
-    # src is of shape (batch_size, beam_width, 1)
-    # cache_indirection is of shape (batch_size, beam_width, max_seq_len)
-    cache_indirection.scatter_(2, index, src)
+        # we can now use torch.where to fill the logprobs of the finished beams with -inf asynchronously
+        logprobs = torch.where(finished_beams_mask_expanded, float("-inf"), logprobs)
+        # set the first token to 0 for finished beams. We will overwrite sampling with a padding token later.
+        logprobs[..., 0] = torch.where(finished_beams_mask, 0, logprobs[..., 0])
 
-    # copy the batched buffer back to the original buffer
-    beam_search_args.cache_indirection[beam_search_args.seq_slots, :beam_width_out] = (
-        cache_indirection
-    )
+        # Add the current cum_log_probs to the logprobs of each beam
+        logprobs += beam_search_args.cum_log_probs.unsqueeze(-1)[
+            beam_search_args.seq_slots, :beam_width_in
+        ]
 
-    # project the next_tokens values to the vocab_size
-    next_tokens = next_tokens % vocab_size
-    ended_predecessor_mask = torch.gather(dim=1, index=predecessor_beam, input=finished_beams_mask)
-    # set the finished beams to the pad token
-    next_tokens = torch.where(ended_predecessor_mask, BEAM_SEARCH_PAD_TOKEN, next_tokens)
+    with nvtx_range("bss.topk"):
+        # get the top <beam_width> logprobs across all beams
+        logprobs = logprobs.view(batch_size, beam_width_in * vocab_size)
+        sorted_logprobs, sorted_indices = torch.topk(
+            logprobs, k=beam_width_out, sorted=True, dim=-1
+        )
 
-    # update the logprobs of the newly generated tokens
-    # NB this is not needed if logprobs are not returned
-    old_cum_log_probs = beam_search_args.cum_log_probs[beam_search_args.seq_slots].view(-1)
-    beam_search_args.new_log_probs[beam_search_args.seq_slots, :beam_width_out] = (
-        sorted_logprobs[:, :beam_width_out] - old_cum_log_probs[offset_predecessor_beam]
-    )
-    # update the beam scores
-    beam_search_args.cum_log_probs[beam_search_args.seq_slots, :beam_width_out] = sorted_logprobs[
-        :, :beam_width_out
-    ]
+    with nvtx_range("bss.predecessor"):
+        next_tokens = sorted_indices.to(torch.int32)
+
+        # Rework the past cache indirection
+        # get the beam idx from which the tokens were sampled (optimal predecessor)
+        predecessor_beam = next_tokens // vocab_size
+        beam_search_args.predecessor_beams[beam_search_args.seq_slots, :beam_width_out] = (
+            predecessor_beam
+        )
+
+    with nvtx_range("bss.finished_beams_update"):
+        # update finished states of each beam
+        max_beam_width = beam_search_args.finished_beams.size(1)
+        finished_beams = beam_search_args.finished_beams[beam_search_args.seq_slots].view(-1)
+
+        # NB: ``seq_offsets`` is pre-computed as ``arange(max_num_sequences) * max_beam_width``
+        # at sampler construction; slicing avoids per-call ``arange`` + multiply kernels.
+        offset_predecessor_beam = predecessor_beam + beam_search_args.seq_offsets[
+            : predecessor_beam.size(0)
+        ].unsqueeze(1)
+        finished_beams = finished_beams[offset_predecessor_beam]
+        beam_search_args.finished_beams[beam_search_args.seq_slots] = finished_beams.view(
+            batch_size, max_beam_width
+        )
+
+    with nvtx_range("bss.cache_indirection_swap"):
+        # Update the cache indirection
+        cache_indirection = beam_search_args.cache_indirection[
+            beam_search_args.seq_slots, :beam_width_out
+        ]
+        cache_indirection_buffer = beam_search_args.cache_indirection_buffer[
+            beam_search_args.seq_slots, :beam_width_in
+        ]
+        # Perform the swap of the cache indirections between beams
+        torch.gather(
+            cache_indirection_buffer,
+            dim=1,
+            index=predecessor_beam.unsqueeze(2).expand(-1, -1, cache_indirection.size(2)),
+            out=cache_indirection,
+        )
+
+        # seq lens is of shape (batch_size), we assume all beams have the same seq len
+        # therefore we can use expand
+        index = beam_search_args.seq_lens.view(-1, 1, 1).expand(-1, beam_width_out, 1)
+        # index is of shape (batch_size, beam_width, 1)
+        # NB: ``beam_idx_arange`` is pre-computed as ``arange(max_beam_width)`` at sampler
+        # construction; the original code allocated ``arange(beam * batch) % beam`` per
+        # call, which is exactly ``[[0, 1, .., beam-1], ...]`` already encoded by the
+        # cached arange. ``expand`` over the batch dim is a strided view (no kernel).
+        src = (
+            beam_search_args.beam_idx_arange[:beam_width_out]
+            .view(1, beam_width_out, 1)
+            .expand(batch_size, beam_width_out, 1)
+        )
+        # src is of shape (batch_size, beam_width, 1)
+        # cache_indirection is of shape (batch_size, beam_width, max_seq_len)
+        cache_indirection.scatter_(2, index, src)
+
+        # copy the batched buffer back to the original buffer
+        beam_search_args.cache_indirection[beam_search_args.seq_slots, :beam_width_out] = (
+            cache_indirection
+        )
+
+    with nvtx_range("bss.next_tokens"):
+        # project the next_tokens values to the vocab_size
+        next_tokens = next_tokens % vocab_size
+        ended_predecessor_mask = torch.gather(
+            dim=1, index=predecessor_beam, input=finished_beams_mask
+        )
+        # set the finished beams to the pad token
+        next_tokens = torch.where(ended_predecessor_mask, BEAM_SEARCH_PAD_TOKEN, next_tokens)
+
+    with nvtx_range("bss.score_update"):
+        # update the logprobs of the newly generated tokens
+        # NB this is not needed if logprobs are not returned
+        old_cum_log_probs = beam_search_args.cum_log_probs[beam_search_args.seq_slots].view(-1)
+        beam_search_args.new_log_probs[beam_search_args.seq_slots, :beam_width_out] = (
+            sorted_logprobs[:, :beam_width_out] - old_cum_log_probs[offset_predecessor_beam]
+        )
+        # update the beam scores
+        beam_search_args.cum_log_probs[beam_search_args.seq_slots, :beam_width_out] = (
+            sorted_logprobs[:, :beam_width_out]
+        )
     return next_tokens, softmax
 
 

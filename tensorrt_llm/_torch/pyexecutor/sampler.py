@@ -2042,6 +2042,18 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         """Shape: batch_size, beam_width, sequence_length
            Usage: Stores the original tokens for each beam.
            This is used to recover the original tokens for each beam when streaming is enabled"""
+        seq_offsets: torch.Tensor
+        """Shape: (max_num_sequences,) dtype int64
+           Pre-computed `arange(max_num_sequences) * max_beam_width` cached on device.
+           Used by ``beam_search_sampling_batch`` to flatten ``predecessor_beam`` into
+           an indexer over the batch * beam dimension without launching a per-call
+           ``torch.arange`` + multiply pair (saves 2 small kernel launches per step)."""
+        beam_idx_arange: torch.Tensor
+        """Shape: (max_beam_width,) dtype int32
+           Pre-computed `arange(max_beam_width)` cached on device. Used as the source
+           of the per-step ``cache_indirection.scatter_`` to mark each beam slot's
+           own index, replacing a per-call ``torch.arange + %`` pair (saves 2 small
+           kernel launches per step)."""
 
     @dataclass(kw_only=True)
     class LogProbsStore:
@@ -2109,6 +2121,19 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             predecessor_beams = int_tensor(self.CACHE_INDIRECTION_SHAPE[:-1])
             original_tokens = int_tensor(self.CACHE_INDIRECTION_SHAPE)
             first_finish_reasons = int_tensor(self.CACHE_INDIRECTION_SHAPE[:-1])
+            # Pre-compute per-step indexer constants once. ``seq_offsets[i]`` =
+            # i * max_beam_width is added (broadcast over the beam dim) to every
+            # ``predecessor_beam`` to flatten (batch_idx, beam_idx) pairs into the
+            # combined dimension of ``finished_beams`` and ``cum_log_probs``;
+            # ``beam_idx_arange[j]`` = j is scatter-written into the seq_lens
+            # position of cache_indirection so each beam slot points at itself
+            # for the current step. Caching saves 4 small kernel launches per step.
+            seq_offsets = torch.arange(
+                self.max_num_sequences, device="cuda", dtype=torch.int64
+            ) * self.max_beam_width
+            beam_idx_arange = torch.arange(
+                self.max_beam_width, device="cuda", dtype=torch.int32
+            )
             beam_search_store = self.BeamSearchStore(
                 cache_indirection=cache_indirection,
                 cache_indirection_buffer=cache_indirection_buffer,
@@ -2116,6 +2141,8 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 predecessor_beams=predecessor_beams,
                 original_tokens=original_tokens,
                 first_finish_reasons=first_finish_reasons,
+                seq_offsets=seq_offsets,
+                beam_idx_arange=beam_idx_arange,
             )
         return self.Store(
             new_tokens=new_tokens,
@@ -3232,6 +3259,8 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                     ),  # Should be on device for beam search
                     finished_beams=beam_search_store.first_finish_reasons,
                     predecessor_beams=beam_search_store.predecessor_beams,
+                    seq_offsets=beam_search_store.seq_offsets,
+                    beam_idx_arange=beam_search_store.beam_idx_arange,
                 )
             elif metadata_type is None:
                 metadata = None
@@ -3635,46 +3664,50 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
     ) -> _BatchedSamplingResult:
         cuda_device = logits_cuda.device
 
-        grouped_requests = self._request_grouper.group_requests_by_strategy_key(
-            requests,
-            pin_memory=prefer_pinned(),
-            strategy_to_key=self._grouped_sampler_cls.strategy_grouping_key,
-            seq_slots=seq_slots,
-            vocab_size=logits_cuda.size(1),  # Dummy value; strategy should already be cached
-        )
-        grouped_requests_with_metadata = self._add_metadata_to_grouped_requests(
-            requests,
-            grouped_requests,
-            seq_slots,
-            seq_lens,
-            get_metadata_type_for_group_fn=self._grouped_sampler_cls.get_metadata_type_for_group,
-        )
-        generator_cuda = self.get_generator(cuda_device)
-
-        # NB: Currently, "d2t" is applied to draft tokens, but not to draft logits,
-        #     breaking _process_draft_tokens_rejection_sampling.
-        needs_d2t = "d2t" in model_outputs
-        if needs_d2t and (
-            len(grouped_requests_with_metadata) > 1
-            or (
-                grouped_requests_with_metadata
-                and next(iter(grouped_requests_with_metadata.values())).strategies[0] != GREEDY
+        with nvtx_range("sbs.group_requests"):
+            grouped_requests = self._request_grouper.group_requests_by_strategy_key(
+                requests,
+                pin_memory=prefer_pinned(),
+                strategy_to_key=self._grouped_sampler_cls.strategy_grouping_key,
+                seq_slots=seq_slots,
+                vocab_size=logits_cuda.size(1),  # Dummy value; strategy should already be cached
             )
-        ):
-            raise ValueError("d2t does not yet support non-greedy sampling")
-
-        # Tensors for collecting sampling results (in batch ordering)
-        batch_req_indices = torch.empty((len(requests),), dtype=torch.int32)
-        batch_next_tokens_cuda_int = torch.empty(
-            (logits_cuda.size(0), self.max_beam_width), device=cuda_device, dtype=token_dtype
-        )
-        batch_logits_for_logprobs_cuda = (
-            torch.empty(
-                (logits_cuda.size(0), logits_cuda.size(1)), device=cuda_device, dtype=torch.float32
+            grouped_requests_with_metadata = self._add_metadata_to_grouped_requests(
+                requests,
+                grouped_requests,
+                seq_slots,
+                seq_lens,
+                get_metadata_type_for_group_fn=self._grouped_sampler_cls.get_metadata_type_for_group,
             )
-            if return_log_probs
-            else None
-        )
+            generator_cuda = self.get_generator(cuda_device)
+
+            # NB: Currently, "d2t" is applied to draft tokens, but not to draft logits,
+            #     breaking _process_draft_tokens_rejection_sampling.
+            needs_d2t = "d2t" in model_outputs
+            if needs_d2t and (
+                len(grouped_requests_with_metadata) > 1
+                or (
+                    grouped_requests_with_metadata
+                    and next(iter(grouped_requests_with_metadata.values())).strategies[0] != GREEDY
+                )
+            ):
+                raise ValueError("d2t does not yet support non-greedy sampling")
+
+        with nvtx_range("sbs.alloc_buffers"):
+            # Tensors for collecting sampling results (in batch ordering)
+            batch_req_indices = torch.empty((len(requests),), dtype=torch.int32)
+            batch_next_tokens_cuda_int = torch.empty(
+                (logits_cuda.size(0), self.max_beam_width), device=cuda_device, dtype=token_dtype
+            )
+            batch_logits_for_logprobs_cuda = (
+                torch.empty(
+                    (logits_cuda.size(0), logits_cuda.size(1)),
+                    device=cuda_device,
+                    dtype=torch.float32,
+                )
+                if return_log_probs
+                else None
+            )
         batch_req_idx_offset_start = 0
         batch_next_tokens_offset_start = 0
         for group_key, group_val_with_metadata in grouped_requests_with_metadata.items():
@@ -3696,100 +3729,113 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 group_req_indices
             )
 
-            need_processed_logprobs_indices = torch.nonzero(group_need_processed_logprobs)
-            need_raw_logprobs_indices = torch.nonzero(group_need_raw_logprobs)
-            any_request_needs_processed_logprobs = need_processed_logprobs_indices.size(0) > 0
-            any_request_needs_raw_logprobs = need_raw_logprobs_indices.size(0) > 0
-            any_request_needs_logprobs = (
-                any_request_needs_processed_logprobs or any_request_needs_raw_logprobs
-            )
+            with nvtx_range("sbs.group.indexer_logits"):
+                need_processed_logprobs_indices = torch.nonzero(group_need_processed_logprobs)
+                need_raw_logprobs_indices = torch.nonzero(group_need_raw_logprobs)
+                any_request_needs_processed_logprobs = (
+                    need_processed_logprobs_indices.size(0) > 0
+                )
+                any_request_needs_raw_logprobs = need_raw_logprobs_indices.size(0) > 0
+                any_request_needs_logprobs = (
+                    any_request_needs_processed_logprobs or any_request_needs_raw_logprobs
+                )
 
-            if any_request_needs_logprobs:
-                # indices for accessing logits within the current group
-                group_logit_indexer = _PackedStepIndexer(
-                    num_steps=req_num_generated_tokens[group_req_indices],
-                    max_steps=cast(
-                        int, req_num_generated_tokens.max().item() * self.max_beam_width
-                    ),
-                )
-                logit_indices_for_processed_logprobs_cuda = group_logit_indexer[
-                    need_processed_logprobs_indices
-                ].to(logits_cuda.device, non_blocking=True)
-                logit_indices_for_raw_logprobs_cuda = group_logit_indexer[
-                    need_raw_logprobs_indices
-                ].to(logits_cuda.device, non_blocking=True)
-            else:
-                logit_indices_for_processed_logprobs_cuda = None
-                logit_indices_for_raw_logprobs_cuda = None
+                if any_request_needs_logprobs:
+                    # indices for accessing logits within the current group
+                    group_logit_indexer = _PackedStepIndexer(
+                        num_steps=req_num_generated_tokens[group_req_indices],
+                        max_steps=cast(
+                            int, req_num_generated_tokens.max().item() * self.max_beam_width
+                        ),
+                    )
+                    logit_indices_for_processed_logprobs_cuda = group_logit_indexer[
+                        need_processed_logprobs_indices
+                    ].to(logits_cuda.device, non_blocking=True)
+                    logit_indices_for_raw_logprobs_cuda = group_logit_indexer[
+                        need_raw_logprobs_indices
+                    ].to(logits_cuda.device, non_blocking=True)
+                else:
+                    logit_indices_for_processed_logprobs_cuda = None
+                    logit_indices_for_raw_logprobs_cuda = None
 
-            group_logits_cuda_indices = logits_cuda_indexer[group_req_indices]
-            # NB: Assuming that group_req_indices are sorted
-            group_req_1st_index, group_req_last_index = group_req_indices[0], group_req_indices[-1]
-            group_logits_cuda_indices_cuda: torch.Tensor | slice
-            logit_indices_for_sampler: Optional[torch.Tensor]
-            if group_req_last_index - group_req_1st_index + 1 == len(group_req_indices):
-                # Avoid data movement if indices are contiguous
-                group_logits_cuda_indices_cuda = slice(
-                    req_offsets[group_req_1st_index],
-                    req_offsets[group_req_last_index]
-                    + req_num_generated_tokens[group_req_last_index],
+                group_logits_cuda_indices = logits_cuda_indexer[group_req_indices]
+                # NB: Assuming that group_req_indices are sorted
+                group_req_1st_index, group_req_last_index = (
+                    group_req_indices[0],
+                    group_req_indices[-1],
                 )
-                group_logits_cuda = logits_cuda[group_logits_cuda_indices_cuda]
-                logit_indices_for_sampler = None
-                # group_logits_cuda already contains only logits for the group
-                group_logits_indices_for_processed_logprobs_cuda = (
-                    logit_indices_for_processed_logprobs_cuda
-                )
-                group_logits_indices_for_raw_logprobs_cuda = logit_indices_for_raw_logprobs_cuda
-            else:
-                group_logits_cuda_indices_cuda = group_logits_cuda_indices.to(
-                    device=logits_cuda.device, non_blocking=True
-                )
-                group_logits_cuda = logits_cuda
-                logit_indices_for_sampler = group_logits_cuda_indices_cuda
-                # group_logits_cuda contains logits for the whole batch
-                # Therefore, we need indices corresponding to the whole batch
-                group_logits_indices_for_processed_logprobs_cuda = (
-                    None
-                    if not any_request_needs_processed_logprobs
-                    else logits_cuda_indexer[group_req_indices[group_need_processed_logprobs]].to(
-                        logits_cuda.device, non_blocking=True
+                group_logits_cuda_indices_cuda: torch.Tensor | slice
+                logit_indices_for_sampler: Optional[torch.Tensor]
+                if group_req_last_index - group_req_1st_index + 1 == len(group_req_indices):
+                    # Avoid data movement if indices are contiguous
+                    group_logits_cuda_indices_cuda = slice(
+                        req_offsets[group_req_1st_index],
+                        req_offsets[group_req_last_index]
+                        + req_num_generated_tokens[group_req_last_index],
+                    )
+                    group_logits_cuda = logits_cuda[group_logits_cuda_indices_cuda]
+                    logit_indices_for_sampler = None
+                    # group_logits_cuda already contains only logits for the group
+                    group_logits_indices_for_processed_logprobs_cuda = (
+                        logit_indices_for_processed_logprobs_cuda
+                    )
+                    group_logits_indices_for_raw_logprobs_cuda = (
+                        logit_indices_for_raw_logprobs_cuda
+                    )
+                else:
+                    group_logits_cuda_indices_cuda = group_logits_cuda_indices.to(
+                        device=logits_cuda.device, non_blocking=True
+                    )
+                    group_logits_cuda = logits_cuda
+                    logit_indices_for_sampler = group_logits_cuda_indices_cuda
+                    # group_logits_cuda contains logits for the whole batch
+                    # Therefore, we need indices corresponding to the whole batch
+                    group_logits_indices_for_processed_logprobs_cuda = (
+                        None
+                        if not any_request_needs_processed_logprobs
+                        else logits_cuda_indexer[
+                            group_req_indices[group_need_processed_logprobs]
+                        ].to(logits_cuda.device, non_blocking=True)
+                    )
+                    group_logits_indices_for_raw_logprobs_cuda = (
+                        None
+                        if not any_request_needs_raw_logprobs
+                        else logits_cuda_indexer[group_req_indices[group_need_raw_logprobs]].to(
+                            logits_cuda.device, non_blocking=True
+                        )
+                    )
+
+            with nvtx_range("sbs.group.sample"):
+                group_strategies_per_step = [  # convert from per-request to per-step
+                    strat
+                    for strat, steps in zip(
+                        group_strategies, req_num_steps[group_req_indices].tolist()
+                    )
+                    for _ in range(steps)
+                ]
+
+                group_next_tokens_cuda, group_softmax_cuda, group_temperature_cuda = (
+                    self._grouped_sampler_cls.sample_grouped_strategies(
+                        strategy_key,
+                        group_strategies_per_step,
+                        group_logits_cuda,
+                        generator=generator_cuda,
+                        return_probs=needs_probs,
+                        group_logit_indices=logit_indices_for_sampler,
+                        group_metadata=group_metadata,
                     )
                 )
-                group_logits_indices_for_raw_logprobs_cuda = (
-                    None
-                    if not any_request_needs_raw_logprobs
-                    else logits_cuda_indexer[group_req_indices[group_need_raw_logprobs]].to(
-                        logits_cuda.device, non_blocking=True
-                    )
-                )
 
-            group_strategies_per_step = [  # convert from per-request to per-step
-                strat
-                for strat, steps in zip(group_strategies, req_num_steps[group_req_indices].tolist())
-                for _ in range(steps)
-            ]
-
-            group_next_tokens_cuda, group_softmax_cuda, group_temperature_cuda = (
-                self._grouped_sampler_cls.sample_grouped_strategies(
-                    strategy_key,
-                    group_strategies_per_step,
-                    group_logits_cuda,
-                    generator=generator_cuda,
-                    return_probs=needs_probs,
-                    group_logit_indices=logit_indices_for_sampler,
-                    group_metadata=group_metadata,
+            with nvtx_range("sbs.group.copy_result"):
+                batch_next_tokens_offset_end = (
+                    batch_next_tokens_offset_start + group_next_tokens_cuda.size(0)
                 )
-            )
-            batch_next_tokens_offset_end = (
-                batch_next_tokens_offset_start + group_next_tokens_cuda.size(0)
-            )
-            # if no beam search is used, the shape is (batch_size,), so we need to unsqueeze it to (batch_size, 1)
-            if group_next_tokens_cuda.dim() == 1:
-                group_next_tokens_cuda = group_next_tokens_cuda.unsqueeze(1)
-            batch_next_tokens_cuda_int[
-                batch_next_tokens_offset_start:batch_next_tokens_offset_end
-            ].copy_(group_next_tokens_cuda, non_blocking=True)
+                # if no beam search is used, the shape is (batch_size,), so we need to unsqueeze it to (batch_size, 1)
+                if group_next_tokens_cuda.dim() == 1:
+                    group_next_tokens_cuda = group_next_tokens_cuda.unsqueeze(1)
+                batch_next_tokens_cuda_int[
+                    batch_next_tokens_offset_start:batch_next_tokens_offset_end
+                ].copy_(group_next_tokens_cuda, non_blocking=True)
 
             if any_request_needs_processed_logprobs:
                 assert group_logits_indices_for_processed_logprobs_cuda is not None
@@ -4274,39 +4320,44 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
     ) -> tuple[list[LlmRequest], torch.Tensor, torch.Tensor, torch.Tensor]:
         raw_logits_cuda = model_outputs["logits"]
 
-        sampling_requests, sampling_requests_metadata, logits_cuda = self._select_generated_logits(
-            scheduled_requests,
-            raw_logits_cuda,
-            num_context_logits_prefix_sum=num_context_logits_prefix_sum,
-        )
-        return_log_probs = self._return_log_probs(sampling_requests)
-        if return_log_probs:
-            self._prepare_log_probs(sampling_requests)
+        with nvtx_range("pr.select_logits"):
+            sampling_requests, sampling_requests_metadata, logits_cuda = (
+                self._select_generated_logits(
+                    scheduled_requests,
+                    raw_logits_cuda,
+                    num_context_logits_prefix_sum=num_context_logits_prefix_sum,
+                )
+            )
+            return_log_probs = self._return_log_probs(sampling_requests)
+            if return_log_probs:
+                self._prepare_log_probs(sampling_requests)
 
-        seq_slots_host = torch.tensor(
-            [r.py_seq_slot for r in sampling_requests],
-            dtype=torch.int32,
-            pin_memory=prefer_pinned(),
-        )
+        with nvtx_range("pr.host_tensors"):
+            seq_slots_host = torch.tensor(
+                [r.py_seq_slot for r in sampling_requests],
+                dtype=torch.int32,
+                pin_memory=prefer_pinned(),
+            )
 
-        # necessary for beam search and max_length checks
-        seq_lens_host = torch.tensor(
-            [r.max_beam_num_tokens for r in sampling_requests],
-            dtype=torch.int32,
-            pin_memory=prefer_pinned(),
-        )
+            # necessary for beam search and max_length checks
+            seq_lens_host = torch.tensor(
+                [r.max_beam_num_tokens for r in sampling_requests],
+                dtype=torch.int32,
+                pin_memory=prefer_pinned(),
+            )
 
-        # Handle embedding bias
-        self._apply_embedding_bias(
-            logits_cuda, sampling_requests, sampling_requests_metadata.req_num_steps
-        )
+        with nvtx_range("pr.apply_biases"):
+            # Handle embedding bias
+            self._apply_embedding_bias(
+                logits_cuda, sampling_requests, sampling_requests_metadata.req_num_steps
+            )
 
-        logits_cuda = self._apply_min_length_penalty(
-            logits_cuda,
-            sampling_requests,
-            sampling_requests_metadata.req_num_steps.tolist(),
-            sampling_requests_metadata.req_num_beams.tolist(),
-        )
+            logits_cuda = self._apply_min_length_penalty(
+                logits_cuda,
+                sampling_requests,
+                sampling_requests_metadata.req_num_steps.tolist(),
+                sampling_requests_metadata.req_num_beams.tolist(),
+            )
 
         # Fast path for greedy sampling
         if self._can_use_fast_greedy_path(sampling_requests):
@@ -4338,14 +4389,15 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             new_tokens_host = self._copy_to_host(new_tokens_cuda)
             return sampling_requests, seq_slots_host, seq_lens_host, new_tokens_host
 
-        # Indexer for accessing tokens in 'logits_cuda', corresponding to the
-        # requests in 'requests'.
-        steps_dim_size = new_tokens_cuda.size(0)
-        logits_cuda_indexer = _PackedStepIndexer(
-            num_steps=sampling_requests_metadata.req_num_generated_tokens,
-            max_steps=steps_dim_size * self.max_beam_width,
-            req_offsets=sampling_requests_metadata.req_offsets,
-        )
+        with nvtx_range("pr.build_indexer"):
+            # Indexer for accessing tokens in 'logits_cuda', corresponding to the
+            # requests in 'requests'.
+            steps_dim_size = new_tokens_cuda.size(0)
+            logits_cuda_indexer = _PackedStepIndexer(
+                num_steps=sampling_requests_metadata.req_num_generated_tokens,
+                max_steps=steps_dim_size * self.max_beam_width,
+                req_offsets=sampling_requests_metadata.req_offsets,
+            )
 
         # Perform sampling in batches
         batched_sampling_result = self._sample_batched_by_strategy(
@@ -4371,13 +4423,14 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 sampling_requests_metadata.req_num_generated_tokens_output,
             )
 
-        # Fill results into output buffers
-        new_tokens_host = self._unbatch_sampling_results(
-            batched_sampling_result,
-            new_tokens_cuda=new_tokens_cuda,
-            req_num_generated_tokens=sampling_requests_metadata.req_num_generated_tokens,
-            seq_slots=seq_slots_host,
-        )
+        with nvtx_range("pr.unbatch"):
+            # Fill results into output buffers
+            new_tokens_host = self._unbatch_sampling_results(
+                batched_sampling_result,
+                new_tokens_cuda=new_tokens_cuda,
+                req_num_generated_tokens=sampling_requests_metadata.req_num_generated_tokens,
+                seq_slots=seq_slots_host,
+            )
 
         # NB: update_requests syncs w/ device computation and async D2H copies
         return sampling_requests, seq_slots_host, seq_lens_host, new_tokens_host
