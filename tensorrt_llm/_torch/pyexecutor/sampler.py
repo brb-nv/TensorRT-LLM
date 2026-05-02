@@ -1422,7 +1422,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         def update_for_new_request(
             self,
             *,
-            seq_slots_cuda: torch.Tensor,
+            seq_slots_cuda_long: torch.Tensor,
             max_lengths_cuda: torch.Tensor,
             end_ids_cuda: torch.Tensor,
             seq_slots_host: torch.Tensor,
@@ -1435,9 +1435,15 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             a resize of the stop words buffers is triggered. If a resize is necessary, all requests in the batch
             need to be re-processed.
 
+            ``Tensor.index_copy_`` is used for the device-side max-lengths/end-ids
+            scatters so PyTorch lowers each to a single fused index-and-copy
+            kernel (no ``direct_copy_kernel`` staging step). ``index_copy_``
+            requires int64 indices, hence the ``_long`` suffix on the parameter.
+
             Args:
-                seq_slots_cuda: The sequence slots of the processed requests. Used for accessing device buffers.
-                  Shape: [len(requests)]
+                seq_slots_cuda_long: The sequence slots of the processed requests, as
+                  int64 CUDA indices. Used for accessing device buffers via
+                  ``index_copy_``. Shape: [len(requests)]
                 max_lengths_cuda: The maximum lengths for each request.
                   Shape: [len(requests)]
                 end_ids_cuda: The end ids for each request.
@@ -1450,8 +1456,8 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
 
             temp_data = self._temp_data
             store = self.store
-            store.max_lengths_cuda[seq_slots_cuda] = max_lengths_cuda
-            store.end_ids_cuda[seq_slots_cuda] = end_ids_cuda
+            store.max_lengths_cuda.index_copy_(0, seq_slots_cuda_long, max_lengths_cuda)
+            store.end_ids_cuda.index_copy_(0, seq_slots_cuda_long, end_ids_cuda)
             store.max_stop_word_lengths_host[seq_slots_host] = torch.tensor(
                 temp_data.max_stop_word_lengths, device="cpu", dtype=torch.int32
             )
@@ -2749,9 +2755,16 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             max_lens_tensor_cuda = full_list_tensor_cuda[1]
             end_ids_tensor_cuda = full_list_tensor_cuda[2]
 
+        # Cast seq_slots to int64 once and reuse for every downstream
+        # ``index_copy_`` / ``index_fill_`` call (both primitives require int64
+        # indices). Hoisting the cast out of the per-callee scopes turns N
+        # casts into 1 and avoids redundant ``copy_kernel`` launches.
+        with nvtx_range("setup.seq_slots_to_long"):
+            seq_slots_tensor_cuda_long = seq_slots_tensor_cuda.long()
+
         with nvtx_range("setup.finish_reasons.update"):
             self._finish_reasons_handler.update_for_new_request(
-                seq_slots_cuda=seq_slots_tensor_cuda,
+                seq_slots_cuda_long=seq_slots_tensor_cuda_long,
                 max_lengths_cuda=max_lens_tensor_cuda,
                 end_ids_cuda=end_ids_tensor_cuda,
                 seq_slots_host=seq_slots_tensor_host,
@@ -2765,7 +2778,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 self._prepare_beam_search(
                     beam_search_store,
                     self.store.log_probs_store,
-                    seq_slots=seq_slots_tensor_cuda,
+                    seq_slots_long=seq_slots_tensor_cuda_long,
                     max_prompt_len=max_prompt_len,
                 )
 
@@ -2774,7 +2787,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
     def _prepare_beam_search(
         beam_search_store: BeamSearchStore,
         log_probs_store: LogProbsStore,
-        seq_slots: torch.Tensor,
+        seq_slots_long: torch.Tensor,
         max_prompt_len: int,
     ) -> None:
         """Prepare the beam search buffers for the requests
@@ -2785,14 +2798,13 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         Each per-buffer fill uses ``Tensor.index_fill_`` so PyTorch lowers
         it to a single fused index-and-fill kernel (no RHS allocation,
         ``FillFunctor``, or ``direct_copy_kernel``). ``index_fill_``
-        requires int64 indices, so ``seq_slots`` (int32, shared with the
-        finish-reasons handler) is cast once and reused for all seven
-        fills. ``FinishReason.NOT_FINISHED`` is the integer 0 (see
-        ``cpp/include/tensorrt_llm/executor/types.h``), so all seven
-        buffers reduce to scalar-zero index_fills.
+        requires int64 indices; the int64 cast is performed once in
+        ``setup_sampler_step`` (under the ``setup.seq_slots_to_long``
+        NVTX range) and shared with the finish-reasons handler, so this
+        function takes ``seq_slots_long`` directly. ``FinishReason.NOT_FINISHED``
+        is the integer 0 (see ``cpp/include/tensorrt_llm/executor/types.h``),
+        so all seven buffers reduce to scalar-zero index_fills.
         """
-        with nvtx_range("pbs.seq_slots_to_long"):
-            seq_slots_long = seq_slots.long()
         with nvtx_range("pbs.cache_indirection_zero"):
             beam_search_store.cache_indirection.narrow(
                 2, 0, max_prompt_len
