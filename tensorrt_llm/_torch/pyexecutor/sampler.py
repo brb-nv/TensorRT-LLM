@@ -2717,54 +2717,60 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         max_prompt_len: int = 0
 
         # Prepare finish reasons handler
-        self._finish_reasons_handler.setup_new_request_handling()
-        for request in new_requests:
-            slot = request.py_seq_slot
-            assert slot is not None
-            seq_slots.append(slot)
-            # update temp_data with this requests data
-            self._finish_reasons_handler.prepare_for_new_request(request)
+        with nvtx_range("setup.collect_loop"):
+            self._finish_reasons_handler.setup_new_request_handling()
+            for request in new_requests:
+                slot = request.py_seq_slot
+                assert slot is not None
+                seq_slots.append(slot)
+                # update temp_data with this requests data
+                self._finish_reasons_handler.prepare_for_new_request(request)
 
-            if self._use_beam_search:
-                assert not (request.py_return_log_probs and request.py_num_logprobs > 1), (
-                    "Beam search does not support returning multiple logprobs per request"
-                )
-                max_prompt_len = max(max_prompt_len, request.py_prompt_len)
+                if self._use_beam_search:
+                    assert not (request.py_return_log_probs and request.py_num_logprobs > 1), (
+                        "Beam search does not support returning multiple logprobs per request"
+                    )
+                    max_prompt_len = max(max_prompt_len, request.py_prompt_len)
 
-            self._request_grouper.prepare_for_new_request(request, slot)
+                self._request_grouper.prepare_for_new_request(request, slot)
 
-        max_lens = self._finish_reasons_handler.new_max_lens
-        end_ids = self._finish_reasons_handler.new_end_ids
-        # Perform updates to the stores
-        full_list = [seq_slots, max_lens, end_ids]
-        # perform only a single copy
-        full_list_tensor_host = torch.tensor(
-            full_list, device="cpu", dtype=torch.int32, pin_memory=prefer_pinned()
-        )
-        full_list_tensor_cuda = full_list_tensor_host.to(device="cuda", non_blocking=True)
-        seq_slots_tensor_host = full_list_tensor_host[0]
-        seq_slots_tensor_cuda = full_list_tensor_cuda[0]
-        max_lens_tensor_cuda = full_list_tensor_cuda[1]
-        end_ids_tensor_cuda = full_list_tensor_cuda[2]
-        self._finish_reasons_handler.update_for_new_request(
-            seq_slots_cuda=seq_slots_tensor_cuda,
-            max_lengths_cuda=max_lens_tensor_cuda,
-            end_ids_cuda=end_ids_tensor_cuda,
-            seq_slots_host=seq_slots_tensor_host,
-            all_sampling_requests=new_requests + scheduled_requests.generation_requests,
-        )
+        with nvtx_range("setup.h2d"):
+            max_lens = self._finish_reasons_handler.new_max_lens
+            end_ids = self._finish_reasons_handler.new_end_ids
+            # Perform updates to the stores
+            full_list = [seq_slots, max_lens, end_ids]
+            # perform only a single copy
+            full_list_tensor_host = torch.tensor(
+                full_list, device="cpu", dtype=torch.int32, pin_memory=prefer_pinned()
+            )
+            full_list_tensor_cuda = full_list_tensor_host.to(device="cuda", non_blocking=True)
+            seq_slots_tensor_host = full_list_tensor_host[0]
+            seq_slots_tensor_cuda = full_list_tensor_cuda[0]
+            max_lens_tensor_cuda = full_list_tensor_cuda[1]
+            end_ids_tensor_cuda = full_list_tensor_cuda[2]
 
-        if self._use_beam_search:
-            beam_search_store = self.store.beam_search_store
-            assert beam_search_store is not None
-            self._prepare_beam_search(
-                beam_search_store,
-                self.store.log_probs_store,
-                seq_slots=seq_slots_tensor_cuda,
-                max_prompt_len=max_prompt_len,
+        with nvtx_range("setup.finish_reasons.update"):
+            self._finish_reasons_handler.update_for_new_request(
+                seq_slots_cuda=seq_slots_tensor_cuda,
+                max_lengths_cuda=max_lens_tensor_cuda,
+                end_ids_cuda=end_ids_tensor_cuda,
+                seq_slots_host=seq_slots_tensor_host,
+                all_sampling_requests=new_requests + scheduled_requests.generation_requests,
             )
 
+        if self._use_beam_search:
+            with nvtx_range("setup.prepare_beam_search"):
+                beam_search_store = self.store.beam_search_store
+                assert beam_search_store is not None
+                self._prepare_beam_search(
+                    beam_search_store,
+                    self.store.log_probs_store,
+                    seq_slots=seq_slots_tensor_cuda,
+                    max_prompt_len=max_prompt_len,
+                )
+
     @staticmethod
+    @nvtx_range("prepare_beam_search")
     def _prepare_beam_search(
         beam_search_store: BeamSearchStore,
         log_probs_store: LogProbsStore,
@@ -2774,54 +2780,37 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         """Prepare the beam search buffers for the requests
 
         If the last context chunk is being processed,
-        initialize/reset the buffers for the request
+        initialize/reset the buffers for the request.
+
+        Each per-buffer fill uses ``Tensor.index_fill_`` so PyTorch lowers
+        it to a single fused index-and-fill kernel (no RHS allocation,
+        ``FillFunctor``, or ``direct_copy_kernel``). ``index_fill_``
+        requires int64 indices, so ``seq_slots`` (int32, shared with the
+        finish-reasons handler) is cast once and reused for all seven
+        fills. ``FinishReason.NOT_FINISHED`` is the integer 0 (see
+        ``cpp/include/tensorrt_llm/executor/types.h``), so all seven
+        buffers reduce to scalar-zero index_fills.
         """
-        cache_indirection = beam_search_store.cache_indirection
-        cache_indirection[seq_slots, :, :max_prompt_len] = torch.zeros(
-            (1),
-            dtype=cache_indirection.dtype,
-            device=cache_indirection.device,
-        )
-        cum_log_probs = beam_search_store.cum_log_probs
-        cum_log_probs[seq_slots] = torch.zeros(
-            (1,),
-            dtype=cum_log_probs.dtype,
-            device=cum_log_probs.device,
-        )
-        sampled_log_probs = log_probs_store.sampled_log_probs
-        sampled_log_probs[seq_slots] = torch.zeros(
-            (1,),
-            dtype=sampled_log_probs.dtype,
-            device=sampled_log_probs.device,
-        )
-        sampled_log_prob_ranks = log_probs_store.sampled_log_prob_ranks
-        sampled_log_prob_ranks[seq_slots] = torch.zeros(
-            (1,),
-            dtype=sampled_log_prob_ranks.dtype,
-            device=sampled_log_prob_ranks.device,
-        )
-        predecessor_beams = beam_search_store.predecessor_beams
-        predecessor_beams[seq_slots] = torch.zeros(
-            (1,),
-            dtype=predecessor_beams.dtype,
-            device=predecessor_beams.device,
-        )
-        first_finish_reasons = beam_search_store.first_finish_reasons
-        first_finish_reasons[seq_slots] = (
-            torch.tensor(
-                FinishReason.NOT_FINISHED.value,
-                pin_memory=prefer_pinned(),
-                dtype=first_finish_reasons.dtype,
+        with nvtx_range("pbs.seq_slots_to_long"):
+            seq_slots_long = seq_slots.long()
+        with nvtx_range("pbs.cache_indirection_zero"):
+            beam_search_store.cache_indirection.narrow(
+                2, 0, max_prompt_len
+            ).index_fill_(0, seq_slots_long, 0)
+        with nvtx_range("pbs.cum_log_probs_zero"):
+            beam_search_store.cum_log_probs.index_fill_(0, seq_slots_long, 0)
+        with nvtx_range("pbs.sampled_log_probs_zero"):
+            log_probs_store.sampled_log_probs.index_fill_(0, seq_slots_long, 0)
+        with nvtx_range("pbs.sampled_log_prob_ranks_zero"):
+            log_probs_store.sampled_log_prob_ranks.index_fill_(0, seq_slots_long, 0)
+        with nvtx_range("pbs.predecessor_beams_zero"):
+            beam_search_store.predecessor_beams.index_fill_(0, seq_slots_long, 0)
+        with nvtx_range("pbs.first_finish_reasons_zero"):
+            beam_search_store.first_finish_reasons.index_fill_(
+                0, seq_slots_long, FinishReason.NOT_FINISHED.value
             )
-            .to(first_finish_reasons.device, non_blocking=True)
-            .unsqueeze(0)
-        )
-        original_tokens = beam_search_store.original_tokens
-        original_tokens[seq_slots] = torch.zeros(
-            (1,),
-            dtype=original_tokens.dtype,
-            device=original_tokens.device,
-        )
+        with nvtx_range("pbs.original_tokens_zero"):
+            beam_search_store.original_tokens.index_fill_(0, seq_slots_long, 0)
 
     @torch.inference_mode()
     def _process_draft_tokens_rejection_sampling(
