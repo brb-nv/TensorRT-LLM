@@ -56,7 +56,7 @@ These two bottlenecks are difficult to optimize simultaneously using traditional
 
 ### Roofline Motivation
 
-The following roofline analysis illustrates why decoupling attention and FFN sharding is essential. We model a dense LLM with batch B=8, MLA attention, query heads Q=128, KV heads K=1, QK head size Hsz=576, V head size Hsz=512, and FFN dimension F=65536 running on GB200 NVLink72. Both weights and KV cache are stored and fetched in FP8. Communication overhead from TP and KVP is not included; these plots show only the change in GPU DRAM-read latency as TP width and KVP width vary.
+The following roofline analysis illustrates why decoupling attention and FFN sharding is essential. We model a dense LLM with batch B=8, MLA attention, query heads Q=128, KV heads K=1, QK head size Hsz=576, V head size Hsz=512, and FFN dimension F=65536 running on GB200 NVLink72. The MLA-attention parameters mirror DeepSeek-R1: Q=128 query heads with a per-token latent KV of `kv_lora_rank=512` plus `qk_rope_head_dim=64` (giving Hsz=576) and V head size 512. DSR1's actual FFN dimension is 18432; we use F=65536 here as a representative large dense FFN so that FFN weight-read time is on the same order as long-context attention reads and the bottleneck crossover is visible in a single plot. Both weights and KV cache are stored and fetched in FP8. Communication overhead from TP and KVP is not included; these plots show only the change in GPU DRAM-read latency as TP width and KVP width vary.
 
 <div align="center">
 <figure>
