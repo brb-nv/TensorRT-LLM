@@ -728,9 +728,13 @@ class TestPiecewiseCudaGraphCaptureDefaults:
 
     Three invariants are exercised:
 
-    1. `TorchCompileConfig.capture_num_tokens` defaults to `None`, so the
-       model engine can fall back to `cuda_graph_config.batch_sizes` (the
-       behavior documented on the field).
+    1. `TorchCompileConfig.capture_num_tokens` defaults to a fixed
+       powers-of-2 + 256-stride list when `enable_piecewise_cuda_graph`
+       is True (and stays `None` otherwise). The fixed list keeps the
+       capture set small to bound startup time and CUDA graph memory;
+       the model-engine filter (invariants 2 and 3) ensures the largest
+       reachable size is always captured even when it is not in this
+       default list.
     2. `_filter_piecewise_capture_num_tokens` caps the candidate list at
        `max_batch_size * (max_seq_len - 1 - num_extra_decoding_steps)` --
        the largest forward-pass `num_tokens` the warmup builder can
@@ -742,18 +746,44 @@ class TestPiecewiseCudaGraphCaptureDefaults:
        than falling back to eager.
     """
 
-    def test_torch_compile_config_capture_num_tokens_defaults_to_none(self):
-        """`capture_num_tokens` is unset by default.
+    _EXPECTED_DEFAULT_CAPTURE_NUM_TOKENS = [2**i for i in range(8)] + list(
+        range(256, 3073, 256))
 
-        Keeps the documented fallback to `cuda_graph_config.batch_sizes`
-        in the model engine reachable; a non-None default here would
-        silently shadow the user's `cuda_graph_config.batch_sizes` choice.
+    def test_torch_compile_config_capture_num_tokens_default_when_piecewise_enabled(
+            self):
+        """Default capture set is the powers-of-2 + 256-stride list.
+
+        Keeps the capture set bounded (~20 entries) so server startup
+        time and CUDA graph memory stay predictable. The model engine
+        further filters and appends the reachable ceiling, so
+        out-of-range entries (e.g. > max_seq_len-1) are never recorded
+        and gap ISLs still get a graph.
         """
         config = TorchCompileConfig(enable_piecewise_cuda_graph=True)
+        assert config.capture_num_tokens == self._EXPECTED_DEFAULT_CAPTURE_NUM_TOKENS
+
+    def test_torch_compile_config_capture_num_tokens_stays_none_when_piecewise_disabled(
+            self):
+        """No default is populated when piecewise is off.
+
+        The capture set is irrelevant in this case; populating it would
+        be misleading in serialized configs.
+        """
+        config = TorchCompileConfig(enable_piecewise_cuda_graph=False)
         assert config.capture_num_tokens is None
 
-    def test_torch_llm_args_capture_num_tokens_defaults_to_none(self):
-        """Same invariant when reached through `TorchLlmArgs` construction.
+    def test_torch_compile_config_capture_num_tokens_user_override_preserved(
+            self):
+        """User-supplied `capture_num_tokens` is not overwritten by the default."""
+        user_list = [4, 8, 16]
+        config = TorchCompileConfig(enable_piecewise_cuda_graph=True,
+                                    capture_num_tokens=user_list)
+        # `validate_capture_num_tokens` dedupes and reverse-sorts.
+        assert config.capture_num_tokens == sorted(set(user_list), reverse=True)
+
+    def test_torch_llm_args_capture_num_tokens_default_when_piecewise_enabled(
+            self):
+        """Same default applies when reached through `TorchLlmArgs` construction.
 
         This is the path real users hit via `trtllm-serve` YAML.
         """
@@ -768,7 +798,7 @@ class TestPiecewiseCudaGraphCaptureDefaults:
             torch_compile_config=TorchCompileConfig(
                 enable_piecewise_cuda_graph=True),
         )
-        assert args.torch_compile_config.capture_num_tokens is None
+        assert args.torch_compile_config.capture_num_tokens == self._EXPECTED_DEFAULT_CAPTURE_NUM_TOKENS
 
     def test_piecewise_filter_drops_entries_above_reachable_ceiling(self):
         """Drop candidates above `max_batch_size * (max_seq_len - 1)`.
