@@ -259,6 +259,10 @@ The following results for DeepSeek-R1 are obtained on GB300 NVL72 using TensorRT
 
 For DeepSeek-R1 at 1M sequence length on GB300 NVL72, Helix delivers up to **32x concurrency improvement** and **1.8x interactivity improvement** compared to conventional parallelism approaches.
 
+The configurations on the baseline Pareto frontier at the low-latency end are largely TP-driven. DeepSeek-R1 uses Multi-Latent Attention (MLA), where the per-token KV cache is a single shared latent vector, so K is effectively 1. As noted in the [KV Cache Streaming](#kv-cache-streaming) section, any TP > 1 with MLA therefore forces the full multi-million-token KV cache to be duplicated on every TP rank. Per-GPU KV-read time stays pinned at its single-GPU value no matter how wide TP grows, and every replica must reserve HBM for the entire KV cache, capping the effective batch each rank can carry. Past a certain TP, additional GPUs only add duplicated KV traffic, so the baseline curve hits the attention DRAM ceiling and per-GPU throughput collapses.
+
+Helix breaks this ceiling on the same pool of N GPUs by pinning TP_A ≤ K (for MLA, TP_A = 1, so no KV duplication) and spending the remaining width on KV Parallelism, which shards the KV cache along the sequence dimension so per-GPU attention DRAM traffic scales as ~1/KVP. The same N GPUs are then re-provisioned as TP_F × EP = N for the FFN block, so attention and FFN bottlenecks shrink together. This is why Helix extends the Pareto frontier into the low-latency region where the baseline degrades, yielding up to 1.8x interactivity improvement at low concurrency.
+
 ## Future Work
 
 - **HOP-B pipelining**: Implement fine-grained batch-wise pipelining in TensorRT-LLM to overlap All-to-All communication with attention computation, delivering up to 12% additional improvement for dense models.
