@@ -30,9 +30,9 @@ By NVIDIA TensorRT LLM Team
 
 ## Introduction
 
-Modern AI applications increasingly rely on models that combine large parameter counts with multi-million-token context windows. Whether it is AI agents following months of conversation, legal assistants reasoning through gigabytes of case law, or coding copilots navigating sprawling repositories, preserving long-range context is essential for relevance and coherence. On top of that, users expect fast, interactive responses.
+Modern AI applications increasingly rely on models that combine large parameter counts with multi-million-token context windows. Whether it is AI agents following months of conversation, legal assistants reasoning through gigabytes of case law, or coding copilots navigating sprawling repositories, preserving long-range context is essential for relevance and coherence. At the same time, users expect fast, interactive responses.
 
-The growing demand to decode at this scale underscores the importance of FP4 compute and the high-bandwidth NVLink domain provided by NVIDIA Blackwell systems. **Helix Parallelism**, co-designed with Blackwell, addresses the two dominant bottlenecks in long-context decoding: KV cache streaming and FFN weight loading. It does so by temporally disaggregating the parallelism strategies used for attention and FFN within each transformer layer, allowing the same pool of GPUs to operate in the configuration best suited to each stage's bottleneck.
+**Helix Parallelism** addresses the two dominant bottlenecks in long-context decoding: KV cache streaming and FFN weight loading. It does so by using different parallelism strategies for attention and FFN within each transformer layer, allowing the same pool of GPUs to operate in the configuration best suited to each stage's bottleneck. In this blog, we focus on sequence parallelism for attention and tensor parallelism (with optional expert parallelism for MoE) for the FFN.
 
 Compared to conventional parallelism approaches, Helix delivers up to **32x** concurrency improvement and **1.8x** interactivity improvement for 1M sequence length on DeepSeek-R1 with GB300 silicon NVL72, pushing forward the throughput-latency Pareto frontier and making real-time inference with ultra-long sequences practical.
 
@@ -44,19 +44,21 @@ To support real-time decoding at scale, a system must overcome two major bottlen
 
 ### KV Cache Streaming
 
-When handling multi-million-token contexts, each GPU must read a massive history of past tokens (KV cache) from DRAM per sample at every decoding step. This constant streaming can saturate DRAM bandwidth, increase TTL, and quickly become a major bottleneck as context length grows.
+When handling multi-million-token contexts, each GPU must read a massive history of past tokens (KV cache) from DRAM per sample at every decoding step. This constant streaming can saturate DRAM bandwidth, increase token-to-token latency (TTL), and quickly become a major bottleneck as context length grows.
 
 Consider Tensor Parallelism (TP) as an example: increasing TP can distribute weight loading across more GPUs, but in attention schemes like Grouped Query Attention (GQA) or Multi-Latent Attention (MLA), multiple query heads share a limited number of KV heads K. When TP exceeds K, the system must **duplicate** the multi-million-token KV cache across GPUs so each shard can serve its assigned query heads. Beyond this point, increasing TP neither shrinks per-GPU KV cache size nor speeds up KV reads, imposing a hard ceiling on attention time and forcing smaller batch sizes under tight TTL constraints. In the case of MLA (used by DeepSeek models), K is effectively 1, so any TP > 1 triggers full KV duplication.
 
 ### FFN Weight Loading
 
-During autoregressive decoding, generating every new token requires loading large FFN weights from DRAM. With small batch sizes typical of latency-sensitive workloads, this cost cannot be amortized, making FFN weight reads a dominant source of latency. More TP helps here by splitting weights across GPUs, but the KV cache duplication ceiling from above limits how far TP can scale - if TP is capped at K shards, only K GPUs can be used to shard the FFN, which accounts for roughly two-thirds of model parameters.
+During autoregressive decoding, generating every new token requires loading large FFN weights from DRAM. With small batch sizes typical of latency-sensitive workloads, this cost cannot be amortized, making FFN weight reads a dominant source of latency. More TP helps here by splitting weights across GPUs, but the KV cache duplication ceiling from above limits how far TP can scale - if TP is capped at K shards, only K GPUs can be used to shard the FFN, which typically accounts for the vast majority of model parameters.
 
 These two bottlenecks are difficult to optimize simultaneously using traditional parallelism strategies, because the optimal sharding for attention (minimize KV duplication, keep TP ≤ K) conflicts with the optimal sharding for FFN (maximize weight distribution, increase TP). Helix Parallelism resolves this conflict.
 
 ### Roofline Motivation
 
 The following roofline analysis illustrates why decoupling attention and FFN sharding is essential. We model a dense LLM with batch B=8, MLA attention, query heads Q=128, KV heads K=1, QK head size Hsz=576, V head size Hsz=512, and FFN dimension F=65536 running on GB200 NVLink72. Both weights and KV cache are stored and fetched in FP8. Communication overhead from TP and KVP is not included; these plots show only the change in GPU DRAM-read latency as TP width and KVP width vary.
+
+The MLA-attention numbers are taken directly from DeepSeek-R1: 128 query heads, K=1 in absorbed form, with the per-token KV cache being the latent vector (`kv_lora_rank=512` plus `qk_rope_head_dim=64`, giving the QK head size of 576). The FFN dimension `F=65536` is intentionally chosen as a representative *large dense* FFN width, rather than literal DSR1 numbers, so that FFN weight-read time is on the same order as long-context attention reads and the bottleneck crossover is visible in a single plot. This makes the **Left** panel directly relevant to a DSR1-style stack at TP=8: with K=1, any TP > 1 already sits in the KV-duplication regime, so increasing attention TP further only adds replicas without shrinking per-GPU KV reads. The end-to-end DSR1 (MoE) numbers appear separately in the [Performance Results](#performance-results-deepseek-r1-moe-mla) section.
 
 <div align="center">
 <figure>
@@ -67,7 +69,7 @@ The following roofline analysis illustrates why decoupling attention and FFN sha
 
 The key insights from this analysis:
 
-- **(Left)** Increasing TP beyond K yields diminishing returns for attention because KV cache must be duplicated, while FFN weight reads continue to benefit linearly from more TP. This divergence motivates using different parallelism widths for the two stages.
+- **(Left)** Increasing TP beyond K yields diminishing returns for attention because KV cache must be duplicated, while FFN weight reads continue to benefit linearly from spreading weights across more GPUs - whether via wider TP_F (dense) or a TP_F × EP grid (MoE). This divergence motivates using different parallelism widths for the two stages.
 - **(Middle)** Self-attention DRAM read time scales linearly with KV sequence length S at fixed TP. At 1M+ tokens, attention reads dominate total layer latency.
 - **(Right)** KV Parallelism (KVP) distributes KV cache reads across GPUs, achieving linear scaling of attention time with KVP width. The same GPUs are then re-provisioned for TP in FFNs to reduce weight-read latency.
 
@@ -75,7 +77,7 @@ The key insights from this analysis:
 
 ### High-Level Execution Flow
 
-Helix is a hybrid sharding strategy that temporally disaggregates the parallelism strategies of attention and FFN within a single transformer layer. Instead of using one fixed parallelism configuration for the entire layer, Helix switches between two configurations using the same pool of N GPUs:
+Helix is a hybrid sharding strategy that uses different parallelism strategies for attention and FFN within a single transformer layer. Instead of using one fixed parallelism configuration for the entire layer, Helix switches between two configurations using the same pool of N GPUs:
 
 - **Attention phase**: N = KVP × TP_A (KV Parallelism × Tensor Parallelism for Attention, where TP_A ≤ K)
 - **FFN phase**: N = TP_F × EP (Tensor Parallelism for FFN × Expert Parallelism)
@@ -110,11 +112,11 @@ After local FlashAttention, each KVP GPU holds a **partial** attention output co
 
 Each GPU then rescales and sums the received fragments to reconstruct the **exact** softmax-normalized attention - not an approximation. The correction works because:
 
-1. Each KVP rank i computes local attention output O_i = softmax(Q · K_i^T) · V_i and the corresponding log-sum-exp LSE_i
+1. Each KVP rank i computes local attention output O_i = softmax(Q · K_i^T) · V_i and the corresponding log-sum-exp LSE_i. Internally, each rank already runs Flash-Decoding across its own SMs, splitting its KV shard into chunks and combining their per-chunk partials and LSEs into the rank-local (O_i, LSE_i).
 2. After the All-to-All, each GPU has all partial outputs {O_i} and scalars {LSE_i}
 3. The global result is reconstructed as: O = Σ_i (exp(LSE_i - LSE_global) · O_i), where LSE_global = log(Σ_i exp(LSE_i))
 
-This is the same online softmax correction used in [Flash-Decoding](https://crfm.stanford.edu/2023/10/12/flashdecoding.html), extended to a distributed setting. The result is mathematically identical to single-GPU attention.
+In effect, Helix is a **hierarchical Flash-Decoding scheme**: the [Flash-Decoding](https://crfm.stanford.edu/2023/10/12/flashdecoding.html) online-softmax correction is applied first within each GPU across its SMs, and then a second time across KVP GPUs over the All-to-All. The result is mathematically identical to single-GPU attention.
 
 ### Communication Volume Analysis
 
