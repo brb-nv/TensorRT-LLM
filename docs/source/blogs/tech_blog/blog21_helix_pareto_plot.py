@@ -65,7 +65,6 @@ HELIX_POINTS: list[ParetoPoint] = [
 
 BASELINE_POINTS: list[ParetoPoint] = [
     ParetoPoint("ck-1_tp64",         1,   False, 1,  64, 1, 8,   74.68,  1.17),
-    ParetoPoint("ck-8_tep8pp8",      8,   False, 1,  8,  8, 8,   53.76,  6.72),
     ParetoPoint("ck-1_ep64",         64,  True,  1,  64, 1, 64,  52.38,  52.38),
     ParetoPoint("ck-2_ep64",         128, True,  1,  64, 1, 64,  39.11,  78.22),
     ParetoPoint("ck-4_ep64",         256, True,  1,  64, 1, 64,  25.44,  101.76),
@@ -109,11 +108,9 @@ BASELINE_LABEL_POSITIONS = {
     # end of each label would intersect the blue curve.
     "ck-4_ep64":         (-22,  92, "left",   "center", True),  # C=256
     "ck-2_ep64":         (-22,  68, "left",   "center", True),  # C=128
-    # Just above the dramatic drop - label snug below the marker, kept in
-    # the margin for visual alignment with the labels above.
+    # Top of the long diagonal segment - label kept in the margin for
+    # visual alignment with the labels above.
     "ck-1_ep64":         (-22,  42, "left",   "center", True),  # C=64
-    # Just below the drop - label tucked in the bottom strip, near the marker.
-    "ck-8_tep8pp8":      ( 35,  -7, "left",   "center", True),  # C=8
     # Bottom-right baseline point - label just below the marker.
     "ck-1_tp64":         ( 78,  -7, "left",   "center", True),  # C=1
 }
@@ -126,8 +123,7 @@ def _smooth_pareto_xy(points):
     """Return densely-sampled (x, y) along a monotone Pareto curve.
 
     Points are sorted by tokens/s/user; PchipInterpolator preserves
-    monotonicity (so the smoothed curve never overshoots its data points,
-    which matters for the dramatic baseline drop near t/s/user ~= 53).
+    monotonicity, so the smoothed curve never overshoots its data points.
     """
     xs = np.array([p.tokens_per_s_per_user for p in points])
     ys = np.array([p.tokens_per_s_per_gpu for p in points])
