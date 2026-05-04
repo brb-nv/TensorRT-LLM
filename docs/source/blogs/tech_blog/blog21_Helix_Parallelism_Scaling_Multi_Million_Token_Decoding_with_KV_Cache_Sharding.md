@@ -256,6 +256,7 @@ The following results for DeepSeek-R1 are obtained on GB300 NVL72 using TensorRT
 </figure>
 </div>
 <p align="center"><sub><em>Figure 4. Throughput-latency Pareto frontier of serving DeepSeek-R1 (FP4) on GB300 NVL72 with Helix on the generation servers. Helix pushes the frontier outward, enabling both higher throughput and lower latency.</em></sub></p>
+<p align="center"><sub><em>Note: KVP × TP × DP = MoE_TP × MoE_EP, with DP=1 when attention is tensor-parallel and TP=1 when attention is data-parallel. The label's EP is MoE_EP; any remaining width is MoE_TP. PP is shown only when PP > 1, and the total GPU count per generation instance is N = KVP × TP × DP × PP.</em></sub></p>
 
 For DeepSeek-R1 at 1M sequence length on GB300 NVL72, Helix delivers up to **32x concurrency improvement** and **1.8x interactivity improvement** compared to conventional parallelism approaches.
 
