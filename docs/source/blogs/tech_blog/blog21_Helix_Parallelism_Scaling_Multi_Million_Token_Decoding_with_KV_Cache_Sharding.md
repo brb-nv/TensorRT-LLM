@@ -254,7 +254,7 @@ The following results for **DeepSeek-R1** are obtained on **GB300 NVL72** using 
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog21_dsr1_fp4_pareto.png" alt="DeepSeek-R1 FP4 throughput-latency Pareto on GB300 NVL72 with Helix" width="700">
+  <img src="../media/tech_blog21_dsr1_fp4_pareto.png" alt="DeepSeek-R1 FP4 throughput-latency Pareto on GB300 NVL72 with Helix, with parallelism configuration (concurrency, KVP, TP/DP, EP, PP) annotated at each Pareto point" width="1000">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 4. Throughput-latency Pareto frontier of serving DeepSeek-R1 (FP4) on GB300 NVL72 with Helix on the generation servers. Helix pushes the frontier outward, enabling both higher throughput and lower latency.</em></sub></p>
