@@ -1,0 +1,22 @@
+[trt] === Warmup x3 ===
+[TRT-LLM] [W] [batchmgr] [RANK 0] Setting mReturnAllGeneratedTokens to True since streaming AND beam search are done simultaneously. Returning the full beams at each streaming step is needed because beam search + streaming can change previous outputs. Initialize request with mReturnAllGeneratedTokens = True to dismiss this error. WARNING: using this option may increase network usage significantly (quadratically w.r.t output length).
+[trt] warmup[0] TTFT=186.46ms total=303.10ms chunks=20 tokens=20
+[TRT-LLM] [W] [batchmgr] [RANK 0] Setting mReturnAllGeneratedTokens to True since streaming AND beam search are done simultaneously. Returning the full beams at each streaming step is needed because beam search + streaming can change previous outputs. Initialize request with mReturnAllGeneratedTokens = True to dismiss this error. WARNING: using this option may increase network usage significantly (quadratically w.r.t output length).
+[trt] warmup[1] TTFT=6.58ms total=80.18ms chunks=20 tokens=20
+[TRT-LLM] [W] [batchmgr] [RANK 0] Setting mReturnAllGeneratedTokens to True since streaming AND beam search are done simultaneously. Returning the full beams at each streaming step is needed because beam search + streaming can change previous outputs. Initialize request with mReturnAllGeneratedTokens = True to dismiss this error. WARNING: using this option may increase network usage significantly (quadratically w.r.t output length).
+[trt] warmup[2] TTFT=6.21ms total=79.72ms chunks=20 tokens=20
+[trt] === Measurement x5 (profiled) ===
+[TRT-LLM] [W] [batchmgr] [RANK 0] Setting mReturnAllGeneratedTokens to True since streaming AND beam search are done simultaneously. Returning the full beams at each streaming step is needed because beam search + streaming can change previous outputs. Initialize request with mReturnAllGeneratedTokens = True to dismiss this error. WARNING: using this option may increase network usage significantly (quadratically w.r.t output length).
+[trt] meas[0]   TTFT=6.11ms total=79.72ms chunks=20 tokens=20
+[TRT-LLM] [W] [batchmgr] [RANK 0] Setting mReturnAllGeneratedTokens to True since streaming AND beam search are done simultaneously. Returning the full beams at each streaming step is needed because beam search + streaming can change previous outputs. Initialize request with mReturnAllGeneratedTokens = True to dismiss this error. WARNING: using this option may increase network usage significantly (quadratically w.r.t output length).
+[trt] meas[1]   TTFT=6.25ms total=79.97ms chunks=20 tokens=20
+[TRT-LLM] [W] [batchmgr] [RANK 0] Setting mReturnAllGeneratedTokens to True since streaming AND beam search are done simultaneously. Returning the full beams at each streaming step is needed because beam search + streaming can change previous outputs. Initialize request with mReturnAllGeneratedTokens = True to dismiss this error. WARNING: using this option may increase network usage significantly (quadratically w.r.t output length).
+[trt] meas[2]   TTFT=6.34ms total=79.87ms chunks=20 tokens=20
+[TRT-LLM] [W] [batchmgr] [RANK 0] Setting mReturnAllGeneratedTokens to True since streaming AND beam search are done simultaneously. Returning the full beams at each streaming step is needed because beam search + streaming can change previous outputs. Initialize request with mReturnAllGeneratedTokens = True to dismiss this error. WARNING: using this option may increase network usage significantly (quadratically w.r.t output length).
+[trt] meas[3]   TTFT=6.07ms total=79.57ms chunks=20 tokens=20
+[TRT-LLM] [W] [batchmgr] [RANK 0] Setting mReturnAllGeneratedTokens to True since streaming AND beam search are done simultaneously. Returning the full beams at each streaming step is needed because beam search + streaming can change previous outputs. Initialize request with mReturnAllGeneratedTokens = True to dismiss this error. WARNING: using this option may increase network usage significantly (quadratically w.r.t output length).
+[trt] meas[4]   TTFT=6.18ms total=79.67ms chunks=20 tokens=20
+[trt] === Summary (5 measurements) ===
+[trt] TTFT  mean=6.19ms min=6.07ms max=6.34ms
+[trt] Total mean=79.76ms min=79.57ms max=79.97ms
+[TRT-LLM] [I] [runtime ] [RANK 0] Refreshed the MPI local session

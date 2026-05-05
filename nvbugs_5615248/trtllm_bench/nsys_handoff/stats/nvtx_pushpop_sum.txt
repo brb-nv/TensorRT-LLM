@@ -1,0 +1,154 @@
+
+NOTICE: Existing SQLite export found: nvbugs_5615248/trtllm_bench/nsys_handoff/pyt_beam10_handoff.sqlite
+        It is assumed file was previously exported from: nvbugs_5615248/trtllm_bench/nsys_handoff/pyt_beam10_handoff.nsys-rep
+        Consider using --force-export=true if needed.
+
+Processing [nvbugs_5615248/trtllm_bench/nsys_handoff/pyt_beam10_handoff.sqlite] with [/usr/local/cuda-13.1/NsightSystems-cli-2026.1.1/target-linux-x64/reports/nvtx_pushpop_sum.py]... 
+
+ ** NVTX Push/Pop Range Summary (nvtx_pushpop_sum):
+
+ Time (%)  Total Time (ns)  Instances   Avg (ns)   Med (ns)   Min (ns)   Max (ns)   StdDev (ns)                                Range                              
+ --------  ---------------  ---------  ----------  ---------  --------  ----------  -----------  -----------------------------------------------------------------
+     83.4      11665138798        217  53756400.0  6781967.0   4958773  4592812350  434054382.5  TensorRT-LLM:_forward_step                                       
+      3.8        536846129        111   4836451.6    49959.0     35130   414888116   40426361.8  TensorRT-LLM:_fetch_new_requests                                 
+      2.8        396995362        102   3892111.4  2715429.5   2654285   116586018   11271231.2  TensorRT-LLM:_sample_async                                       
+      2.8        394134005        102   3864058.9  2688364.5   2627665   116533098   11268701.9  TensorRT-LLM:sample_async                                        
+      2.1        294007916        102   2882430.5  1900692.5   1843593   100231101    9734812.0  TensorRT-LLM:_process_requests                                   
+      1.8        256180353        102   2511572.1  1545136.0   1494776    99392309    9687716.1  TensorRT-LLM:sample_batched_by_strategy                          
+      1.2        170493602        308    553550.7   518555.5    370226     1323638     131100.2  TensorRT-LLM:_prepare_inputs                                     
+      0.3         37224593        102    364947.0   222898.0    211828    14249146    1388406.0  TensorRT-LLM:maybe_create_beam_histories                         
+      0.2         30758394        102    301552.9   296072.5    286747      656114      36406.1  TensorRT-LLM:_write_finish_reasons                               
+      0.1         15185982        102    148882.2   144103.5     44999      295598      50802.6  TensorRT-LLM:prepare_resources                                   
+      0.1         14085298          2   7042649.0  7042649.0   6820026     7265272     314836.5  TensorRT-LLM:[Executor] _forward_step 0: 1 ctx reqs, 0 gen reqs  
+      0.1         12079082        102    118422.4    77064.0     75039      928091     162258.0  TensorRT-LLM:_update_requests                                    
+      0.1         11843276        102    116110.5    75019.0     73019      921731     161940.1  TensorRT-LLM:update_requests                                     
+      0.1          7964534        102     78083.7    76800.0     75330       89919       3315.4  TensorRT-LLM:update_original_tokens                              
+      0.0          6523098          1   6523098.0  6523098.0   6523098     6523098          0.0  TensorRT-LLM:[Executor] _forward_step 2: 1 ctx reqs, 0 gen reqs  
+      0.0          6063031        102     59441.5    52640.0     31540      392276      44375.1  TensorRT-LLM:_handle_responses                                   
+      0.0          5674697          1   5674697.0  5674697.0   5674697     5674697          0.0  TensorRT-LLM:[Executor] _forward_step 63: 1 ctx reqs, 0 gen reqs 
+      0.0          5631277          1   5631277.0  5631277.0   5631277     5631277          0.0  TensorRT-LLM:[Executor] _forward_step 21: 1 ctx reqs, 0 gen reqs 
+      0.0          5619908          1   5619908.0  5619908.0   5619908     5619908          0.0  TensorRT-LLM:[Executor] _forward_step 42: 1 ctx reqs, 0 gen reqs 
+      0.0          5556278          1   5556278.0  5556278.0   5556278     5556278          0.0  TensorRT-LLM:[Executor] _forward_step 84: 1 ctx reqs, 0 gen reqs 
+      0.0          5372416        102     52670.7     1535.0      1280     1024451     191480.6  TensorRT-LLM:setup_sampler_step                                  
+      0.0          4723322        220     21469.6    20275.0     12760       98429       6183.0  CCCL:cub::DeviceScan::InclusiveScan                              
+      0.0          3520136          7    502876.6   491245.0    477555      586165      38301.0  TensorRT-LLM:setup.prepare_beam_search                           
+      0.0          3500027          7    500003.9   489075.0    474616      582065      37676.9  TensorRT-LLM:prepare_beam_search                                 
+      0.0          2805912        204     13754.5    13885.0     11570       84309       5185.2  CCCL:cub::DeviceScan::InclusiveSumByKey                          
+      0.0          2173102        109     19936.7    20910.0     12179       40800       4256.0  TensorRT-LLM:_enqueue_responses                                  
+      0.0          2035363       6144       331.3      190.0       160      234918       5066.0  TensorRT-LLM:wait_on_pp_send_handles                             
+      0.0          1710626        109     15693.8    13599.0     12600       99799      10890.9  TensorRT-LLM:_schedule                                           
+      0.0          1328755        102     13027.0     6715.0      5480      249177      31849.9  TensorRT-LLM:update_resources                                    
+      0.0          1128791        111     10169.3     1400.0      1160      190269      34452.1  TensorRT-LLM:merge_requests                                      
+      0.0           954311          1    954311.0   954311.0    954311      954311          0.0  TensorRT-LLM:[Executor] _forward_step 1: 0 ctx reqs, 1 gen reqs  
+      0.0           919632          7    131376.0   109919.0    100569      282328      66771.6  TensorRT-LLM:setup.finish_reasons.update                         
+      0.0           912082          1    912082.0   912082.0    912082      912082          0.0  TensorRT-LLM:[Executor] _forward_step 2: 0 ctx reqs, 1 gen reqs  
+      0.0           836742          1    836742.0   836742.0    836742      836742          0.0  TensorRT-LLM:[Executor] _forward_step 31: 0 ctx reqs, 1 gen reqs 
+      0.0           832543          1    832543.0   832543.0    832543      832543          0.0  TensorRT-LLM:[Executor] _forward_step 32: 0 ctx reqs, 1 gen reqs 
+      0.0           829182          1    829182.0   829182.0    829182      829182          0.0  TensorRT-LLM:[Executor] _forward_step 61: 0 ctx reqs, 1 gen reqs 
+      0.0           823373          1    823373.0   823373.0    823373      823373          0.0  TensorRT-LLM:[Executor] _forward_step 45: 0 ctx reqs, 1 gen reqs 
+      0.0           823062          1    823062.0   823062.0    823062      823062          0.0  TensorRT-LLM:[Executor] _forward_step 38: 0 ctx reqs, 1 gen reqs 
+      0.0           821982          1    821982.0   821982.0    821982      821982          0.0  TensorRT-LLM:[Executor] _forward_step 95: 0 ctx reqs, 1 gen reqs 
+      0.0           821172          1    821172.0   821172.0    821172      821172          0.0  TensorRT-LLM:[Executor] _forward_step 25: 0 ctx reqs, 1 gen reqs 
+      0.0           818082          1    818082.0   818082.0    818082      818082          0.0  TensorRT-LLM:[Executor] _forward_step 64: 0 ctx reqs, 1 gen reqs 
+      0.0           817972          1    817972.0   817972.0    817972      817972          0.0  TensorRT-LLM:[Executor] _forward_step 24: 0 ctx reqs, 1 gen reqs 
+      0.0           817163          1    817163.0   817163.0    817163      817163          0.0  TensorRT-LLM:[Executor] _forward_step 67: 0 ctx reqs, 1 gen reqs 
+      0.0           816883          1    816883.0   816883.0    816883      816883          0.0  TensorRT-LLM:[Executor] _forward_step 57: 0 ctx reqs, 1 gen reqs 
+      0.0           816862          1    816862.0   816862.0    816862      816862          0.0  TensorRT-LLM:[Executor] _forward_step 77: 0 ctx reqs, 1 gen reqs 
+      0.0           816763          1    816763.0   816763.0    816763      816763          0.0  TensorRT-LLM:[Executor] _forward_step 94: 0 ctx reqs, 1 gen reqs 
+      0.0           815192          1    815192.0   815192.0    815192      815192          0.0  TensorRT-LLM:[Executor] _forward_step 71: 0 ctx reqs, 1 gen reqs 
+      0.0           814243          1    814243.0   814243.0    814243      814243          0.0  TensorRT-LLM:[Executor] _forward_step 40: 0 ctx reqs, 1 gen reqs 
+      0.0           814043          1    814043.0   814043.0    814043      814043          0.0  TensorRT-LLM:[Executor] _forward_step 65: 0 ctx reqs, 1 gen reqs 
+      0.0           813963          1    813963.0   813963.0    813963      813963          0.0  TensorRT-LLM:[Executor] _forward_step 72: 0 ctx reqs, 1 gen reqs 
+      0.0           813922          1    813922.0   813922.0    813922      813922          0.0  TensorRT-LLM:[Executor] _forward_step 52: 0 ctx reqs, 1 gen reqs 
+      0.0           813253          1    813253.0   813253.0    813253      813253          0.0  TensorRT-LLM:[Executor] _forward_step 36: 0 ctx reqs, 1 gen reqs 
+      0.0           812522          1    812522.0   812522.0    812522      812522          0.0  TensorRT-LLM:[Executor] _forward_step 59: 0 ctx reqs, 1 gen reqs 
+      0.0           812023          1    812023.0   812023.0    812023      812023          0.0  TensorRT-LLM:[Executor] _forward_step 99: 0 ctx reqs, 1 gen reqs 
+      0.0           811642          1    811642.0   811642.0    811642      811642          0.0  TensorRT-LLM:[Executor] _forward_step 66: 0 ctx reqs, 1 gen reqs 
+      0.0           811163          1    811163.0   811163.0    811163      811163          0.0  TensorRT-LLM:[Executor] _forward_step 60: 0 ctx reqs, 1 gen reqs 
+      0.0           810452          1    810452.0   810452.0    810452      810452          0.0  TensorRT-LLM:[Executor] _forward_step 88: 0 ctx reqs, 1 gen reqs 
+      0.0           809262          1    809262.0   809262.0    809262      809262          0.0  TensorRT-LLM:[Executor] _forward_step 27: 0 ctx reqs, 1 gen reqs 
+      0.0           808792          1    808792.0   808792.0    808792      808792          0.0  TensorRT-LLM:[Executor] _forward_step 53: 0 ctx reqs, 1 gen reqs 
+      0.0           808402          1    808402.0   808402.0    808402      808402          0.0  TensorRT-LLM:[Executor] _forward_step 55: 0 ctx reqs, 1 gen reqs 
+      0.0           805683          1    805683.0   805683.0    805683      805683          0.0  TensorRT-LLM:[Executor] _forward_step 56: 0 ctx reqs, 1 gen reqs 
+      0.0           805503          1    805503.0   805503.0    805503      805503          0.0  TensorRT-LLM:[Executor] _forward_step 87: 0 ctx reqs, 1 gen reqs 
+      0.0           805473          1    805473.0   805473.0    805473      805473          0.0  TensorRT-LLM:[Executor] _forward_step 34: 0 ctx reqs, 1 gen reqs 
+      0.0           805393          1    805393.0   805393.0    805393      805393          0.0  TensorRT-LLM:[Executor] _forward_step 33: 0 ctx reqs, 1 gen reqs 
+      0.0           804762          1    804762.0   804762.0    804762      804762          0.0  TensorRT-LLM:[Executor] _forward_step 97: 0 ctx reqs, 1 gen reqs 
+      0.0           804353          1    804353.0   804353.0    804353      804353          0.0  TensorRT-LLM:[Executor] _forward_step 68: 0 ctx reqs, 1 gen reqs 
+      0.0           804132          1    804132.0   804132.0    804132      804132          0.0  TensorRT-LLM:[Executor] _forward_step 26: 0 ctx reqs, 1 gen reqs 
+      0.0           803992          1    803992.0   803992.0    803992      803992          0.0  TensorRT-LLM:[Executor] _forward_step 35: 0 ctx reqs, 1 gen reqs 
+      0.0           803893          1    803893.0   803893.0    803893      803893          0.0  TensorRT-LLM:[Executor] _forward_step 70: 0 ctx reqs, 1 gen reqs 
+      0.0           803382          1    803382.0   803382.0    803382      803382          0.0  TensorRT-LLM:[Executor] _forward_step 91: 0 ctx reqs, 1 gen reqs 
+      0.0           803113          1    803113.0   803113.0    803113      803113          0.0  TensorRT-LLM:[Executor] _forward_step 81: 0 ctx reqs, 1 gen reqs 
+      0.0           803043          1    803043.0   803043.0    803043      803043          0.0  TensorRT-LLM:[Executor] _forward_step 82: 0 ctx reqs, 1 gen reqs 
+      0.0           800733          1    800733.0   800733.0    800733      800733          0.0  TensorRT-LLM:[Executor] _forward_step 46: 0 ctx reqs, 1 gen reqs 
+      0.0           800632          1    800632.0   800632.0    800632      800632          0.0  TensorRT-LLM:[Executor] _forward_step 29: 0 ctx reqs, 1 gen reqs 
+      0.0           799602          1    799602.0   799602.0    799602      799602          0.0  TensorRT-LLM:[Executor] _forward_step 49: 0 ctx reqs, 1 gen reqs 
+      0.0           799033          1    799033.0   799033.0    799033      799033          0.0  TensorRT-LLM:[Executor] _forward_step 100: 0 ctx reqs, 1 gen reqs
+      0.0           798973          1    798973.0   798973.0    798973      798973          0.0  TensorRT-LLM:[Executor] _forward_step 28: 0 ctx reqs, 1 gen reqs 
+      0.0           798883          1    798883.0   798883.0    798883      798883          0.0  TensorRT-LLM:[Executor] _forward_step 48: 0 ctx reqs, 1 gen reqs 
+      0.0           798743          1    798743.0   798743.0    798743      798743          0.0  TensorRT-LLM:[Executor] _forward_step 37: 0 ctx reqs, 1 gen reqs 
+      0.0           798512          1    798512.0   798512.0    798512      798512          0.0  TensorRT-LLM:[Executor] _forward_step 92: 0 ctx reqs, 1 gen reqs 
+      0.0           798423          1    798423.0   798423.0    798423      798423          0.0  TensorRT-LLM:[Executor] _forward_step 103: 0 ctx reqs, 1 gen reqs
+      0.0           798383          1    798383.0   798383.0    798383      798383          0.0  TensorRT-LLM:[Executor] _forward_step 47: 0 ctx reqs, 1 gen reqs 
+      0.0           798113          1    798113.0   798113.0    798113      798113          0.0  TensorRT-LLM:[Executor] _forward_step 102: 0 ctx reqs, 1 gen reqs
+      0.0           798082          1    798082.0   798082.0    798082      798082          0.0  TensorRT-LLM:[Executor] _forward_step 22: 0 ctx reqs, 1 gen reqs 
+      0.0           797663          1    797663.0   797663.0    797663      797663          0.0  TensorRT-LLM:[Executor] _forward_step 75: 0 ctx reqs, 1 gen reqs 
+      0.0           797493          1    797493.0   797493.0    797493      797493          0.0  TensorRT-LLM:[Executor] _forward_step 89: 0 ctx reqs, 1 gen reqs 
+      0.0           797263          1    797263.0   797263.0    797263      797263          0.0  TensorRT-LLM:[Executor] _forward_step 10: 0 ctx reqs, 1 gen reqs 
+      0.0           797103          1    797103.0   797103.0    797103      797103          0.0  TensorRT-LLM:[Executor] _forward_step 54: 0 ctx reqs, 1 gen reqs 
+      0.0           797053          1    797053.0   797053.0    797053      797053          0.0  TensorRT-LLM:[Executor] _forward_step 80: 0 ctx reqs, 1 gen reqs 
+      0.0           797012          1    797012.0   797012.0    797012      797012          0.0  TensorRT-LLM:[Executor] _forward_step 50: 0 ctx reqs, 1 gen reqs 
+      0.0           796692          1    796692.0   796692.0    796692      796692          0.0  TensorRT-LLM:[Executor] _forward_step 51: 0 ctx reqs, 1 gen reqs 
+      0.0           796582          1    796582.0   796582.0    796582      796582          0.0  TensorRT-LLM:[Executor] _forward_step 44: 0 ctx reqs, 1 gen reqs 
+      0.0           796342          1    796342.0   796342.0    796342      796342          0.0  TensorRT-LLM:[Executor] _forward_step 78: 0 ctx reqs, 1 gen reqs 
+      0.0           796162          1    796162.0   796162.0    796162      796162          0.0  TensorRT-LLM:[Executor] _forward_step 79: 0 ctx reqs, 1 gen reqs 
+      0.0           796042          1    796042.0   796042.0    796042      796042          0.0  TensorRT-LLM:[Executor] _forward_step 90: 0 ctx reqs, 1 gen reqs 
+      0.0           795803          1    795803.0   795803.0    795803      795803          0.0  TensorRT-LLM:[Executor] _forward_step 73: 0 ctx reqs, 1 gen reqs 
+      0.0           795772          1    795772.0   795772.0    795772      795772          0.0  TensorRT-LLM:[Executor] _forward_step 98: 0 ctx reqs, 1 gen reqs 
+      0.0           795322          1    795322.0   795322.0    795322      795322          0.0  TensorRT-LLM:[Executor] _forward_step 58: 0 ctx reqs, 1 gen reqs 
+      0.0           795142          1    795142.0   795142.0    795142      795142          0.0  TensorRT-LLM:[Executor] _forward_step 39: 0 ctx reqs, 1 gen reqs 
+      0.0           794033          1    794033.0   794033.0    794033      794033          0.0  TensorRT-LLM:[Executor] _forward_step 76: 0 ctx reqs, 1 gen reqs 
+      0.0           794013          1    794013.0   794013.0    794013      794013          0.0  TensorRT-LLM:[Executor] _forward_step 74: 0 ctx reqs, 1 gen reqs 
+      0.0           793842          1    793842.0   793842.0    793842      793842          0.0  TensorRT-LLM:[Executor] _forward_step 101: 0 ctx reqs, 1 gen reqs
+      0.0           793783          1    793783.0   793783.0    793783      793783          0.0  TensorRT-LLM:[Executor] _forward_step 96: 0 ctx reqs, 1 gen reqs 
+      0.0           793092          1    793092.0   793092.0    793092      793092          0.0  TensorRT-LLM:[Executor] _forward_step 43: 0 ctx reqs, 1 gen reqs 
+      0.0           791692          1    791692.0   791692.0    791692      791692          0.0  TensorRT-LLM:[Executor] _forward_step 6: 0 ctx reqs, 1 gen reqs  
+      0.0           791443          1    791443.0   791443.0    791443      791443          0.0  TensorRT-LLM:[Executor] _forward_step 69: 0 ctx reqs, 1 gen reqs 
+      0.0           788603          1    788603.0   788603.0    788603      788603          0.0  TensorRT-LLM:[Executor] _forward_step 86: 0 ctx reqs, 1 gen reqs 
+      0.0           788512          1    788512.0   788512.0    788512      788512          0.0  TensorRT-LLM:[Executor] _forward_step 23: 0 ctx reqs, 1 gen reqs 
+      0.0           788333          1    788333.0   788333.0    788333      788333          0.0  TensorRT-LLM:[Executor] _forward_step 85: 0 ctx reqs, 1 gen reqs 
+      0.0           788293          1    788293.0   788293.0    788293      788293          0.0  TensorRT-LLM:[Executor] _forward_step 12: 0 ctx reqs, 1 gen reqs 
+      0.0           787103          1    787103.0   787103.0    787103      787103          0.0  TensorRT-LLM:[Executor] _forward_step 30: 0 ctx reqs, 1 gen reqs 
+      0.0           787072          1    787072.0   787072.0    787072      787072          0.0  TensorRT-LLM:[Executor] _forward_step 8: 0 ctx reqs, 1 gen reqs  
+      0.0           783813          1    783813.0   783813.0    783813      783813          0.0  TensorRT-LLM:[Executor] _forward_step 14: 0 ctx reqs, 1 gen reqs 
+      0.0           783653          1    783653.0   783653.0    783653      783653          0.0  TensorRT-LLM:[Executor] _forward_step 4: 0 ctx reqs, 1 gen reqs  
+      0.0           780402          1    780402.0   780402.0    780402      780402          0.0  TensorRT-LLM:[Executor] _forward_step 93: 0 ctx reqs, 1 gen reqs 
+      0.0           779593          1    779593.0   779593.0    779593      779593          0.0  TensorRT-LLM:[Executor] _forward_step 5: 0 ctx reqs, 1 gen reqs  
+      0.0           776613          1    776613.0   776613.0    776613      776613          0.0  TensorRT-LLM:[Executor] _forward_step 18: 0 ctx reqs, 1 gen reqs 
+      0.0           774573          1    774573.0   774573.0    774573      774573          0.0  TensorRT-LLM:[Executor] _forward_step 7: 0 ctx reqs, 1 gen reqs  
+      0.0           773692          1    773692.0   773692.0    773692      773692          0.0  TensorRT-LLM:[Executor] _forward_step 15: 0 ctx reqs, 1 gen reqs 
+      0.0           773443          1    773443.0   773443.0    773443      773443          0.0  TensorRT-LLM:[Executor] _forward_step 19: 0 ctx reqs, 1 gen reqs 
+      0.0           773153          1    773153.0   773153.0    773153      773153          0.0  TensorRT-LLM:[Executor] _forward_step 13: 0 ctx reqs, 1 gen reqs 
+      0.0           768523          1    768523.0   768523.0    768523      768523          0.0  TensorRT-LLM:[Executor] _forward_step 3: 0 ctx reqs, 1 gen reqs  
+      0.0           766913          1    766913.0   766913.0    766913      766913          0.0  TensorRT-LLM:[Executor] _forward_step 16: 0 ctx reqs, 1 gen reqs 
+      0.0           766123          1    766123.0   766123.0    766123      766123          0.0  TensorRT-LLM:[Executor] _forward_step 11: 0 ctx reqs, 1 gen reqs 
+      0.0           763153          1    763153.0   763153.0    763153      763153          0.0  TensorRT-LLM:[Executor] _forward_step 17: 0 ctx reqs, 1 gen reqs 
+      0.0           759703          1    759703.0   759703.0    759703      759703          0.0  TensorRT-LLM:[Executor] _forward_step 9: 0 ctx reqs, 1 gen reqs  
+      0.0           576675          7     82382.1    81059.0     77829       90359       4848.6  TensorRT-LLM:pbs.first_finish_reasons_zero                       
+      0.0           563444          7     80492.0    78469.0     73879       94389       7107.7  TensorRT-LLM:pbs.cache_indirection_zero                          
+      0.0           440307          7     62901.0    60449.0     59610       68909       3837.3  TensorRT-LLM:setup.h2d                                           
+      0.0           434077          7     62011.0    60340.0     59199       68220       3318.5  TensorRT-LLM:pbs.cum_log_probs_zero                              
+      0.0           428106          7     61158.0    59610.0     58219       70199       4347.8  TensorRT-LLM:pbs.original_tokens_zero                            
+      0.0           424136          7     60590.9    57960.0     55030       75049       7053.3  TensorRT-LLM:pbs.sampled_log_probs_zero                          
+      0.0           394176          7     56310.9    55650.0     54479       60519       2043.9  TensorRT-LLM:pbs.sampled_log_prob_ranks_zero                     
+      0.0           390957          7     55851.0    54600.0     53479       60290       2789.5  TensorRT-LLM:pbs.predecessor_beams_zero                          
+      0.0           332985        102      3264.6     2629.5      2310       30070       3062.8  TensorRT-LLM:_update_request_states                              
+      0.0           305177        102      2991.9     2869.5      2510       12040        955.9  TensorRT-LLM:handle_logits                                       
+      0.0           179949        102      1764.2     1625.0      1400        6850        732.6  TensorRT-LLM:handle_additional_outputs                           
+      0.0           153809        102      1507.9     1420.0      1100        6390        527.0  TensorRT-LLM:_send_kv_async                                      
+      0.0           109000        111       982.0      860.0       690        5480        574.2  TensorRT-LLM:broadcast_requests                                  
+      0.0            88708          7     12672.6     7230.0      6600       23240       7380.7  TensorRT-LLM:setup.collect_loop                                  
+      0.0            72369        102       709.5      680.0       490        1290        115.4  TensorRT-LLM:_handle_canceled_requests                           
+      0.0            58608        109       537.7      510.0       340        1460        148.3  TensorRT-LLM:_pad_attention_dp_dummy_request                     
+

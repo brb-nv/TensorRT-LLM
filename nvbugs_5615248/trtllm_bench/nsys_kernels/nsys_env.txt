@@ -1,0 +1,9 @@
+=== nsys version ===
+NVIDIA Nsight Systems version 2026.1.1.204-261137176666v0
+
+=== nsys path ===
+/usr/local/cuda/bin/nsys
+
+=== host ===
+a1u1g-mil-0527
+Linux a1u1g-mil-0527 6.14.0-29-generic #29~24.04.1-Ubuntu SMP PREEMPT_DYNAMIC Thu Aug 14 16:52:50 UTC 2 x86_64 x86_64 x86_64 GNU/Linux

@@ -1,0 +1,22 @@
+# NVBug 5615248 — TensorRT backend runtime config for trtllm-bench (throughput mode), beam=1.
+#
+# Runtime knobs only. Engine geometry (max_seq_len=129, max_batch_size=1,
+# max_beam_width=1, max_input_len=129, max_num_tokens=129,
+# paged_context_fmha=true) is baked into the prebuilt engine at:
+#   nvbugs_5615248/trtllm_bench/beamwidth1/tinyllama_trt_engine
+# and is read back by trtllm-bench from <engine_dir>/config.json.
+#
+# This file is structurally identical to ../trt.yaml — beam width is *not*
+# a runtime knob on the TRT side, it's baked into the engine — but the
+# engine is rebuilt with max_beam_width=1 here so the PyTorch (forced to
+# max_beam_width=1 by _validate_request) and TRT engines have identical
+# geometry, preserving the apples-to-apples comparison.
+
+enable_chunked_prefill: true
+
+kv_cache_config:
+  enable_block_reuse: true
+
+extended_runtime_perf_knob_config:
+  cuda_graph_mode: true
+  multi_block_mode: true

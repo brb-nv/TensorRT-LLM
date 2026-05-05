@@ -1,0 +1,29 @@
+# NVBug 5615248 — buggy case (max_seq_len=128).
+#
+# Mirrors the customer's "Steps to Reproduce" YAML for TinyLlama, plus
+# enable_piecewise_cuda_graph: True (the bug only manifests with piecewise
+# CUDA graph). The key invariant is that torch_compile_config.capture_num_tokens
+# is NOT set — leaving it unset triggers the buggy power-of-2 default in
+# TorchCompileConfig.set_default_capture_num_tokens.
+
+backend: pytorch
+
+tensor_parallel_size: 1
+pipeline_parallel_size: 1
+
+max_beam_width: 10
+max_batch_size: 1
+max_seq_len: 128
+
+enable_chunked_prefill: true
+
+cuda_graph_config:
+  max_batch_size: 128
+  enable_padding: true
+
+kv_cache_config:
+  enable_block_reuse: true
+
+torch_compile_config:
+  enable_piecewise_cuda_graph: true
+  # capture_num_tokens: <unset on purpose — triggers buggy default>

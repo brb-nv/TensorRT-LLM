@@ -1,0 +1,127 @@
+{
+    "engine": {
+        "model": "/home/scratch.trt_llm_data_ci/llm-models/llama-models-v2/TinyLlama-1.1B-Chat-v1.0",
+        "model_path": "/home/scratch.trt_llm_data_ci/llm-models/llama-models-v2/TinyLlama-1.1B-Chat-v1.0",
+        "engine_dir": "None",
+        "revision": null,
+        "version": "1.2",
+        "backend": "Pytorch",
+        "dtype": "bfloat16",
+        "kv_cache_dtype": null,
+        "quantization": null
+    },
+    "machine": {
+        "name": "NVIDIA L40S",
+        "memory.total": 44.39404296875,
+        "clocks.mem": 9.001
+    },
+    "world_info": {
+        "tp_size": 1,
+        "pp_size": 1,
+        "ep_size": null,
+        "world_size": 1,
+        "max_batch_size": 1,
+        "max_num_tokens": 24576,
+        "scheduling_policy": "GUARANTEED_NO_EVICT",
+        "kv_cache_percentage": 0.9,
+        "issue_rate": 7.88966015625e+16
+    },
+    "request_info": {
+        "num_requests": 16,
+        "avg_num_concurrent_requests": 0.9995692985171547,
+        "avg_input_length": 100.0,
+        "avg_output_length": 200.0
+    },
+    "performance": {
+        "total_latency_ms": 1347.1604419999999,
+        "avg_request_latency_ms": 84.16126362499999,
+        "request_throughput_req_s": 11.876833301493276,
+        "system_output_throughput_tok_s": 2375.3666602986555,
+        "system_total_throughput_tok_s": 3563.0499904479825,
+        "output_throughput_per_user_tok_s": 2376.4392367704554,
+        "output_throughput_per_gpu_tok_s": 2375.3666602986555,
+        "request_latency_percentiles_ms": {
+            "p50": 84.05083499999999,
+            "p90": 84.712818,
+            "p95": 84.81481699999999,
+            "p99": 84.81481699999999,
+            "minimum": 83.48939899999999,
+            "maximum": 84.81481699999999,
+            "average": 84.16126362499999
+        }
+    },
+    "energy": {
+        "total_energy_j": 310.12,
+        "output_tps_per_w": 10.318586353669547,
+        "average_gpu_power": 230.2027214661934
+    },
+    "streaming_metrics": {
+        "token_output_speed_tok_s": 2728.7008833208542,
+        "avg_ttft_ms": 11.2307434375,
+        "avg_tpot_ms": 0.36648502606783917,
+        "tpot_percentiles": {
+            "p50": 0.3662233015075376,
+            "p90": 0.36911955778894473,
+            "p95": 0.37059788442211056,
+            "p99": 0.37059788442211056,
+            "minimum": 0.3638493065326633,
+            "maximum": 0.37059788442211056,
+            "average": 0.36648502606783917
+        },
+        "ttft_percentiles": {
+            "p50": 11.258026,
+            "p90": 11.487914,
+            "p95": 11.515944,
+            "p99": 11.515944,
+            "minimum": 10.892769999999999,
+            "maximum": 11.515944,
+            "average": 11.2307434375
+        },
+        "gen_tps_percentiles": {
+            "p50": 2731.9591917233774,
+            "p90": 2745.1410623842135,
+            "p95": 2748.3905618224076,
+            "p99": 2748.3905618224076,
+            "minimum": 2698.3424407814514,
+            "maximum": 2748.3905618224076,
+            "average": 2728.7008833208542
+        }
+    },
+    "dataset": {
+        "isl_stats": {
+            "p50": 100.0,
+            "p90": 100.0,
+            "p95": 100.0,
+            "p99": 100.0,
+            "minimum": 100.0,
+            "maximum": 100.0,
+            "average": 100.0
+        },
+        "osl_stats": {
+            "p50": 20.0,
+            "p90": 20.0,
+            "p95": 20.0,
+            "p99": 20.0,
+            "minimum": 20.0,
+            "maximum": 20.0,
+            "average": 20.0
+        },
+        "seq_len_stats": {
+            "p50": 120.0,
+            "p90": 120.0,
+            "p95": 120.0,
+            "p99": 120.0,
+            "minimum": 120.0,
+            "maximum": 120.0,
+            "average": 120.0
+        },
+        "num_requests": 16,
+        "dataset_path": "/home/scratch.bbuddharaju_gpu/TensorRT-LLM/nvbugs_5615248/trtllm_bench/dataset_isl100_osl20.jsonl",
+        "max_isl": 100,
+        "max_osl": 20,
+        "max_sequence_length": 120,
+        "avg_isl": 100,
+        "avg_osl": 20,
+        "avg_sequence_length": 120
+    }
+}

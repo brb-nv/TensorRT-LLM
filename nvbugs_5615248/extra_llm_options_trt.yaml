@@ -1,0 +1,25 @@
+# NVBug 5615248 — TensorRT (legacy) backend reference config.
+#
+# Mirrors the workaround YAML's shape (max_seq_len=129, beam=10, batch=1) but
+# strips PyTorch-only keys that TrtLlmArgs doesn't accept:
+#   * `backend: pytorch`            (TRT is implicit when using _TrtLLM)
+#   * `cuda_graph_config`           (PyTorch backend only; TRT uses
+#                                    extended_runtime_perf_knob_config below)
+#   * `torch_compile_config`        (PyTorch backend only)
+#
+# TRT-side CUDA graphs are toggled via extended_runtime_perf_knob_config.
+
+tensor_parallel_size: 1
+pipeline_parallel_size: 1
+
+max_beam_width: 10
+max_batch_size: 1
+max_seq_len: 129
+
+enable_chunked_prefill: true
+
+kv_cache_config:
+  enable_block_reuse: true
+
+extended_runtime_perf_knob_config:
+  cuda_graph_mode: true

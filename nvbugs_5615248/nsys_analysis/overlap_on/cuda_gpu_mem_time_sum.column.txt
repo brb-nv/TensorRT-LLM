@@ -1,0 +1,16 @@
+
+NOTICE: Existing SQLite export found: /home/scratch.bbuddharaju_gpu/TensorRT-LLM/nvbugs_5615248/trace_overlap_on.sqlite
+        It is assumed file was previously exported from: /home/scratch.bbuddharaju_gpu/TensorRT-LLM/nvbugs_5615248/trace_overlap_on.nsys-rep
+        Consider using --force-export=true if needed.
+
+Processing [/home/scratch.bbuddharaju_gpu/TensorRT-LLM/nvbugs_5615248/trace_overlap_on.sqlite] with [/usr/local/cuda-13.1/NsightSystems-cli-2026.1.1/target-linux-x64/reports/cuda_gpu_mem_time_sum.py]... 
+
+ ** CUDA GPU MemOps Summary (by Time) (cuda_gpu_mem_time_sum):
+
+ Time (%)  Total Time (ns)  Count  Avg (ns)  Med (ns)  Min (ns)  Max (ns)  StdDev (ns)            Operation           
+ --------  ---------------  -----  --------  --------  --------  --------  -----------  ------------------------------
+     33.1           634018   1210     524.0     384.0       352      8768        307.3  [CUDA memcpy Host-to-Device]  
+     29.6           567717    600     946.2     928.0       800      1280         71.5  [CUDA memcpy Device-to-Host]  
+     27.6           528391    490    1078.3    1088.0       960      1248         59.5  [CUDA memcpy Device-to-Device]
+      9.7           185793    200     929.0     928.0       384      1344        124.2  [CUDA memset]                 
+

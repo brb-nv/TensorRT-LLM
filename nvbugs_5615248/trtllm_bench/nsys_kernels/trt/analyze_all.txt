@@ -1,0 +1,4 @@
+Generating SQLite file /home/bbuddharaju/scratch/TensorRT-LLM/nvbugs_5615248/trtllm_bench/trace_trt_kernels.sqlite from /home/bbuddharaju/scratch/TensorRT-LLM/nvbugs_5615248/trtllm_bench/trace_trt_kernels.nsys-rep
+Processing [/home/bbuddharaju/scratch/TensorRT-LLM/nvbugs_5615248/trtllm_bench/trace_trt_kernels.sqlite] with [all]... 
+ERROR: Report 'all' could not be found.
+

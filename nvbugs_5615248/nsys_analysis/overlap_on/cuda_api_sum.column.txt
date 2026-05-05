@@ -1,0 +1,29 @@
+
+NOTICE: Existing SQLite export found: /home/scratch.bbuddharaju_gpu/TensorRT-LLM/nvbugs_5615248/trace_overlap_on.sqlite
+        It is assumed file was previously exported from: /home/scratch.bbuddharaju_gpu/TensorRT-LLM/nvbugs_5615248/trace_overlap_on.nsys-rep
+        Consider using --force-export=true if needed.
+
+Processing [/home/scratch.bbuddharaju_gpu/TensorRT-LLM/nvbugs_5615248/trace_overlap_on.sqlite] with [/usr/local/cuda-13.1/NsightSystems-cli-2026.1.1/target-linux-x64/reports/cuda_api_sum.py]... 
+
+ ** CUDA API Summary (cuda_api_sum):
+
+ Time (%)  Total Time (ns)  Num Calls  Avg (ns)  Med (ns)  Min (ns)  Max (ns)  StdDev (ns)            Name          
+ --------  ---------------  ---------  --------  --------  --------  --------  -----------  ------------------------
+     49.6         49865348       9260    5385.0    4850.0      2810    102219       2367.6  cudaLaunchKernel        
+     17.9         17950599       2300    7804.6    7285.0      3810     25040       2477.4  cudaMemcpyAsync         
+     12.3         12348953        210   58804.5   15955.0     12640    157898      49070.2  cudaGraphLaunch         
+      4.3          4287025       2384    1798.2    1410.0       530     13390        929.2  cudaEventQuery          
+      4.1          4147200        205   20230.2    3870.0      3400    814823     101819.6  cudaEventSynchronize    
+      3.1          3154584       1820    1733.3    1530.0       560     16649       1394.3  cudaEventRecordWithFlags
+      2.1          2111061        100   21110.6   20430.0     20150     35830       2413.0  cudaMemGetInfo          
+      1.4          1426985       9260     154.1     140.0        90       650         44.2  cuKernelGetName         
+      1.2          1198370       2230     537.4     540.0       240      4400        277.2  cudaStreamIsCapturing   
+      0.9           953232        700    1361.8    1305.0       340     19890       1002.7  cudaEventCreateWithFlags
+      0.8           758085        600    1263.5    1220.0       480     15980        789.9  cudaStreamWaitEvent     
+      0.7           730422        200    3652.1    3675.0      2210      7340       1241.7  cudaMemsetAsync         
+      0.6           581102        400    1452.8    1130.0       540     21839       1511.1  cudaEventRecord         
+      0.5           483395        110    4394.5    4240.0      4020      9639        708.9  cudaLaunchKernelExC     
+      0.4           407599        700     582.3     545.0       250      2180        225.5  cudaEventDestroy        
+      0.0            39060          1   39060.0   39060.0     39060     39060          0.0  cudaDeviceSynchronize   
+      0.0            11969          1   11969.0   11969.0     11969     11969          0.0  cuProfilerStart         
+

@@ -26,67 +26,67 @@
         "max_num_tokens": 129,
         "scheduling_policy": "GUARANTEED_NO_EVICT",
         "kv_cache_percentage": 0.9,
-        "issue_rate": 7.58668775e+16
+        "issue_rate": 7.5524232875e+16
     },
     "request_info": {
         "num_requests": 16,
-        "avg_num_concurrent_requests": 0.9995682815922289,
+        "avg_num_concurrent_requests": 0.9995596214604804,
         "avg_input_length": 100.0,
         "avg_output_length": 200.0
     },
     "performance": {
-        "total_latency_ms": 1294.892666,
-        "avg_request_latency_ms": 80.8958523125,
-        "request_throughput_req_s": 12.356236482074568,
-        "system_output_throughput_tok_s": 2471.2472964149138,
-        "system_total_throughput_tok_s": 3706.8709446223706,
-        "output_throughput_per_user_tok_s": 2472.3324716887337,
-        "output_throughput_per_gpu_tok_s": 2471.2472964149138,
+        "total_latency_ms": 1288.970622,
+        "avg_request_latency_ms": 80.5251866875,
+        "request_throughput_req_s": 12.413005949797357,
+        "system_output_throughput_tok_s": 2482.6011899594714,
+        "system_total_throughput_tok_s": 3723.901784939207,
+        "output_throughput_per_user_tok_s": 2483.7049805893366,
+        "output_throughput_per_gpu_tok_s": 2482.6011899594714,
         "request_latency_percentiles_ms": {
-            "p50": 80.904336,
-            "p90": 81.126205,
-            "p95": 81.365764,
-            "p99": 81.365764,
-            "minimum": 80.479908,
-            "maximum": 81.365764,
-            "average": 80.8958523125
+            "p50": 80.535935,
+            "p90": 80.674454,
+            "p95": 80.860923,
+            "p99": 80.860923,
+            "minimum": 80.1148,
+            "maximum": 80.860923,
+            "average": 80.5251866875
         }
     },
     "energy": {
-        "total_energy_j": 286.088,
-        "output_tps_per_w": 11.185369536646066,
-        "average_gpu_power": 220.93568641773433
+        "total_energy_j": 305.565,
+        "output_tps_per_w": 10.472403580252974,
+        "average_gpu_power": 237.06126019061435
     },
     "streaming_metrics": {
-        "token_output_speed_tok_s": 2668.861495032487,
-        "avg_ttft_ms": 6.3321009375,
-        "avg_tpot_ms": 0.3746922179648241,
+        "token_output_speed_tok_s": 2666.3314847628294,
+        "avg_ttft_ms": 5.8902401875,
+        "avg_tpot_ms": 0.3750499824120603,
         "tpot_percentiles": {
-            "p50": 0.3746594673366834,
-            "p90": 0.3754207738693467,
-            "p95": 0.37559438693467334,
-            "p99": 0.37559438693467334,
-            "minimum": 0.3739618341708542,
-            "maximum": 0.37559438693467334,
-            "average": 0.3746922179648241
+            "p50": 0.3750918040201005,
+            "p90": 0.3770181155778894,
+            "p95": 0.37705726130653267,
+            "p99": 0.37705726130653267,
+            "minimum": 0.37225916582914576,
+            "maximum": 0.37705726130653267,
+            "average": 0.3750499824120603
         },
         "ttft_percentiles": {
-            "p50": 6.308591,
-            "p90": 6.604221,
-            "p95": 6.917599,
-            "p99": 6.917599,
-            "minimum": 5.972553,
-            "maximum": 6.917599,
-            "average": 6.3321009375
+            "p50": 5.938737,
+            "p90": 6.041636,
+            "p95": 6.145955,
+            "p99": 6.145955,
+            "minimum": 5.4354309999999995,
+            "maximum": 6.145955,
+            "average": 5.8902401875
         },
         "gen_tps_percentiles": {
-            "p50": 2669.4258782595584,
-            "p90": 2673.5121115808415,
-            "p95": 2674.0696740275475,
-            "p99": 2674.0696740275475,
-            "minimum": 2662.446604064742,
-            "maximum": 2674.0696740275475,
-            "average": 2668.861495032487
+            "p50": 2666.165802634678,
+            "p90": 2671.7000242064078,
+            "p95": 2686.3005448708436,
+            "p99": 2686.3005448708436,
+            "minimum": 2652.1170724439107,
+            "maximum": 2686.3005448708436,
+            "average": 2666.3314847628294
         }
     },
     "dataset": {

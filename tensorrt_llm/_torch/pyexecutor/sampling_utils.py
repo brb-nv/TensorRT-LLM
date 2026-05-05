@@ -30,6 +30,8 @@ from tensorrt_llm._utils import nvtx_range, prefer_pinned
 from tensorrt_llm.bindings.executor import FinishReason
 from tensorrt_llm.sampling_params import SamplingParams
 
+from ._beam_search_kernels import beam_logprobs_prep_triton
+
 if sys.version_info[:2] >= (3, 12):
     from typing import override
 else:
@@ -328,32 +330,33 @@ def beam_search_sampling_batch(
     )
 
     with nvtx_range("bss.logprobs_prep"):
-        # get logprobs of each beam
-        logprobs = torch.log_softmax(logits, dim=-1)
-
-        # handle finished beams
-        # Guarantee that finished beams will only sample their end_id token, with logprob 0.
-        # This implies that a finished beam will not alter its score
-
         # mask showing which beams in the batch are finished: Shape: (batch_size, beam_width)
+        # Guarantee that finished beams will only sample their end_id token, with logprob 0.
+        # This implies that a finished beam will not alter its score.
         finished_beams_mask = (
             beam_search_args.finished_beams[beam_search_args.seq_slots, :beam_width_in]
             != FinishReason.NOT_FINISHED.value
         )
-        # expand the mask in the vocabulary dimension
-        finished_beams_mask_expanded = finished_beams_mask.unsqueeze(-1).expand(
-            -1, -1, logprobs.size(-1)
-        )
-
-        # we can now use torch.where to fill the logprobs of the finished beams with -inf asynchronously
-        logprobs = torch.where(finished_beams_mask_expanded, float("-inf"), logprobs)
-        # set the first token to 0 for finished beams. We will overwrite sampling with a padding token later.
-        logprobs[..., 0] = torch.where(finished_beams_mask, 0, logprobs[..., 0])
-
-        # Add the current cum_log_probs to the logprobs of each beam
-        logprobs += beam_search_args.cum_log_probs.unsqueeze(-1)[
+        cum_log_probs_active = beam_search_args.cum_log_probs[
             beam_search_args.seq_slots, :beam_width_in
         ]
+
+        if logits.is_cuda:
+            # Single-launch Triton fusion of log_softmax + finished-beam mask
+            # + first-token reset + cum_log_probs broadcast-add (replaces 9
+            # small eager kernels per generation step).
+            logprobs = beam_logprobs_prep_triton(
+                logits, finished_beams_mask, cum_log_probs_active
+            )
+        else:
+            # Eager path for CPU (unit tests). Triton kernels are CUDA-only.
+            logprobs = torch.log_softmax(logits, dim=-1)
+            finished_beams_mask_expanded = finished_beams_mask.unsqueeze(-1).expand(
+                -1, -1, logprobs.size(-1)
+            )
+            logprobs = torch.where(finished_beams_mask_expanded, float("-inf"), logprobs)
+            logprobs[..., 0] = torch.where(finished_beams_mask, 0, logprobs[..., 0])
+            logprobs += cum_log_probs_active.unsqueeze(-1)
 
     with nvtx_range("bss.topk"):
         # get the top <beam_width> logprobs across all beams

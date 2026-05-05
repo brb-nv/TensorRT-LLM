@@ -1,0 +1,16 @@
+
+NOTICE: Existing SQLite export found: /home/bbuddharaju/scratch/TensorRT-LLM/nvbugs_5615248/trtllm_bench/trace_pytorch_kernels.sqlite
+        It is assumed file was previously exported from: /home/bbuddharaju/scratch/TensorRT-LLM/nvbugs_5615248/trtllm_bench/trace_pytorch_kernels.nsys-rep
+        Consider using --force-export=true if needed.
+
+Processing [/home/bbuddharaju/scratch/TensorRT-LLM/nvbugs_5615248/trtllm_bench/trace_pytorch_kernels.sqlite] with [/usr/local/cuda-13.1/NsightSystems-cli-2026.1.1/target-linux-x64/reports/cuda_gpu_mem_time_sum.py]... 
+
+ ** CUDA GPU MemOps Summary (by Time) (cuda_gpu_mem_time_sum):
+
+ Time (%)  Total Time (ns)  Count  Avg (ns)  Med (ns)  Min (ns)  Max (ns)  StdDev (ns)            Operation           
+ --------  ---------------  -----  --------  --------  --------  --------  -----------  ------------------------------
+     32.7           377570    726     520.1     384.0       352      2144        200.6  [CUDA memcpy Host-to-Device]  
+     29.5           341216    360     947.8     928.0       864      1312         74.6  [CUDA memcpy Device-to-Host]  
+     28.1           324547    294    1103.9    1120.0       992      1248         50.3  [CUDA memcpy Device-to-Device]
+      9.7           112193    120     934.9     960.0       416      1312        121.0  [CUDA memset]                 
+

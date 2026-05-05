@@ -1,0 +1,7 @@
+
+WARNING: Existing SQLite export found: /home/scratch.bbuddharaju_gpu/TensorRT-LLM/nvbugs_5615248/trace_overlap_off.sqlite
+         File is older than input file: /home/scratch.bbuddharaju_gpu/TensorRT-LLM/nvbugs_5615248/trace_overlap_off.nsys-rep
+         Use --force-export=true to update export file.
+
+usage: nsys analyze [<args>] <input-file>
+Try 'nsys analyze --help' for more information.

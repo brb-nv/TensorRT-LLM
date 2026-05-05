@@ -1,0 +1,35 @@
+# NVBug 5615248 — TRT engine *build* config for the beam=1 experiment.
+#
+# Fed to nvbugs_5615248/profile_ttft_trt.py via --config when running with
+# --save-engine, e.g.:
+#
+#   python nvbugs_5615248/profile_ttft_trt.py \
+#       --config nvbugs_5615248/trtllm_bench/beamwidth1/trt_build.yaml \
+#       --model  /path/to/TinyLlama-1.1B-Chat-v1.0 \
+#       --tag    trt_beam1 \
+#       --save-engine nvbugs_5615248/trtllm_bench/beamwidth1/tinyllama_trt_engine
+#
+# Same shape as nvbugs_5615248/extra_llm_options_trt.yaml (the YAML used to
+# build the beam=10 engine) but with max_beam_width=1. Everything else
+# (max_seq_len=129, max_batch_size=1, paged-context FMHA, chunked prefill,
+# block reuse, generation-phase CUDA graphs) is held constant so any
+# downstream perf delta vs the beam=10 engine is attributable to beam width.
+#
+# This is a *build* YAML, distinct from trt.yaml in this directory which is
+# the runtime YAML for trtllm-bench. trtllm-bench's TRT path does NOT rebuild
+# the engine — it consumes an already-built engine via --engine_dir.
+
+tensor_parallel_size: 1
+pipeline_parallel_size: 1
+
+max_beam_width: 1
+max_batch_size: 1
+max_seq_len: 129
+
+enable_chunked_prefill: true
+
+kv_cache_config:
+  enable_block_reuse: true
+
+extended_runtime_perf_knob_config:
+  cuda_graph_mode: true

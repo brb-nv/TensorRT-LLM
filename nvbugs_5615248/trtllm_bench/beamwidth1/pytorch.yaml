@@ -1,0 +1,28 @@
+# NVBug 5615248 — PyTorch backend config for trtllm-bench (throughput mode), beam=1.
+#
+# Mirrors ../pytorch.yaml but with max_beam_width=1, because the PyTorch
+# PyExecutor enforces a strict equality between the per-request beam_width
+# and the engine's configured max_beam_width
+# (tensorrt_llm/_torch/pyexecutor/py_executor.py::_validate_request).
+# Running --beam_width 1 against ../pytorch.yaml's max_beam_width=10 fails with
+#   "Request beam width 1 is not equal to max_beam_width 10. This is not supported!"
+#
+# max_seq_len=129 is kept identical to the beam=10 setup so prefill geometry
+# (and the piecewise-CUDA-graph capture buckets) match the apples-to-apples
+# beam=10 baseline as closely as possible — only the beam width changes.
+
+max_beam_width: 1
+max_batch_size: 1
+max_seq_len: 129
+
+enable_chunked_prefill: true
+
+cuda_graph_config:
+  max_batch_size: 128
+  enable_padding: true
+
+kv_cache_config:
+  enable_block_reuse: true
+
+torch_compile_config:
+  enable_piecewise_cuda_graph: true

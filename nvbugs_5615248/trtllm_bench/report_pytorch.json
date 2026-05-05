@@ -24,67 +24,67 @@
         "max_num_tokens": 24576,
         "scheduling_policy": "GUARANTEED_NO_EVICT",
         "kv_cache_percentage": 0.9,
-        "issue_rate": 7.91874475625e+16
+        "issue_rate": 7.8948283625e+16
     },
     "request_info": {
         "num_requests": 16,
-        "avg_num_concurrent_requests": 0.9995652773561822,
+        "avg_num_concurrent_requests": 0.9995440470131746,
         "avg_input_length": 100.0,
         "avg_output_length": 200.0
     },
     "performance": {
-        "total_latency_ms": 1352.922394,
-        "avg_request_latency_ms": 84.5208905,
-        "request_throughput_req_s": 11.826251136766977,
-        "system_output_throughput_tok_s": 2365.250227353395,
-        "system_total_throughput_tok_s": 3547.8753410300933,
-        "output_throughput_per_user_tok_s": 2366.366949001408,
-        "output_throughput_per_gpu_tok_s": 2365.250227353395,
+        "total_latency_ms": 1347.404267,
+        "avg_request_latency_ms": 84.174369625,
+        "request_throughput_req_s": 11.874684080987848,
+        "system_output_throughput_tok_s": 2374.9368161975694,
+        "system_total_throughput_tok_s": 3562.4052242963544,
+        "output_throughput_per_user_tok_s": 2376.0278286046487,
+        "output_throughput_per_gpu_tok_s": 2374.9368161975694,
         "request_latency_percentiles_ms": {
-            "p50": 84.42090999999999,
-            "p90": 85.170236,
-            "p95": 85.923233,
-            "p99": 85.923233,
-            "minimum": 83.969402,
-            "maximum": 85.923233,
-            "average": 84.5208905
+            "p50": 84.21159,
+            "p90": 84.446018,
+            "p95": 84.475537,
+            "p99": 84.475537,
+            "minimum": 83.897722,
+            "maximum": 84.475537,
+            "average": 84.174369625
         }
     },
     "energy": {
-        "total_energy_j": 280.586,
-        "output_tps_per_w": 11.404703014405564,
-        "average_gpu_power": 207.39253134130618
+        "total_energy_j": 300.554,
+        "output_tps_per_w": 10.647005197069413,
+        "average_gpu_power": 223.06148745482636
     },
     "streaming_metrics": {
-        "token_output_speed_tok_s": 2725.1558387986815,
-        "avg_ttft_ms": 11.494222624999999,
-        "avg_tpot_ms": 0.3669681802763819,
+        "token_output_speed_tok_s": 2733.0685347085237,
+        "avg_ttft_ms": 11.35927575,
+        "avg_tpot_ms": 0.3659049943467337,
         "tpot_percentiles": {
-            "p50": 0.3676507537688442,
-            "p90": 0.36845974874371856,
-            "p95": 0.3687105527638191,
-            "p99": 0.3687105527638191,
-            "minimum": 0.35796210552763813,
-            "maximum": 0.3687105527638191,
-            "average": 0.3669681802763819
+            "p50": 0.3667952613065326,
+            "p90": 0.3677740452261306,
+            "p95": 0.3679496231155779,
+            "p99": 0.3679496231155779,
+            "minimum": 0.35955618090452257,
+            "maximum": 0.3679496231155779,
+            "average": 0.3659049943467337
         },
         "ttft_percentiles": {
-            "p50": 11.369729,
-            "p90": 12.663922999999999,
-            "p95": 13.392598999999999,
-            "p99": 13.392598999999999,
-            "minimum": 10.761452,
-            "maximum": 13.392598999999999,
-            "average": 11.494222624999999
+            "p50": 11.169872999999999,
+            "p90": 12.620659999999999,
+            "p95": 12.894338,
+            "p99": 12.894338,
+            "minimum": 10.860795999999999,
+            "maximum": 12.894338,
+            "average": 11.35927575
         },
         "gen_tps_percentiles": {
-            "p50": 2721.0430055924544,
-            "p90": 2730.4896157558965,
-            "p95": 2793.5917924216983,
-            "p99": 2793.5917924216983,
-            "minimum": 2712.1545410189524,
-            "maximum": 2793.5917924216983,
-            "average": 2725.1558387986815
+            "p50": 2727.534004844895,
+            "p90": 2777.150244163142,
+            "p95": 2781.206534912947,
+            "p99": 2781.206534912947,
+            "minimum": 2717.763349049244,
+            "maximum": 2781.206534912947,
+            "average": 2733.0685347085237
         }
     },
     "dataset": {

@@ -1,0 +1,146 @@
+Generating SQLite file nvbugs_5615248/trtllm_bench/nsys_handoff_v2/pyt_beam10_handoff.sqlite from nvbugs_5615248/trtllm_bench/nsys_handoff_v2/pyt_beam10_handoff.nsys-rep
+Processing [nvbugs_5615248/trtllm_bench/nsys_handoff_v2/pyt_beam10_handoff.sqlite] with [/usr/local/cuda-13.1/NsightSystems-cli-2026.1.1/target-linux-x64/reports/nvtx_pushpop_sum.py]... 
+Time (%),Total Time (ns),Instances,Avg (ns),Med (ns),Min (ns),Max (ns),StdDev (ns),Range
+85.8,14091138331,217,64936121.3,6698687.0,4705019,6970047205,563962925.9,TensorRT-LLM:_forward_step
+3.3,537976736,111,4846637.3,44699.0,42109,414334847,40382453.3,TensorRT-LLM:_fetch_new_requests
+2.4,399114720,102,3912889.4,2727420.0,2668191,117678532,11378261.2,TensorRT-LLM:_sample_async
+2.4,396302839,102,3885322.0,2700800.5,2641931,117625023,11375620.3,TensorRT-LLM:sample_async
+1.8,296158261,102,2903512.4,1912544.0,1852310,101375250,9847125.2,TensorRT-LLM:_process_requests
+1.6,258954035,102,2538765.0,1554988.0,1498333,100543520,9800324.5,TensorRT-LLM:sample_batched_by_strategy
+1.0,168772265,308,547961.9,501114.5,378186,976540,119748.5,TensorRT-LLM:_prepare_inputs
+0.2,37365514,102,366328.6,224863.0,215167,14256004,1388938.4,TensorRT-LLM:maybe_create_beam_histories
+0.2,30826867,102,302224.2,296547.0,289527,628743,33512.3,TensorRT-LLM:_write_finish_reasons
+0.1,17279438,102,169406.3,122313.5,44690,3991916,384606.4,TensorRT-LLM:prepare_resources
+0.1,14112825,2,7056412.5,7056412.5,6930144,7182681,178570.6,"TensorRT-LLM:[Executor] _forward_step 0: 1 ctx reqs, 0 gen reqs"
+0.1,12192289,102,119532.2,76869.0,75119,909320,164029.5,TensorRT-LLM:_update_requests
+0.1,11982400,102,117474.5,74874.0,72999,907840,164108.5,TensorRT-LLM:update_requests
+0.1,9322743,102,91399.4,49129.5,29840,3648620,358431.7,TensorRT-LLM:_handle_responses
+0.0,7940032,102,77843.5,76699.0,74999,94089,3611.0,TensorRT-LLM:update_original_tokens
+0.0,6689956,1,6689956.0,6689956.0,6689956,6689956,0.0,"TensorRT-LLM:[Executor] _forward_step 2: 1 ctx reqs, 0 gen reqs"
+0.0,6627228,109,60800.3,13039.0,12189,5067324,484045.8,TensorRT-LLM:_schedule
+0.0,5416591,1,5416591.0,5416591.0,5416591,5416591,0.0,"TensorRT-LLM:[Executor] _forward_step 42: 1 ctx reqs, 0 gen reqs"
+0.0,5395911,1,5395911.0,5395911.0,5395911,5395911,0.0,"TensorRT-LLM:[Executor] _forward_step 63: 1 ctx reqs, 0 gen reqs"
+0.0,5357271,1,5357271.0,5357271.0,5357271,5357271,0.0,"TensorRT-LLM:[Executor] _forward_step 21: 1 ctx reqs, 0 gen reqs"
+0.0,5293292,1,5293292.0,5293292.0,5293292,5293292,0.0,"TensorRT-LLM:[Executor] _forward_step 84: 1 ctx reqs, 0 gen reqs"
+0.0,5155103,102,50540.2,1470.0,1190,982880,183972.8,TensorRT-LLM:setup_sampler_step
+0.0,4855990,220,22072.7,20724.5,13379,100639,6584.4,CCCL:cub::DeviceScan::InclusiveScan
+0.0,3309234,7,472747.7,459335.0,446545,550164,36480.0,TensorRT-LLM:setup.prepare_beam_search
+0.0,3282775,7,468967.9,452485.0,444075,545694,36081.5,TensorRT-LLM:prepare_beam_search
+0.0,2890240,204,14167.8,13835.0,11890,87959,5565.9,CCCL:cub::DeviceScan::InclusiveSumByKey
+0.0,2009642,109,18437.1,19140.0,11360,48580,4921.6,TensorRT-LLM:_enqueue_responses
+0.0,1800998,6144,293.1,180.0,160,216717,3897.5,TensorRT-LLM:wait_on_pp_send_handles
+0.0,1302387,102,12768.5,6440.0,4670,168608,25628.5,TensorRT-LLM:update_resources
+0.0,1182668,111,10654.7,1400.0,1190,192838,36775.8,TensorRT-LLM:merge_requests
+0.0,944550,1,944550.0,944550.0,944550,944550,0.0,"TensorRT-LLM:[Executor] _forward_step 1: 0 ctx reqs, 1 gen reqs"
+0.0,929449,1,929449.0,929449.0,929449,929449,0.0,"TensorRT-LLM:[Executor] _forward_step 23: 0 ctx reqs, 1 gen reqs"
+0.0,918260,7,131180.0,110089.0,101259,276497,64324.2,TensorRT-LLM:setup.finish_reasons.update
+0.0,867450,1,867450.0,867450.0,867450,867450,0.0,"TensorRT-LLM:[Executor] _forward_step 47: 0 ctx reqs, 1 gen reqs"
+0.0,835511,1,835511.0,835511.0,835511,835511,0.0,"TensorRT-LLM:[Executor] _forward_step 2: 0 ctx reqs, 1 gen reqs"
+0.0,830561,1,830561.0,830561.0,830561,830561,0.0,"TensorRT-LLM:[Executor] _forward_step 24: 0 ctx reqs, 1 gen reqs"
+0.0,822871,1,822871.0,822871.0,822871,822871,0.0,"TensorRT-LLM:[Executor] _forward_step 66: 0 ctx reqs, 1 gen reqs"
+0.0,819131,1,819131.0,819131.0,819131,819131,0.0,"TensorRT-LLM:[Executor] _forward_step 27: 0 ctx reqs, 1 gen reqs"
+0.0,818751,1,818751.0,818751.0,818751,818751,0.0,"TensorRT-LLM:[Executor] _forward_step 40: 0 ctx reqs, 1 gen reqs"
+0.0,817631,1,817631.0,817631.0,817631,817631,0.0,"TensorRT-LLM:[Executor] _forward_step 50: 0 ctx reqs, 1 gen reqs"
+0.0,817502,1,817502.0,817502.0,817502,817502,0.0,"TensorRT-LLM:[Executor] _forward_step 35: 0 ctx reqs, 1 gen reqs"
+0.0,817081,1,817081.0,817081.0,817081,817081,0.0,"TensorRT-LLM:[Executor] _forward_step 97: 0 ctx reqs, 1 gen reqs"
+0.0,816511,1,816511.0,816511.0,816511,816511,0.0,"TensorRT-LLM:[Executor] _forward_step 45: 0 ctx reqs, 1 gen reqs"
+0.0,815462,1,815462.0,815462.0,815462,815462,0.0,"TensorRT-LLM:[Executor] _forward_step 59: 0 ctx reqs, 1 gen reqs"
+0.0,814701,1,814701.0,814701.0,814701,814701,0.0,"TensorRT-LLM:[Executor] _forward_step 49: 0 ctx reqs, 1 gen reqs"
+0.0,813611,1,813611.0,813611.0,813611,813611,0.0,"TensorRT-LLM:[Executor] _forward_step 73: 0 ctx reqs, 1 gen reqs"
+0.0,813141,1,813141.0,813141.0,813141,813141,0.0,"TensorRT-LLM:[Executor] _forward_step 102: 0 ctx reqs, 1 gen reqs"
+0.0,813041,1,813041.0,813041.0,813041,813041,0.0,"TensorRT-LLM:[Executor] _forward_step 3: 0 ctx reqs, 1 gen reqs"
+0.0,812362,1,812362.0,812362.0,812362,812362,0.0,"TensorRT-LLM:[Executor] _forward_step 89: 0 ctx reqs, 1 gen reqs"
+0.0,811691,1,811691.0,811691.0,811691,811691,0.0,"TensorRT-LLM:[Executor] _forward_step 39: 0 ctx reqs, 1 gen reqs"
+0.0,811671,1,811671.0,811671.0,811671,811671,0.0,"TensorRT-LLM:[Executor] _forward_step 94: 0 ctx reqs, 1 gen reqs"
+0.0,811201,1,811201.0,811201.0,811201,811201,0.0,"TensorRT-LLM:[Executor] _forward_step 30: 0 ctx reqs, 1 gen reqs"
+0.0,809771,1,809771.0,809771.0,809771,809771,0.0,"TensorRT-LLM:[Executor] _forward_step 58: 0 ctx reqs, 1 gen reqs"
+0.0,809671,1,809671.0,809671.0,809671,809671,0.0,"TensorRT-LLM:[Executor] _forward_step 54: 0 ctx reqs, 1 gen reqs"
+0.0,808371,1,808371.0,808371.0,808371,808371,0.0,"TensorRT-LLM:[Executor] _forward_step 33: 0 ctx reqs, 1 gen reqs"
+0.0,808272,1,808272.0,808272.0,808272,808272,0.0,"TensorRT-LLM:[Executor] _forward_step 65: 0 ctx reqs, 1 gen reqs"
+0.0,808262,1,808262.0,808262.0,808262,808262,0.0,"TensorRT-LLM:[Executor] _forward_step 99: 0 ctx reqs, 1 gen reqs"
+0.0,805941,1,805941.0,805941.0,805941,805941,0.0,"TensorRT-LLM:[Executor] _forward_step 26: 0 ctx reqs, 1 gen reqs"
+0.0,805822,1,805822.0,805822.0,805822,805822,0.0,"TensorRT-LLM:[Executor] _forward_step 31: 0 ctx reqs, 1 gen reqs"
+0.0,805301,1,805301.0,805301.0,805301,805301,0.0,"TensorRT-LLM:[Executor] _forward_step 61: 0 ctx reqs, 1 gen reqs"
+0.0,805091,1,805091.0,805091.0,805091,805091,0.0,"TensorRT-LLM:[Executor] _forward_step 67: 0 ctx reqs, 1 gen reqs"
+0.0,803091,1,803091.0,803091.0,803091,803091,0.0,"TensorRT-LLM:[Executor] _forward_step 69: 0 ctx reqs, 1 gen reqs"
+0.0,803031,1,803031.0,803031.0,803031,803031,0.0,"TensorRT-LLM:[Executor] _forward_step 74: 0 ctx reqs, 1 gen reqs"
+0.0,802661,1,802661.0,802661.0,802661,802661,0.0,"TensorRT-LLM:[Executor] _forward_step 55: 0 ctx reqs, 1 gen reqs"
+0.0,802171,1,802171.0,802171.0,802171,802171,0.0,"TensorRT-LLM:[Executor] _forward_step 75: 0 ctx reqs, 1 gen reqs"
+0.0,801371,1,801371.0,801371.0,801371,801371,0.0,"TensorRT-LLM:[Executor] _forward_step 32: 0 ctx reqs, 1 gen reqs"
+0.0,801141,1,801141.0,801141.0,801141,801141,0.0,"TensorRT-LLM:[Executor] _forward_step 76: 0 ctx reqs, 1 gen reqs"
+0.0,801022,1,801022.0,801022.0,801022,801022,0.0,"TensorRT-LLM:[Executor] _forward_step 48: 0 ctx reqs, 1 gen reqs"
+0.0,800951,1,800951.0,800951.0,800951,800951,0.0,"TensorRT-LLM:[Executor] _forward_step 38: 0 ctx reqs, 1 gen reqs"
+0.0,800761,1,800761.0,800761.0,800761,800761,0.0,"TensorRT-LLM:[Executor] _forward_step 51: 0 ctx reqs, 1 gen reqs"
+0.0,799792,1,799792.0,799792.0,799792,799792,0.0,"TensorRT-LLM:[Executor] _forward_step 34: 0 ctx reqs, 1 gen reqs"
+0.0,799331,1,799331.0,799331.0,799331,799331,0.0,"TensorRT-LLM:[Executor] _forward_step 71: 0 ctx reqs, 1 gen reqs"
+0.0,799251,1,799251.0,799251.0,799251,799251,0.0,"TensorRT-LLM:[Executor] _forward_step 90: 0 ctx reqs, 1 gen reqs"
+0.0,798792,1,798792.0,798792.0,798792,798792,0.0,"TensorRT-LLM:[Executor] _forward_step 56: 0 ctx reqs, 1 gen reqs"
+0.0,798742,1,798742.0,798742.0,798742,798742,0.0,"TensorRT-LLM:[Executor] _forward_step 57: 0 ctx reqs, 1 gen reqs"
+0.0,798331,1,798331.0,798331.0,798331,798331,0.0,"TensorRT-LLM:[Executor] _forward_step 29: 0 ctx reqs, 1 gen reqs"
+0.0,798281,1,798281.0,798281.0,798281,798281,0.0,"TensorRT-LLM:[Executor] _forward_step 82: 0 ctx reqs, 1 gen reqs"
+0.0,798121,1,798121.0,798121.0,798121,798121,0.0,"TensorRT-LLM:[Executor] _forward_step 36: 0 ctx reqs, 1 gen reqs"
+0.0,798031,1,798031.0,798031.0,798031,798031,0.0,"TensorRT-LLM:[Executor] _forward_step 79: 0 ctx reqs, 1 gen reqs"
+0.0,797691,1,797691.0,797691.0,797691,797691,0.0,"TensorRT-LLM:[Executor] _forward_step 25: 0 ctx reqs, 1 gen reqs"
+0.0,797292,1,797292.0,797292.0,797292,797292,0.0,"TensorRT-LLM:[Executor] _forward_step 98: 0 ctx reqs, 1 gen reqs"
+0.0,797131,1,797131.0,797131.0,797131,797131,0.0,"TensorRT-LLM:[Executor] _forward_step 92: 0 ctx reqs, 1 gen reqs"
+0.0,797101,1,797101.0,797101.0,797101,797101,0.0,"TensorRT-LLM:[Executor] _forward_step 100: 0 ctx reqs, 1 gen reqs"
+0.0,796721,1,796721.0,796721.0,796721,796721,0.0,"TensorRT-LLM:[Executor] _forward_step 70: 0 ctx reqs, 1 gen reqs"
+0.0,796382,1,796382.0,796382.0,796382,796382,0.0,"TensorRT-LLM:[Executor] _forward_step 95: 0 ctx reqs, 1 gen reqs"
+0.0,795901,1,795901.0,795901.0,795901,795901,0.0,"TensorRT-LLM:[Executor] _forward_step 86: 0 ctx reqs, 1 gen reqs"
+0.0,795071,1,795071.0,795071.0,795071,795071,0.0,"TensorRT-LLM:[Executor] _forward_step 53: 0 ctx reqs, 1 gen reqs"
+0.0,794531,1,794531.0,794531.0,794531,794531,0.0,"TensorRT-LLM:[Executor] _forward_step 78: 0 ctx reqs, 1 gen reqs"
+0.0,793931,1,793931.0,793931.0,793931,793931,0.0,"TensorRT-LLM:[Executor] _forward_step 52: 0 ctx reqs, 1 gen reqs"
+0.0,793772,1,793772.0,793772.0,793772,793772,0.0,"TensorRT-LLM:[Executor] _forward_step 87: 0 ctx reqs, 1 gen reqs"
+0.0,793731,1,793731.0,793731.0,793731,793731,0.0,"TensorRT-LLM:[Executor] _forward_step 80: 0 ctx reqs, 1 gen reqs"
+0.0,793521,1,793521.0,793521.0,793521,793521,0.0,"TensorRT-LLM:[Executor] _forward_step 93: 0 ctx reqs, 1 gen reqs"
+0.0,793451,1,793451.0,793451.0,793451,793451,0.0,"TensorRT-LLM:[Executor] _forward_step 77: 0 ctx reqs, 1 gen reqs"
+0.0,793351,1,793351.0,793351.0,793351,793351,0.0,"TensorRT-LLM:[Executor] _forward_step 72: 0 ctx reqs, 1 gen reqs"
+0.0,793151,1,793151.0,793151.0,793151,793151,0.0,"TensorRT-LLM:[Executor] _forward_step 37: 0 ctx reqs, 1 gen reqs"
+0.0,792821,1,792821.0,792821.0,792821,792821,0.0,"TensorRT-LLM:[Executor] _forward_step 91: 0 ctx reqs, 1 gen reqs"
+0.0,792051,1,792051.0,792051.0,792051,792051,0.0,"TensorRT-LLM:[Executor] _forward_step 60: 0 ctx reqs, 1 gen reqs"
+0.0,791091,1,791091.0,791091.0,791091,791091,0.0,"TensorRT-LLM:[Executor] _forward_step 44: 0 ctx reqs, 1 gen reqs"
+0.0,790692,1,790692.0,790692.0,790692,790692,0.0,"TensorRT-LLM:[Executor] _forward_step 4: 0 ctx reqs, 1 gen reqs"
+0.0,789511,1,789511.0,789511.0,789511,789511,0.0,"TensorRT-LLM:[Executor] _forward_step 28: 0 ctx reqs, 1 gen reqs"
+0.0,787911,1,787911.0,787911.0,787911,787911,0.0,"TensorRT-LLM:[Executor] _forward_step 85: 0 ctx reqs, 1 gen reqs"
+0.0,787861,1,787861.0,787861.0,787861,787861,0.0,"TensorRT-LLM:[Executor] _forward_step 43: 0 ctx reqs, 1 gen reqs"
+0.0,787701,1,787701.0,787701.0,787701,787701,0.0,"TensorRT-LLM:[Executor] _forward_step 64: 0 ctx reqs, 1 gen reqs"
+0.0,787562,1,787562.0,787562.0,787562,787562,0.0,"TensorRT-LLM:[Executor] _forward_step 46: 0 ctx reqs, 1 gen reqs"
+0.0,787361,1,787361.0,787361.0,787361,787361,0.0,"TensorRT-LLM:[Executor] _forward_step 81: 0 ctx reqs, 1 gen reqs"
+0.0,787311,1,787311.0,787311.0,787311,787311,0.0,"TensorRT-LLM:[Executor] _forward_step 22: 0 ctx reqs, 1 gen reqs"
+0.0,786881,1,786881.0,786881.0,786881,786881,0.0,"TensorRT-LLM:[Executor] _forward_step 101: 0 ctx reqs, 1 gen reqs"
+0.0,786822,1,786822.0,786822.0,786822,786822,0.0,"TensorRT-LLM:[Executor] _forward_step 68: 0 ctx reqs, 1 gen reqs"
+0.0,786411,1,786411.0,786411.0,786411,786411,0.0,"TensorRT-LLM:[Executor] _forward_step 103: 0 ctx reqs, 1 gen reqs"
+0.0,786391,1,786391.0,786391.0,786391,786391,0.0,"TensorRT-LLM:[Executor] _forward_step 96: 0 ctx reqs, 1 gen reqs"
+0.0,785481,1,785481.0,785481.0,785481,785481,0.0,"TensorRT-LLM:[Executor] _forward_step 88: 0 ctx reqs, 1 gen reqs"
+0.0,779971,1,779971.0,779971.0,779971,779971,0.0,"TensorRT-LLM:[Executor] _forward_step 5: 0 ctx reqs, 1 gen reqs"
+0.0,779901,1,779901.0,779901.0,779901,779901,0.0,"TensorRT-LLM:[Executor] _forward_step 13: 0 ctx reqs, 1 gen reqs"
+0.0,779862,1,779862.0,779862.0,779862,779862,0.0,"TensorRT-LLM:[Executor] _forward_step 8: 0 ctx reqs, 1 gen reqs"
+0.0,779202,1,779202.0,779202.0,779202,779202,0.0,"TensorRT-LLM:[Executor] _forward_step 19: 0 ctx reqs, 1 gen reqs"
+0.0,778181,1,778181.0,778181.0,778181,778181,0.0,"TensorRT-LLM:[Executor] _forward_step 12: 0 ctx reqs, 1 gen reqs"
+0.0,777651,1,777651.0,777651.0,777651,777651,0.0,"TensorRT-LLM:[Executor] _forward_step 6: 0 ctx reqs, 1 gen reqs"
+0.0,776902,1,776902.0,776902.0,776902,776902,0.0,"TensorRT-LLM:[Executor] _forward_step 11: 0 ctx reqs, 1 gen reqs"
+0.0,774031,1,774031.0,774031.0,774031,774031,0.0,"TensorRT-LLM:[Executor] _forward_step 10: 0 ctx reqs, 1 gen reqs"
+0.0,773621,1,773621.0,773621.0,773621,773621,0.0,"TensorRT-LLM:[Executor] _forward_step 14: 0 ctx reqs, 1 gen reqs"
+0.0,772762,1,772762.0,772762.0,772762,772762,0.0,"TensorRT-LLM:[Executor] _forward_step 15: 0 ctx reqs, 1 gen reqs"
+0.0,772202,1,772202.0,772202.0,772202,772202,0.0,"TensorRT-LLM:[Executor] _forward_step 16: 0 ctx reqs, 1 gen reqs"
+0.0,771602,1,771602.0,771602.0,771602,771602,0.0,"TensorRT-LLM:[Executor] _forward_step 7: 0 ctx reqs, 1 gen reqs"
+0.0,767832,1,767832.0,767832.0,767832,767832,0.0,"TensorRT-LLM:[Executor] _forward_step 17: 0 ctx reqs, 1 gen reqs"
+0.0,760002,1,760002.0,760002.0,760002,760002,0.0,"TensorRT-LLM:[Executor] _forward_step 18: 0 ctx reqs, 1 gen reqs"
+0.0,753731,1,753731.0,753731.0,753731,753731,0.0,"TensorRT-LLM:[Executor] _forward_step 9: 0 ctx reqs, 1 gen reqs"
+0.0,541604,7,77372.0,74269.0,71110,99008,9711.8,TensorRT-LLM:pbs.cache_indirection_zero
+0.0,449515,7,64216.4,64619.0,59869,68729,3779.2,TensorRT-LLM:setup.h2d
+0.0,423495,7,60499.3,59689.0,59270,65210,2095.5,TensorRT-LLM:pbs.cum_log_probs_zero
+0.0,412646,7,58949.4,59020.0,56300,62979,2432.6,TensorRT-LLM:pbs.sampled_log_probs_zero
+0.0,411054,7,58722.0,57120.0,55659,65049,3596.6,TensorRT-LLM:pbs.first_finish_reasons_zero
+0.0,408005,7,58286.4,55539.0,54500,71929,6224.5,TensorRT-LLM:pbs.predecessor_beams_zero
+0.0,396845,7,56692.1,55949.0,55749,60089,1565.7,TensorRT-LLM:pbs.sampled_log_prob_ranks_zero
+0.0,388200,7,55457.1,54740.0,54160,59010,1734.5,TensorRT-LLM:pbs.original_tokens_zero
+0.0,301225,102,2953.2,2400.0,2250,26760,2692.5,TensorRT-LLM:_update_request_states
+0.0,290988,102,2852.8,2810.0,2520,5340,368.7,TensorRT-LLM:handle_logits
+0.0,171648,102,1682.8,1650.0,1410,2630,176.1,TensorRT-LLM:handle_additional_outputs
+0.0,147558,102,1446.6,1400.0,1220,2380,168.9,TensorRT-LLM:_send_kv_async
+0.0,104487,111,941.3,840.0,650,3270,418.0,TensorRT-LLM:broadcast_requests
+0.0,81579,7,11654.1,7710.0,7329,22390,5974.0,TensorRT-LLM:setup.collect_loop
+0.0,72510,102,710.9,695.0,500,1390,127.6,TensorRT-LLM:_handle_canceled_requests
+0.0,61290,109,562.3,520.0,380,1490,163.0,TensorRT-LLM:_pad_attention_dp_dummy_request
+

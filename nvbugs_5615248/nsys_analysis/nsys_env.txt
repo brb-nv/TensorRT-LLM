@@ -1,0 +1,5 @@
+=== nsys version ===
+NVIDIA Nsight Systems version 2026.1.1.204-261137176666v0
+
+=== nsys path ===
+/usr/local/cuda/bin/nsys
