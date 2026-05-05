@@ -3520,6 +3520,13 @@ class TorchCompileConfig(StrictBaseModel):
         description=
         "The maximum number of CUDA streams to use for torch.compile.")
 
+    @model_validator(mode='after')
+    def set_default_capture_num_tokens(self) -> 'TorchCompileConfig':
+        if self.enable_piecewise_cuda_graph and self.capture_num_tokens is None:
+            self.capture_num_tokens = [2**i for i in range(8)
+                                       ] + [i for i in range(256, 3073, 256)]
+        return self
+
 
 class TorchLlmArgs(BaseLlmArgs):
     # PyTorch backend specific configurations
