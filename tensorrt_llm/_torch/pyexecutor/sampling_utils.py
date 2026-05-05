@@ -64,11 +64,9 @@ class BeamSearchMetadata(StrategyMetadata):
     seq_lens: torch.Tensor
     finished_beams: torch.Tensor
     predecessor_beams: torch.Tensor
-    # Pre-computed per-step constants. Sliced (not allocated) per call.
-    # ``seq_offsets[i] = i * max_beam_width`` (int64), shape ``(max_num_sequences,)``.
-    # ``beam_idx_arange[j] = j``        (int32), shape ``(max_beam_width,)``.
-    # Caching them eliminates two ``torch.arange`` allocations and the associated
-    # multiply / modulo kernel per beam-search step (~4 kernel launches saved).
+    # Pre-computed indexer constants sliced (not allocated) per call.
+    # seq_offsets[i] = i * max_beam_width, shape (max_num_sequences,), int64.
+    # beam_idx_arange[j] = j, shape (max_beam_width,), int32.
     seq_offsets: torch.Tensor
     beam_idx_arange: torch.Tensor
 
@@ -368,8 +366,6 @@ def beam_search_sampling_batch(
     max_beam_width = beam_search_args.finished_beams.size(1)
     finished_beams = beam_search_args.finished_beams[beam_search_args.seq_slots].view(-1)
 
-    # NB: ``seq_offsets`` is pre-computed as ``arange(max_num_sequences) * max_beam_width``
-    # at sampler construction; slicing avoids per-call ``arange`` + multiply kernels.
     offset_predecessor_beam = predecessor_beam + beam_search_args.seq_offsets[
         : predecessor_beam.size(0)
     ].unsqueeze(1)
@@ -397,10 +393,6 @@ def beam_search_sampling_batch(
     # therefore we can use expand
     index = beam_search_args.seq_lens.view(-1, 1, 1).expand(-1, beam_width_out, 1)
     # index is of shape (batch_size, beam_width, 1)
-    # NB: ``beam_idx_arange`` is pre-computed as ``arange(max_beam_width)`` at sampler
-    # construction; the original code allocated ``arange(beam * batch) % beam`` per
-    # call, which is exactly ``[[0, 1, .., beam-1], ...]`` already encoded by the
-    # cached arange. ``expand`` over the batch dim is a strided view (no kernel).
     src = (
         beam_search_args.beam_idx_arange[:beam_width_out]
         .view(1, beam_width_out, 1)

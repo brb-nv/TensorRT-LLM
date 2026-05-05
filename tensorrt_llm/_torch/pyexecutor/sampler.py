@@ -1435,15 +1435,9 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             a resize of the stop words buffers is triggered. If a resize is necessary, all requests in the batch
             need to be re-processed.
 
-            ``Tensor.index_copy_`` is used for the device-side max-lengths/end-ids
-            scatters so PyTorch lowers each to a single fused index-and-copy
-            kernel (no ``direct_copy_kernel`` staging step). ``index_copy_``
-            requires int64 indices, hence the ``_long`` suffix on the parameter.
-
             Args:
-                seq_slots_cuda_long: The sequence slots of the processed requests, as
-                  int64 CUDA indices. Used for accessing device buffers via
-                  ``index_copy_``. Shape: [len(requests)]
+                seq_slots_cuda_long: The sequence slots of the processed requests, as int64
+                  CUDA indices (required by ``index_copy_``). Shape: [len(requests)]
                 max_lengths_cuda: The maximum lengths for each request.
                   Shape: [len(requests)]
                 end_ids_cuda: The end ids for each request.
@@ -2043,17 +2037,13 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
            Usage: Stores the original tokens for each beam.
            This is used to recover the original tokens for each beam when streaming is enabled"""
         seq_offsets: torch.Tensor
-        """Shape: (max_num_sequences,) dtype int64
-           Pre-computed `arange(max_num_sequences) * max_beam_width` cached on device.
-           Used by ``beam_search_sampling_batch`` to flatten ``predecessor_beam`` into
-           an indexer over the batch * beam dimension without launching a per-call
-           ``torch.arange`` + multiply pair (saves 2 small kernel launches per step)."""
+        """Shape: (max_num_sequences,), dtype int64
+           Usage: Cached `arange(max_num_sequences) * max_beam_width` used by
+           ``beam_search_sampling_batch`` to flatten (batch_idx, beam_idx) pairs."""
         beam_idx_arange: torch.Tensor
-        """Shape: (max_beam_width,) dtype int32
-           Pre-computed `arange(max_beam_width)` cached on device. Used as the source
-           of the per-step ``cache_indirection.scatter_`` to mark each beam slot's
-           own index, replacing a per-call ``torch.arange + %`` pair (saves 2 small
-           kernel launches per step)."""
+        """Shape: (max_beam_width,), dtype int32
+           Usage: Cached `arange(max_beam_width)` used as the scatter source in the
+           per-step ``cache_indirection.scatter_``."""
 
     @dataclass(kw_only=True)
     class LogProbsStore:
@@ -2121,13 +2111,6 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             predecessor_beams = int_tensor(self.CACHE_INDIRECTION_SHAPE[:-1])
             original_tokens = int_tensor(self.CACHE_INDIRECTION_SHAPE)
             first_finish_reasons = int_tensor(self.CACHE_INDIRECTION_SHAPE[:-1])
-            # Pre-compute per-step indexer constants once. ``seq_offsets[i]`` =
-            # i * max_beam_width is added (broadcast over the beam dim) to every
-            # ``predecessor_beam`` to flatten (batch_idx, beam_idx) pairs into the
-            # combined dimension of ``finished_beams`` and ``cum_log_probs``;
-            # ``beam_idx_arange[j]`` = j is scatter-written into the seq_lens
-            # position of cache_indirection so each beam slot points at itself
-            # for the current step. Caching saves 4 small kernel launches per step.
             seq_offsets = (
                 torch.arange(self.max_num_sequences, device="cuda", dtype=torch.int64)
                 * self.max_beam_width
@@ -2779,10 +2762,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         max_lens_tensor_cuda = full_list_tensor_cuda[1]
         end_ids_tensor_cuda = full_list_tensor_cuda[2]
 
-        # Cast seq_slots to int64 once and reuse for every downstream
-        # ``index_copy_`` / ``index_fill_`` call (both primitives require int64
-        # indices). Hoisting the cast out of the per-callee scopes turns N
-        # casts into 1 and avoids redundant ``copy_kernel`` launches.
+        # Cast to int64 once for downstream ``index_copy_`` / ``index_fill_`` calls.
         seq_slots_tensor_cuda_long = seq_slots_tensor_cuda.long()
 
         self._finish_reasons_handler.update_for_new_request(
@@ -2815,15 +2795,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         If the last context chunk is being processed,
         initialize/reset the buffers for the request.
 
-        Each per-buffer fill uses ``Tensor.index_fill_`` so PyTorch lowers
-        it to a single fused index-and-fill kernel (no RHS allocation,
-        ``FillFunctor``, or ``direct_copy_kernel``). ``index_fill_``
-        requires int64 indices; the int64 cast is performed once in
-        ``setup_sampler_step`` and shared with the finish-reasons handler,
-        so this function takes ``seq_slots_long`` directly.
-        ``FinishReason.NOT_FINISHED`` is the integer 0 (see
-        ``cpp/include/tensorrt_llm/executor/types.h``), so all seven
-        buffers reduce to scalar-zero index_fills.
+        ``seq_slots_long`` must be int64 (required by ``index_fill_``).
         """
         beam_search_store.cache_indirection.narrow(2, 0, max_prompt_len).index_fill_(
             0, seq_slots_long, 0
