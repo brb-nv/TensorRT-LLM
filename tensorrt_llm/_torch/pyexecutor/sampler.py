@@ -1422,7 +1422,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         def update_for_new_request(
             self,
             *,
-            seq_slots_cuda: torch.Tensor,
+            seq_slots_cuda_long: torch.Tensor,
             max_lengths_cuda: torch.Tensor,
             end_ids_cuda: torch.Tensor,
             seq_slots_host: torch.Tensor,
@@ -1435,8 +1435,13 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             a resize of the stop words buffers is triggered. If a resize is necessary, all requests in the batch
             need to be re-processed.
 
+            ``Tensor.index_copy_`` is used for the device-side scatters
+            (one fused kernel per scatter, vs two via indexed-assignment);
+            it requires int64 indices, hence the ``_long`` suffix.
+
             Args:
-                seq_slots_cuda: The sequence slots of the processed requests. Used for accessing device buffers.
+                seq_slots_cuda_long: The sequence slots of the processed requests, as
+                  int64 CUDA indices. Used for accessing device buffers via ``index_copy_``.
                   Shape: [len(requests)]
                 max_lengths_cuda: The maximum lengths for each request.
                   Shape: [len(requests)]
@@ -1450,8 +1455,8 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
 
             temp_data = self._temp_data
             store = self.store
-            store.max_lengths_cuda[seq_slots_cuda] = max_lengths_cuda
-            store.end_ids_cuda[seq_slots_cuda] = end_ids_cuda
+            store.max_lengths_cuda.index_copy_(0, seq_slots_cuda_long, max_lengths_cuda)
+            store.end_ids_cuda.index_copy_(0, seq_slots_cuda_long, end_ids_cuda)
             store.max_stop_word_lengths_host[seq_slots_host] = torch.tensor(
                 temp_data.max_stop_word_lengths, device="cpu", dtype=torch.int32
             )
@@ -2746,8 +2751,13 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         seq_slots_tensor_cuda = full_list_tensor_cuda[0]
         max_lens_tensor_cuda = full_list_tensor_cuda[1]
         end_ids_tensor_cuda = full_list_tensor_cuda[2]
+
+        # Cast seq_slots to int64 once and reuse for every downstream
+        # ``index_copy_`` / ``index_fill_`` (both require int64 indices).
+        seq_slots_tensor_cuda_long = seq_slots_tensor_cuda.long()
+
         self._finish_reasons_handler.update_for_new_request(
-            seq_slots_cuda=seq_slots_tensor_cuda,
+            seq_slots_cuda_long=seq_slots_tensor_cuda_long,
             max_lengths_cuda=max_lens_tensor_cuda,
             end_ids_cuda=end_ids_tensor_cuda,
             seq_slots_host=seq_slots_tensor_host,
@@ -2760,7 +2770,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             self._prepare_beam_search(
                 beam_search_store,
                 self.store.log_probs_store,
-                seq_slots=seq_slots_tensor_cuda,
+                seq_slots_long=seq_slots_tensor_cuda_long,
                 max_prompt_len=max_prompt_len,
             )
 
@@ -2768,7 +2778,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
     def _prepare_beam_search(
         beam_search_store: BeamSearchStore,
         log_probs_store: LogProbsStore,
-        seq_slots: torch.Tensor,
+        seq_slots_long: torch.Tensor,
         max_prompt_len: int,
     ) -> None:
         """Prepare the beam search buffers for the requests
@@ -2777,10 +2787,9 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         initialize/reset the buffers for the request. Each buffer is
         reset via ``Tensor.index_fill_`` (one fused kernel) instead of
         indexed-assignment from a device-resident RHS (three kernels);
-        ``index_fill_`` requires int64 indices, so cast ``seq_slots``
-        (int32) once. ``FinishReason.NOT_FINISHED`` is 0.
+        ``index_fill_`` requires int64 indices, hoisted once in
+        ``setup_sampler_step``. ``FinishReason.NOT_FINISHED`` is 0.
         """
-        seq_slots_long = seq_slots.long()
         beam_search_store.cache_indirection.narrow(
             2, 0, max_prompt_len
         ).index_fill_(0, seq_slots_long, 0)
