@@ -1,0 +1,29 @@
+# NVBug 5615248 — TensorRT backend runtime config for trtllm-bench (throughput mode).
+#
+# This YAML carries ONLY runtime knobs that trtllm-bench's TRT path
+# accepts at LLM-construction time. Engine geometry (max_seq_len=129,
+# max_batch_size=1, max_beam_width=10, max_input_len=129,
+# max_num_tokens=129, paged_context_fmha=true) is baked into the
+# prebuilt engine at:
+#   nvbugs_5615248/tinyllama_trt_engine
+# and is read back by trtllm-bench from <engine_dir>/config.json.
+#
+# Notes:
+#   * `backend: tensorrt` is set via `--backend tensorrt` on the CLI.
+#   * trtllm-bench passes `--engine_dir nvbugs_5615248/tinyllama_trt_engine`
+#     so trtllm-bench picks up max_batch_size / max_num_tokens from the
+#     engine's build_config; do NOT pass `--max_seq_len` for TRT
+#     (throughput.py asserts it must be None for the C++ backend).
+#   * `extended_runtime_perf_knob_config.cuda_graph_mode: true` is the TRT
+#     analogue of PyTorch's CUDA-graph + piecewise capture: it enables
+#     CUDA graphs for the generation phase (TRT does not have piecewise
+#     prefill graphs).
+
+enable_chunked_prefill: true
+
+kv_cache_config:
+  enable_block_reuse: true
+
+extended_runtime_perf_knob_config:
+  cuda_graph_mode: true
+  multi_block_mode: true
