@@ -64,6 +64,13 @@ class BeamSearchMetadata(StrategyMetadata):
     seq_lens: torch.Tensor
     finished_beams: torch.Tensor
     predecessor_beams: torch.Tensor
+    # Pre-computed per-step constants. Sliced (not allocated) per call.
+    # ``seq_offsets[i] = i * max_beam_width`` (int64), shape ``(max_num_sequences,)``.
+    # ``beam_idx_arange[j] = j``        (int32), shape ``(max_beam_width,)``.
+    # Caching eliminates two ``torch.arange`` allocations + the associated
+    # multiply / modulo per beam-search step (~4 kernel launches saved).
+    seq_offsets: torch.Tensor
+    beam_idx_arange: torch.Tensor
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -361,10 +368,11 @@ def beam_search_sampling_batch(
     max_beam_width = beam_search_args.finished_beams.size(1)
     finished_beams = beam_search_args.finished_beams[beam_search_args.seq_slots].view(-1)
 
-    offset_predecessor_beam = predecessor_beam + (
-        torch.arange(predecessor_beam.size(0), device=predecessor_beam.device).unsqueeze(1)
-        * max_beam_width
-    )
+    # ``seq_offsets`` is pre-computed as ``arange(max_num_sequences) * max_beam_width``;
+    # slicing avoids per-call ``arange`` + multiply kernels.
+    offset_predecessor_beam = predecessor_beam + beam_search_args.seq_offsets[
+        : predecessor_beam.size(0)
+    ].unsqueeze(1)
     finished_beams = finished_beams[offset_predecessor_beam]
     beam_search_args.finished_beams[beam_search_args.seq_slots] = finished_beams.view(
         batch_size, max_beam_width
@@ -385,21 +393,17 @@ def beam_search_sampling_batch(
         out=cache_indirection,
     )
 
-    # Prepare target values
-    target_values = (
-        torch.arange(
-            beam_width_out * batch_size, device=cache_indirection.device, dtype=torch.int32
-        )
-        % beam_width_out
-    )
-
-    # seq lens is of shape (batch_size), we assume all beams have the same seq len
-    # therefore we can use expand
+    # seq lens is of shape (batch_size), we assume all beams have the same seq len.
+    # ``beam_idx_arange`` is pre-computed as ``arange(max_beam_width)``; the original
+    # per-call ``arange(beam * batch) % beam`` is exactly ``[[0..beam-1], ...]``,
+    # which the cached arange + ``expand`` over the batch dim already encodes
+    # (``expand`` is a strided view, no kernel).
     index = beam_search_args.seq_lens.view(-1, 1, 1).expand(-1, beam_width_out, 1)
-    # index is of shape (batch_size, beam_width, 1)
-    src = target_values.view(batch_size, beam_width_out, 1)
-    # src is of shape (batch_size, beam_width, 1)
-    # cache_indirection is of shape (batch_size, beam_width, max_seq_len)
+    src = (
+        beam_search_args.beam_idx_arange[:beam_width_out]
+        .view(1, beam_width_out, 1)
+        .expand(batch_size, beam_width_out, 1)
+    )
     cache_indirection.scatter_(2, index, src)
 
     # copy the batched buffer back to the original buffer

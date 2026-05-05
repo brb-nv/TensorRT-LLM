@@ -2041,6 +2041,17 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         """Shape: batch_size, beam_width, sequence_length
            Usage: Stores the original tokens for each beam.
            This is used to recover the original tokens for each beam when streaming is enabled"""
+        seq_offsets: torch.Tensor
+        """Shape: (max_num_sequences,) dtype int64
+           Pre-computed `arange(max_num_sequences) * max_beam_width`. Used by
+           ``beam_search_sampling_batch`` to flatten ``predecessor_beam`` into an
+           indexer over the ``batch * beam`` dimension without launching a per-call
+           ``arange`` + multiply (saves 2 small kernels per step)."""
+        beam_idx_arange: torch.Tensor
+        """Shape: (max_beam_width,) dtype int32
+           Pre-computed `arange(max_beam_width)`. Used as the source of the per-step
+           ``cache_indirection.scatter_`` so each beam slot points at itself,
+           replacing a per-call ``arange + %`` (saves 2 small kernels per step)."""
 
     @dataclass(kw_only=True)
     class LogProbsStore:
@@ -2108,6 +2119,15 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             predecessor_beams = int_tensor(self.CACHE_INDIRECTION_SHAPE[:-1])
             original_tokens = int_tensor(self.CACHE_INDIRECTION_SHAPE)
             first_finish_reasons = int_tensor(self.CACHE_INDIRECTION_SHAPE[:-1])
+            # Per-step indexer constants, sliced (not allocated) by
+            # ``beam_search_sampling_batch`` on every step. See BeamSearchStore docstring.
+            seq_offsets = (
+                torch.arange(self.max_num_sequences, device="cuda", dtype=torch.int64)
+                * self.max_beam_width
+            )
+            beam_idx_arange = torch.arange(
+                self.max_beam_width, device="cuda", dtype=torch.int32
+            )
             beam_search_store = self.BeamSearchStore(
                 cache_indirection=cache_indirection,
                 cache_indirection_buffer=cache_indirection_buffer,
@@ -2115,6 +2135,8 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 predecessor_beams=predecessor_beams,
                 original_tokens=original_tokens,
                 first_finish_reasons=first_finish_reasons,
+                seq_offsets=seq_offsets,
+                beam_idx_arange=beam_idx_arange,
             )
         return self.Store(
             new_tokens=new_tokens,
@@ -3210,6 +3232,8 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                     ),  # Should be on device for beam search
                     finished_beams=beam_search_store.first_finish_reasons,
                     predecessor_beams=beam_search_store.predecessor_beams,
+                    seq_offsets=beam_search_store.seq_offsets,
+                    beam_idx_arange=beam_search_store.beam_idx_arange,
                 )
             elif metadata_type is None:
                 metadata = None
