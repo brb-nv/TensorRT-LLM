@@ -1,0 +1,32 @@
+# PyTorch backend config for the beam-search prefill->decode handoff
+# perf-repro workload (NVBug 5615248, TinyLlama-1.1B-Chat beam=10).
+#
+# CLI overrides applied by trtllm-bench:
+#   * --backend pytorch       sets backend=pytorch
+#   * --tp / --pp             set tensor_parallel_size / pipeline_parallel_size
+#   * --beam_width            sets max_beam_width
+#   * --max_batch_size        sets max_batch_size
+#
+# Bug-relevant knobs (max_seq_len, piecewise CUDA graph, beam width)
+# stay in this YAML so they always win over trtllm-bench's auto-tuned
+# defaults (extra_llm_api_options is overlaid last on the LLM args).
+#
+# max_seq_len = 129 = ISL(100) + OSL(20) + small slack; keeps the
+# engine geometry small so the per-step decode cost is dominated by
+# host-side overhead (the regime the optimization targets).
+
+max_beam_width: 10
+max_batch_size: 1
+max_seq_len: 129
+
+enable_chunked_prefill: true
+
+cuda_graph_config:
+  max_batch_size: 128
+  enable_padding: true
+
+kv_cache_config:
+  enable_block_reuse: true
+
+torch_compile_config:
+  enable_piecewise_cuda_graph: true
