@@ -1,0 +1,30 @@
+# NVBug 5615248 — PyTorch backend config for trtllm-bench (throughput mode).
+#
+# Mirrors the customer's original max_seq_len=128 + piecewise-CUDA-graph
+# scenario, but with max_seq_len bumped to 129 so the engine geometry
+# matches the prebuilt TRT engine in nvbugs_5615248/tinyllama_trt_engine
+# (max_seq_len=129, max_batch_size=1, max_beam_width=10). That keeps the
+# PyTorch vs TRT TTFT comparison apples-to-apples on the same workload.
+#
+# Trimmed vs the serve-style YAMLs in the parent dir:
+#   * `backend` is set via `--backend pytorch` on the trtllm-bench CLI.
+#   * `tensor_parallel_size` / `pipeline_parallel_size` come from `--tp` / `--pp`.
+# The bug-relevant knobs (max_seq_len, piecewise CUDA graph, beam width)
+# stay in this YAML so they always win over trtllm-bench's auto-tuned
+# defaults (extra_llm_api_options is overlaid last on the LLM args).
+
+max_beam_width: 10
+max_batch_size: 1
+max_seq_len: 129
+
+enable_chunked_prefill: true
+
+cuda_graph_config:
+  max_batch_size: 128
+  enable_padding: true
+
+kv_cache_config:
+  enable_block_reuse: true
+
+torch_compile_config:
+  enable_piecewise_cuda_graph: true
