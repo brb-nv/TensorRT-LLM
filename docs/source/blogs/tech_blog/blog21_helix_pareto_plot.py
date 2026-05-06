@@ -88,16 +88,18 @@ HELIX_LABEL_POSITIONS = {
     # Knee of the Helix curve - label snug above-right of the marker.
     "ck-64_ctp64":       ( 55,  70, "left",   "center", True),  # C=64
     # Bottom-right cluster: stack labels in a tight column above the curve,
-    # with text starting just to the right of x=140 (close to the markers,
-    # which span x=70..132).
-    "ck-32_ctp64":       (140,  60, "left",   "center", True),  # C=32
-    "ck-16_ctp64":       (140,  47, "left",   "center", True),  # C=16
-    "ck-8_ctp64":        (140,  35, "left",   "center", True),  # C=8
-    "ck-4_cep64":        (140,  24, "left",   "center", True),  # C=4
+    # with text starting just past x=132 (the rightmost marker
+    # ck-1_ctp32tp2 sits at x=131.75). Keeping the column flush with the
+    # rightmost marker minimises leader length and ensures the label text
+    # fits inside the side-by-side combined plot's tighter xlim.
+    "ck-32_ctp64":       (132,  60, "left",   "center", True),  # C=32
+    "ck-16_ctp64":       (132,  47, "left",   "center", True),  # C=16
+    "ck-8_ctp64":        (132,  35, "left",   "center", True),  # C=8
+    "ck-4_cep64":        (132,  24, "left",   "center", True),  # C=4
     # The two C=2 points are tied (~0.3% apart) - keep only one label.
-    "ck-2_ctp8cep4tep2": (140,  14, "left",   "center", True),  # C=2 (EP=8)
+    "ck-2_ctp8cep4tep2": (132,  14, "left",   "center", True),  # C=2 (EP=8)
     "ck-2_ctp4cep8tep2": None,                                   # tied with above
-    "ck-1_ctp32tp2":     (140,   5, "left",   "center", True),  # C=1
+    "ck-1_ctp32tp2":     (132,   5, "left",   "center", True),  # C=1
 }
 
 BASELINE_LABEL_POSITIONS = {
@@ -183,7 +185,9 @@ def main() -> None:
     # xlim is extended slightly to the left so the C=256 / C=128 / C=64
     # baseline labels sit in the left margin without crossing the Helix
     # curve, which runs diagonally through the (10..50, 50..125) region.
-    ax.set_xlim(-25, 195)
+    # On the right, the bottom-right Helix label cluster ends near x=162;
+    # xlim right = 165 keeps that cluster snug with no unused whitespace.
+    ax.set_xlim(-25, 165)
     ax.set_ylim(-10, 145)
     ax.set_xlabel("Tokens/s/user", fontsize=11)
     ax.set_ylabel("Tokens/s/GPU", fontsize=11)

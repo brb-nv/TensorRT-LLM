@@ -63,11 +63,14 @@ HELIX_POINTS: list[ParetoPoint] = [
 
 # Baseline runs (KVP=1, no Helix).
 BASELINE_POINTS: list[ParetoPoint] = [
-    ParetoPoint("k2base-c256_dp16",   256, True, 1, 16, 1, 16, 27.51, 440.22),
-    ParetoPoint("k2base-c64_dp8",      64, True, 1,  8, 1,  8, 41.47, 331.78),
-    ParetoPoint("k2base-c128_dp32",   128, True, 1, 32, 1, 32, 55.81, 223.24),
-    ParetoPoint("k2base-c8_dp4",        8, True, 1,  4, 1,  4, 66.31, 132.61),
-    ParetoPoint("k2base-c16_dp16",     16, True, 1, 16, 1, 16, 73.27,  73.27),
+    ParetoPoint("k2base-c256_dp16",   256, True,  1, 16, 1, 16,  27.51, 440.22),
+    ParetoPoint("k2base-c64_dp8",      64, True,  1,  8, 1,  8,  41.47, 331.78),
+    ParetoPoint("k2base-c128_dp32",   128, True,  1, 32, 1, 32,  55.81, 223.24),
+    ParetoPoint("k2base-c8_dp4",        8, True,  1,  4, 1,  4,  66.31, 132.61),
+    ParetoPoint("k2base-c16_dp16",     16, True,  1, 16, 1, 16,  73.27,  73.27),
+    ParetoPoint("k2base-c2_tp4",        2, False, 1,  4, 1,  4,  78.61,  39.31),
+    ParetoPoint("k2base-c1_tp4",        1, False, 1,  4, 1,  4, 116.34,  29.09),
+    ParetoPoint("k2base-c1_tp8",        1, False, 1,  8, 1,  8, 136.97,  17.12),
 ]
 
 
@@ -88,18 +91,19 @@ HELIX_LABEL_POSITIONS = {
     "k2-c16_kvp8":      ( 95, 175, "left", "center", True),
     "k2-c8_kvp8":       (113, 115, "left", "center", True),
     "k2-c8_kvp16":      (128,  78, "left", "center", True),
-    # Bottom-right cluster (all C=1): stack labels in a tight column to the
-    # right of the markers, which sit between x=121 and x=159.
-    "k2-c1_kvp4_tp1":   (170,  60, "left", "center", True),
-    "k2-c1_kvp4_tp2":   (170,  45, "left", "center", True),
-    "k2-c1_kvp8_tp2":   (170,  30, "left", "center", True),
+    # Bottom-right cluster (all C=1): stack labels in a tight column just
+    # past the rightmost marker (x=158.69), so leaders are short and label
+    # text fits inside the side-by-side combined plot's tighter xlim.
+    "k2-c1_kvp4_tp1":   (160,  60, "left", "center", True),
+    "k2-c1_kvp4_tp2":   (160,  45, "left", "center", True),
+    "k2-c1_kvp8_tp2":   (160,  30, "left", "center", True),
 }
 
 BASELINE_LABEL_POSITIONS = {
     # Top-left point sits above all helix data, so its label can ride along
     # in the same upper-right whitespace.
     "k2base-c256_dp16": ( 48, 458, "left", "center", True),
-    # Remaining baseline points: labels in the left margin, stacked
+    # Remaining top-left baseline points: labels in the left margin, stacked
     # vertically. Leader lines stay below the helix curve except for
     # k2base-c128_dp32, whose marker sits ~3 units above the helix curve and
     # therefore unavoidably brushes it.
@@ -107,6 +111,10 @@ BASELINE_LABEL_POSITIONS = {
     "k2base-c128_dp32": (-55, 245, "left", "center", True),
     "k2base-c8_dp4":    (-55, 130, "left", "center", True),
     "k2base-c16_dp16":  (-55,  75, "left", "center", True),
+    "k2base-c2_tp4":    (-55,  35, "left", "center", True),
+    # Bottom-right baseline points - labels just below the curve.
+    "k2base-c1_tp4":    ( 85, -10, "left", "center", True),
+    "k2base-c1_tp8":    (115, -22, "left", "center", True),
 }
 
 OUT_PATH = Path(__file__).resolve().parents[2] / "blogs" / "media" / \
