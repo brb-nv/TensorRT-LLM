@@ -3224,28 +3224,50 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         get_metadata_type_for_group_fn: Callable[
             [GenericStrategyKeyType], Type[StrategyMetadata] | None
         ],
+        *,
+        seq_slots_cuda: torch.Tensor | None = None,
+        seq_lens_cuda: torch.Tensor | None = None,
     ) -> dict[RequestGroupKey[GenericStrategyKeyType], RequestGroupValueWithMetadata]:
         grouped_requests_with_metadata: dict[
             RequestGroupKey[GenericStrategyKeyType], RequestGroupValueWithMetadata
         ] = {}
         beam_search_store = self.store.beam_search_store
         log_probs_store = self.store.log_probs_store
+        num_requests = len(requests)
         for key, value in grouped_requests.items():
             metadata_type = get_metadata_type_for_group_fn(key.strategy_key)
             if metadata_type is BeamSearchMetadata:
                 assert beam_search_store is not None
                 assert seq_lens is not None, "seq_lens is required for beam search"
+                # Reuse the CUDA tensors precomputed in ``_process_requests``
+                # whenever the current strategy group covers all sampling
+                # requests (the typical concurrency=1 / single-strategy
+                # beam-search case). This eliminates a redundant H2D pair per
+                # decode step. The fall-back path (per-group host gather +
+                # H2D) is preserved for the multi-strategy case where each
+                # group only covers a subset of the batch.
+                full_batch_group = (
+                    seq_slots_cuda is not None
+                    and seq_lens_cuda is not None
+                    and value.indices.size(0) == num_requests
+                )
+                if full_batch_group:
+                    group_seq_slots_cuda = seq_slots_cuda
+                    group_seq_lens_cuda = seq_lens_cuda
+                else:
+                    group_seq_slots_cuda = seq_slots[value.indices].to(
+                        device="cuda", dtype=torch.int64, non_blocking=True
+                    )  # Should be on device for beam search, need long for index_copy_
+                    group_seq_lens_cuda = seq_lens[value.indices].to(
+                        device="cuda", non_blocking=True
+                    )  # Should be on device for beam search
                 metadata = BeamSearchMetadata(
                     cache_indirection=beam_search_store.cache_indirection,
                     cache_indirection_buffer=beam_search_store.cache_indirection_buffer,
                     cum_log_probs=beam_search_store.cum_log_probs,
                     new_log_probs=log_probs_store.sampled_log_probs[..., DEFAULT_STEP_IDX],
-                    seq_slots=seq_slots[grouped_requests[key].indices].to(
-                        device="cuda", dtype=torch.int64, non_blocking=True
-                    ),  # Should be on device for beam search, need long for index_copy_
-                    seq_lens=seq_lens[grouped_requests[key].indices].to(
-                        device="cuda", non_blocking=True
-                    ),  # Should be on device for beam search
+                    seq_slots=group_seq_slots_cuda,
+                    seq_lens=group_seq_lens_cuda,
                     finished_beams=beam_search_store.first_finish_reasons,
                     predecessor_beams=beam_search_store.predecessor_beams,
                 )
@@ -3424,7 +3446,18 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         self.setup_sampler_step(scheduled_requests)
         new_tokens = self.store.new_tokens
 
-        requests, seq_slots_host, seq_lens_host, new_tokens_host = self._process_requests(
+        # ``seq_slots_cuda`` (int64) and ``seq_lens_cuda`` are materialised
+        # exactly once inside ``_process_requests`` and shared with the
+        # per-group beam-search metadata builder. Sharing them here removes
+        # the redundant H2D pair this branch previously emitted.
+        (
+            requests,
+            seq_slots_host,
+            seq_lens_host,
+            seq_slots_cuda,
+            seq_lens_cuda,
+            new_tokens_host,
+        ) = self._process_requests(
             scheduled_requests,
             model_outputs,
             new_tokens,
@@ -3435,13 +3468,6 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         first_finish_reasons_host: torch.Tensor | None = None
         beam_history_builders: list[BeamHistoryBuilder | None] | None = None
         if requests:
-            seq_slots_cuda = seq_slots_host.to(
-                device="cuda",
-                dtype=torch.int64,  # for index_fill_
-                non_blocking=True,
-            )
-            seq_lens_cuda = seq_lens_host.to(device="cuda", non_blocking=True)
-
             beam_search_store = self.store.beam_search_store
             assert self._use_beam_search == (beam_search_store is not None)
             # Prepare stop word handling
@@ -3646,6 +3672,8 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         req_offsets: torch.Tensor,
         seq_slots: torch.Tensor,
         seq_lens: Optional[torch.Tensor] = None,
+        seq_slots_cuda: Optional[torch.Tensor] = None,
+        seq_lens_cuda: Optional[torch.Tensor] = None,
         token_dtype: torch.dtype,
         return_log_probs: bool,
     ) -> _BatchedSamplingResult:
@@ -3664,6 +3692,8 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             seq_slots,
             seq_lens,
             get_metadata_type_for_group_fn=self._grouped_sampler_cls.get_metadata_type_for_group,
+            seq_slots_cuda=seq_slots_cuda,
+            seq_lens_cuda=seq_lens_cuda,
         )
         generator_cuda = self.get_generator(cuda_device)
 
@@ -4287,7 +4317,9 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         model_outputs: dict[str, Any],
         new_tokens_cuda: torch.Tensor,
         num_context_logits_prefix_sum: list[int],
-    ) -> tuple[list[LlmRequest], torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[
+        list[LlmRequest], torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+    ]:
         raw_logits_cuda = model_outputs["logits"]
 
         sampling_requests, sampling_requests_metadata, logits_cuda = self._select_generated_logits(
@@ -4311,6 +4343,22 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             dtype=torch.int32,
             pin_memory=prefer_pinned(),
         )
+
+        # Cast the host ``seq_slots`` / ``seq_lens`` to CUDA exactly once and
+        # share the result with both the per-group beam-search metadata builder
+        # (``_add_metadata_to_grouped_requests``) and the ``sample_async`` path
+        # that consumes them for finish-reasons handling. Previously each of
+        # those sites performed its own H2D cast, producing 2 redundant pairs
+        # of async H2D launches per decode step in the typical
+        # single-strategy / concurrency=1 beam-search workload.
+        #
+        # int64 is the dtype required downstream for ``index_fill_`` /
+        # ``index_copy_`` in the finish-reasons handler and for beam-search
+        # ``index_copy_`` in ``beam_search_sampling_batch``.
+        seq_slots_cuda = seq_slots_host.to(
+            device="cuda", dtype=torch.int64, non_blocking=True
+        )
+        seq_lens_cuda = seq_lens_host.to(device="cuda", non_blocking=True)
 
         # Handle embedding bias
         self._apply_embedding_bias(
@@ -4352,7 +4400,14 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             )
 
             new_tokens_host = self._copy_to_host(new_tokens_cuda)
-            return sampling_requests, seq_slots_host, seq_lens_host, new_tokens_host
+            return (
+                sampling_requests,
+                seq_slots_host,
+                seq_lens_host,
+                seq_slots_cuda,
+                seq_lens_cuda,
+                new_tokens_host,
+            )
 
         # Indexer for accessing tokens in 'logits_cuda', corresponding to the
         # requests in 'requests'.
@@ -4372,6 +4427,8 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             req_offsets=sampling_requests_metadata.req_offsets,
             seq_slots=seq_slots_host,
             seq_lens=seq_lens_host,
+            seq_slots_cuda=seq_slots_cuda,
+            seq_lens_cuda=seq_lens_cuda,
             req_num_generated_tokens=sampling_requests_metadata.req_num_generated_tokens,
             req_num_steps=sampling_requests_metadata.req_num_steps,
             token_dtype=new_tokens_cuda.dtype,
@@ -4396,7 +4453,14 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         )
 
         # NB: update_requests syncs w/ device computation and async D2H copies
-        return sampling_requests, seq_slots_host, seq_lens_host, new_tokens_host
+        return (
+            sampling_requests,
+            seq_slots_host,
+            seq_lens_host,
+            seq_slots_cuda,
+            seq_lens_cuda,
+            new_tokens_host,
+        )
 
     @override
     def should_provide_draft_probs(self, request: LlmRequest) -> bool:
