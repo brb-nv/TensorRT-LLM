@@ -1335,6 +1335,13 @@ def create_py_executor_instance(
                     if not has_dense_mlp:
                         target_modules.remove(mlp_mod)
 
+        # Reject unsupported LoRA target modules (e.g. per-expert MoE targets
+        # not yet wired through FusedMoE) before any C++ LoRA setup runs.
+        if isinstance(model_engine, PyTorchModelEngine):
+            from ..peft.lora.layer import validate_lora_target_modules_supported
+            validate_lora_target_modules_supported(model_engine.model,
+                                                   target_modules)
+
         lora_modules = LoraModule.create_lora_modules(
             lora_module_names=target_modules,
             hidden_size=model_binding_config.hidden_size,

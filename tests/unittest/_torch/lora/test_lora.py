@@ -1,7 +1,14 @@
+import pytest
 import torch
 
 from tensorrt_llm._torch.peft.lora.adapter_slot_manager import AdapterSlotManager
 from tensorrt_llm._torch.peft.lora.cuda_graph_lora_params import CudaGraphLoraParams
+from tensorrt_llm._torch.peft.lora.layer import (
+    LoraLayer,
+    LoraModuleType,
+    UnsupportedLoraTargetModulesError,
+    validate_lora_target_modules_supported,
+)
 
 
 def test_cuda_graph_lora_params_handle_missing_peft_table():
@@ -36,3 +43,55 @@ def test_adapter_slot_manager_handles_missing_peft_cache_manager():
 
     assert manager.get_slot_to_task_mapping() == (123, None)
     assert manager.task2slot[123] == 0
+
+
+def _make_attention_only_model() -> torch.nn.Module:
+    """Tiny model registering only the four attention LoRA targets."""
+    model = torch.nn.Module()
+    model.attn_lora = LoraLayer(
+        [
+            LoraModuleType.ATTENTION_Q,
+            LoraModuleType.ATTENTION_K,
+            LoraModuleType.ATTENTION_V,
+            LoraModuleType.ATTENTION_DENSE,
+        ],
+        [16, 16, 16, 16],
+    )
+    return model
+
+
+def test_validate_lora_target_modules_supported_accepts_supported_targets():
+    validate_lora_target_modules_supported(
+        _make_attention_only_model(), ["attn_q", "attn_k", "attn_v", "attn_dense"]
+    )
+
+
+def test_validate_lora_target_modules_supported_noops_on_empty_list():
+    model = _make_attention_only_model()
+    validate_lora_target_modules_supported(model, [])
+    validate_lora_target_modules_supported(model, None)
+
+
+def test_validate_lora_target_modules_supported_rejects_per_expert_moe_targets():
+    with pytest.raises(UnsupportedLoraTargetModulesError) as exc:
+        validate_lora_target_modules_supported(
+            _make_attention_only_model(), ["attn_q", "moe_h_to_4h", "moe_4h_to_h"]
+        )
+    msg = str(exc.value)
+    assert "moe_h_to_4h" in msg
+    assert "moe_4h_to_h" in msg
+    assert "attn_q" in msg  # listed under "Supported on this model"
+
+
+def test_validate_lora_target_modules_supported_unsupported_is_notimplemented():
+    """Subclass of NotImplementedError so callers can `except` broadly."""
+    with pytest.raises(NotImplementedError):
+        validate_lora_target_modules_supported(_make_attention_only_model(), ["moe_h_to_4h"])
+
+
+def test_validate_lora_target_modules_supported_rejects_unknown_names():
+    with pytest.raises(ValueError) as exc:
+        validate_lora_target_modules_supported(
+            _make_attention_only_model(), ["attn_q", "not_a_real_module"]
+        )
+    assert "not_a_real_module" in str(exc.value)

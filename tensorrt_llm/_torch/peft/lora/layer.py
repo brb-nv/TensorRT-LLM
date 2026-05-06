@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import Dict, List, Optional
+from typing import Dict, Iterable, List, Optional
 
 import torch
 
@@ -540,3 +540,57 @@ class LoraLayer(torch.nn.Module):
                                         device=x.device))
                 lora_output = torch.cat(lora_output, dim=-1)
                 return lora_output
+
+
+class UnsupportedLoraTargetModulesError(NotImplementedError):
+    """LoRA target modules requested but not wired into the model's forward path."""
+
+
+def validate_lora_target_modules_supported(
+        model: torch.nn.Module, lora_target_modules: Iterable[str]) -> None:
+    """Fail fast if any requested LoRA target module is unsupported by this model.
+
+    Supported = at least one `LoraLayer` in the model tree registers the
+    corresponding `LoraModuleType` (the canonical "this delta is wired into
+    forward" signal).
+
+    Raises:
+        ValueError: requested name is not a known LoRA module name.
+        UnsupportedLoraTargetModulesError: requested name has no LoraLayer
+            registered on this model+backend combination.
+    """
+    target_modules = list(lora_target_modules) if lora_target_modules else []
+    if not target_modules:
+        return
+
+    from ....lora_manager import LoraManager
+
+    requested: Dict[str, int] = {}
+    unknown: List[str] = []
+    for name in target_modules:
+        try:
+            requested[name] = LoraManager.LORA_MODULE_IDS[name]
+        except KeyError:
+            unknown.append(name)
+    if unknown:
+        raise ValueError(f"Unknown LoRA target module name(s): {unknown}. "
+                         f"Valid names: {sorted(LoraManager.LORA_MODULE_IDS)}.")
+
+    registered_ids: set = set()
+    for module in model.modules():
+        if isinstance(module, LoraLayer):
+            registered_ids.update(int(t) for t in module.lora_module_types)
+
+    unsupported = sorted(name for name, mid in requested.items()
+                         if mid not in registered_ids)
+    if not unsupported:
+        return
+
+    supported_names = sorted(
+        name for name, mid in LoraManager.LORA_MODULE_IDS.items()
+        if mid in registered_ids)
+    raise UnsupportedLoraTargetModulesError(
+        f"LoRA target module(s) {unsupported} have no LoraLayer registered on "
+        f"this model. Supported on this model: {supported_names}. Remove the "
+        f"unsupported entries from `LoraConfig.lora_target_modules` and from "
+        f"`target_modules` in your adapter checkpoints to proceed.")
