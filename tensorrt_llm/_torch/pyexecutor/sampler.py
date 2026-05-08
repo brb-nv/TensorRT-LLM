@@ -495,6 +495,7 @@ class _CachingRequestGrouper(Generic[GenericStrategyKeyType]):
         store.slots_needing_recompute.add(slot)
         store.non_greedy_slots.discard(slot)  # reset until strategy is computed
 
+    @nvtx_range("group_requests_by_strategy_key")
     def group_requests_by_strategy_key(
         self,
         requests: Iterable[LlmRequest],
@@ -3216,6 +3217,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 gen_log_probs_list, cum_log_probs=beam_history.cum_logprobs.tolist()
             )
 
+    @nvtx_range("_add_metadata_to_grouped_requests")
     def _add_metadata_to_grouped_requests(
         self,
         requests: list[LlmRequest],
@@ -3415,6 +3417,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
     def _return_log_probs(self, requests: list[LlmRequest]) -> bool:
         return any(req.py_return_log_probs for req in requests)
 
+    @nvtx_range("_prepare_log_probs")
     def _prepare_log_probs(self, requests: list[LlmRequest]) -> None:
         self.batch_max_topk_logprobs = max(
             (req.py_num_logprobs or 0 for req in requests),
@@ -3478,53 +3481,62 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             # their buffers in the store.
             # Assume that either all requests are drafts or none are drafts
             is_draft_batch = requests[0].py_is_draft
-            finish_reasons_device = self._finish_reasons_handler.write_finish_reasons(
-                seq_slots_host=seq_slots_host,
-                is_draft_batch=is_draft_batch,
-                seq_slots_cuda=seq_slots_cuda,
-                seq_lens_cuda=seq_lens_cuda,
-                new_tokens_cuda=new_tokens,
-                first_finish_reasons_cuda=(
-                    beam_search_store.first_finish_reasons
-                    if beam_search_store is not None
-                    else None
-                ),
-            )
-            finish_reasons_host = self._copy_to_host(finish_reasons_device)
+            with nvtx_range("sample_async/finish_reasons_block"):
+                finish_reasons_device = self._finish_reasons_handler.write_finish_reasons(
+                    seq_slots_host=seq_slots_host,
+                    is_draft_batch=is_draft_batch,
+                    seq_slots_cuda=seq_slots_cuda,
+                    seq_lens_cuda=seq_lens_cuda,
+                    new_tokens_cuda=new_tokens,
+                    first_finish_reasons_cuda=(
+                        beam_search_store.first_finish_reasons
+                        if beam_search_store is not None
+                        else None
+                    ),
+                )
+                finish_reasons_host = self._copy_to_host(finish_reasons_device)
 
             if self._use_beam_search:
-                assert beam_search_store is not None
-                first_finish_reasons = beam_search_store.first_finish_reasons
-                first_finish_reasons_host = self._copy_to_host(first_finish_reasons)
-                self._update_original_tokens(
-                    beam_search_store.original_tokens, seq_slots_cuda, seq_lens_cuda, new_tokens
-                )
-                beam_history_builders = self._prepare_beam_histories(
-                    requests, finish_reasons=first_finish_reasons
-                )
+                with nvtx_range("sample_async/beam_post_process"):
+                    assert beam_search_store is not None
+                    first_finish_reasons = beam_search_store.first_finish_reasons
+                    first_finish_reasons_host = self._copy_to_host(first_finish_reasons)
+                    self._update_original_tokens(
+                        beam_search_store.original_tokens,
+                        seq_slots_cuda,
+                        seq_lens_cuda,
+                        new_tokens,
+                    )
+                    beam_history_builders = self._prepare_beam_histories(
+                        requests, finish_reasons=first_finish_reasons
+                    )
 
         # copy logprobs to host
         logprobs_state: LogProbsState | None = None
         if self._return_log_probs(requests):
-            log_probs_store = self.store.log_probs_store
-            host_topk_vals = self._copy_to_host(
-                log_probs_store.topk_vals[..., : self.batch_max_topk_logprobs]
-            )
-            host_topk_indices = self._copy_to_host(
-                log_probs_store.topk_indices[..., : self.batch_max_topk_logprobs]
-            )
-            host_sampled_vals = self._copy_to_host(log_probs_store.sampled_log_probs)
-            host_sampled_indices = self._copy_to_host(log_probs_store.sampled_log_prob_indices)
-            host_sampled_rank = self._copy_to_host(log_probs_store.sampled_log_prob_ranks)
-            logprobs_state = LogProbsState(
-                topk_vals=host_topk_vals,
-                topk_indices=host_topk_indices,
-                sampled_vals=host_sampled_vals,
-                sampled_indices=host_sampled_indices,
-                sampled_rank=host_sampled_rank,
-            )
+            with nvtx_range("sample_async/logprobs_d2h"):
+                log_probs_store = self.store.log_probs_store
+                host_topk_vals = self._copy_to_host(
+                    log_probs_store.topk_vals[..., : self.batch_max_topk_logprobs]
+                )
+                host_topk_indices = self._copy_to_host(
+                    log_probs_store.topk_indices[..., : self.batch_max_topk_logprobs]
+                )
+                host_sampled_vals = self._copy_to_host(log_probs_store.sampled_log_probs)
+                host_sampled_indices = self._copy_to_host(
+                    log_probs_store.sampled_log_prob_indices
+                )
+                host_sampled_rank = self._copy_to_host(log_probs_store.sampled_log_prob_ranks)
+                logprobs_state = LogProbsState(
+                    topk_vals=host_topk_vals,
+                    topk_indices=host_topk_indices,
+                    sampled_vals=host_sampled_vals,
+                    sampled_indices=host_sampled_indices,
+                    sampled_rank=host_sampled_rank,
+                )
 
-        sampler_event = self._record_sampler_event()
+        with nvtx_range("sample_async/record_event"):
+            sampler_event = self._record_sampler_event()
         return SampleStateTorch(
             requests=requests,
             device=SampleStateTensors(new_tokens=new_tokens),
@@ -3577,6 +3589,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         )
 
     @staticmethod
+    @nvtx_range("_apply_embedding_bias")
     def _apply_embedding_bias(
         logits: torch.Tensor,
         requests: list[LlmRequest],
@@ -3923,6 +3936,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             batch_logits_for_logprobs_cuda=batch_logits_for_logprobs_cuda,
         )
 
+    @nvtx_range("_unbatch_sampling_results")
     def _unbatch_sampling_results(
         self,
         batched_sampling_result: _BatchedSamplingResult,
@@ -3969,6 +3983,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
 
     @staticmethod
     @torch.inference_mode()
+    @nvtx_range("_apply_min_length_penalty")
     def _apply_min_length_penalty(
         logits: torch.Tensor,
         requests: list[LlmRequest],
@@ -4018,6 +4033,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         return logits
 
     @staticmethod
+    @nvtx_range("_select_generated_logits")
     def _select_generated_logits(
         scheduled_requests: ScheduledRequests,
         raw_logits_cuda: torch.Tensor,
@@ -4334,34 +4350,35 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         if return_log_probs:
             self._prepare_log_probs(sampling_requests)
 
-        seq_slots_host = torch.tensor(
-            [r.py_seq_slot for r in sampling_requests],
-            dtype=torch.int32,
-            pin_memory=prefer_pinned(),
-        )
+        with nvtx_range("seq_slots_lens_h2d"):
+            seq_slots_host = torch.tensor(
+                [r.py_seq_slot for r in sampling_requests],
+                dtype=torch.int32,
+                pin_memory=prefer_pinned(),
+            )
 
-        # necessary for beam search and max_length checks
-        seq_lens_host = torch.tensor(
-            [r.max_beam_num_tokens for r in sampling_requests],
-            dtype=torch.int32,
-            pin_memory=prefer_pinned(),
-        )
+            # necessary for beam search and max_length checks
+            seq_lens_host = torch.tensor(
+                [r.max_beam_num_tokens for r in sampling_requests],
+                dtype=torch.int32,
+                pin_memory=prefer_pinned(),
+            )
 
-        # Cast the host ``seq_slots`` / ``seq_lens`` to CUDA exactly once and
-        # share the result with both the per-group beam-search metadata builder
-        # (``_add_metadata_to_grouped_requests``) and the ``sample_async`` path
-        # that consumes them for finish-reasons handling. Previously each of
-        # those sites performed its own H2D cast, producing 2 redundant pairs
-        # of async H2D launches per decode step in the typical
-        # single-strategy / concurrency=1 beam-search workload.
-        #
-        # int64 is the dtype required downstream for ``index_fill_`` /
-        # ``index_copy_`` in the finish-reasons handler and for beam-search
-        # ``index_copy_`` in ``beam_search_sampling_batch``.
-        seq_slots_cuda = seq_slots_host.to(
-            device="cuda", dtype=torch.int64, non_blocking=True
-        )
-        seq_lens_cuda = seq_lens_host.to(device="cuda", non_blocking=True)
+            # Cast the host ``seq_slots`` / ``seq_lens`` to CUDA exactly once and
+            # share the result with both the per-group beam-search metadata builder
+            # (``_add_metadata_to_grouped_requests``) and the ``sample_async`` path
+            # that consumes them for finish-reasons handling. Previously each of
+            # those sites performed its own H2D cast, producing 2 redundant pairs
+            # of async H2D launches per decode step in the typical
+            # single-strategy / concurrency=1 beam-search workload.
+            #
+            # int64 is the dtype required downstream for ``index_fill_`` /
+            # ``index_copy_`` in the finish-reasons handler and for beam-search
+            # ``index_copy_`` in ``beam_search_sampling_batch``.
+            seq_slots_cuda = seq_slots_host.to(
+                device="cuda", dtype=torch.int64, non_blocking=True
+            )
+            seq_lens_cuda = seq_lens_host.to(device="cuda", non_blocking=True)
 
         # Handle embedding bias
         self._apply_embedding_bias(

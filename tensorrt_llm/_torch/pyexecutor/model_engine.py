@@ -1398,6 +1398,7 @@ class PyTorchModelEngine(ModelEngine):
                     req.py_is_first_draft = True
                     req.py_draft_tokens = []
 
+    @nvtx_range("_set_up_attn_metadata")
     def _set_up_attn_metadata(
         self,
         kv_cache_manager: Union[KVCacheManager, KVCacheManagerV2],
@@ -1463,6 +1464,7 @@ class PyTorchModelEngine(ModelEngine):
 
         return self.attn_metadata
 
+    @nvtx_range("_set_up_spec_metadata")
     def _set_up_spec_metadata(
             self,
             spec_resource_manager: Optional[BaseResourceManager],
@@ -1602,6 +1604,7 @@ class PyTorchModelEngine(ModelEngine):
         num_batches = self.mapping.pp_size
         return num_batches * self.batch_size
 
+    @nvtx_range("_preprocess_inputs")
     def _preprocess_inputs(self, inputs: Dict[str, Any]):
         """
         Make some changes to the device inputs and avoid blocking the async data transfer
@@ -4031,6 +4034,7 @@ class PyTorchModelEngine(ModelEngine):
         """Access the spec_worker from DecoderModelForCausalLM (one-model spec dec)."""
         return getattr(self.model, 'spec_worker', None)
 
+    @nvtx_range("model_forward")
     def model_forward(self, **kwargs):
         attrs = get_model_extra_attrs()
         assert attrs is not None, "Model extra attrs is not set"
@@ -4176,6 +4180,7 @@ class PyTorchModelEngine(ModelEngine):
         if callable(loader):
             loader(target_model)
 
+    @nvtx_range("_execute_logit_post_processors")
     def _execute_logit_post_processors(self,
                                        scheduled_requests: ScheduledRequests,
                                        outputs: dict):
