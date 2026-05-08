@@ -52,6 +52,14 @@ FEATURE_LABEL="${FEATURE_LABEL:-feature_piecewise_v6_v7}"
 
 cd "${REPO_DIR}"
 
+# v6 and v7 only modify sampler.py, and the test harness commit
+# (``8653b1d62b``) only touches files under nvbugs_5615248/. Toggling refs
+# via a narrow ``git checkout <ref> -- <sampler.py>`` instead of a
+# whole-tree checkout means the bench harness in the working tree survives
+# even when the target ref predates the harness commit, which is required
+# for the typical ``BASELINE_REF`` = piecewise (pre-harness) case.
+SAMPLER_PATH="tensorrt_llm/_torch/pyexecutor/sampler.py"
+
 # -----------------------------------------------------------------------------
 # Pre-flight: make sure the user is inside the container, that the bench harness
 # is on disk, and that the branch HEAD is the expected three-commit shape.
@@ -102,21 +110,22 @@ if ! git diff --cached --quiet --exit-code; then
     exit 1
 fi
 
-# Restore original HEAD on any exit (success, error, ctrl-c).
+# Restore original sampler.py on any exit (success, error, ctrl-c).
+# Branch HEAD is never moved by this driver (we only narrow-checkout
+# sampler.py per ref), so a path-scoped restore is sufficient.
 restore_head () {
     local rc=$?
-    if [[ -n "${ORIGINAL_HEAD}" ]]; then
-        echo "[v6_v7_bench] restoring original HEAD: ${ORIGINAL_HEAD}"
-        git checkout --quiet "${ORIGINAL_HEAD}" || true
-    fi
+    echo "[v6_v7_bench] restoring ${SAMPLER_PATH} from ${ORIGINAL_HEAD}"
+    git checkout --quiet "${ORIGINAL_HEAD}" -- "${SAMPLER_PATH}" || true
     exit "${rc}"
 }
 trap restore_head EXIT
 
 # -----------------------------------------------------------------------------
-# One-ref bench helper. Toggles working tree to ${ref}, runs the existing
-# multi-run launcher into ${out}, then leaves ${ref} checked out (the trap
-# restores the original HEAD at the very end).
+# One-ref bench helper. Narrow-checks-out sampler.py at ${ref} (the rest of
+# the working tree, including this harness, is untouched), runs the existing
+# multi-run launcher into ${out}. The trap restores the original sampler.py
+# at the very end.
 # -----------------------------------------------------------------------------
 bench_ref () {
     local ref="$1"
@@ -129,16 +138,16 @@ bench_ref () {
     fi
 
     echo "=================================================================="
-    echo "[v6_v7_bench] ${label}: checking out ${ref}"
+    echo "[v6_v7_bench] ${label}: narrow checkout ${SAMPLER_PATH}@${ref}"
     echo "=================================================================="
-    git checkout --quiet "${ref}"
+    git checkout --quiet "${ref}" -- "${SAMPLER_PATH}"
 
     mkdir -p "${out}"
 
     NUM_RUNS="${NUM_RUNS}" bash "${WORKDIR}/run_multirun_pytorch.sh" "${out}"
 
     # Stamp a .done marker so re-running the driver auto-skips this ref.
-    git rev-parse HEAD >"${out}/.head_sha"
+    echo "${ref}" >"${out}/.head_sha"
     echo "${label}" >"${out}/.label"
     touch "${out}/.done"
 }
