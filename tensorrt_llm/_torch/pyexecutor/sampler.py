@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
 import enum
 import sys
 from abc import ABC, abstractmethod
@@ -1076,8 +1077,14 @@ class AsyncWorkerMixin:
         # ``_d2h_side_stream_pending`` is set by ``_async_d2h_via_side_stream``
         # and cleared by ``_record_sampler_event`` once the side stream has
         # been chained into the recorded cuda event.
+        # ``_in_side_stream_batch`` is set by :meth:`_side_stream_d2h_batch`
+        # while a batch context is open; it lets
+        # :meth:`_async_d2h_via_side_stream` skip the per-call
+        # ``with torch.cuda.stream(...)`` push/pop because the batch context
+        # has already made the side stream the current stream.
         self._d2h_side_stream: torch.cuda.Stream | None = None
         self._d2h_side_stream_pending: bool = False
+        self._in_side_stream_batch: bool = False
 
     def async_worker_enabled(self) -> bool:
         return getattr(self, "_enable_async_worker", False)
@@ -1204,9 +1211,51 @@ class AsyncWorkerMixin:
             self._d2h_side_stream.wait_stream(torch.cuda.current_stream())
             self._d2h_side_stream_pending = True
         dest = torch.empty_like(src, device="cpu", pin_memory=prefer_pinned())
-        with torch.cuda.stream(self._d2h_side_stream):
+        if self._in_side_stream_batch:
+            # The caller has already entered ``with torch.cuda.stream(side)``
+            # via :meth:`_side_stream_d2h_batch`, so the per-call push/pop
+            # (and the ``current_stream()`` lookup it implies) is unnecessary
+            # here; just enqueue the copy on the now-current side stream.
             dest.copy_(src, non_blocking=True)
+        else:
+            with torch.cuda.stream(self._d2h_side_stream):
+                dest.copy_(src, non_blocking=True)
         return dest
+
+    @contextlib.contextmanager
+    def _side_stream_d2h_batch(self):
+        """Open a batched side-stream D2H context.
+
+        Within this context, callers may issue many
+        :meth:`_async_d2h_via_side_stream` calls with reduced per-copy
+        Python overhead: the ``with torch.cuda.stream(side)`` push/pop is
+        opened once on enter and closed once on exit, instead of being
+        opened and closed per copy. The side stream is also ordered after
+        the current main stream once on enter (instead of per call).
+
+        Like :meth:`_async_d2h_via_side_stream`, the host destinations
+        produced inside this context must not be read until the next
+        :class:`SamplerEvent` (recorded via :meth:`_record_sampler_event`)
+        has been synchronized; the contract on ``src`` not being mutated on
+        the main stream until then also still applies.
+        """
+        if self._d2h_side_stream is None:
+            self._d2h_side_stream = torch.cuda.Stream()
+        if not self._d2h_side_stream_pending:
+            self._d2h_side_stream.wait_stream(torch.cuda.current_stream())
+            self._d2h_side_stream_pending = True
+        # ``with torch.cuda.stream(...)`` is the only Python-level state
+        # change required to swap the current stream for the duration of
+        # the batch. ``_in_side_stream_batch`` is the Python flag that lets
+        # nested :meth:`_async_d2h_via_side_stream` calls skip their own
+        # per-call ``with`` block.
+        prev_in_batch = self._in_side_stream_batch
+        self._in_side_stream_batch = True
+        try:
+            with torch.cuda.stream(self._d2h_side_stream):
+                yield
+        finally:
+            self._in_side_stream_batch = prev_in_batch
 
     def _record_sampler_event(self) -> SamplerEvent:
         cuda_event = torch.cuda.Event()
@@ -3432,11 +3481,20 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
 
         The builders returned by this function create a beam history object containing
         the corrected tokens and logprobs for each beam of a request.
+
+        Per-request, :meth:`_prepare_beam_history` issues 2-5 async D2H
+        copies on the private side stream via
+        :meth:`_async_d2h_via_side_stream`. To avoid one
+        ``with torch.cuda.stream(side)`` push/pop per copy (a measurable
+        per-iter Python+C++ overhead on hot beam-search paths), wrap the
+        whole loop in :meth:`_side_stream_d2h_batch` so the side stream is
+        made current exactly once per ``_prepare_beam_histories`` call.
         """
-        return [
-            self._prepare_beam_history(req, finish_reasons=finish_reasons[req.py_seq_slot])
-            for req in requests
-        ]
+        with self._side_stream_d2h_batch():
+            return [
+                self._prepare_beam_history(req, finish_reasons=finish_reasons[req.py_seq_slot])
+                for req in requests
+            ]
 
     @override
     @nvtx_range("update_requests")
