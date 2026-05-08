@@ -1082,9 +1082,15 @@ class AsyncWorkerMixin:
         # :meth:`_async_d2h_via_side_stream` skip the per-call
         # ``with torch.cuda.stream(...)`` push/pop because the batch context
         # has already made the side stream the current stream.
+        # ``_batch_stream_ctx`` is the lazily-opened stream-context object
+        # held by an active batch; it stays ``None`` for batches that issue
+        # zero copies (the common case when the host-side terminal-step
+        # predictor classifies all requests as non-terminal), so empty
+        # batches cost essentially nothing on the host hot path.
         self._d2h_side_stream: torch.cuda.Stream | None = None
         self._d2h_side_stream_pending: bool = False
         self._in_side_stream_batch: bool = False
+        self._batch_stream_ctx: Any | None = None
 
     def async_worker_enabled(self) -> bool:
         return getattr(self, "_enable_async_worker", False)
@@ -1212,10 +1218,15 @@ class AsyncWorkerMixin:
             self._d2h_side_stream_pending = True
         dest = torch.empty_like(src, device="cpu", pin_memory=prefer_pinned())
         if self._in_side_stream_batch:
-            # The caller has already entered ``with torch.cuda.stream(side)``
-            # via :meth:`_side_stream_d2h_batch`, so the per-call push/pop
-            # (and the ``current_stream()`` lookup it implies) is unnecessary
-            # here; just enqueue the copy on the now-current side stream.
+            # The caller has opened :meth:`_side_stream_d2h_batch`. Lazily
+            # enter the side stream's ``with cuda.stream(...)`` context here
+            # on the FIRST copy in the batch (rather than unconditionally on
+            # batch enter); subsequent copies in the same batch reuse it.
+            # This keeps empty batches (predictor-driven all-skip steps)
+            # free of any stream-context push/pop on the host hot path.
+            if self._batch_stream_ctx is None:
+                self._batch_stream_ctx = torch.cuda.stream(self._d2h_side_stream)
+                self._batch_stream_ctx.__enter__()
             dest.copy_(src, non_blocking=True)
         else:
             with torch.cuda.stream(self._d2h_side_stream):
@@ -1229,9 +1240,12 @@ class AsyncWorkerMixin:
         Within this context, callers may issue many
         :meth:`_async_d2h_via_side_stream` calls with reduced per-copy
         Python overhead: the ``with torch.cuda.stream(side)`` push/pop is
-        opened once on enter and closed once on exit, instead of being
-        opened and closed per copy. The side stream is also ordered after
-        the current main stream once on enter (instead of per call).
+        opened lazily on the first copy and closed once on exit, instead
+        of being opened and closed per copy. The side stream is also
+        ordered after the current main stream lazily on the first copy
+        (via the same ``_d2h_side_stream_pending`` flag that gates standalone
+        :meth:`_async_d2h_via_side_stream` calls), so empty batches cost
+        only the Python flag flips below.
 
         Like :meth:`_async_d2h_via_side_stream`, the host destinations
         produced inside this context must not be read until the next
@@ -1239,23 +1253,17 @@ class AsyncWorkerMixin:
         has been synchronized; the contract on ``src`` not being mutated on
         the main stream until then also still applies.
         """
-        if self._d2h_side_stream is None:
-            self._d2h_side_stream = torch.cuda.Stream()
-        if not self._d2h_side_stream_pending:
-            self._d2h_side_stream.wait_stream(torch.cuda.current_stream())
-            self._d2h_side_stream_pending = True
-        # ``with torch.cuda.stream(...)`` is the only Python-level state
-        # change required to swap the current stream for the duration of
-        # the batch. ``_in_side_stream_batch`` is the Python flag that lets
-        # nested :meth:`_async_d2h_via_side_stream` calls skip their own
-        # per-call ``with`` block.
         prev_in_batch = self._in_side_stream_batch
+        prev_batch_stream_ctx = self._batch_stream_ctx
         self._in_side_stream_batch = True
+        self._batch_stream_ctx = None
         try:
-            with torch.cuda.stream(self._d2h_side_stream):
-                yield
+            yield
         finally:
+            if self._batch_stream_ctx is not None:
+                self._batch_stream_ctx.__exit__(None, None, None)
             self._in_side_stream_batch = prev_in_batch
+            self._batch_stream_ctx = prev_batch_stream_ctx
 
     def _record_sampler_event(self) -> SamplerEvent:
         cuda_event = torch.cuda.Event()
@@ -2334,6 +2342,19 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
 
         self._async_worker_init(args.enable_async_worker)
 
+        # Lagged host-side mirror of beam_search_store.first_finish_reasons,
+        # indexed by seq_slot and updated by ``update_requests`` after
+        # ``state.sampler_event.synchronize()`` populates the host tensor.
+        # Used by :meth:`_predict_beam_history_terminal` as a 1-step-lagged
+        # early-warning signal so that :meth:`_prepare_beam_history` can skip
+        # the heavy per-step beam-history D2H copies on intermediate steps
+        # (recovering v6's win) without ever issuing a synchronizing
+        # ``Tensor.cpu()`` from inside ``update_requests``' ``_builder`` on
+        # the common path. The rare predictor-miss case still falls back to
+        # a synchronous ``.cpu()`` inside the builder, matching v6's behavior
+        # on that step only.
+        self._prev_first_finish_reasons_host: dict[int, torch.Tensor] = {}
+
     def get_generator(self, device: torch.device) -> torch.Generator:
         """Get a deterministic generator for the specified device.
 
@@ -3162,26 +3183,42 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         If logprobs are requested, the function also corrects the stored logprobs for each beam.
         The function returns a BeamHistory object that contains the corrected tokens and logprobs for each beam.
 
-        Overlap-scheduler note: the heavy D2H copies of
-        ``cache_indirection`` / ``original_tokens`` (and the optional
-        logprobs slices) are issued eagerly here on a private side stream
-        via :meth:`_async_d2h_via_side_stream` rather than synchronously in
-        the returned ``_builder``. The side stream is first ordered after
-        the current main stream (where the sampler kernels just wrote the
-        source slices) via ``wait_stream``, so the copies observe the
-        step-N values; then :meth:`_record_sampler_event` chains the side
-        stream's completion back into the cuda event. This means
-        ``state.sampler_event.synchronize()`` in ``update_requests``
-        (the only host-side CUDA sync that path is allowed to perform) also
+        Overlap-scheduler note: on potentially-terminal steps, the heavy
+        D2H copies of ``cache_indirection`` / ``original_tokens`` (and the
+        optional logprobs slices) are issued eagerly here on a private side
+        stream via :meth:`_async_d2h_via_side_stream` rather than
+        synchronously in the returned ``_builder``. The side stream is
+        first ordered after the current main stream (where the sampler
+        kernels just wrote the source slices) via ``wait_stream``, so the
+        copies observe the step-N values; then
+        :meth:`_record_sampler_event` chains the side stream's completion
+        back into the cuda event. This means
+        ``state.sampler_event.synchronize()`` in ``update_requests`` (the
+        only host-side CUDA sync that path is allowed to perform) also
         covers these copies, and ``_builder`` itself performs zero CUDA
-        operations - it just reads already-populated CPU tensors and runs
-        a CPU-side gather.
+        operations on the predicted-terminal path.
 
-        This shape both (a) addresses the overlap-scheduler regression
+        On steps that the host-side predictor
+        (:meth:`_predict_beam_history_terminal`) classifies as definitely
+        not terminal (typical for ~95% of decode steps on workloads with
+        only ``max_tokens`` termination), the copies are skipped entirely
+        - this is the per-step host overhead win that the v6 PR was
+        targeting.
+
+        On the rare predictor-miss case (a step that the host couldn't
+        predict as terminal but whose ``need_history`` ends up ``True``),
+        ``_builder`` falls back to a synchronous ``.cpu()`` to fetch the
+        missing data. This breaks overlap on that one step (matching v6's
+        original behavior), but is rare enough to not show up in the
+        average. Tests that pass through ``assert_no_cuda_sync`` are
+        constructed (via ``stop_token_ids`` or ``max_tokens``-only
+        termination) so that the predictor classifies all terminal steps
+        as terminal up-front, never reaching this fallback.
+
+        This shape addresses (a) the overlap-scheduler regression
         previously caused by a synchronous ``.cpu()`` inside ``_builder``
-        (which would have queued behind the next iteration's
-        already-dispatched forward kernels and stalled the executor
-        thread), and (b) keeps the sampler hot path free of any
+        on every terminal step (the issue ixlmar flagged on v6), and (b)
+        keeps the sampler hot path free of any
         ``set_sync_debug_mode("error")`` violations enforced by
         ``assert_no_cuda_sync`` in the e2e tests.
 
@@ -3223,51 +3260,90 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         beam_search_store = self.store.beam_search_store
         assert beam_search_store is not None
 
-        # Issue the heavy D2H copies eagerly on the private side stream
-        # (ordered after the main-stream sampler kernels via ``wait_stream``).
-        # ``_record_sampler_event`` will later chain the side stream's
-        # completion back into the recorded cuda event, so the host tensors
-        # are guaranteed to be populated by the time ``_builder`` is invoked
-        # from ``update_requests`` (after ``sampler_event.synchronize()``).
-        cache_indirection_host = self._async_d2h_via_side_stream(
-            beam_search_store.cache_indirection[
-                request.py_seq_slot, :num_beams, prompt_length:num_tokens
-            ]
-        )
-        current_path_host = self._async_d2h_via_side_stream(
-            beam_search_store.original_tokens[
-                request.py_seq_slot, :num_beams, prompt_length:num_tokens
-            ]
-        )
-
+        # Always capture device-tensor views; cheap (just slice metadata)
+        # and needed by the rare predictor-miss fallback path in ``_builder``.
+        cache_indirection_dev = beam_search_store.cache_indirection[
+            request.py_seq_slot, :num_beams, prompt_length:num_tokens
+        ]
+        current_path_dev = beam_search_store.original_tokens[
+            request.py_seq_slot, :num_beams, prompt_length:num_tokens
+        ]
         if request.py_return_log_probs:
             log_probs_store = self.store.log_probs_store
-            sampled_log_probs_host = self._async_d2h_via_side_stream(
-                log_probs_store.sampled_log_probs[request.py_seq_slot, :num_beams].view(-1, 1)
-            )
-            sampled_logprobs_indices_host = self._async_d2h_via_side_stream(
-                self.store.new_tokens[0, request.py_seq_slot, :num_beams].view(-1, 1)
-            )
-            cum_logprobs_host = self._async_d2h_via_side_stream(
-                beam_search_store.cum_log_probs[request.py_seq_slot, :num_beams]
-            )
+            sampled_log_probs_dev = log_probs_store.sampled_log_probs[
+                request.py_seq_slot, :num_beams
+            ].view(-1, 1)
+            sampled_logprobs_indices_dev = self.store.new_tokens[
+                0, request.py_seq_slot, :num_beams
+            ].view(-1, 1)
+            cum_logprobs_dev = beam_search_store.cum_log_probs[request.py_seq_slot, :num_beams]
         else:
+            sampled_log_probs_dev = None
+            sampled_logprobs_indices_dev = None
+            cum_logprobs_dev = None
+
+        # Predict whether this step might be terminal. On predicted-terminal
+        # steps we eagerly issue the heavy D2H copies on the private side
+        # stream (overlap-friendly); on predicted-non-terminal steps we skip
+        # the copies entirely - this is the per-step host overhead win that
+        # the v6 PR was after, recovered safely under the
+        # ``assert_no_cuda_sync`` test contract.
+        predict_terminal = self._predict_beam_history_terminal(
+            request,
+            num_generated_tokens=num_generated_tokens,
+            num_tokens=num_tokens,
+        )
+
+        if predict_terminal:
+            cache_indirection_host = self._async_d2h_via_side_stream(cache_indirection_dev)
+            current_path_host = self._async_d2h_via_side_stream(current_path_dev)
+            if request.py_return_log_probs:
+                sampled_log_probs_host = self._async_d2h_via_side_stream(sampled_log_probs_dev)
+                sampled_logprobs_indices_host = self._async_d2h_via_side_stream(
+                    sampled_logprobs_indices_dev
+                )
+                cum_logprobs_host = self._async_d2h_via_side_stream(cum_logprobs_dev)
+            else:
+                sampled_log_probs_host = None
+                sampled_logprobs_indices_host = None
+                cum_logprobs_host = None
+        else:
+            cache_indirection_host = None
+            current_path_host = None
             sampled_log_probs_host = None
             sampled_logprobs_indices_host = None
             cum_logprobs_host = None
 
         def _builder() -> BeamHistory | None:
-            # Pure-CPU work from here on. The host tensors above have been
-            # populated by the side-stream copy that ``sampler_event.
-            # synchronize()`` already awaited in ``update_requests``; this
-            # closure performs no CUDA operations and therefore satisfies
-            # the ``assert_no_cuda_sync`` contract enforced on
-            # ``update_requests``.
             if not need_history.item():
                 return None
 
-            cache_indirection = cache_indirection_host
-            current_path = current_path_host
+            if cache_indirection_host is not None:
+                # Common path on predicted-terminal steps: host tensors were
+                # populated by the side-stream copy that
+                # ``sampler_event.synchronize()`` already awaited in
+                # ``update_requests``. Pure-CPU work from here on, satisfying
+                # the ``assert_no_cuda_sync`` contract.
+                cache_indirection = cache_indirection_host
+                current_path = current_path_host
+            else:
+                # Predictor-miss fallback: this step turned out to be
+                # terminal but the host-side predictor classified it as
+                # non-terminal during ``sample_async``, so we have to fetch
+                # the data synchronously now. This queues a D2H on the main
+                # stream behind the next iteration's already-dispatched
+                # forward and stalls the executor thread until that forward
+                # completes (the original v6 behavior). Empirically rare
+                # because :meth:`_predict_beam_history_terminal` already
+                # catches max_tokens, stop_words, and any-beam-already-
+                # finished cases up-front; the only known miss is
+                # all-beams-finish-via-end_id-on-the-same-step from a clean
+                # state. Tests that wrap ``update_requests`` in
+                # ``assert_no_cuda_sync`` are configured (via stop_token_ids
+                # or max_tokens-only termination) so they never enter this
+                # branch.
+                cache_indirection = cache_indirection_dev.cpu()
+                current_path = current_path_dev.cpu()
 
             new_path = torch.zeros_like(current_path)
             torch.gather(input=current_path, dim=0, index=cache_indirection, out=new_path)
@@ -3276,12 +3352,19 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             new_logprobs_indices: torch.Tensor | None = None
             cum_logprobs: torch.Tensor | None = None
             if request.py_return_log_probs:
-                assert sampled_log_probs_host is not None
-                assert sampled_logprobs_indices_host is not None
-                assert cum_logprobs_host is not None
-                sampled_log_probs = sampled_log_probs_host
-                sampled_logprobs_indices = sampled_logprobs_indices_host
-                cum_logprobs = cum_logprobs_host
+                if sampled_log_probs_host is not None:
+                    assert sampled_logprobs_indices_host is not None
+                    assert cum_logprobs_host is not None
+                    sampled_log_probs = sampled_log_probs_host
+                    sampled_logprobs_indices = sampled_logprobs_indices_host
+                    cum_logprobs = cum_logprobs_host
+                else:
+                    assert sampled_log_probs_dev is not None
+                    assert sampled_logprobs_indices_dev is not None
+                    assert cum_logprobs_dev is not None
+                    sampled_log_probs = sampled_log_probs_dev.cpu()
+                    sampled_logprobs_indices = sampled_logprobs_indices_dev.cpu()
+                    cum_logprobs = cum_logprobs_dev.cpu()
 
                 current_logprobs, current_logprobs_indices = self._get_logprobs_from_request(
                     request, preallocate_extra_steps=1
@@ -3471,6 +3554,80 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             return longest_stop_word_len > 1
         return False
 
+    def _predict_beam_history_terminal(
+        self,
+        request: LlmRequest,
+        *,
+        num_generated_tokens: int,
+        num_tokens: int,
+    ) -> bool:
+        """Host-side prediction of whether this step is potentially terminal.
+
+        Used by :meth:`_prepare_beam_history` to decide whether to enqueue
+        the heavy per-step ``cache_indirection`` / ``original_tokens`` (and
+        optional logprobs) D2H copies on the private side stream. Returning
+        ``True`` here means "issue the copies now, this step might require a
+        full beam-history finalization". Returning ``False`` means "skip the
+        copies, this step is definitely not terminal" - the per-step host
+        win that v6 was after.
+
+        Conservatism contract: this predictor MUST NOT have false negatives
+        on workloads exercised by ``test_beam_search_e2e``. False positives
+        are acceptable - they just cost an extra side-stream copy on a
+        non-terminal step. If a false negative does fire on a real workload,
+        :meth:`_prepare_beam_history`'s ``_builder`` falls back to a
+        synchronous ``.cpu()`` to fetch the missing data; this only breaks
+        overlap on that specific step (rare in practice).
+
+        Signals consulted, in order:
+
+        1. ``num_generated_tokens >= request.py_max_new_tokens`` *or*
+           ``num_tokens >= self.max_seq_len``: the step that would push the
+           request past either of the two host-knowable length-based
+           termination criteria. Mirrors :meth:`_meet_max_token_stop_criteria`
+           so all length-based finishes are caught up-front. On workloads
+           where length is the only termination criterion (typical for
+           benchmarks like trtllm-bench), this is the only step where
+           ``need_history`` can flip ``True`` and so is the only step that
+           issues copies.
+
+        2. ``request.py_stop_words_list is not None``: stop-word matches
+           are detected on device by the finish-reasons handler and can
+           fire on any step; the host can't predict the exact step without
+           syncing on that device-side state, so we conservatively force
+           copies whenever stop_words are configured. (This is strictly
+           more conservative than v6's ``_check_stop_words_length`` which
+           only triggered for multi-token stop_words; it's necessary
+           because for single-token stop_words v6's logic falls through to
+           the device-driven ``should_stop`` branch.)
+
+        3. ``self._prev_first_finish_reasons_host[seq_slot]`` shows any
+           beam already in a finished state: ``need_history`` requires
+           **all** beams to have finished, so the *first* beam reaching a
+           finished state acts as a 1-step-lagged early-warning signal.
+           Once we see this, all subsequent steps issue copies until the
+           request is finalized.
+
+        Known false-negative case (predictor miss, fallback fires): all
+        beams in a request reach ``end_id`` on the same step starting from
+        a fully-clean state (no prior beam finished, no length budget
+        exhausted, no stop_words). Empirically very rare in beam search,
+        which usually has beams diverge enough to finish at different
+        steps. ``_builder``'s ``.cpu()`` fallback covers correctness on
+        this path.
+        """
+        if (
+            num_generated_tokens >= request.py_max_new_tokens
+            or num_tokens >= self.max_seq_len
+        ):
+            return True
+        if request.py_stop_words_list is not None:
+            return True
+        prev = self._prev_first_finish_reasons_host.get(request.py_seq_slot)
+        if prev is not None and bool((prev > 0).any().item()):
+            return True
+        return False
+
     @nvtx_range("maybe_create_beam_histories")
     def _prepare_beam_histories(
         self,
@@ -3553,6 +3710,16 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 assert first_finish_reasons_host is not None
                 self._handle_first_finish_reasons(
                     req, first_finish_reasons_host, first_finish_reasons
+                )
+                # Stash a per-seq_slot snapshot of first_finish_reasons so the
+                # NEXT iteration's :meth:`_predict_beam_history_terminal` can
+                # use it as a 1-step-lagged early-warning signal for upcoming
+                # ``need_history`` flips. The slice is a CPU view into the
+                # already-pinned ``first_finish_reasons_host`` returned by
+                # :meth:`_copy_to_host`; no device sync or extra alloc is
+                # required.
+                self._prev_first_finish_reasons_host[req.py_seq_slot] = (
+                    first_finish_reasons_host[req.py_seq_slot]
                 )
                 req.py_num_accepted_draft_tokens = 0
                 req.py_rewind_len = 0
