@@ -156,12 +156,21 @@ class SampleStateTensors:
 @dataclass(kw_only=True)
 class SamplerEvent:
     cuda_event: torch.cuda.Event
+    # Recorded on the sampler's private D2H side stream when at least one
+    # ``_async_d2h_via_side_stream`` copy was in flight at
+    # ``_record_sampler_event`` time. Synchronized host-side here so callers
+    # can read the corresponding pinned host tensors safely without forcing
+    # the main stream to wait for the side stream (which would serialize the
+    # next iteration's forward in the overlap scheduler).
+    side_stream_event: Optional[torch.cuda.Event] = None
     worker_futures: Optional[list[futures.Future[Any]]] = None
 
     def synchronize(self) -> None:
         if self.worker_futures:
             futures.wait(self.worker_futures)
         self.cuda_event.synchronize()
+        if self.side_stream_event is not None:
+            self.side_stream_event.synchronize()
 
 
 GenericSampleStateTensorsHost = TypeVar("GenericSampleStateTensorsHost", bound=SampleStateTensors)
@@ -1182,32 +1191,46 @@ class AsyncWorkerMixin:
         """
         if self._d2h_side_stream is None:
             self._d2h_side_stream = torch.cuda.Stream()
-        # Order the side stream after the current main-stream work, so the
-        # copy observes any writes that have already been queued (e.g.,
-        # sampler kernels writing ``src``).
-        self._d2h_side_stream.wait_stream(torch.cuda.current_stream())
-        self._d2h_side_stream_pending = True
+        # Order the side stream after the current main-stream work on the
+        # FIRST call of a batch (the same flag that is cleared by
+        # :meth:`_record_sampler_event` when it ships the side-stream event
+        # to ``SamplerEvent``). Once the side stream has waited for the main
+        # stream, subsequent copies in the same batch don't need to wait
+        # again because the main stream doesn't write the source slices
+        # in between (callers must respect the contract above). Avoiding
+        # the per-copy wait_stream removes ~N * (cudaEventRecord +
+        # cudaStreamWaitEvent) per beam-search step on hot paths.
+        if not self._d2h_side_stream_pending:
+            self._d2h_side_stream.wait_stream(torch.cuda.current_stream())
+            self._d2h_side_stream_pending = True
         dest = torch.empty_like(src, device="cpu", pin_memory=prefer_pinned())
         with torch.cuda.stream(self._d2h_side_stream):
             dest.copy_(src, non_blocking=True)
         return dest
 
     def _record_sampler_event(self) -> SamplerEvent:
-        # If any side-stream D2H copies are in flight, chain the side stream
-        # back into the current/main stream so the cuda event recorded below
-        # subsumes them. This means a downstream
-        # ``state.sampler_event.synchronize()`` (which is the *only* sync
-        # ``update_requests`` is allowed to perform) will also wait for the
-        # side-stream copies, and any host tensor returned by
-        # :meth:`_async_d2h_via_side_stream` is safe to read after that
-        # synchronize. Cleared so subsequent record cycles re-arm.
-        if getattr(self, "_d2h_side_stream_pending", False):
-            assert self._d2h_side_stream is not None
-            torch.cuda.current_stream().wait_stream(self._d2h_side_stream)
-            self._d2h_side_stream_pending = False
-
         cuda_event = torch.cuda.Event()
         cuda_event.record()
+
+        # If any side-stream D2H copies are in flight, record a *separate*
+        # event on the side stream and ship it inside ``SamplerEvent``.
+        #
+        # NB: deliberately DO NOT call ``current_stream.wait_stream(side)``
+        # here. Pulling the side stream into the main stream's queue would
+        # force whatever the overlap scheduler dispatches next on the main
+        # stream (typically the next iteration's model forward) to serialize
+        # behind the side-stream copies, defeating the entire purpose of
+        # using a side stream. Instead, ``SamplerEvent.synchronize()`` host-
+        # side-syncs the side-stream event in addition to ``cuda_event``,
+        # which keeps the two streams independent on the GPU while still
+        # guaranteeing the pinned host tensors are populated before any
+        # consumer (e.g., a beam-history builder) reads them.
+        side_stream_event: torch.cuda.Event | None = None
+        if self._d2h_side_stream_pending:
+            assert self._d2h_side_stream is not None
+            side_stream_event = torch.cuda.Event()
+            side_stream_event.record(self._d2h_side_stream)
+            self._d2h_side_stream_pending = False
 
         # Transfer ownership to worker_futures and re-initialize
         if self._async_worker_active():
@@ -1216,7 +1239,11 @@ class AsyncWorkerMixin:
         else:
             worker_futures = None
 
-        return SamplerEvent(cuda_event=cuda_event, worker_futures=worker_futures)
+        return SamplerEvent(
+            cuda_event=cuda_event,
+            side_stream_event=side_stream_event,
+            worker_futures=worker_futures,
+        )
 
 
 class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
