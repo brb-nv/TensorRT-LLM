@@ -1062,6 +1062,13 @@ class AsyncWorkerMixin:
         self._enable_async_worker = enable_async_worker
         self._async_worker: futures.ThreadPoolExecutor | None = None
         self._async_worker_futures: list[futures.Future[Any]] = []
+        # Lazily allocated in ``_async_d2h_via_side_stream`` on first use.
+        # Kept on ``self`` so the stream survives across iterations / requests.
+        # ``_d2h_side_stream_pending`` is set by ``_async_d2h_via_side_stream``
+        # and cleared by ``_record_sampler_event`` once the side stream has
+        # been chained into the recorded cuda event.
+        self._d2h_side_stream: torch.cuda.Stream | None = None
+        self._d2h_side_stream_pending: bool = False
 
     def async_worker_enabled(self) -> bool:
         return getattr(self, "_enable_async_worker", False)
@@ -1135,7 +1142,70 @@ class AsyncWorkerMixin:
             dest.copy_(src, non_blocking=True)
         return dest
 
+    def _async_d2h_via_side_stream(self, src: torch.Tensor) -> torch.Tensor:
+        """Issue a non-blocking D2H copy on a private side stream.
+
+        Allocates a pinned host destination and submits
+        ``dest.copy_(src, non_blocking=True)`` on a dedicated CUDA stream that
+        is *not* the current/main stream. The side stream is first ordered
+        after the current/main stream via ``wait_stream``, so the copy
+        observes any writes already queued on the main stream (e.g., sampler
+        kernels writing the source tensor). The copy itself then proceeds in
+        parallel with subsequent main-stream work (e.g., the next iteration's
+        model forward dispatched by the overlap scheduler) instead of
+        serializing with it.
+
+        Caller contract:
+        1. ``src`` MUST not be concurrently mutated on the main stream after
+           this call returns until the next :meth:`_record_sampler_event`
+           has been awaited host-side (typically via
+           ``state.sampler_event.synchronize()`` in ``update_requests``).
+        2. The caller MUST NOT read the returned host tensor until the
+           subsequently issued :class:`SamplerEvent` has been synchronized.
+           :meth:`_record_sampler_event` chains the side stream's completion
+           into the recorded cuda event so this happens automatically.
+
+        This path is the async-friendly analogue of ``Tensor.cpu()`` for
+        sites where a host-blocking D2H is otherwise needed inside an
+        overlap-scheduler critical section. Compared to a synchronous
+        ``.cpu()`` (which queues behind the next iteration's already-
+        dispatched forward kernels and stalls the executor thread for the
+        full forward duration), the side-stream copy runs concurrently with
+        that forward and contributes zero host-side wait beyond what
+        ``sampler_event.synchronize()`` was going to cost anyway.
+
+        Compared to the non-blocking-on-current-stream copy in
+        :meth:`_copy_to_host`, this avoids the ``src.clone()`` snapshot kernel
+        on the main stream (the source is read directly from the side stream
+        after a single ``wait_stream``), which is a measurable per-step host
+        win on hot beam-search paths.
+        """
+        if self._d2h_side_stream is None:
+            self._d2h_side_stream = torch.cuda.Stream()
+        # Order the side stream after the current main-stream work, so the
+        # copy observes any writes that have already been queued (e.g.,
+        # sampler kernels writing ``src``).
+        self._d2h_side_stream.wait_stream(torch.cuda.current_stream())
+        self._d2h_side_stream_pending = True
+        dest = torch.empty_like(src, device="cpu", pin_memory=prefer_pinned())
+        with torch.cuda.stream(self._d2h_side_stream):
+            dest.copy_(src, non_blocking=True)
+        return dest
+
     def _record_sampler_event(self) -> SamplerEvent:
+        # If any side-stream D2H copies are in flight, chain the side stream
+        # back into the current/main stream so the cuda event recorded below
+        # subsumes them. This means a downstream
+        # ``state.sampler_event.synchronize()`` (which is the *only* sync
+        # ``update_requests`` is allowed to perform) will also wait for the
+        # side-stream copies, and any host tensor returned by
+        # :meth:`_async_d2h_via_side_stream` is safe to read after that
+        # synchronize. Cleared so subsequent record cycles re-arm.
+        if getattr(self, "_d2h_side_stream_pending", False):
+            assert self._d2h_side_stream is not None
+            torch.cuda.current_stream().wait_stream(self._d2h_side_stream)
+            self._d2h_side_stream_pending = False
+
         cuda_event = torch.cuda.Event()
         cuda_event.record()
 
@@ -3016,22 +3086,28 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         If logprobs are requested, the function also corrects the stored logprobs for each beam.
         The function returns a BeamHistory object that contains the corrected tokens and logprobs for each beam.
 
-        Hot-path note: ``need_history`` is False on every step except the
-        terminal one, so the heavy D2H copies of ``cache_indirection``,
-        ``original_tokens`` (and the optional logprobs slices) are deferred
-        into the returned ``_builder`` and only fire when the host has
-        observed ``need_history.item() is True``. This avoids 2-5 wasted
-        async copies per beam-search request per intermediate decode step
-        (≈ 4 ms / request of host budget at OSL=20, more at larger OSL).
+        Overlap-scheduler note: the heavy D2H copies of
+        ``cache_indirection`` / ``original_tokens`` (and the optional
+        logprobs slices) are issued eagerly here on a private side stream
+        via :meth:`_async_d2h_via_side_stream` rather than synchronously in
+        the returned ``_builder``. The side stream is first ordered after
+        the current main stream (where the sampler kernels just wrote the
+        source slices) via ``wait_stream``, so the copies observe the
+        step-N values; then :meth:`_record_sampler_event` chains the side
+        stream's completion back into the cuda event. This means
+        ``state.sampler_event.synchronize()`` in ``update_requests``
+        (the only host-side CUDA sync that path is allowed to perform) also
+        covers these copies, and ``_builder`` itself performs zero CUDA
+        operations - it just reads already-populated CPU tensors and runs
+        a CPU-side gather.
 
-        Correctness: ``_builder`` runs from ``update_requests``, after
-        ``state.sampler_event.synchronize()`` and before the next step's
-        ``_process_requests`` is dispatched. The device-side
-        ``beam_search_store.cache_indirection`` /
-        ``beam_search_store.original_tokens`` slices captured here are only
-        mutated by the next step's sampler kernels, so the deferred ``.cpu()``
-        calls inside ``_builder`` observe the same step-N values that the
-        previous async-snapshot path used to capture.
+        This shape both (a) addresses the overlap-scheduler regression
+        previously caused by a synchronous ``.cpu()`` inside ``_builder``
+        (which would have queued behind the next iteration's
+        already-dispatched forward kernels and stalled the executor
+        thread), and (b) keeps the sampler hot path free of any
+        ``set_sync_debug_mode("error")`` violations enforced by
+        ``assert_no_cuda_sync`` in the e2e tests.
 
         Note: To defer the decision whether or not to skip BeamHistory construction until update_requests(), only
               a builder (BeamHistoryBuilder) is returned here. The builder contains host tensors which are
@@ -3071,41 +3147,51 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         beam_search_store = self.store.beam_search_store
         assert beam_search_store is not None
 
-        # Capture device-side views; the heavy slice copies are deferred to
-        # ``_builder`` so they only fire on the terminal step (when
-        # ``need_history.item()`` is True).
-        cache_indirection_dev = beam_search_store.cache_indirection[
-            request.py_seq_slot, :num_beams, prompt_length:num_tokens
-        ]
-        current_path_dev = beam_search_store.original_tokens[
-            request.py_seq_slot, :num_beams, prompt_length:num_tokens
-        ]
+        # Issue the heavy D2H copies eagerly on the private side stream
+        # (ordered after the main-stream sampler kernels via ``wait_stream``).
+        # ``_record_sampler_event`` will later chain the side stream's
+        # completion back into the recorded cuda event, so the host tensors
+        # are guaranteed to be populated by the time ``_builder`` is invoked
+        # from ``update_requests`` (after ``sampler_event.synchronize()``).
+        cache_indirection_host = self._async_d2h_via_side_stream(
+            beam_search_store.cache_indirection[
+                request.py_seq_slot, :num_beams, prompt_length:num_tokens
+            ]
+        )
+        current_path_host = self._async_d2h_via_side_stream(
+            beam_search_store.original_tokens[
+                request.py_seq_slot, :num_beams, prompt_length:num_tokens
+            ]
+        )
 
         if request.py_return_log_probs:
             log_probs_store = self.store.log_probs_store
-            sampled_log_probs_dev = log_probs_store.sampled_log_probs[
-                request.py_seq_slot, :num_beams
-            ].view(-1, 1)
-            sampled_logprobs_indices_dev = self.store.new_tokens[
-                0, request.py_seq_slot, :num_beams
-            ].view(-1, 1)
-            cum_logprobs_dev = beam_search_store.cum_log_probs[request.py_seq_slot, :num_beams]
+            sampled_log_probs_host = self._async_d2h_via_side_stream(
+                log_probs_store.sampled_log_probs[request.py_seq_slot, :num_beams].view(-1, 1)
+            )
+            sampled_logprobs_indices_host = self._async_d2h_via_side_stream(
+                self.store.new_tokens[0, request.py_seq_slot, :num_beams].view(-1, 1)
+            )
+            cum_logprobs_host = self._async_d2h_via_side_stream(
+                beam_search_store.cum_log_probs[request.py_seq_slot, :num_beams]
+            )
         else:
-            sampled_log_probs_dev = None
-            sampled_logprobs_indices_dev = None
-            cum_logprobs_dev = None
+            sampled_log_probs_host = None
+            sampled_logprobs_indices_host = None
+            cum_logprobs_host = None
 
         def _builder() -> BeamHistory | None:
+            # Pure-CPU work from here on. The host tensors above have been
+            # populated by the side-stream copy that ``sampler_event.
+            # synchronize()`` already awaited in ``update_requests``; this
+            # closure performs no CUDA operations and therefore satisfies
+            # the ``assert_no_cuda_sync`` contract enforced on
+            # ``update_requests``.
             if not need_history.item():
                 return None
 
-            # Synchronous D2H. Fires only on the terminal step. Safe because
-            # ``_builder`` runs after ``state.sampler_event.synchronize()`` in
-            # ``update_requests`` and before the next step's sampler kernels
-            # are dispatched, so the device-side slices still hold the step-N
-            # values that were current when this builder was created.
-            cache_indirection = cache_indirection_dev.cpu()
-            current_path = current_path_dev.cpu()
+            cache_indirection = cache_indirection_host
+            current_path = current_path_host
 
             new_path = torch.zeros_like(current_path)
             torch.gather(input=current_path, dim=0, index=cache_indirection, out=new_path)
@@ -3114,12 +3200,12 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             new_logprobs_indices: torch.Tensor | None = None
             cum_logprobs: torch.Tensor | None = None
             if request.py_return_log_probs:
-                assert sampled_log_probs_dev is not None
-                assert sampled_logprobs_indices_dev is not None
-                assert cum_logprobs_dev is not None
-                sampled_log_probs = sampled_log_probs_dev.cpu()
-                sampled_logprobs_indices = sampled_logprobs_indices_dev.cpu()
-                cum_logprobs = cum_logprobs_dev.cpu()
+                assert sampled_log_probs_host is not None
+                assert sampled_logprobs_indices_host is not None
+                assert cum_logprobs_host is not None
+                sampled_log_probs = sampled_log_probs_host
+                sampled_logprobs_indices = sampled_logprobs_indices_host
+                cum_logprobs = cum_logprobs_host
 
                 current_logprobs, current_logprobs_indices = self._get_logprobs_from_request(
                     request, preallocate_extra_steps=1
