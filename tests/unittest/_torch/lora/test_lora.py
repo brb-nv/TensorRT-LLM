@@ -1,3 +1,5 @@
+import logging
+
 import pytest
 import torch
 
@@ -6,8 +8,7 @@ from tensorrt_llm._torch.peft.lora.cuda_graph_lora_params import CudaGraphLoraPa
 from tensorrt_llm._torch.peft.lora.layer import (
     LoraLayer,
     LoraModuleType,
-    UnsupportedLoraTargetModulesError,
-    validate_lora_target_modules_supported,
+    filter_unsupported_lora_target_modules,
 )
 
 
@@ -60,38 +61,42 @@ def _make_attention_only_model() -> torch.nn.Module:
     return model
 
 
-def test_validate_lora_target_modules_supported_accepts_supported_targets():
-    validate_lora_target_modules_supported(
-        _make_attention_only_model(), ["attn_q", "attn_k", "attn_v", "attn_dense"]
-    )
+def test_filter_lora_target_modules_returns_supported_targets_unchanged():
+    targets = ["attn_q", "attn_k", "attn_v", "attn_dense"]
+    assert filter_unsupported_lora_target_modules(_make_attention_only_model(), targets) == targets
 
 
-def test_validate_lora_target_modules_supported_noops_on_empty_list():
+def test_filter_lora_target_modules_handles_empty_input():
     model = _make_attention_only_model()
-    validate_lora_target_modules_supported(model, [])
-    validate_lora_target_modules_supported(model, None)
+    assert filter_unsupported_lora_target_modules(model, []) == []
+    assert filter_unsupported_lora_target_modules(model, None) == []
 
 
-def test_validate_lora_target_modules_supported_rejects_per_expert_moe_targets():
-    with pytest.raises(UnsupportedLoraTargetModulesError) as exc:
-        validate_lora_target_modules_supported(
-            _make_attention_only_model(), ["attn_q", "moe_h_to_4h", "moe_4h_to_h"]
-        )
-    msg = str(exc.value)
+def test_filter_lora_target_modules_drops_per_expert_moe_targets(caplog):
+    caplog.set_level(logging.WARNING, logger="tensorrt_llm")
+    result = filter_unsupported_lora_target_modules(
+        _make_attention_only_model(),
+        ["attn_q", "moe_h_to_4h", "moe_4h_to_h"],
+    )
+    assert result == ["attn_q"]
+
+    msg = "\n".join(r.getMessage() for r in caplog.records)
+    assert "Dropping LoRA target module(s)" in msg
     assert "moe_h_to_4h" in msg
     assert "moe_4h_to_h" in msg
-    assert "attn_q" in msg  # listed under "Supported on this model"
+    assert "attn_q" in msg
 
 
-def test_validate_lora_target_modules_supported_unsupported_is_notimplemented():
-    """Subclass of NotImplementedError so callers can `except` broadly."""
-    with pytest.raises(NotImplementedError):
-        validate_lora_target_modules_supported(_make_attention_only_model(), ["moe_h_to_4h"])
-
-
-def test_validate_lora_target_modules_supported_rejects_unknown_names():
+def test_filter_lora_target_modules_rejects_unknown_names():
     with pytest.raises(ValueError) as exc:
-        validate_lora_target_modules_supported(
+        filter_unsupported_lora_target_modules(
             _make_attention_only_model(), ["attn_q", "not_a_real_module"]
         )
     assert "not_a_real_module" in str(exc.value)
+
+
+def test_filter_lora_target_modules_noops_when_no_lora_layers_registered():
+    model = torch.nn.Module()
+    model.linear = torch.nn.Linear(4, 4)
+    targets = ["attn_q", "moe_h_to_4h", "moe_4h_to_h"]
+    assert filter_unsupported_lora_target_modules(model, targets) == targets

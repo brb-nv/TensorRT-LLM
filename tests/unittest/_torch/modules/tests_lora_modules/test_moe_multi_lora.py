@@ -15,9 +15,10 @@
 """Multi-LoRA correctness on MoE models (Qwen1.5-MoE-A2.7B-Chat, O(10) adapters).
 
 Positive coverage: attention and shared-expert MLP targets across O(10)
-co-resident adapters. Negative coverage: per-expert MoE targets (`moe_*`)
-fail fast at LLM construction time. CPU-only validator unit tests live in
-`tests/unittest/_torch/lora/test_lora.py`.
+co-resident adapters. Negative coverage: per-expert MoE targets (moe_*)
+are dropped with a warning at LLM construction; the LLM still runs and
+attention LoRA is applied. CPU-only filter unit tests live in
+tests/unittest/_torch/lora/test_lora.py.
 """
 
 import json
@@ -31,7 +32,6 @@ from utils.llm_data import llm_models_root
 from utils.util import skip_gpu_memory_less_than_40gb
 
 from tensorrt_llm import LLM, SamplingParams
-from tensorrt_llm._torch.peft.lora.layer import UnsupportedLoraTargetModulesError
 from tensorrt_llm.executor.request import LoRARequest
 from tensorrt_llm.lora_helper import LoraConfig
 
@@ -238,51 +238,62 @@ class TestQwen15MoEMultiLoRA:
 
 
 @skip_gpu_memory_less_than_40gb
-class TestPerExpertMoELoRARejected:
-    """Per-expert MoE LoRA targets fail fast at LLM construction."""
+class TestPerExpertMoELoRADropped:
+    """Per-expert MoE LoRA targets are dropped with a warning; LLM still runs."""
 
     @pytest.fixture(autouse=True)
     def setup(self):
         self.model_path = f"{llm_models_root()}/Qwen1.5-MoE-A2.7B-Chat"
         if not os.path.exists(self.model_path):
             pytest.skip(f"Model not found: {self.model_path}")
+        self.dims = _load_qwen_moe_dims(self.model_path)
 
-    def test_per_expert_moe_targets_rejected(self):
-        # Mix supported + unsupported targets to confirm the validator
-        # reports all unsupported ones together and isn't masked by the
-        # presence of a valid target.
-        lora_config = LoraConfig(
-            lora_target_modules=[
-                "attn_q",
-                "moe_h_to_4h",
-                "moe_4h_to_h",
-                "moe_gate",
-            ],
-            max_lora_rank=8,
-            max_loras=1,
-            max_cpu_loras=1,
-        )
+    def test_per_expert_moe_targets_dropped(self):
+        # Mixed targets: attention names are wired (LoraLayer registered),
+        # routed-expert names are not. The PyT filter prunes the latter and
+        # construction proceeds; the attention LoRA still affects output.
+        lora_rank = 8
+        with tempfile.TemporaryDirectory() as tmpdir:
+            adapter_dir = os.path.join(tmpdir, "lora_attn")
+            _create_attention_plus_shared_expert_adapter(
+                adapter_dir,
+                self.model_path,
+                self.dims,
+                lora_rank=lora_rank,
+                dtype=torch.bfloat16,
+                seed=42,
+                include_shared_expert=False,
+            )
 
-        # The validator runs inside the executor worker; `proxy.py` re-raises
-        # init failures as `RuntimeError("...") from <original>`, so the
-        # validator error is reachable via `__cause__` on the caller side.
-        with pytest.raises(RuntimeError) as excinfo:
-            LLM(
+            lora_config = LoraConfig(
+                lora_target_modules=[
+                    "attn_q",
+                    "attn_k",
+                    "attn_v",
+                    "attn_dense",
+                    "moe_h_to_4h",
+                    "moe_4h_to_h",
+                    "moe_gate",
+                ],
+                max_lora_rank=lora_rank,
+                max_loras=1,
+                max_cpu_loras=1,
+            )
+
+            with LLM(
                 model=self.model_path,
                 backend="pytorch",
                 lora_config=lora_config,
                 tensor_parallel_size=1,
                 max_batch_size=1,
                 max_num_tokens=512,
-            )
+            ) as llm:
+                sampling = SamplingParams(max_tokens=10, temperature=0.0, logprobs=0)
+                prompts = ["Question: What is the capital of France?"]
+                lora_request = [LoRARequest("lora-attn", 1, adapter_dir)]
+                out_lora = llm.generate(prompts, sampling, lora_request=lora_request)
+                out_base = llm.generate(prompts, sampling)
 
-        cause = excinfo.value.__cause__ or excinfo.value.__context__
-        assert isinstance(cause, UnsupportedLoraTargetModulesError), (
-            f"Expected UnsupportedLoraTargetModulesError as the cause of the "
-            f"RuntimeError, got {type(cause).__name__}: {cause!r}"
-        )
-
-        msg = str(cause)
-        for name in ("moe_h_to_4h", "moe_4h_to_h", "moe_gate"):
-            assert name in msg, f"Missing '{name}' in: {msg!r}"
-        assert "attn_q" in msg  # listed under supported targets
+                assert _outputs_differ(out_lora[0], out_base[0]), (
+                    "Attention LoRA did not affect output despite being a supported target."
+                )

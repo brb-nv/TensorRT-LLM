@@ -4,6 +4,8 @@ from typing import Dict, Iterable, List, Optional
 
 import torch
 
+from tensorrt_llm.logger import logger
+
 from .cuda_graph_lora_params import CudaGraphLoraParams
 
 
@@ -542,55 +544,55 @@ class LoraLayer(torch.nn.Module):
                 return lora_output
 
 
-class UnsupportedLoraTargetModulesError(NotImplementedError):
-    """LoRA target modules requested but not wired into the model's forward path."""
+def filter_unsupported_lora_target_modules(
+        model: torch.nn.Module,
+        lora_target_modules: Iterable[str]) -> list[str]:
+    """Drop LoRA target modules with no registered LoraLayer on this model.
 
-
-def validate_lora_target_modules_supported(
-        model: torch.nn.Module, lora_target_modules: Iterable[str]) -> None:
-    """Fail fast if any requested LoRA target module is unsupported by this model.
-
-    Supported = at least one `LoraLayer` in the model tree registers the
-    corresponding `LoraModuleType` (the canonical "this delta is wired into
-    forward" signal).
-
-    Raises:
-        ValueError: requested name is not a known LoRA module name.
-        UnsupportedLoraTargetModulesError: requested name has no LoraLayer
-            registered on this model+backend combination.
+    Behavior:
+        Empty / None input returns an empty list. Names not present in
+        LoraManager.LORA_MODULE_IDS raise ValueError (typo). When the model
+        exposes no LoraLayer instances (e.g. TRT engine path or AutoDeploy
+        graph), the input is returned unchanged. Otherwise, target modules
+        whose LoraModuleType is not registered on any LoraLayer are dropped
+        with a single warning, mirroring the warn-and-drop behavior used in
+        lora_manager.iterate_hf_lora and load_hf_lora.
     """
     target_modules = list(lora_target_modules) if lora_target_modules else []
     if not target_modules:
-        return
+        return target_modules
 
     from ....lora_manager import LoraManager
 
-    requested: Dict[str, int] = {}
-    unknown: List[str] = []
+    name_to_id: dict[str, int] = {}
+    unknown: list[str] = []
     for name in target_modules:
         try:
-            requested[name] = LoraManager.LORA_MODULE_IDS[name]
+            name_to_id[name] = LoraManager.LORA_MODULE_IDS[name]
         except KeyError:
             unknown.append(name)
     if unknown:
         raise ValueError(f"Unknown LoRA target module name(s): {unknown}. "
                          f"Valid names: {sorted(LoraManager.LORA_MODULE_IDS)}.")
 
-    registered_ids: set = set()
+    registered_ids: set[int] = set()
     for module in model.modules():
         if isinstance(module, LoraLayer):
             registered_ids.update(int(t) for t in module.lora_module_types)
 
-    unsupported = sorted(name for name, mid in requested.items()
-                         if mid not in registered_ids)
-    if not unsupported:
-        return
+    if not registered_ids:
+        return target_modules
 
-    supported_names = sorted(
-        name for name, mid in LoraManager.LORA_MODULE_IDS.items()
-        if mid in registered_ids)
-    raise UnsupportedLoraTargetModulesError(
-        f"LoRA target module(s) {unsupported} have no LoraLayer registered on "
-        f"this model. Supported on this model: {supported_names}. Remove the "
-        f"unsupported entries from `LoraConfig.lora_target_modules` and from "
-        f"`target_modules` in your adapter checkpoints to proceed.")
+    supported = [n for n in target_modules if name_to_id[n] in registered_ids]
+    dropped = sorted(set(target_modules) - set(supported))
+    if dropped:
+        supported_on_model = sorted(
+            n for n, mid in LoraManager.LORA_MODULE_IDS.items()
+            if mid in registered_ids)
+        logger.warning(
+            f"Dropping LoRA target module(s) {dropped}: no LoraLayer is "
+            f"registered for them on this model. Adapter weights for these "
+            f"modules will be ignored. Supported on this model: "
+            f"{supported_on_model}.")
+
+    return supported

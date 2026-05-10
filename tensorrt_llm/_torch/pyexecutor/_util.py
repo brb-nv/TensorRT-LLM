@@ -1335,12 +1335,12 @@ def create_py_executor_instance(
                     if not has_dense_mlp:
                         target_modules.remove(mlp_mod)
 
-        # Reject unsupported LoRA target modules (e.g. per-expert MoE targets
-        # not yet wired through FusedMoE) before any C++ LoRA setup runs.
+        # Drop target modules with no LoraLayer wiring on the PyT model so the
+        # C++ LoRA workspace and CudaGraphLoraParams stay consistent.
         if isinstance(model_engine, PyTorchModelEngine):
-            from ..peft.lora.layer import validate_lora_target_modules_supported
-            validate_lora_target_modules_supported(model_engine.model,
-                                                   target_modules)
+            from ..peft.lora.layer import filter_unsupported_lora_target_modules
+            target_modules = filter_unsupported_lora_target_modules(
+                model_engine.model, target_modules)
 
         lora_modules = LoraModule.create_lora_modules(
             lora_module_names=target_modules,
