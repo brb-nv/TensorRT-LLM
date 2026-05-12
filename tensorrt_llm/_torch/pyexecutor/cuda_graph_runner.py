@@ -1,5 +1,6 @@
 import bisect
 import contextlib
+import os
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Optional, Tuple, TypeAlias
 
@@ -7,6 +8,7 @@ import torch
 
 from tensorrt_llm.llmapi.llm_args import (BaseSparseAttentionConfig,
                                           DecodingBaseConfig)
+from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
 from ...inputs.multimodal import MultimodalParams
@@ -27,6 +29,16 @@ from .scheduler import ScheduledRequests
 # A large prime number used for dummy request IDs to avoid collisions
 CUDA_GRAPH_DUMMY_REQUEST_ID = (1 << 64) - 1
 KeyType: TypeAlias = Tuple[int, int, bool, bool]
+
+# Prefill CUDA graph PoC: hardcoded shape (1 ctx req, 100 tokens). Gated on
+# at process start by ``TLLM_ENABLE_PREFILL_CUDA_GRAPH=1``; behavior is
+# byte-identical to today when the env var is unset.
+PREFILL_GRAPH_NUM_TOKENS = 100
+PREFILL_GRAPH_BATCH_SIZE = 1
+PREFILL_GRAPH_ENV_VAR = "TLLM_ENABLE_PREFILL_CUDA_GRAPH"
+# Distinct dummy request id for the prefill CUDA graph warmup so it does not
+# collide with the decode-graph dummy requests.
+PREFILL_CUDA_GRAPH_DUMMY_REQUEST_ID = (1 << 63) - 1
 
 
 @dataclass
@@ -120,6 +132,39 @@ class CUDAGraphRunner:
         # tensor reallocation from invalidating addresses baked into existing
         # CUDA graphs.  Use allow_capture() context manager during warmup.
         self._capture_allowed = False
+
+        # ---- Prefill CUDA graph PoC state -----------------------------------
+        # Opt-in proof-of-concept: capture/replay a single full-forward CUDA
+        # graph for a context-only iteration of exactly
+        # PREFILL_GRAPH_NUM_TOKENS tokens (BS=1). Gated by env var so
+        # behavior is byte-identical to today when disabled. Decode-graph
+        # data structures above are not touched.
+        self.prefill_enabled: bool = self.enabled and bool(
+            int(os.environ.get(PREFILL_GRAPH_ENV_VAR, "0")))
+        self.prefill_num_tokens: int = PREFILL_GRAPH_NUM_TOKENS
+        if self.prefill_enabled:
+            logger.info(
+                f"[prefill graph] PoC enabled "
+                f"(num_tokens={self.prefill_num_tokens}); set "
+                f"{PREFILL_GRAPH_ENV_VAR}=0 to disable.")
+        self.prefill_graphs: Dict[int, torch.cuda.CUDAGraph] = {}
+        self.prefill_graph_outputs: Dict[int, Callable[[],
+                                                       Optional[
+                                                           torch.Tensor]]] = {}
+        self.prefill_graph_metadata: Dict[int, Dict[str, Any]] = {}
+        # Static input buffers reused across prefill graph replays.
+        if self.prefill_enabled:
+            self.prefill_static_input_ids = torch.ones(
+                (self.prefill_num_tokens, ),
+                device="cuda",
+                dtype=torch.int32)
+            self.prefill_static_position_ids = torch.zeros(
+                (1, self.prefill_num_tokens),
+                device="cuda",
+                dtype=torch.int32)
+        else:
+            self.prefill_static_input_ids = None
+            self.prefill_static_position_ids = None
 
     def _create_shared_static_tensors(self):
         """Allocates static tensors sized for the largest possible batch."""
@@ -391,6 +436,142 @@ class CUDAGraphRunner:
         self.graph_outputs[key] = make_weak_ref(output)
         self.memory_pool = graph.pool()
 
+    # ---------------------------------------------------------------- Prefill
+    #
+    # The methods below implement an opt-in PoC that captures a full-forward
+    # CUDA graph for a 1-context-request / PREFILL_GRAPH_NUM_TOKENS-token
+    # prefill iteration. They are intentionally kept separate from the decode
+    # path so the existing decode graph behavior is unchanged.
+
+    def maybe_get_prefill_cuda_graph(
+        self,
+        batch: ScheduledRequests,
+        attn_metadata: Any,
+    ) -> Tuple[Optional[Any], Optional[int]]:
+        """Determine whether the current iteration matches the prefill PoC.
+
+        Returns ``(graph_attn_metadata, key)`` if the iteration is eligible
+        for prefill graph capture/replay (or already cached), else
+        ``(None, None)`` so the caller falls through to the decode path /
+        eager / piecewise.
+        """
+        if not self.prefill_enabled:
+            return None, None
+
+        # Respect transient disables (e.g. ``ModelEngine.no_cuda_graph`` is
+        # active during piecewise warmup) so the prefill path doesn't
+        # interfere with other capture flows that share this runner.
+        if not self.enabled:
+            return None, None
+        # Only the TRTLLM attention backend has been validated for prefill
+        # graph replay (FlashInfer / Star explicitly assert
+        # not is_cuda_graph in the prefill path).
+        if attn_metadata.__class__.__name__ != "TrtllmAttentionMetadata":
+            return None, None
+        if not batch.can_run_prefill_cuda_graph(self.prefill_num_tokens):
+            return None, None
+
+        key = self.prefill_num_tokens
+        if key in self.prefill_graphs:
+            graph_attn_metadata = self.prefill_graph_metadata[key][
+                "attn_metadata"]
+        elif self._capture_allowed:
+            graph_attn_metadata = (
+                attn_metadata.create_cuda_graph_metadata_prefill(
+                    num_tokens=self.prefill_num_tokens,
+                    buffers=self.cuda_graph_meta_buffers,
+                ))
+            assert graph_attn_metadata.is_cuda_graph
+        else:
+            # Graph not captured yet, and on-the-fly capture is disallowed
+            # outside the warmup window.
+            return None, None
+
+        # The single user-facing diagnostic: prints the actual context
+        # chunk size on every iteration where the prefill graph is picked.
+        ctx_reqs = (batch.context_requests_last_chunk +
+                    batch.context_requests_chunking)
+        actual = ctx_reqs[0].context_chunk_size if ctx_reqs else None
+        logger.info(f"[prefill graph] selected: "
+                    f"context_chunk_size={actual} key={key}")
+        return graph_attn_metadata, key
+
+    def needs_capture_prefill(self, key: int) -> bool:
+        return self._capture_allowed and key not in self.prefill_graph_outputs
+
+    def capture_prefill(
+        self,
+        key: int,
+        forward_fn: Callable,
+        initial_inputs: Dict[str, Any],
+    ) -> None:
+        """Capture a prefill CUDA graph for ``key`` tokens.
+
+        ``key`` must equal ``self.prefill_num_tokens`` (PoC supports a
+        single configured shape per process).
+        """
+        assert self.prefill_enabled
+        num_tokens = key
+        assert num_tokens == self.prefill_num_tokens, (
+            "Prefill CUDA graph PoC only supports "
+            f"{self.prefill_num_tokens} tokens per process (got {num_tokens})")
+
+        sliced_static_tensors = {
+            "input_ids": self.prefill_static_input_ids,
+            "position_ids": self.prefill_static_position_ids,
+        }
+        capture_inputs = initial_inputs.copy()
+        capture_inputs.update(sliced_static_tensors)
+
+        self.prefill_graph_metadata[key] = {
+            "attn_metadata": initial_inputs["attn_metadata"],
+        }
+
+        # Mirror the decode capture path: warmup runs initialize PyTorch's
+        # internal state (and the attn_metadata) before capture, and we
+        # disable piecewise CUDA graph capture so that path doesn't fight
+        # with the full-forward graph.
+        graph = torch.cuda.CUDAGraph()
+        with with_multi_stream(True), piecewise_cuda_graph(False):
+            for _ in range(self.WARMUP_STEPS):
+                forward_fn(capture_inputs)
+            with torch.cuda.graph(graph, pool=self.memory_pool):
+                output = forward_fn(capture_inputs)
+
+        self.prefill_graphs[key] = graph
+        self.prefill_graph_outputs[key] = make_weak_ref(output)
+        self.memory_pool = graph.pool()
+
+    def replay_prefill(
+        self,
+        key: int,
+        current_inputs: Dict[str, Any],
+    ) -> Optional[torch.Tensor]:
+        """Replay a previously captured prefill graph for ``key`` tokens."""
+        stored_meta = self.prefill_graph_metadata[key]
+        assert current_inputs["attn_metadata"] is stored_meta["attn_metadata"]
+
+        num_tokens = key
+        input_ids = current_inputs["input_ids"]
+        assert input_ids.shape[0] == num_tokens, (
+            f"Prefill graph expects {num_tokens} tokens, "
+            f"got {input_ids.shape[0]}")
+        self.prefill_static_input_ids.copy_(input_ids, non_blocking=True)
+
+        position_ids = current_inputs["position_ids"]
+        # The model engine produces position_ids with shape (1, num_tokens)
+        # for the standard (non-mrope) path; mrope is intentionally not
+        # supported by this PoC.
+        self.prefill_static_position_ids[:, :num_tokens].copy_(
+            position_ids[:, :num_tokens], non_blocking=True)
+
+        torch.cuda.nvtx.range_push("prefill_cuda_graph_replay")
+        try:
+            self.prefill_graphs[key].replay()
+        finally:
+            torch.cuda.nvtx.range_pop()
+        return self.prefill_graph_outputs[key]
+
     def replay(self, key: KeyType,
                current_inputs: Dict[str, Any]) -> Optional[torch.Tensor]:
         """Replays a previously captured graph."""
@@ -558,6 +739,11 @@ class CUDAGraphRunner:
         self.graphs.clear()
         self.graph_outputs.clear()
         self.graph_metadata.clear()
+        for prefill_graph in self.prefill_graphs.values():
+            prefill_graph.reset()
+        self.prefill_graphs.clear()
+        self.prefill_graph_outputs.clear()
+        self.prefill_graph_metadata.clear()
         self.padding_dummy_requests = {}
         del self.memory_pool
         self.memory_pool = None

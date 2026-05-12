@@ -1000,6 +1000,7 @@ class PyTorchModelEngine(ModelEngine):
             return
 
         self._capture_generation_cuda_graphs(resource_manager)
+        self._capture_prefill_cuda_graph(resource_manager)
         self._capture_piecewise_cuda_graphs(resource_manager)
 
     def _capture_generation_cuda_graphs(self,
@@ -1073,6 +1074,36 @@ class PyTorchModelEngine(ModelEngine):
                     torch.cuda.synchronize()
         # Set the value back to the original value after cuda graph warmups are complete
         self.enable_spec_decode = self.is_spec_decode
+
+    def _capture_prefill_cuda_graph(self,
+                                    resource_manager: ResourceManager):
+        """Captures the opt-in prefill CUDA graph (PoC).
+
+        Captures 1 context request of
+        ``cuda_graph_runner.prefill_num_tokens`` tokens (hardcoded to
+        100). Only runs when the env var
+        ``TLLM_ENABLE_PREFILL_CUDA_GRAPH=1`` is set; skipped silently
+        otherwise so the production warmup path is unchanged.
+        """
+        if not self.cuda_graph_runner.prefill_enabled:
+            return
+
+        num_tokens = self.cuda_graph_runner.prefill_num_tokens
+        logger.info(
+            f"Run prefill CUDA graph warmup for num_tokens={num_tokens}")
+        warmup_request = self._create_warmup_request(resource_manager,
+                                                     num_tokens, 0)
+        with self._release_batch_context(warmup_request,
+                                         resource_manager) as batch:
+            if batch is None:
+                logger.warning(
+                    "Prefill CUDA graph warmup skipped: insufficient KV cache "
+                    f"space for num_tokens={num_tokens}")
+                return
+            self.forward(batch,
+                         new_tensors_device=None,
+                         resource_manager=resource_manager)
+            torch.cuda.synchronize()
 
     def _capture_piecewise_cuda_graphs(self, resource_manager: ResourceManager):
         """Captures piecewise CUDA graphs for context/prefill steps via torch.compile."""
@@ -1707,8 +1738,11 @@ class PyTorchModelEngine(ModelEngine):
         return None
 
     def _get_padding_params(
-        self, total_num_tokens: int, num_ctx_requests: int,
-        attn_all_rank_num_tokens: Optional[List[int]]
+        self,
+        total_num_tokens: int,
+        num_ctx_requests: int,
+        attn_all_rank_num_tokens: Optional[List[int]],
+        attn_metadata: Optional[AttentionMetadata] = None,
     ) -> Tuple[int, bool, Optional[List[int]]]:
         """
         Get the padding parameters for tensor padding.
@@ -1718,6 +1752,12 @@ class PyTorchModelEngine(ModelEngine):
             attn_all_rank_num_tokens: the number of tokens for each rank
         """
         padded_num_tokens = total_num_tokens
+
+        # When a captured CUDA graph (decode or prefill) is in use, the
+        # tensor shapes are pinned to the captured shape; skip piecewise
+        # padding so the input shape stays consistent with the graph.
+        if attn_metadata is not None and attn_metadata.is_cuda_graph:
+            return total_num_tokens, False, attn_all_rank_num_tokens
 
         all_rank_ctx_requests = self._get_all_rank_ctx_requests(
             num_ctx_requests)
@@ -3073,7 +3113,10 @@ class PyTorchModelEngine(ModelEngine):
 
         attn_all_rank_num_tokens = self._get_all_rank_num_tokens(attn_metadata)
         padded_num_tokens, can_run_piecewise_cuda_graph, attn_all_rank_num_tokens = self._get_padding_params(
-            total_num_tokens, num_ctx_requests, attn_all_rank_num_tokens)
+            total_num_tokens,
+            num_ctx_requests,
+            attn_all_rank_num_tokens,
+            attn_metadata=attn_metadata)
         set_per_request_piecewise_cuda_graph_flag(can_run_piecewise_cuda_graph)
         attn_metadata.padded_num_tokens = padded_num_tokens if padded_num_tokens != total_num_tokens else None
 
@@ -3243,7 +3286,10 @@ class PyTorchModelEngine(ModelEngine):
 
         attn_all_rank_num_tokens = self._get_all_rank_num_tokens(attn_metadata)
         padded_num_tokens, can_run_piecewise_cuda_graph, attn_all_rank_num_tokens = self._get_padding_params(
-            num_tokens, attn_metadata.num_contexts, attn_all_rank_num_tokens)
+            num_tokens,
+            attn_metadata.num_contexts,
+            attn_all_rank_num_tokens,
+            attn_metadata=attn_metadata)
         set_per_request_piecewise_cuda_graph_flag(can_run_piecewise_cuda_graph)
         attn_metadata.padded_num_tokens = padded_num_tokens if padded_num_tokens != num_tokens else None
 
@@ -3927,27 +3973,44 @@ class PyTorchModelEngine(ModelEngine):
                 scheduled_requests, resource_manager,
                 self.runtime_draft_len) as padded_requests:
 
-            maybe_attn_metadata, maybe_spec_metadata, key = self.cuda_graph_runner.maybe_get_cuda_graph(
-                padded_requests,
-                enable_spec_decode=self.enable_spec_decode,
-                attn_metadata=attn_metadata,
-                spec_metadata=spec_metadata,
-                draft_tokens_cuda=self.draft_tokens_cuda
-                if self.is_spec_decode else None,
-                new_tensors_device=new_tensors_device,
-                spec_resource_manager=spec_resource_manager,
-            )
+            # Prefill CUDA graph PoC: try the prefill graph path first.
+            # When the iteration matches the configured shape (1 context
+            # request of self.cuda_graph_runner.prefill_num_tokens tokens,
+            # 0 generation requests, TRTLLM attention backend), prefill_key
+            # is set and we skip the decode-graph eligibility check
+            # entirely.
+            prefill_attn_metadata, prefill_key = (
+                self.cuda_graph_runner.maybe_get_prefill_cuda_graph(
+                    padded_requests, attn_metadata))
+            is_prefill_graph = prefill_key is not None
 
-            can_run_graph = key is not None
-            if can_run_graph:
-                attn_metadata = maybe_attn_metadata
-                spec_metadata = maybe_spec_metadata
+            if is_prefill_graph:
+                attn_metadata = prefill_attn_metadata
+                spec_metadata = None
+                can_run_graph = True
+                key = prefill_key
             else:
-                attn_metadata = self.attn_metadata
-                if self.enable_spec_decode:
-                    spec_metadata = self.spec_metadata
+                maybe_attn_metadata, maybe_spec_metadata, key = self.cuda_graph_runner.maybe_get_cuda_graph(
+                    padded_requests,
+                    enable_spec_decode=self.enable_spec_decode,
+                    attn_metadata=attn_metadata,
+                    spec_metadata=spec_metadata,
+                    draft_tokens_cuda=self.draft_tokens_cuda
+                    if self.is_spec_decode else None,
+                    new_tensors_device=new_tensors_device,
+                    spec_resource_manager=spec_resource_manager,
+                )
+
+                can_run_graph = key is not None
+                if can_run_graph:
+                    attn_metadata = maybe_attn_metadata
+                    spec_metadata = maybe_spec_metadata
                 else:
-                    spec_metadata = None
+                    attn_metadata = self.attn_metadata
+                    if self.enable_spec_decode:
+                        spec_metadata = self.spec_metadata
+                    else:
+                        spec_metadata = None
 
             # Fill slot-ID buffer for scatter inside draft loop
             if (self.enable_spec_decode and spec_tree_manager is not None
@@ -3981,6 +4044,31 @@ class PyTorchModelEngine(ModelEngine):
                             inputs,
                             gather_ids=gather_ids,
                             gather_context_logits=gather_context_logits)
+                elif is_prefill_graph:
+                    # Prefill CUDA graph PoC path. No spec-decode / draft KV
+                    # cache fixups are needed because the prefill graph never
+                    # runs alongside generation requests.
+                    if self.cuda_graph_runner.needs_capture_prefill(key):
+
+                        def prefill_capture_forward_fn(
+                                inputs: Dict[str, Any]):
+                            with MoeLoadBalancerIterContext(
+                                    moe_load_balancer):
+                                return self._forward_step(
+                                    inputs,
+                                    gather_ids=gather_ids,
+                                    gather_context_logits=
+                                    gather_context_logits)
+
+                        self.cuda_graph_runner.capture_prefill(
+                            key, prefill_capture_forward_fn, inputs)
+                        outputs = self.cuda_graph_runner.replay_prefill(
+                            key, inputs)
+                    else:
+                        with MoeLoadBalancerIterContext(moe_load_balancer):
+                            outputs = (
+                                self.cuda_graph_runner.replay_prefill(
+                                    key, inputs))
                 else:
                     if self.cuda_graph_runner.needs_capture(key):
 

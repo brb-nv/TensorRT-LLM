@@ -62,6 +62,21 @@ class ScheduledRequests:
     def can_run_cuda_graph(self) -> bool:
         return self.num_context_requests == 0
 
+    def can_run_prefill_cuda_graph(self, num_tokens: int) -> bool:
+        """Eligibility check for the opt-in prefill CUDA graph PoC.
+
+        Returns True only when the iteration consists of exactly one
+        context request whose current chunk is ``num_tokens`` tokens, with
+        no generation requests in flight. The decode CUDA graph path is
+        unaffected.
+        """
+        if len(self.generation_requests) != 0:
+            return False
+        if self.num_context_requests != 1:
+            return False
+        ctx_reqs = self.context_requests_last_chunk + self.context_requests_chunking
+        return ctx_reqs[0].context_chunk_size == num_tokens
+
     @property
     def batch_size(self) -> int:
         return self.num_context_requests + len(self.generation_requests)

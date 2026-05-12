@@ -359,6 +359,33 @@ class AttentionMetadata:
         cuda_graph_metadata.__post_init__()
         return cuda_graph_metadata
 
+    def create_cuda_graph_metadata_prefill(self,
+                                           num_tokens: int,
+                                           buffers=None) -> Self:
+        """Create CUDA graph metadata for a single-context-request prefill.
+
+        Mirrors :meth:`create_cuda_graph_metadata` but keeps ``num_contexts = 1``
+        and pins ``seq_lens`` to ``[num_tokens]``. Used by the prefill CUDA
+        graph PoC (see ``CUDAGraphRunner.maybe_get_prefill_cuda_graph``).
+        Backends that cannot replay prefill graphs (e.g. FlashInfer) must
+        gate their use upstream.
+        """
+        if self.is_cuda_graph:
+            return self
+
+        cuda_graph_metadata = copy.copy(self)
+        cuda_graph_metadata.is_cuda_graph = True
+        cuda_graph_metadata.cuda_graph_buffers = buffers
+        # Force seq_lens / seq_lens_cuda to be reallocated at the prefill
+        # shape; the seq_lens setter on AttentionMetadata syncs the CUDA copy
+        # whenever _seq_lens_cuda is None.
+        cuda_graph_metadata._seq_lens_cuda = None
+        cuda_graph_metadata.seq_lens = torch.tensor([num_tokens],
+                                                    dtype=torch.int)
+        cuda_graph_metadata.num_contexts = 1
+        cuda_graph_metadata.__post_init__()
+        return cuda_graph_metadata
+
     def prepare_for_spec_dec(self, *fields) -> None:
         assert len(self._saved_tensors) == 0
         for f in fields:
