@@ -157,6 +157,16 @@ def _register_fake():
             shape, dtype=out_dtype if out_dtype is not None else mat_a.dtype)
         return ret
 
+    @torch.library.register_fake("trtllm::tune_bf16_gemm")
+    def _(m, n, k, warmup_iters, timing_iters, max_candidates):
+        # Returns (int64[11] on CPU, float64[2] on CPU). The op is a tuning
+        # utility intended for offline use; the fake impl is only here so
+        # the op is callable from torch.compile / fake-tensor traces (it
+        # never actually runs in those contexts).
+        int_out = torch.empty(11, dtype=torch.int64, device="cpu")
+        float_out = torch.empty(2, dtype=torch.float64, device="cpu")
+        return int_out, float_out
+
     @torch.library.register_fake("trtllm::dsv3_router_gemm_op")
     def _(mat_a, mat_b, bias, out_dtype):
         shape = list(mat_a.shape)

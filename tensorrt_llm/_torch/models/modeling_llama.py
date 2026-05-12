@@ -1004,7 +1004,24 @@ class LlamaModel(DecoderModel):
         config = self.model_config.pretrained_config
         self.num_hidden_layers = config.num_hidden_layers
 
-        self.use_custom_cublas_mm = get_sm_version() == 121
+        # The custom trtllm::cublas_mm path consults find_special_algo() in
+        # cublasScaledMM.cpp, which looks up a pre-tuned cuBLASLt algo in
+        # bf16_algo_list keyed on (nextPowerOfTwo(M), K, N). On SM 12.1 the
+        # spark_bf16_algo_list is used unconditionally because cuBLAS's own
+        # heuristic is known-bad for that arch. On other arches we only enter
+        # the LUT path when the user opts in via TRTLLM_FORCE_CUSTOM_CUBLAS_MM=1
+        # so we don't regress shapes that don't yet have entries.
+        self.use_custom_cublas_mm = (get_sm_version() == 121
+                                     or os.environ.get(
+                                         "TRTLLM_FORCE_CUSTOM_CUBLAS_MM",
+                                         "0") == "1")
+        # NVBug 5615248 instrumentation: confirm whether the LUT path is live.
+        # Remove once the diagnostic round is done.
+        logger.info(
+            "[NVBUG-5615248] LlamaModel use_custom_cublas_mm=%s "
+            "(sm=%s, TRTLLM_FORCE_CUSTOM_CUBLAS_MM=%r)",
+            self.use_custom_cublas_mm, get_sm_version(),
+            os.environ.get("TRTLLM_FORCE_CUSTOM_CUBLAS_MM"))
 
         vocab_size = config.vocab_size
         # TODO smor- we load manually only if there is a single lora dir, need to come up with a better solution

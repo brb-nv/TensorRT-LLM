@@ -79,12 +79,42 @@ inline const AlgoListType spark_bf16_algo_list = {
 };
 
 // bf16*bf16->fp32->bf16
+//
+// Entries are looked up by find_special_algo() in cublasScaledMM.cpp keyed on
+// {nextPowerOfTwo(M), K, N}. To populate this table for a new model/shape,
+// run nvbugs_5615248/trtllm_bench/tune_bf16_gemms.py on the target GPU and
+// paste the printed entries below.
 inline const AlgoListType bf16_algo_list = {
     // Deepseek v3/R1 router gemm
     // [-algo66 -m_tile10 -m_stages35 -m_numsK1 -m_reduction0 -m_swizzle0 -m_custom3 -m_mma0 -m_cga2 -m_scheduling1]
     {{8, 7168, 256}, {66, 10, 35, 1, 0, 0, 3, 2}},
     {{512, 7168, 256}, {66, 48, 35, 1, 0, 0, 0, 2}},
     {{1024, 7168, 256}, {66, 13, 35, 1, 0, 0, 1, 3}},
+
+    // === BEGIN: TinyLlama-1.1B prefill on L40S (sm89) — NVBug 5615248 ===
+    // Tuned via nvbugs_5615248/trtllm_bench/tune_bf16_gemms.py at M=104
+    // (piecewise CUDA-graph padding bucket for ISL=100). All four winners
+    // are algo 6 (modern sm80 family) which gets o_proj off the legacy
+    // CUTLASS WMMA tensorop path that cuBLASLt's heuristic falls into for
+    // (M=104, K=2048, N=2048).
+    //
+    // Per-call timing (us) on L40S, BF16, batch_size=1:
+    //   qkv_proj      heuristic 10.77 -> tuned 10.67 (1.01x)
+    //   o_proj        heuristic 16.61 -> tuned 10.25 (1.62x)  ← was WMMA
+    //   gate_up_proj  heuristic 34.67 -> tuned 31.19 (1.11x)
+    //   down_proj     heuristic 19.18 -> tuned 18.09 (1.06x)
+    // Aggregate savings across 22 transformer layers: ~243 us / iteration.
+    //
+    // Reachable only with TRTLLM_FORCE_CUSTOM_CUBLAS_MM=1 (modeling_llama.py).
+    // [-algo6 -m_tile15 -m_stages17 -m_numsK1 -m_reduction0 -m_swizzle0 -m_custom0 -m_cga0]
+    {{128, 2048, 2560}, {6, 15, 17, 1, 0, 0, 0, 0}},   // qkv_proj
+    // [-algo6 -m_tile15 -m_stages17 -m_numsK1 -m_reduction0 -m_swizzle0 -m_custom0 -m_cga0]
+    {{128, 2048, 2048}, {6, 15, 17, 1, 0, 0, 0, 0}},   // o_proj
+    // [-algo6 -m_tile20 -m_stages15 -m_numsK1 -m_reduction0 -m_swizzle1 -m_custom0 -m_cga0]
+    {{128, 2048, 11264}, {6, 20, 15, 1, 0, 1, 0, 0}},  // gate_up_proj (fused)
+    // [-algo6 -m_tile20 -m_stages15 -m_numsK8 -m_reduction4 -m_swizzle0 -m_custom0 -m_cga0]
+    {{128, 5632, 2048}, {6, 20, 15, 8, 4, 0, 0, 0}},   // down_proj
+    // === END: TinyLlama-1.1B prefill on L40S ===
 };
 
 // fp8*fp8->fp32->fp16
