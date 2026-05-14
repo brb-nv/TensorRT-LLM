@@ -14,6 +14,7 @@
 
 import contextlib
 import enum
+import os
 import sys
 from abc import ABC, abstractmethod
 from collections import defaultdict
@@ -2286,8 +2287,19 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
 
         self._async_worker_init(args.enable_async_worker)
 
+        # Opt-in switch for the speculative side-stream / host-predictor
+        # beam-history D2H path in _prepare_beam_history. Default off so the
+        # safe pre-PR behavior (synchronous per-step _copy_to_host on every
+        # beam-search step) is used everywhere; setting the env var to "1"
+        # enables the speculative path that's only known to help small
+        # models. This is a stopgap until we expose it as an LlmArgs field.
+        self._use_speculative_beam_history_d2h: bool = (
+            os.environ.get("TRTLLM_ENABLE_BEAM_SEARCH_SPECULATIVE_D2H", "0") == "1"
+        )
+
         # 1-step-lagged host mirror of beam_search_store.first_finish_reasons,
-        # consumed by _predict_beam_search_is_likely_finishing.
+        # consumed by _predict_beam_search_is_likely_finishing when the
+        # speculative path is enabled. Remains empty in default mode.
         self._prev_first_finish_reasons_host: dict[int, torch.Tensor] = {}
 
     def get_generator(self, device: torch.device) -> torch.Generator:
@@ -2832,11 +2844,12 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                     "Beam search does not support returning multiple logprobs per request"
                 )
                 max_prompt_len = max(max_prompt_len, request.py_prompt_len)
-                # The slot may have been previously occupied by a finished
-                # beam-search request; clear the lagged finish-reason snapshot
-                # so _predict_beam_search_is_likely_finishing doesn't inherit
-                # stale state from the prior occupant.
-                self._prev_first_finish_reasons_host.pop(slot, None)
+                if self._use_speculative_beam_history_d2h:
+                    # The slot may have been previously occupied by a finished
+                    # beam-search request; clear the lagged finish-reason
+                    # snapshot so _predict_beam_search_is_likely_finishing
+                    # doesn't inherit stale state from the prior occupant.
+                    self._prev_first_finish_reasons_host.pop(slot, None)
 
             self._request_grouper.prepare_for_new_request(request, slot)
 
@@ -3094,12 +3107,18 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         If logprobs are requested, the function also corrects the stored logprobs for each beam.
         The function returns a BeamHistory object that contains the corrected tokens and logprobs for each beam.
 
-        Overlap-scheduler note: on steps the host predictor classifies as
-        potentially terminal, the heavy D2H copies are issued eagerly on
-        the side stream via _async_d2h_via_side_stream so _builder is
-        pure-CPU on the common path. On predicted-non-terminal steps the
-        copies are skipped entirely. On the rare predictor miss, _builder
-        falls back to a synchronous .cpu() to fetch the missing data.
+        Two D2H strategies are supported and selected by
+        ``self._use_speculative_beam_history_d2h``:
+
+          - Default (env var unset): ``_prepare_beam_history_default``
+            issues ``_copy_to_host`` for every beam-search step. Safe for
+            all models; matches the pre-PR behavior.
+          - Speculative (env var ``TRTLLM_ENABLE_BEAM_SEARCH_SPECULATIVE_D2H=1``):
+            ``_prepare_beam_history_speculative`` uses a host-side predictor
+            to skip the D2H copies on definitely-non-terminal steps and
+            routes the rest through a private side stream. Only known to
+            help small models; falls back to a synchronous ``.cpu()`` on
+            predictor misses.
 
         Note: To defer the decision whether or not to skip BeamHistory construction until update_requests(), only
               a builder (BeamHistoryBuilder) is returned here. The builder contains host tensors which are
@@ -3137,8 +3156,8 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         beam_search_store = self.store.beam_search_store
         assert beam_search_store is not None
 
-        # Device-tensor views are always captured (cheap slice metadata);
-        # _host variants are populated only on predicted-terminal steps.
+        # Device-tensor views are cheap slice metadata; both strategies
+        # capture them here and decide how/when to D2H below.
         cache_indirection_dev = beam_search_store.cache_indirection[
             request.py_seq_slot, :num_beams, prompt_length:num_tokens
         ]
@@ -3158,6 +3177,139 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             ].view(-1, 1)
             cum_logprobs_dev = beam_search_store.cum_log_probs[request.py_seq_slot, :num_beams]
 
+        if self._use_speculative_beam_history_d2h:
+            return self._prepare_beam_history_speculative(
+                request,
+                need_history=need_history,
+                num_tokens=num_tokens,
+                num_generated_tokens=num_generated_tokens,
+                cache_indirection_dev=cache_indirection_dev,
+                current_path_dev=current_path_dev,
+                sampled_log_probs_dev=sampled_log_probs_dev,
+                sampled_logprobs_indices_dev=sampled_logprobs_indices_dev,
+                cum_logprobs_dev=cum_logprobs_dev,
+            )
+        return self._prepare_beam_history_default(
+            request,
+            need_history=need_history,
+            cache_indirection_dev=cache_indirection_dev,
+            current_path_dev=current_path_dev,
+            sampled_log_probs_dev=sampled_log_probs_dev,
+            sampled_logprobs_indices_dev=sampled_logprobs_indices_dev,
+            cum_logprobs_dev=cum_logprobs_dev,
+        )
+
+    def _prepare_beam_history_default(
+        self,
+        request: LlmRequest,
+        *,
+        need_history: torch.Tensor,
+        cache_indirection_dev: torch.Tensor,
+        current_path_dev: torch.Tensor,
+        sampled_log_probs_dev: torch.Tensor | None,
+        sampled_logprobs_indices_dev: torch.Tensor | None,
+        cum_logprobs_dev: torch.Tensor | None,
+    ) -> BeamHistoryBuilder | None:
+        """Default D2H strategy: enqueue ``_copy_to_host`` for the beam-history
+        tensors on every beam-search step. ``_builder`` reads the resulting
+        host tensors directly after ``SamplerEvent.synchronize()`` is called
+        in ``update_requests``. Matches the pre-PR behavior.
+        """
+        # enqueue async D2H copies
+        cache_indirection = self._copy_to_host(cache_indirection_dev)
+        current_path = self._copy_to_host(current_path_dev)
+
+        sampled_log_probs: torch.Tensor | None = None
+        sampled_logprobs_indices: torch.Tensor | None = None
+        cum_logprobs: torch.Tensor | None = None
+        if request.py_return_log_probs:
+            assert sampled_log_probs_dev is not None
+            assert sampled_logprobs_indices_dev is not None
+            assert cum_logprobs_dev is not None
+            sampled_log_probs = self._copy_to_host(sampled_log_probs_dev)
+            sampled_logprobs_indices = self._copy_to_host(sampled_logprobs_indices_dev)
+            cum_logprobs = self._copy_to_host(cum_logprobs_dev)
+
+        def _post_process_path() -> torch.Tensor:
+            # Gather the correct tokens for each beam.
+            new_path = torch.zeros_like(current_path)
+            torch.gather(input=current_path, dim=0, index=cache_indirection, out=new_path)
+            return new_path
+
+        def _maybe_postprocess_logprobs() -> tuple[
+            torch.Tensor | None, torch.Tensor | None, torch.Tensor | None
+        ]:
+            if not request.py_return_log_probs:
+                return None, None, None
+            assert sampled_log_probs is not None
+            assert sampled_logprobs_indices is not None
+
+            current_logprobs, current_logprobs_indices = self._get_logprobs_from_request(
+                request, preallocate_extra_steps=1
+            )
+            # concatenate the newly generated logprobs and newly
+            # generated tokens to the current logprobs and logprobs indices
+            current_logprobs[:, -1, :].copy_(sampled_log_probs)
+            current_logprobs_indices[:, -1, :].copy_(sampled_logprobs_indices)
+
+            # Gather the correct logprobs for each beam.
+            new_logprobs = torch.zeros_like(current_logprobs)
+            new_logprobs_indices = torch.zeros_like(current_logprobs_indices)
+            cache_indirection_for_logprobs = cache_indirection.unsqueeze(-1).expand(
+                -1, -1, current_logprobs.shape[2]
+            )
+            torch.gather(
+                input=current_logprobs,
+                dim=0,
+                index=cache_indirection_for_logprobs,
+                out=new_logprobs,
+            )
+            torch.gather(
+                input=current_logprobs_indices,
+                dim=0,
+                index=cache_indirection_for_logprobs,
+                out=new_logprobs_indices,
+            )
+            return new_logprobs, new_logprobs_indices, cum_logprobs
+
+        def _builder() -> BeamHistory | None:
+            if not need_history.item():
+                return None
+            new_path = _post_process_path()
+            new_logprobs, new_logprobs_indices, cum_logprobs_out = _maybe_postprocess_logprobs()
+            return BeamHistory(
+                tokens=new_path,
+                logprobs=new_logprobs,
+                logprobs_indices=new_logprobs_indices,
+                cum_logprobs=cum_logprobs_out,
+            )
+
+        return _builder
+
+    def _prepare_beam_history_speculative(
+        self,
+        request: LlmRequest,
+        *,
+        need_history: torch.Tensor,
+        num_tokens: int,
+        num_generated_tokens: int,
+        cache_indirection_dev: torch.Tensor,
+        current_path_dev: torch.Tensor,
+        sampled_log_probs_dev: torch.Tensor | None,
+        sampled_logprobs_indices_dev: torch.Tensor | None,
+        cum_logprobs_dev: torch.Tensor | None,
+    ) -> BeamHistoryBuilder | None:
+        """Speculative D2H strategy (opt-in via
+        ``TRTLLM_ENABLE_BEAM_SEARCH_SPECULATIVE_D2H=1``): a host-side predictor
+        decides whether to enqueue side-stream D2H copies eagerly. On
+        predicted-non-terminal steps the copies are skipped entirely; on the
+        rare predictor miss, ``_builder`` falls back to a synchronous
+        ``.cpu()`` to fetch the missing data.
+
+        See ``_predict_beam_search_is_likely_finishing`` for the predictor
+        logic and ``_async_d2h_via_side_stream`` / ``_record_sampler_event``
+        for the side-stream completion plumbing.
+        """
         cache_indirection_host: torch.Tensor | None = None
         current_path_host: torch.Tensor | None = None
         sampled_log_probs_host: torch.Tensor | None = None
@@ -3251,13 +3403,13 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 return new_logprobs, new_logprobs_indices, cum_logprobs
 
             new_path = _post_process_path()
-            new_logprobs, new_logprobs_indices, cum_logprobs = _maybe_postprocess_logprobs()
+            new_logprobs, new_logprobs_indices, cum_logprobs_out = _maybe_postprocess_logprobs()
 
             return BeamHistory(
                 tokens=new_path,
                 logprobs=new_logprobs,
                 logprobs_indices=new_logprobs_indices,
-                cum_logprobs=cum_logprobs,
+                cum_logprobs=cum_logprobs_out,
             )
 
         return _builder
@@ -3458,14 +3610,21 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         The builders returned by this function create a beam history object containing
         the corrected tokens and logprobs for each beam of a request.
 
-        The loop is wrapped in _side_stream_d2h_batch so the side stream is
-        made current at most once per call instead of once per copy.
+        When the speculative D2H path is enabled, the loop is wrapped in
+        _side_stream_d2h_batch so the side stream is made current at most
+        once per call instead of once per copy. The default path uses the
+        main stream only, so no side-stream batching is needed.
         """
-        with self._side_stream_d2h_batch():
-            return [
-                self._prepare_beam_history(req, finish_reasons=finish_reasons[req.py_seq_slot])
-                for req in requests
-            ]
+        if self._use_speculative_beam_history_d2h:
+            with self._side_stream_d2h_batch():
+                return [
+                    self._prepare_beam_history(req, finish_reasons=finish_reasons[req.py_seq_slot])
+                    for req in requests
+                ]
+        return [
+            self._prepare_beam_history(req, finish_reasons=finish_reasons[req.py_seq_slot])
+            for req in requests
+        ]
 
     @override
     @nvtx_range("update_requests")
@@ -3525,12 +3684,13 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 self._handle_first_finish_reasons(
                     req, first_finish_reasons_host, first_finish_reasons
                 )
-                # Snapshot for the next step's
-                # _predict_beam_search_is_likely_finishing.
-                assert req.py_seq_slot is not None
-                self._prev_first_finish_reasons_host[req.py_seq_slot] = first_finish_reasons_host[
-                    req.py_seq_slot
-                ]
+                if self._use_speculative_beam_history_d2h:
+                    # Snapshot for the next step's
+                    # _predict_beam_search_is_likely_finishing.
+                    assert req.py_seq_slot is not None
+                    self._prev_first_finish_reasons_host[req.py_seq_slot] = (
+                        first_finish_reasons_host[req.py_seq_slot]
+                    )
                 req.py_num_accepted_draft_tokens = 0
                 req.py_rewind_len = 0
             else:
