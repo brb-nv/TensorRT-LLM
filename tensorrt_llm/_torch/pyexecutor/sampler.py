@@ -1073,13 +1073,13 @@ class AsyncWorkerMixin:
         self._async_worker: futures.ThreadPoolExecutor | None = None
         self._async_worker_futures: list[futures.Future[Any]] = []
         # Side-stream D2H state (lazily initialized; see
-        # _async_d2h_via_side_stream and _side_stream_d2h_batch). The pending
-        # flag is cleared by _record_sampler_event after recording the
-        # side-stream event into SamplerEvent.
+        # _async_d2h_via_side_stream and _side_stream_d2h_batch). The
+        # sync-pending flag is cleared by _record_sampler_event after
+        # recording the side-stream event into SamplerEvent.
         self._d2h_side_stream: torch.cuda.Stream | None = None
-        self._d2h_side_stream_pending: bool = False
+        self._d2h_side_stream_sync_pending: bool = False
         self._in_side_stream_batch: bool = False
-        self._batch_stream_ctx: Any | None = None
+        self._batch_stream_ctx: torch.cuda.StreamContext | None = None
 
     def async_worker_enabled(self) -> bool:
         return getattr(self, "_enable_async_worker", False)
@@ -1167,9 +1167,9 @@ class AsyncWorkerMixin:
             self._d2h_side_stream = torch.cuda.Stream()
         # Order the side stream after the main stream once per batch; copies
         # within the batch then run independently of the main stream.
-        if not self._d2h_side_stream_pending:
+        if not self._d2h_side_stream_sync_pending:
             self._d2h_side_stream.wait_stream(torch.cuda.current_stream())
-            self._d2h_side_stream_pending = True
+            self._d2h_side_stream_sync_pending = True
         dest = torch.empty_like(src, device="cpu", pin_memory=prefer_pinned())
         if self._in_side_stream_batch:
             # Lazily enter the stream context on the first copy so empty
@@ -1212,11 +1212,11 @@ class AsyncWorkerMixin:
         # next iteration's main-stream work behind these copies. The event
         # is synchronized host-side by SamplerEvent.synchronize().
         side_stream_event: torch.cuda.Event | None = None
-        if self._d2h_side_stream_pending:
+        if self._d2h_side_stream_sync_pending:
             assert self._d2h_side_stream is not None
             side_stream_event = torch.cuda.Event()
             side_stream_event.record(self._d2h_side_stream)
-            self._d2h_side_stream_pending = False
+            self._d2h_side_stream_sync_pending = False
 
         # Transfer ownership to worker_futures and re-initialize
         if self._async_worker_active():
@@ -2287,7 +2287,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         self._async_worker_init(args.enable_async_worker)
 
         # 1-step-lagged host mirror of beam_search_store.first_finish_reasons,
-        # consumed by _predict_beam_history_terminal.
+        # consumed by _predict_beam_search_is_likely_finishing.
         self._prev_first_finish_reasons_host: dict[int, torch.Tensor] = {}
 
     def get_generator(self, device: torch.device) -> torch.Generator:
@@ -2832,6 +2832,11 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                     "Beam search does not support returning multiple logprobs per request"
                 )
                 max_prompt_len = max(max_prompt_len, request.py_prompt_len)
+                # The slot may have been previously occupied by a finished
+                # beam-search request; clear the lagged finish-reason snapshot
+                # so _predict_beam_search_is_likely_finishing doesn't inherit
+                # stale state from the prior occupant.
+                self._prev_first_finish_reasons_host.pop(slot, None)
 
             self._request_grouper.prepare_for_new_request(request, slot)
 
@@ -3158,7 +3163,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         sampled_log_probs_host: torch.Tensor | None = None
         sampled_logprobs_indices_host: torch.Tensor | None = None
         cum_logprobs_host: torch.Tensor | None = None
-        if self._predict_beam_history_terminal(
+        if self._predict_beam_search_is_likely_finishing(
             request,
             num_generated_tokens=num_generated_tokens,
             num_tokens=num_tokens,
@@ -3191,13 +3196,18 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 cache_indirection = cache_indirection_dev.cpu()
                 current_path = current_path_dev.cpu()
 
-            new_path = torch.zeros_like(current_path)
-            torch.gather(input=current_path, dim=0, index=cache_indirection, out=new_path)
+            def _post_process_path() -> torch.Tensor:
+                # Gather the correct tokens for each beam.
+                new_path = torch.zeros_like(current_path)
+                torch.gather(input=current_path, dim=0, index=cache_indirection, out=new_path)
+                return new_path
 
-            new_logprobs: torch.Tensor | None = None
-            new_logprobs_indices: torch.Tensor | None = None
-            cum_logprobs: torch.Tensor | None = None
-            if request.py_return_log_probs:
+            def _maybe_postprocess_logprobs() -> tuple[
+                torch.Tensor | None, torch.Tensor | None, torch.Tensor | None
+            ]:
+                if not request.py_return_log_probs:
+                    return None, None, None
+
                 if sampled_log_probs_host is not None:
                     assert sampled_logprobs_indices_host is not None
                     assert cum_logprobs_host is not None
@@ -3220,10 +3230,9 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 current_logprobs[:, -1, :].copy_(sampled_log_probs)
                 current_logprobs_indices[:, -1, :].copy_(sampled_logprobs_indices)
 
-                # Initialize the buffers to store the results
+                # Gather the correct logprobs for each beam.
                 new_logprobs = torch.zeros_like(current_logprobs)
                 new_logprobs_indices = torch.zeros_like(current_logprobs_indices)
-
                 cache_indirection_for_logprobs = cache_indirection.unsqueeze(-1).expand(
                     -1, -1, current_logprobs.shape[2]
                 )
@@ -3239,6 +3248,10 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                     index=cache_indirection_for_logprobs,
                     out=new_logprobs_indices,
                 )
+                return new_logprobs, new_logprobs_indices, cum_logprobs
+
+            new_path = _post_process_path()
+            new_logprobs, new_logprobs_indices, cum_logprobs = _maybe_postprocess_logprobs()
 
             return BeamHistory(
                 tokens=new_path,
@@ -3316,8 +3329,8 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             [GenericStrategyKeyType], Type[StrategyMetadata] | None
         ],
         *,
-        seq_slots_cuda: torch.Tensor | None = None,
-        seq_lens_cuda: torch.Tensor | None = None,
+        seq_slots_cuda: torch.Tensor,
+        seq_lens_cuda: torch.Tensor,
     ) -> dict[RequestGroupKey[GenericStrategyKeyType], RequestGroupValueWithMetadata]:
         grouped_requests_with_metadata: dict[
             RequestGroupKey[GenericStrategyKeyType], RequestGroupValueWithMetadata
@@ -3333,11 +3346,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 # Reuse the precomputed CUDA tensors when the strategy group
                 # covers the full batch (typical single-strategy case);
                 # otherwise fall back to a per-group H2D for the subset.
-                if (
-                    seq_slots_cuda is not None
-                    and seq_lens_cuda is not None
-                    and value.indices.size(0) == num_requests
-                ):
+                if value.indices.size(0) == num_requests:
                     group_seq_slots_cuda = seq_slots_cuda
                     group_seq_lens_cuda = seq_lens_cuda
                 else:
@@ -3397,7 +3406,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             return longest_stop_word_len > 1
         return False
 
-    def _predict_beam_history_terminal(
+    def _predict_beam_search_is_likely_finishing(
         self,
         request: LlmRequest,
         *,
@@ -3414,8 +3423,11 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         Signals (any one triggers True):
           1. Length budget reached (max_new_tokens or max_seq_len) - mirrors
              _meet_max_token_stop_criteria.
-          2. stop_words configured - cannot be predicted host-side without
-             a device sync, so force copies.
+          2. Multi-token stop_words configured - _prepare_beam_history forces
+             unconditional finalization for these (see
+             _check_stop_words_length), so eagerly issue copies. Single-token
+             stop words are still detected via signal 3 and the predictor-miss
+             .cpu() fallback.
           3. Lagged first_finish_reasons from the previous step shows any
              beam already finished - need_history requires all beams to
              finish, so this is a reliable 1-step early-warning signal.
@@ -3425,11 +3437,13 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         """
         if num_generated_tokens >= request.py_max_new_tokens or num_tokens >= self.max_seq_len:
             return True
-        if request.py_stop_words_list is not None:
+        if self._check_stop_words_length(request):
             return True
         assert request.py_seq_slot is not None
         prev = self._prev_first_finish_reasons_host.get(request.py_seq_slot)
-        if prev is not None and bool((prev > 0).any().item()):
+        # FinishReason.NOT_FINISHED == 0, so a nonzero entry implies that
+        # some beam has already finished.
+        if prev is not None and prev.any().item():
             return True
         return False
 
@@ -3511,7 +3525,8 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 self._handle_first_finish_reasons(
                     req, first_finish_reasons_host, first_finish_reasons
                 )
-                # Snapshot for the next step's _predict_beam_history_terminal.
+                # Snapshot for the next step's
+                # _predict_beam_search_is_likely_finishing.
                 assert req.py_seq_slot is not None
                 self._prev_first_finish_reasons_host[req.py_seq_slot] = first_finish_reasons_host[
                     req.py_seq_slot
@@ -3803,8 +3818,8 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         req_offsets: torch.Tensor,
         seq_slots: torch.Tensor,
         seq_lens: Optional[torch.Tensor] = None,
-        seq_slots_cuda: Optional[torch.Tensor] = None,
-        seq_lens_cuda: Optional[torch.Tensor] = None,
+        seq_slots_cuda: torch.Tensor,
+        seq_lens_cuda: torch.Tensor,
         token_dtype: torch.dtype,
         return_log_probs: bool,
     ) -> _BatchedSamplingResult:
