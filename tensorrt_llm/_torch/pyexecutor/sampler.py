@@ -12,16 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import contextlib
 import enum
 import os
 import sys
 from abc import ABC, abstractmethod
 from collections import defaultdict
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable
 from concurrent import futures
 from dataclasses import dataclass
 from itertools import repeat
+from types import TracebackType
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -158,8 +158,7 @@ class SampleStateTensors:
 @dataclass(kw_only=True)
 class SamplerEvent:
     cuda_event: torch.cuda.Event
-    # Recorded on the sampler's D2H side stream when side-stream copies are
-    # in flight; synchronized host-side without making the main stream wait.
+    # Side-stream D2H completion, synced host-side without gating the main stream.
     side_stream_event: Optional[torch.cuda.Event] = None
     worker_futures: Optional[list[futures.Future[Any]]] = None
 
@@ -1057,11 +1056,72 @@ class SampleStateTorch(SampleState[SampleStateTensorsHostTorch, SampleStateTenso
     beam_history_builders: list[BeamHistoryBuilder | None] | None = None
 
 
+class _SideStreamCopier:
+    """Batch non-blocking D2H copies onto a private side stream.
+
+    Inside the `with` block, copy_to_host(src) queues a copy and returns
+    a pinned-CPU destination. On exit, all queued copies are issued on
+    the side stream in a single stream-context. record_event() then
+    returns an event recorded after those copies, or None when none
+    were queued.
+
+    Caller contract: src must not be mutated on the main stream, and
+    the returned host tensor must not be read, until the event has
+    been synced host-side. Each copier is single-use.
+    """
+
+    def __init__(self, side_stream: torch.cuda.Stream) -> None:
+        self._side_stream = side_stream
+        self._tasks: list[tuple[torch.Tensor, torch.Tensor]] = []
+        self._flushed: bool = False
+
+    def __enter__(self) -> "_SideStreamCopier":
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
+    ) -> None:
+        if exc_type is not None:
+            return
+        self._flush()
+
+    def copy_to_host(self, src: torch.Tensor) -> torch.Tensor:
+        """Queue a non-blocking D2H copy of src and return its pinned-CPU dst."""
+        assert not self._flushed, "copy_to_host called after the copier was flushed"
+        dst = torch.empty_like(src, device="cpu", pin_memory=prefer_pinned())
+        self._tasks.append((dst, src))
+        return dst
+
+    def _flush(self) -> None:
+        if not self._tasks:
+            return
+        self._side_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(self._side_stream):
+            for dst, src in self._tasks:
+                dst.copy_(src, non_blocking=True)
+        self._tasks.clear()
+        self._flushed = True
+
+    def record_event(self) -> torch.cuda.Event | None:
+        """Return an event recorded after the queued copies, or None if none were queued."""
+        if not self._flushed:
+            return None
+        event = torch.cuda.Event()
+        event.record(self._side_stream)
+        return event
+
+
 class AsyncWorkerMixin:
     """
     Mixin that adds the ability to fork off operations to run on a worker
     thread (particularly D2H copies). If the async worker isn't active,
     operations will seamlessly run on the main thread.
+
+    Also owns a lazily-allocated private D2H side stream, handed out via
+    _make_side_stream_copier for batched non-blocking D2H copies.
     """
 
     MAX_WORKERS = 1
@@ -1073,14 +1133,8 @@ class AsyncWorkerMixin:
         self._enable_async_worker = enable_async_worker
         self._async_worker: futures.ThreadPoolExecutor | None = None
         self._async_worker_futures: list[futures.Future[Any]] = []
-        # Side-stream D2H state (lazily initialized; see
-        # _async_d2h_via_side_stream and _side_stream_d2h_batch). The
-        # sync-pending flag is cleared by _record_sampler_event after
-        # recording the side-stream event into SamplerEvent.
-        self._d2h_side_stream: torch.cuda.Stream | None = None
-        self._d2h_side_stream_sync_pending: bool = False
-        self._in_side_stream_batch: bool = False
-        self._batch_stream_ctx: torch.cuda.StreamContext | None = None
+        # Private D2H side stream shared by all copiers.
+        self._d2h_side_stream: torch.cuda.Stream = torch.cuda.Stream()
 
     def async_worker_enabled(self) -> bool:
         return getattr(self, "_enable_async_worker", False)
@@ -1154,70 +1208,19 @@ class AsyncWorkerMixin:
             dest.copy_(src, non_blocking=True)
         return dest
 
-    def _async_d2h_via_side_stream(self, src: torch.Tensor) -> torch.Tensor:
-        """Non-blocking D2H copy on a private side stream.
+    def _make_side_stream_copier(self) -> _SideStreamCopier:
+        """Return a fresh copier bound to the shared D2H side stream."""
+        return _SideStreamCopier(self._d2h_side_stream)
 
-        Caller contract:
-          1. src must not be mutated on the main stream until the next
-             SamplerEvent has been synchronized host-side.
-          2. The returned host tensor must not be read until the next
-             SamplerEvent has been synchronized; _record_sampler_event
-             chains the side stream's completion into that event.
+    def _record_sampler_event(
+        self, side_stream_event: torch.cuda.Event | None = None
+    ) -> SamplerEvent:
+        """Record a SamplerEvent on the main stream. side_stream_event,
+        if given, is forwarded so SamplerEvent.synchronize also awaits
+        the side-stream copies host-side.
         """
-        if self._d2h_side_stream is None:
-            self._d2h_side_stream = torch.cuda.Stream()
-        # Order the side stream after the main stream once per batch; copies
-        # within the batch then run independently of the main stream.
-        if not self._d2h_side_stream_sync_pending:
-            self._d2h_side_stream.wait_stream(torch.cuda.current_stream())
-            self._d2h_side_stream_sync_pending = True
-        dest = torch.empty_like(src, device="cpu", pin_memory=prefer_pinned())
-        if self._in_side_stream_batch:
-            # Lazily enter the stream context on the first copy so empty
-            # batches (predictor-driven all-skip steps) cost nothing.
-            if self._batch_stream_ctx is None:
-                self._batch_stream_ctx = torch.cuda.stream(self._d2h_side_stream)
-                self._batch_stream_ctx.__enter__()
-            dest.copy_(src, non_blocking=True)
-        else:
-            with torch.cuda.stream(self._d2h_side_stream):
-                dest.copy_(src, non_blocking=True)
-        return dest
-
-    @contextlib.contextmanager
-    def _side_stream_d2h_batch(self) -> Iterator[None]:
-        """Amortize the stream-context push/pop across many side-stream copies.
-
-        The stream context is opened lazily on the first copy issued inside
-        the with-block, so empty batches (all-skip steps) cost nothing.
-        Same caller contract as _async_d2h_via_side_stream applies.
-        """
-        prev_in_batch = self._in_side_stream_batch
-        prev_batch_stream_ctx = self._batch_stream_ctx
-        self._in_side_stream_batch = True
-        self._batch_stream_ctx = None
-        try:
-            yield
-        finally:
-            if self._batch_stream_ctx is not None:
-                self._batch_stream_ctx.__exit__(None, None, None)
-            self._in_side_stream_batch = prev_in_batch
-            self._batch_stream_ctx = prev_batch_stream_ctx
-
-    def _record_sampler_event(self) -> SamplerEvent:
         cuda_event = torch.cuda.Event()
         cuda_event.record()
-
-        # Record a separate event on the side stream rather than calling
-        # current_stream.wait_stream(side); the latter would serialize the
-        # next iteration's main-stream work behind these copies. The event
-        # is synchronized host-side by SamplerEvent.synchronize().
-        side_stream_event: torch.cuda.Event | None = None
-        if self._d2h_side_stream_sync_pending:
-            assert self._d2h_side_stream is not None
-            side_stream_event = torch.cuda.Event()
-            side_stream_event.record(self._d2h_side_stream)
-            self._d2h_side_stream_sync_pending = False
 
         # Transfer ownership to worker_futures and re-initialize
         if self._async_worker_active():
@@ -2287,19 +2290,14 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
 
         self._async_worker_init(args.enable_async_worker)
 
-        # Opt-in switch for the speculative side-stream / host-predictor
-        # beam-history D2H path in _prepare_beam_history. Default off so the
-        # safe pre-PR behavior (synchronous per-step _copy_to_host on every
-        # beam-search step) is used everywhere; setting the env var to "1"
-        # enables the speculative path that's only known to help small
-        # models. This is a stopgap until we expose it as an LlmArgs field.
+        # Opt-in switch for the speculative beam-history D2H path; default off
+        # uses the safe per-step _copy_to_host. Stopgap until exposed in LlmArgs.
         self._use_speculative_beam_history_d2h: bool = (
             os.environ.get("TRTLLM_ENABLE_BEAM_SEARCH_SPECULATIVE_D2H", "0") == "1"
         )
 
-        # 1-step-lagged host mirror of beam_search_store.first_finish_reasons,
-        # consumed by _predict_beam_search_is_likely_finishing when the
-        # speculative path is enabled. Remains empty in default mode.
+        # 1-step-lagged host mirror of first_finish_reasons used by the
+        # speculative predictor; empty in default mode.
         self._prev_first_finish_reasons_host: dict[int, torch.Tensor] = {}
 
     def get_generator(self, device: torch.device) -> torch.Generator:
@@ -2845,10 +2843,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 )
                 max_prompt_len = max(max_prompt_len, request.py_prompt_len)
                 if self._use_speculative_beam_history_d2h:
-                    # The slot may have been previously occupied by a finished
-                    # beam-search request; clear the lagged finish-reason
-                    # snapshot so _predict_beam_search_is_likely_finishing
-                    # doesn't inherit stale state from the prior occupant.
+                    # Drop stale predictor state from any prior occupant of this slot.
                     self._prev_first_finish_reasons_host.pop(slot, None)
 
             self._request_grouper.prepare_for_new_request(request, slot)
@@ -3098,6 +3093,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         request: LlmRequest,
         *,
         finish_reasons: torch.Tensor,
+        copier: _SideStreamCopier | None = None,
     ) -> BeamHistoryBuilder | None:
         """Correct the stored tokens for each beam and return it as a BeamHistory object.
 
@@ -3107,18 +3103,14 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         If logprobs are requested, the function also corrects the stored logprobs for each beam.
         The function returns a BeamHistory object that contains the corrected tokens and logprobs for each beam.
 
-        Two D2H strategies are supported and selected by
-        ``self._use_speculative_beam_history_d2h``:
-
-          - Default (env var unset): ``_prepare_beam_history_default``
-            issues ``_copy_to_host`` for every beam-search step. Safe for
-            all models; matches the pre-PR behavior.
-          - Speculative (env var ``TRTLLM_ENABLE_BEAM_SEARCH_SPECULATIVE_D2H=1``):
-            ``_prepare_beam_history_speculative`` uses a host-side predictor
-            to skip the D2H copies on definitely-non-terminal steps and
-            routes the rest through a private side stream. Only known to
-            help small models; falls back to a synchronous ``.cpu()`` on
-            predictor misses.
+        Dispatches to one of two D2H strategies based on
+        self._use_speculative_beam_history_d2h:
+          - Default: _prepare_beam_history_default, _copy_to_host per step.
+          - Speculative (TRTLLM_ENABLE_BEAM_SEARCH_SPECULATIVE_D2H=1):
+            _prepare_beam_history_speculative skips definitely-non-terminal
+            steps via a host-side predictor and routes the rest through
+            copier; predictor misses fall back to a synchronous .cpu().
+            copier is required for this path only.
 
         Note: To defer the decision whether or not to skip BeamHistory construction until update_requests(), only
               a builder (BeamHistoryBuilder) is returned here. The builder contains host tensors which are
@@ -3129,6 +3121,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             request: The request to create the beam history for
             finish_reasons: The first finish reason encountered for each beam of the request.
                             Shape: (max_tokens, max_beam_width)
+            copier: Side-stream copier; required for the speculative path.
         """
 
         # Gather data used for skipping beam history processing
@@ -3156,8 +3149,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         beam_search_store = self.store.beam_search_store
         assert beam_search_store is not None
 
-        # Device-tensor views are cheap slice metadata; both strategies
-        # capture them here and decide how/when to D2H below.
+        # Device-tensor views; the strategies below decide how to D2H them.
         cache_indirection_dev = beam_search_store.cache_indirection[
             request.py_seq_slot, :num_beams, prompt_length:num_tokens
         ]
@@ -3178,6 +3170,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             cum_logprobs_dev = beam_search_store.cum_log_probs[request.py_seq_slot, :num_beams]
 
         if self._use_speculative_beam_history_d2h:
+            assert copier is not None, "speculative path requires a _SideStreamCopier"
             return self._prepare_beam_history_speculative(
                 request,
                 need_history=need_history,
@@ -3188,6 +3181,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 sampled_log_probs_dev=sampled_log_probs_dev,
                 sampled_logprobs_indices_dev=sampled_logprobs_indices_dev,
                 cum_logprobs_dev=cum_logprobs_dev,
+                copier=copier,
             )
         return self._prepare_beam_history_default(
             request,
@@ -3210,11 +3204,9 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         sampled_logprobs_indices_dev: torch.Tensor | None,
         cum_logprobs_dev: torch.Tensor | None,
     ) -> BeamHistoryBuilder | None:
-        """Default D2H strategy: enqueue ``_copy_to_host`` for the beam-history
-        tensors on every beam-search step. ``_builder`` reads the resulting
-        host tensors directly after ``SamplerEvent.synchronize()`` is called
-        in ``update_requests``. Matches the pre-PR behavior.
-        """
+        """Default D2H strategy: _copy_to_host per beam-search step; _builder
+        reads the host tensors after SamplerEvent.synchronize() in
+        update_requests."""
         # enqueue async D2H copies
         cache_indirection = self._copy_to_host(cache_indirection_dev)
         current_path = self._copy_to_host(current_path_dev)
@@ -3298,17 +3290,15 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         sampled_log_probs_dev: torch.Tensor | None,
         sampled_logprobs_indices_dev: torch.Tensor | None,
         cum_logprobs_dev: torch.Tensor | None,
+        copier: _SideStreamCopier,
     ) -> BeamHistoryBuilder | None:
         """Speculative D2H strategy (opt-in via
-        ``TRTLLM_ENABLE_BEAM_SEARCH_SPECULATIVE_D2H=1``): a host-side predictor
-        decides whether to enqueue side-stream D2H copies eagerly. On
-        predicted-non-terminal steps the copies are skipped entirely; on the
-        rare predictor miss, ``_builder`` falls back to a synchronous
-        ``.cpu()`` to fetch the missing data.
+        TRTLLM_ENABLE_BEAM_SEARCH_SPECULATIVE_D2H=1).
 
-        See ``_predict_beam_search_is_likely_finishing`` for the predictor
-        logic and ``_async_d2h_via_side_stream`` / ``_record_sampler_event``
-        for the side-stream completion plumbing.
+        A host-side predictor skips side-stream D2H copies on non-terminal
+        steps; misses fall back to a synchronous .cpu() in _builder. All
+        side-stream copies are queued onto copier and flushed when its
+        `with` block exits.
         """
         cache_indirection_host: torch.Tensor | None = None
         current_path_host: torch.Tensor | None = None
@@ -3320,8 +3310,8 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             num_generated_tokens=num_generated_tokens,
             num_tokens=num_tokens,
         ):
-            cache_indirection_host = self._async_d2h_via_side_stream(cache_indirection_dev)
-            current_path_host = self._async_d2h_via_side_stream(current_path_dev)
+            cache_indirection_host = copier.copy_to_host(cache_indirection_dev)
+            current_path_host = copier.copy_to_host(current_path_dev)
             # The three log-prob *_dev tensors are bound iff py_return_log_probs;
             # the conjunction also narrows them for mypy.
             if (
@@ -3329,11 +3319,9 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 and sampled_logprobs_indices_dev is not None
                 and cum_logprobs_dev is not None
             ):
-                sampled_log_probs_host = self._async_d2h_via_side_stream(sampled_log_probs_dev)
-                sampled_logprobs_indices_host = self._async_d2h_via_side_stream(
-                    sampled_logprobs_indices_dev
-                )
-                cum_logprobs_host = self._async_d2h_via_side_stream(cum_logprobs_dev)
+                sampled_log_probs_host = copier.copy_to_host(sampled_log_probs_dev)
+                sampled_logprobs_indices_host = copier.copy_to_host(sampled_logprobs_indices_dev)
+                cum_logprobs_host = copier.copy_to_host(cum_logprobs_dev)
 
         def _builder() -> BeamHistory | None:
             if not need_history.item():
@@ -3554,7 +3542,8 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             _, cumsum = request.py_stop_words_list
             if -1 in cumsum:
                 cumsum = cumsum[: cumsum.index(-1)]
-            longest_stop_word_len = np.max(np.diff(cumsum, prepend=0), initial=0).item()
+            # int() pin: np.ndarray.item() returns Any, breaking the bool return.
+            longest_stop_word_len = int(np.max(np.diff(cumsum, prepend=0), initial=0).item())
             return longest_stop_word_len > 1
         return False
 
@@ -3565,27 +3554,17 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         num_generated_tokens: int,
         num_tokens: int,
     ) -> bool:
-        """Predict whether this step might require beam-history finalization.
+        """Predict whether this step might finalize the beam history.
 
-        True means: enqueue the side-stream D2H copies eagerly. False means:
-        skip the copies; this step is definitely not terminal. False
-        positives only cost an extra side-stream copy; false negatives fall
-        back to a synchronous .cpu() in _builder.
+        True triggers an eager side-stream D2H copy; False skips it. False
+        negatives fall back to a synchronous .cpu() in _builder.
 
-        Signals (any one triggers True):
-          1. Length budget reached (max_new_tokens or max_seq_len) - mirrors
-             _meet_max_token_stop_criteria.
-          2. Multi-token stop_words configured - _prepare_beam_history forces
-             unconditional finalization for these (see
-             _check_stop_words_length), so eagerly issue copies. Single-token
-             stop words are still detected via signal 3 and the predictor-miss
-             .cpu() fallback.
-          3. Lagged first_finish_reasons from the previous step shows any
-             beam already finished - need_history requires all beams to
-             finish, so this is a reliable 1-step early-warning signal.
+        Returns True if any of:
+          1. Length budget reached (max_new_tokens or max_seq_len).
+          2. Multi-token stop_words configured (forces finalization).
+          3. Lagged first_finish_reasons shows any beam finished previously.
 
-        Known miss: all beams hit end_id on the same step from a clean
-        state. Rare in practice; covered by _builder's .cpu() fallback.
+        Known miss: all beams hit end_id on the same step from a clean state.
         """
         if num_generated_tokens >= request.py_max_new_tokens or num_tokens >= self.max_seq_len:
             return True
@@ -3604,27 +3583,35 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         self,
         requests: list[LlmRequest],
         finish_reasons: torch.Tensor,
-    ) -> list[BeamHistoryBuilder | None]:
+    ) -> tuple[list[BeamHistoryBuilder | None], torch.cuda.Event | None]:
         """Create the corrected tokens and logprobs for each beam of a request.
 
         The builders returned by this function create a beam history object containing
         the corrected tokens and logprobs for each beam of a request.
 
-        When the speculative D2H path is enabled, the loop is wrapped in
-        _side_stream_d2h_batch so the side stream is made current at most
-        once per call instead of once per copy. The default path uses the
-        main stream only, so no side-stream batching is needed.
+        Returns (builders, side_stream_event). side_stream_event is set
+        only when the speculative path queued copies; the caller must
+        forward it to _record_sampler_event so SamplerEvent.synchronize
+        awaits the side stream before any builder is invoked.
         """
-        if self._use_speculative_beam_history_d2h:
-            with self._side_stream_d2h_batch():
-                return [
-                    self._prepare_beam_history(req, finish_reasons=finish_reasons[req.py_seq_slot])
-                    for req in requests
-                ]
-        return [
-            self._prepare_beam_history(req, finish_reasons=finish_reasons[req.py_seq_slot])
-            for req in requests
-        ]
+        if not self._use_speculative_beam_history_d2h:
+            builders = [
+                self._prepare_beam_history(req, finish_reasons=finish_reasons[req.py_seq_slot])
+                for req in requests
+            ]
+            return builders, None
+
+        # Speculative path: queue D2H copies onto one copier; flushed on exit.
+        with self._make_side_stream_copier() as copier:
+            builders = [
+                self._prepare_beam_history(
+                    req,
+                    finish_reasons=finish_reasons[req.py_seq_slot],
+                    copier=copier,
+                )
+                for req in requests
+            ]
+        return builders, copier.record_event()
 
     @override
     @nvtx_range("update_requests")
@@ -3685,8 +3672,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                     req, first_finish_reasons_host, first_finish_reasons
                 )
                 if self._use_speculative_beam_history_d2h:
-                    # Snapshot for the next step's
-                    # _predict_beam_search_is_likely_finishing.
+                    # Snapshot for the next step's predictor.
                     assert req.py_seq_slot is not None
                     self._prev_first_finish_reasons_host[req.py_seq_slot] = (
                         first_finish_reasons_host[req.py_seq_slot]
@@ -3773,6 +3759,9 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         finish_reasons_host: torch.Tensor | None = None
         first_finish_reasons_host: torch.Tensor | None = None
         beam_history_builders: list[BeamHistoryBuilder | None] | None = None
+        # Forwarded to _record_sampler_event so SamplerEvent.synchronize
+        # awaits any side-stream D2H copies host-side.
+        side_stream_event: torch.cuda.Event | None = None
         if requests:
             beam_search_store = self.store.beam_search_store
             assert self._use_beam_search == (beam_search_store is not None)
@@ -3802,7 +3791,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 self._update_original_tokens(
                     beam_search_store.original_tokens, seq_slots_cuda, seq_lens_cuda, new_tokens
                 )
-                beam_history_builders = self._prepare_beam_histories(
+                beam_history_builders, side_stream_event = self._prepare_beam_histories(
                     requests, finish_reasons=first_finish_reasons
                 )
 
@@ -3827,7 +3816,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 sampled_rank=host_sampled_rank,
             )
 
-        sampler_event = self._record_sampler_event()
+        sampler_event = self._record_sampler_event(side_stream_event=side_stream_event)
         return SampleStateTorch(
             requests=requests,
             device=SampleStateTensors(new_tokens=new_tokens),
