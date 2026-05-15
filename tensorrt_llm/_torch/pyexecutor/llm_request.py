@@ -675,9 +675,6 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.is_cuda_graph_dummy = False
         self.py_kv_transfer_start_time = None
         self.py_kv_transfer_timed_out = False
-        # Set by `_emit_first_token_responses` so the iteration's later
-        # `_handle_responses` pass skips a duplicate `create_response`.
-        self.py_first_token_response_sent = False
 
         # Performance timing info (step metrics, GPU events, context GPU timing)
         # Lazily created only when return_perf_metrics is enabled to avoid

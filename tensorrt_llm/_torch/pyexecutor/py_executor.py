@@ -2943,7 +2943,8 @@ class PyExecutor:
 
     def _process_previous_batch(self):
         self._handle_canceled_requests()
-        finished_requests = self._handle_responses()
+        # iter-1 already emitted earlier in this iteration by `_emit_first_token_responses`.
+        finished_requests = self._handle_responses(emit_first_iter=False)
         scheduled_requests = self.previous_batch.scheduled_requests
         attn_metadata = getattr(self.model_engine, 'attn_metadata', None)
         kv_cache_dtype_byte_size = getattr(self.model_engine,
@@ -4202,8 +4203,7 @@ class PyExecutor:
     def _emit_first_token_responses(self, prev_scheduled_requests):
         """Emit first-token responses ahead of `_sample_async` to keep
         them off the TTFT critical path. Termination, cleanup and perf
-        stats remain in `_handle_responses`, which skips the duplicate
-        `create_response` via `py_first_token_response_sent`.
+        stats remain in `_handle_responses`.
         """
         new_responses = []
         for request in prev_scheduled_requests.all_requests():
@@ -4216,15 +4216,9 @@ class PyExecutor:
             # Disagg gen-only requests are emitted by `_handle_first_token_response`. Skip here.
             if request.is_generation_only_request() and not request.is_finished:
                 continue
-            # Let `_handle_responses` issue the terminal response so the
-            # post-step perf snapshot lands on it; this also keeps the
-            # invariant that an early-emitted response is never final, which
-            # `_handle_responses` relies on to detect a cancel-after-emit
-            # race.
+            # Terminal response is issued by `_handle_responses`; an
+            # early-emitted response is never final.
             if request.is_finished:
-                continue
-            # Defensive guard against state recycling.
-            if request.py_first_token_response_sent:
                 continue
 
             logger.debug(
@@ -4253,12 +4247,11 @@ class PyExecutor:
             if logits_snapshot is not None:
                 response.result.generation_logits = logits_snapshot
             new_responses.append((request.py_request_id, response))
-            request.py_first_token_response_sent = True
 
         self._enqueue_responses(new_responses)
 
     @nvtx_range("_handle_responses")
-    def _handle_responses(self):
+    def _handle_responses(self, emit_first_iter: bool = True):
         new_responses = []
         requests_to_terminate = []
         # Requests terminated by _check_disagg_ctx_cache_transfer_status (DISAGG_CONTEXT_COMPLETE);
@@ -4316,21 +4309,13 @@ class PyExecutor:
                 request.update_perf_metrics(self.iter_counter)
 
             request_done = False
-            # `_emit_first_token_responses` only enqueues non-terminal
-            # streaming responses. If the request became finished after
-            # that emit (e.g. cancelled by `_handle_canceled_requests`),
-            # issue a fresh terminal response here; otherwise skip the
-            # duplicate `create_response`.
-            if request.py_first_token_response_sent:
-                request.py_first_token_response_sent = False
-                if request.is_finished:
-                    response = request.create_response(False, self.dist.rank)
-                    if response:
-                        response.result.cached_tokens = request.cached_tokens
-                        new_responses.append((req_id, response))
-                    request_done = True
-            elif request.py_decoding_iter == 1 or request.is_finished or \
-                    request.py_decoding_iter % self.stream_interval == 0:
+            emit_iter1 = emit_first_iter and request.py_decoding_iter == 1
+            emit_terminal = request.is_finished
+            # `> 1` guard avoids re-emitting iter 1 when stream_interval == 1.
+            emit_streaming = (request.py_decoding_iter > 1
+                              and request.py_decoding_iter %
+                              self.stream_interval == 0)
+            if emit_iter1 or emit_terminal or emit_streaming:
                 response = request.create_response(False, self.dist.rank)
                 if response:
                     request_done = request.is_finished
