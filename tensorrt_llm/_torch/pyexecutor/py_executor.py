@@ -703,10 +703,6 @@ class PyExecutor:
     # Performance metrics methods are in PerfMetricsManager (self.perf_manager)
 
     def _event_loop_wrapper(self):
-        logger.info(
-            f"[SHUTDOWN_DEBUG] _event_loop_wrapper ENTER rank={self.dist.rank} "
-            f"event_loop={self.event_loop.__name__ if hasattr(self.event_loop, '__name__') else self.event_loop}"
-        )
         try:
             # Skip line profiler during warmup/memory estimation phase to avoid
             # saving incomplete results that would be overwritten anyway
@@ -715,23 +711,12 @@ class PyExecutor:
             with host_profiler_context(enable=enable_profiler), \
                  customized_gc_thresholds(self.garbage_collection_gen0_threshold):
                 self.event_loop()
-            logger.info(
-                f"[SHUTDOWN_DEBUG] _event_loop_wrapper event_loop returned "
-                f"rank={self.dist.rank}")
         except Exception as e:
-            logger.error(
-                f"[SHUTDOWN_DEBUG] _event_loop_wrapper EXCEPTION rank={self.dist.rank} "
-                f"err={e}")
+            logger.error(f"Error in event loop: {e}")
             logger.error(traceback.format_exc())
             raise e
         finally:
-            logger.info(
-                f"[SHUTDOWN_DEBUG] _event_loop_wrapper finally: calling cleanup "
-                f"rank={self.dist.rank}")
             self._executor_loop_cleanup()
-            logger.info(
-                f"[SHUTDOWN_DEBUG] _event_loop_wrapper EXIT rank={self.dist.rank}"
-            )
 
     @property
     def is_warmup(self) -> bool:
@@ -859,19 +844,8 @@ class PyExecutor:
         """
         Signals the server to shutdown.
         """
-        logger.info(
-            f"[SHUTDOWN_DEBUG] PyExecutor.shutdown() ENTER rank={self.dist.rank} "
-            f"iter_counter={self.iter_counter} "
-            f"active_requests={len(self.active_requests)} "
-            f"is_shutdown={self.is_shutdown}")
         self.executor_request_queue.enqueue_shutdown_request()
-        logger.info(
-            f"[SHUTDOWN_DEBUG] PyExecutor.shutdown() rank={self.dist.rank} "
-            f"enqueue_shutdown_request DONE, waiting on shutdown_event")
         self.shutdown_event.wait()
-        logger.info(
-            f"[SHUTDOWN_DEBUG] PyExecutor.shutdown() rank={self.dist.rank} "
-            f"shutdown_event SET, hang_detected={self.hang_detector.detected()}")
         if self.hang_detector.detected():
             # Early return here to avoid waiting for hanging threads.
             # Since `on_detected` has sent the error message as response,
@@ -880,13 +854,7 @@ class PyExecutor:
             # All threads and memory pools will be freed properly.
             logger.error("Hang detected, shutting down immediately.")
             return
-        logger.info(
-            f"[SHUTDOWN_DEBUG] PyExecutor.shutdown() rank={self.dist.rank} "
-            f"joining worker_thread")
         self.worker_thread.join()
-        logger.info(
-            f"[SHUTDOWN_DEBUG] PyExecutor.shutdown() rank={self.dist.rank} "
-            f"worker_thread joined")
         if self.dist.pp_size > 1:
             self.executed_batch_queue.put(None)
             self.broadcast_sample_state_handler.join()
@@ -922,8 +890,6 @@ class PyExecutor:
         if self.dwdp_manager is not None:
             self.dwdp_manager.__exit__(None, None, None)
             self.dwdp_manager = None
-        logger.info(
-            f"[SHUTDOWN_DEBUG] PyExecutor.shutdown() EXIT rank={self.dist.rank}")
 
     def can_enqueue_requests(self) -> bool:
         """
@@ -1535,11 +1501,6 @@ class PyExecutor:
                                     micro_batch_id), req_stats)
 
     def _executor_loop_cleanup(self):
-        logger.info(
-            f"[SHUTDOWN_DEBUG] _executor_loop_cleanup ENTER rank={self.dist.rank} "
-            f"iter_counter={self.iter_counter} "
-            f"active_requests={len(self.active_requests)} "
-            f"num_micro_batches={self.num_micro_batches}")
 
         for i in range(self.num_micro_batches):
             self.wait_on_pp_send_handles(self.send_handles, i)
@@ -1551,9 +1512,6 @@ class PyExecutor:
             self.is_shutdown = True
             self.response_cv.notify_all()
         self.shutdown_event.set()
-        logger.info(
-            f"[SHUTDOWN_DEBUG] _executor_loop_cleanup EXIT rank={self.dist.rank} "
-            f"shutdown_event SET")
 
     def _pp_schedule_and_propagate(self, microbatch_id: int):
         """The first PP rank schedules the requests and propagates the result to all other PP ranks."""
@@ -2170,15 +2128,6 @@ class PyExecutor:
 
     def _prepare_and_schedule_batch(self):
         new_requests = self._fetch_and_activate_new_requests()
-        if self.is_shutdown:
-            # Track why we are/aren't stopping during shutdown so we can spot
-            # the case where active_requests/waiting_queue keep us from breaking.
-            logger.info(
-                f"[SHUTDOWN_DEBUG] _prepare_and_schedule_batch shutdown_state "
-                f"rank={self.dist.rank} iter_counter={self.iter_counter} "
-                f"is_shutdown=True active_requests={len(self.active_requests)} "
-                f"waiting_queue={len(self.waiting_queue)} "
-                f"should_stop_processing={self.should_stop_processing}")
         if self.should_stop_processing:
             return None, None
 
@@ -2393,8 +2342,6 @@ class PyExecutor:
         return can_forward, False
 
     def _executor_loop(self):
-        logger.info(
-            f"[SHUTDOWN_DEBUG] _executor_loop ENTER rank={self.dist.rank}")
         torch.cuda.set_device(self.device_id)
         # ensure the context is created, otherwise, some MPI calls will fail.
         CUASSERT(cudart.cudaSetDevice(self.device_id))
@@ -2416,12 +2363,6 @@ class PyExecutor:
                 self._handle_control_request()
 
                 if scheduled_batch is None:
-                    logger.info(
-                        f"[SHUTDOWN_DEBUG] _executor_loop SENTINEL observed "
-                        f"rank={self.dist.rank} "
-                        f"iter_counter={self.iter_counter} "
-                        f"active_requests={len(self.active_requests)} "
-                        f"breaking out of loop")
                     break
 
                 can_forward, should_retry = self._check_benchmark_disagg_gate(
@@ -2680,9 +2621,6 @@ class PyExecutor:
             self.control_request_barrier.clear()
 
     def _executor_loop_overlap(self):
-        logger.info(
-            f"[SHUTDOWN_DEBUG] _executor_loop_overlap ENTER rank={self.dist.rank}"
-        )
         torch.cuda.set_device(self.device_id)
         # ensure the context is created, otherwise, some MPI calls will fail.
         CUASSERT(cudart.cudaSetDevice(self.device_id))
@@ -2705,13 +2643,6 @@ class PyExecutor:
                 self._handle_control_request()
 
                 if scheduled_batch is None:
-                    logger.info(
-                        f"[SHUTDOWN_DEBUG] _executor_loop_overlap SENTINEL "
-                        f"observed rank={self.dist.rank} "
-                        f"iter_counter={self.iter_counter} "
-                        f"active_requests={len(self.active_requests)} "
-                        f"previous_batch={'set' if self.previous_batch is not None else 'None'} "
-                        f"breaking out of loop")
                     break
 
                 can_forward, should_retry = self._check_benchmark_disagg_gate(
@@ -3217,11 +3148,6 @@ class PyExecutor:
         accepted_new_requests = []
         for idx, req_item in enumerate(new_requests):
             if req_item.is_shutdown_request:
-                logger.info(
-                    f"[SHUTDOWN_DEBUG] worker received SHUTDOWN_REQUEST "
-                    f"rank={self.dist.rank} iter_counter={self.iter_counter} "
-                    f"active_requests={len(self.active_requests)} "
-                    f"waiting_queue={len(self.waiting_queue)}")
                 self.is_shutdown = True
                 break
             elif req_item.is_canceled_request:
@@ -4280,33 +4206,19 @@ class PyExecutor:
         stats remain in `_handle_responses`.
         """
         new_responses = []
-        # Counters for shutdown debugging.
-        n_total = 0
-        n_skip_iter = 0
-        n_skip_dummy = 0
-        n_skip_kv_timeout = 0
-        n_skip_disagg_gen = 0
-        n_skip_finished = 0
-        n_create_returned_none = 0
         for request in prev_scheduled_requests.all_requests():
-            n_total += 1
             if request.py_decoding_iter != 1:
-                n_skip_iter += 1
                 continue
             if request.is_attention_dp_dummy or request.is_cuda_graph_dummy:
-                n_skip_dummy += 1
                 continue
             if request.py_kv_transfer_timed_out:
-                n_skip_kv_timeout += 1
                 continue
             # Disagg gen-only requests are emitted by `_handle_first_token_response`. Skip here.
             if request.is_generation_only_request() and not request.is_finished:
-                n_skip_disagg_gen += 1
                 continue
             # Terminal response is issued by `_handle_responses`; an
             # early-emitted response is never final.
             if request.is_finished:
-                n_skip_finished += 1
                 continue
 
             logger.debug(
@@ -4330,22 +4242,12 @@ class PyExecutor:
 
             response = request.create_response(False, self.dist.rank)
             if response is None:
-                n_create_returned_none += 1
                 continue
             response.result.cached_tokens = request.cached_tokens
             if logits_snapshot is not None:
                 response.result.generation_logits = logits_snapshot
             new_responses.append((request.py_request_id, response))
 
-        if n_total > 0:
-            logger.info(
-                f"[SHUTDOWN_DEBUG] _emit_first_token_responses rank={self.dist.rank} "
-                f"iter_counter={self.iter_counter} "
-                f"total={n_total} emitted={len(new_responses)} "
-                f"skip_iter!=1={n_skip_iter} skip_dummy={n_skip_dummy} "
-                f"skip_kv_timeout={n_skip_kv_timeout} skip_disagg_gen={n_skip_disagg_gen} "
-                f"skip_finished={n_skip_finished} "
-                f"create_returned_none={n_create_returned_none}")
         self._enqueue_responses(new_responses)
 
     @nvtx_range("_handle_responses")
@@ -4356,10 +4258,6 @@ class PyExecutor:
         # included in the return value for stats but not re-terminated here.
         requests_finished_by_transfer = []
         new_active_requests = []
-        # Counters for shutdown debugging.
-        n_active_in = len(self.active_requests)
-        n_finished_no_response = 0
-        n_finished_with_response = 0
         logger.debug(
             f'------before _handle_responses, rank = {self.dist.rank}, output = {self.active_requests}'
         )
@@ -4423,21 +4321,6 @@ class PyExecutor:
                     request_done = request.is_finished
                     response.result.cached_tokens = request.cached_tokens
                     new_responses.append((req_id, response))
-                    if emit_terminal:
-                        n_finished_with_response += 1
-                elif emit_terminal:
-                    # H5: is_finished but create_response returned None.
-                    # Without `request_done` being set, this request leaks.
-                    n_finished_no_response += 1
-                    logger.info(
-                        f"[SHUTDOWN_DEBUG] _handle_responses FINISHED_NO_RESPONSE "
-                        f"rank={self.dist.rank} iter_counter={self.iter_counter} "
-                        f"req_id={req_id} py_decoding_iter={request.py_decoding_iter} "
-                        f"emit_first_iter={emit_first_iter} "
-                        f"emit_iter1={emit_iter1} emit_streaming={emit_streaming} "
-                        f"is_disagg_context_complete_state={request.is_disagg_context_complete_state} "
-                        f"is_disagg_context_transmission_state={request.is_disagg_context_transmission_state}"
-                    )
 
             if request_done:
                 if (self.drafter is not None and getattr(
@@ -4487,16 +4370,6 @@ class PyExecutor:
         self._enqueue_responses(new_responses)
         for request in requests_to_terminate:
             self._terminate_request(request)
-        if n_active_in > 0 or n_finished_no_response > 0:
-            logger.info(
-                f"[SHUTDOWN_DEBUG] _handle_responses rank={self.dist.rank} "
-                f"iter_counter={self.iter_counter} "
-                f"emit_first_iter={emit_first_iter} "
-                f"active_in={n_active_in} active_out={len(new_active_requests)} "
-                f"to_terminate={len(requests_to_terminate)} "
-                f"finished_with_response={n_finished_with_response} "
-                f"finished_no_response={n_finished_no_response} "
-                f"new_responses_enqueued={len(new_responses)}")
         return requests_to_terminate + requests_finished_by_transfer
 
     def _await_any_response(self,

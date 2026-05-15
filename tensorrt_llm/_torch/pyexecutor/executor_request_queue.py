@@ -131,16 +131,9 @@ class ExecutorRequestQueue:
             self.request_queue.put(RequestQueueItem(id=CONTROL_REQUEST_ID))
 
     def enqueue_shutdown_request(self):
-        from tensorrt_llm.logger import logger
-        logger.info(
-            f"[SHUTDOWN_DEBUG] enqueue_shutdown_request ENTER "
-            f"rank={self.dist.rank} active={self.active}")
         with self.enqueue_lock:
             self.request_queue.put(RequestQueueItem(SHUTDOWN_REQUEST_ID))
             self.active = False
-        logger.info(
-            f"[SHUTDOWN_DEBUG] enqueue_shutdown_request EXIT "
-            f"rank={self.dist.rank}")
 
     def can_enqueue_request(self) -> bool:
         with self.enqueue_lock:
