@@ -408,11 +408,23 @@ class GenerationExecutorProxy(GenerationExecutor):
             result.abort()
 
     def pre_shutdown(self):
+        logger.info(
+            f"[SHUTDOWN_DEBUG] Proxy.pre_shutdown ENTER "
+            f"workers_started={self.workers_started} "
+            f"doing_shutdown={self.doing_shutdown} "
+            f"mpi_futures_count={len(self.mpi_futures)} "
+            f"mpi_futures_done={[f.done() for f in self.mpi_futures]}")
         if not self.workers_started:
+            logger.info(
+                "[SHUTDOWN_DEBUG] Proxy.pre_shutdown EXIT (workers_not_started)"
+            )
             return
         logger_debug('Proxy.pre_shutdown...\n', "yellow")
 
         if self.doing_shutdown:
+            logger.info(
+                "[SHUTDOWN_DEBUG] Proxy.pre_shutdown EXIT (already_doing_shutdown)"
+            )
             return
         else:
             self.doing_shutdown = True
@@ -440,10 +452,26 @@ class GenerationExecutorProxy(GenerationExecutor):
         # to bare ``any(...)`` to better handle partial crashes regressed
         # case (a); keep both behaviours explicit.
         if not self.mpi_futures or any(not f.done() for f in self.mpi_futures):
-            self.request_queue.put_noblock(None, retry=4)
+            sent = self.request_queue.put_noblock(None, retry=4)
+            logger.info(
+                f"[SHUTDOWN_DEBUG] Proxy.pre_shutdown sentinel SENT "
+                f"result={sent} mpi_futures_done={[f.done() for f in self.mpi_futures]}"
+            )
+        else:
+            logger.info(
+                f"[SHUTDOWN_DEBUG] Proxy.pre_shutdown sentinel SKIPPED "
+                f"mpi_futures_done={[f.done() for f in self.mpi_futures]}")
+        logger.info("[SHUTDOWN_DEBUG] Proxy.pre_shutdown EXIT")
 
     def shutdown(self):
+        logger.info(
+            f"[SHUTDOWN_DEBUG] Proxy.shutdown ENTER "
+            f"workers_started={self.workers_started} "
+            f"doing_shutdown={self.doing_shutdown} "
+            f"mpi_futures_count={len(self.mpi_futures)}")
         if not self.workers_started:
+            logger.info(
+                "[SHUTDOWN_DEBUG] Proxy.shutdown EXIT (workers_not_started)")
             return
 
         if not self.doing_shutdown:
@@ -451,13 +479,20 @@ class GenerationExecutorProxy(GenerationExecutor):
 
         logger_debug('Proxy.shutdown...\n', "yellow")
 
-        for f in self.mpi_futures:
+        for idx, f in enumerate(self.mpi_futures):
+            logger.info(
+                f"[SHUTDOWN_DEBUG] Proxy.shutdown waiting on mpi_future[{idx}] "
+                f"done={f.done()}")
             try:
                 f.result()
-            except:
+            except Exception as e:
                 # The errors are already captured in mpi_done_callback, ignored
                 # here
-                pass
+                logger.info(
+                    f"[SHUTDOWN_DEBUG] Proxy.shutdown mpi_future[{idx}] "
+                    f"raised {type(e).__name__}: {e}")
+            logger.info(
+                f"[SHUTDOWN_DEBUG] Proxy.shutdown mpi_future[{idx}] DONE")
 
         # step2: notify the background threads to quit
         if (hasattr(self, '_error_monitor_thread')
@@ -485,13 +520,16 @@ class GenerationExecutorProxy(GenerationExecutor):
             self._resource_governor_queue.close()
 
         self.workers_started = False
+        logger.info("[SHUTDOWN_DEBUG] Proxy.shutdown calling mpi_session.shutdown")
         self.mpi_session.shutdown()
+        logger.info("[SHUTDOWN_DEBUG] Proxy.shutdown mpi_session.shutdown DONE")
 
         # Process the errors in-case error during shutting down the threads
         self._handle_background_error()
 
         if enable_llm_debug():
             print_alive_threads()
+        logger.info("[SHUTDOWN_DEBUG] Proxy.shutdown EXIT")
 
     def submit(self, request: GenerationRequest) -> GenerationResult:
         """

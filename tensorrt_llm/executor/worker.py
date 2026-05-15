@@ -92,8 +92,15 @@ class GenerationExecutorWorker(RpcWorkerMixin, BaseWorker):
         self.start_thread(self.await_response_thread)
 
     def shutdown(self):
+        logger.info(
+            f"[SHUTDOWN_DEBUG] GenerationExecutorWorker.shutdown ENTER "
+            f"rank={mpi_rank()} doing_shutdown={self.doing_shutdown} "
+            f"engine_is_None={self.engine is None}")
 
         if self.doing_shutdown:
+            logger.info(
+                f"[SHUTDOWN_DEBUG] GenerationExecutorWorker.shutdown EXIT "
+                f"rank={mpi_rank()} (already_doing_shutdown)")
             return
         else:
             self.doing_shutdown = True
@@ -103,10 +110,22 @@ class GenerationExecutorWorker(RpcWorkerMixin, BaseWorker):
         if self.engine is not None:
             if self.engine.can_enqueue_requests():
                 if self.await_response_thread.is_alive():
+                    logger.info(
+                        f"[SHUTDOWN_DEBUG] GenerationExecutorWorker.shutdown "
+                        f"rank={mpi_rank()} stopping await_response_thread")
                     self.await_response_thread.stop()
                     self.await_response_thread.join()
+                    logger.info(
+                        f"[SHUTDOWN_DEBUG] GenerationExecutorWorker.shutdown "
+                        f"rank={mpi_rank()} await_response_thread joined")
 
+            logger.info(
+                f"[SHUTDOWN_DEBUG] GenerationExecutorWorker.shutdown "
+                f"rank={mpi_rank()} calling engine.shutdown()")
             self.engine.shutdown()
+            logger.info(
+                f"[SHUTDOWN_DEBUG] GenerationExecutorWorker.shutdown "
+                f"rank={mpi_rank()} engine.shutdown() returned")
             self.engine = None
 
             if self.llm_args is not None:
@@ -127,6 +146,9 @@ class GenerationExecutorWorker(RpcWorkerMixin, BaseWorker):
         self._handle_background_error()
 
         logger_debug(f"Worker {mpi_rank()} shutdown done.\n", "yellow")
+        logger.info(
+            f"[SHUTDOWN_DEBUG] GenerationExecutorWorker.shutdown EXIT "
+            f"rank={mpi_rank()}")
 
     def block_subordinates(self):
         if self.rank != 0:
@@ -190,6 +212,9 @@ def worker_main(
         _init_hf_modules()
 
     logger_debug(f"Worker {mpi_rank()} entering worker_main...\n", "green")
+    logger.info(
+        f"[SHUTDOWN_DEBUG] worker_main ENTER rank={mpi_rank()} pid={os.getpid()}"
+    )
 
     result_queue: Optional[IpcQueue] = None
     result_queues: Optional[List[IpcQueue]] = None
@@ -247,12 +272,20 @@ def worker_main(
 
     def notify_proxy_threads_to_quit():
         # Signal the dispatcher thread in the proxy to quit
+        logger.info(
+            f"[SHUTDOWN_DEBUG] notify_proxy_threads_to_quit ENTER "
+            f"rank={mpi_rank()} "
+            f"single_q={result_queue is not None} "
+            f"multi_q_count={len(result_queues) if result_queues else 0}")
         if result_queue is not None:
             result_queue.put(None)
         else:
             assert result_queues is not None
             for q in result_queues:
                 q.put(None)
+        logger.info(
+            f"[SHUTDOWN_DEBUG] notify_proxy_threads_to_quit EXIT "
+            f"rank={mpi_rank()}")
 
     postprocess_worker_futures = []
     if is_leader and postproc_worker_config.enabled:
@@ -353,15 +386,36 @@ def worker_main(
                     else:
                         raise ValueError(f"Unknown request type: {type(req)}")
 
+                logger.info(
+                    f"[SHUTDOWN_DEBUG] worker_main rank={mpi_rank()} "
+                    f"received SENTINEL from request_queue, "
+                    f"notifying proxy threads to quit")
                 notify_proxy_threads_to_quit()
+                logger.info(
+                    f"[SHUTDOWN_DEBUG] worker_main rank={mpi_rank()} "
+                    f"notify_proxy_threads_to_quit returned, "
+                    f"exiting `with worker:` block")
 
         except GenerationExecutorWorker.WorkerExit as e:
             # This will capture by the with-statement and exit normally.
+            logger.info(
+                f"[SHUTDOWN_DEBUG] worker_main rank={mpi_rank()} "
+                f"caught WorkerExit, re-raising")
             raise e
 
         except Exception as e:  # other critical errors
+            logger.info(
+                f"[SHUTDOWN_DEBUG] worker_main rank={mpi_rank()} "
+                f"caught {type(e).__name__}: {e}")
             if is_leader:
                 notify_proxy_threads_to_quit()
             logger.error(traceback.format_exc())
             # This will be captured by mpi4py and handled by future.done_callback
             raise e
+        logger.info(
+            f"[SHUTDOWN_DEBUG] worker_main rank={mpi_rank()} "
+            f"about to exit `with worker:` block (will trigger worker.__exit__)"
+        )
+    logger.info(
+        f"[SHUTDOWN_DEBUG] worker_main rank={mpi_rank()} "
+        f"`with worker:` block returned, returning from worker_main")
