@@ -13,15 +13,14 @@
 # limitations under the License.
 
 import enum
-import os
 import sys
 from abc import ABC, abstractmethod
 from collections import defaultdict
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 from concurrent import futures
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass
 from itertools import repeat
-from types import TracebackType
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -1107,47 +1106,35 @@ class _SideStreamCopier:
     been synced host-side. Each copier is single-use.
     """
 
-    def __init__(self, side_stream: torch.cuda.Stream) -> None:
-        self._side_stream = side_stream
-        self._tasks: list[tuple[torch.Tensor, torch.Tensor]] = []
-        self._flushed: bool = False
-
-    def __enter__(self) -> "_SideStreamCopier":
-        return self
-
-    def __exit__(
+    def __init__(
         self,
-        exc_type: type[BaseException] | None,
-        exc_val: BaseException | None,
-        exc_tb: TracebackType | None,
+        side_stream: torch.cuda.Stream,
+        side_stream_ctx: torch.cuda.StreamContext,
     ) -> None:
-        if exc_type is not None:
-            return
-        self._flush()
+        self._side_stream = side_stream
+        self._side_stream_ctx = side_stream_ctx
+        self._tasks: list[tuple[torch.Tensor, torch.Tensor]] = []
+        self.event: torch.cuda.Event | None = None
 
     def copy_to_host(self, src: torch.Tensor) -> torch.Tensor:
         """Queue a non-blocking D2H copy of src and return its pinned-CPU dst."""
-        assert not self._flushed, "copy_to_host called after the copier was flushed"
         dst = torch.empty_like(src, device="cpu", pin_memory=prefer_pinned())
         self._tasks.append((dst, src))
         return dst
 
-    def _flush(self) -> None:
+    def record_event(self) -> torch.cuda.Event | None:
+        """Flush the queued copies and record (and return) an event after them, or None if none were queued."""
         if not self._tasks:
-            return
+            self.event = None
+            return None
         self._side_stream.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(self._side_stream):
+        with self._side_stream_ctx:
             for dst, src in self._tasks:
                 dst.copy_(src, non_blocking=True)
         self._tasks.clear()
-        self._flushed = True
-
-    def record_event(self) -> torch.cuda.Event | None:
-        """Return an event recorded after the queued copies, or None if none were queued."""
-        if not self._flushed:
-            return None
         event = torch.cuda.Event()
         event.record(self._side_stream)
+        self.event = event
         return event
 
 
@@ -1170,8 +1157,12 @@ class AsyncWorkerMixin:
         self._enable_async_worker = enable_async_worker
         self._async_worker: futures.ThreadPoolExecutor | None = None
         self._async_worker_futures: list[futures.Future[Any]] = []
-        # Private D2H side stream shared by all speculative beam-history copiers.
+        # Private D2H side stream + cached stream context shared by all
+        # speculative beam-history copiers.
         self._d2h_side_stream: torch.cuda.Stream = torch.cuda.Stream()
+        self._d2h_side_stream_ctx: torch.cuda.StreamContext = torch.cuda.stream(
+            self._d2h_side_stream
+        )
 
     def async_worker_enabled(self) -> bool:
         return getattr(self, "_enable_async_worker", False)
@@ -1245,9 +1236,19 @@ class AsyncWorkerMixin:
             dest.copy_(src, non_blocking=True)
         return dest
 
-    def _make_side_stream_copier(self) -> _SideStreamCopier:
-        """Return a fresh copier bound to the shared D2H side stream."""
-        return _SideStreamCopier(self._d2h_side_stream)
+    @contextmanager
+    def _make_side_stream_copier(self) -> Iterator[_SideStreamCopier]:
+        """Yield a fresh copier bound to the shared D2H side stream.
+
+        On exit, queued copies are flushed and an event is recorded;
+        retrieve it from `copier.event` (`None` if nothing was queued).
+        The `@contextmanager` form forces callers to use `with`.
+        """
+        copier = _SideStreamCopier(self._d2h_side_stream, self._d2h_side_stream_ctx)
+        try:
+            yield copier
+        finally:
+            copier.record_event()
 
     def _record_sampler_event(
         self, side_stream_event: torch.cuda.Event | None = None
@@ -2266,6 +2267,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         disable_overlap_scheduler: bool = False
         disable_flashinfer_sampling: bool = False
         enable_async_worker: bool = False
+        enable_speculative_beam_history_d2h: bool = False
 
     def __init__(self, args: Args):
         self.max_seq_len = args.max_seq_len
@@ -2327,17 +2329,17 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
 
         self._async_worker_init(args.enable_async_worker)
 
-        # Opt-in switch for the speculative beam-history D2H path; default off
-        # uses the safe per-step _copy_to_host. Stopgap until exposed in LlmArgs.
-        # The speculative path bypasses AsyncWorkerMixin's _copy_to_host, so it
-        # is incompatible with the async worker and is force-disabled there.
-        self._use_speculative_beam_history_d2h: bool = (
-            os.environ.get("TRTLLM_ENABLE_BEAM_SEARCH_SPECULATIVE_D2H", "0") == "1"
-        )
+        # The speculative path bypasses _copy_to_host, so it cannot coexist
+        # with the async worker. LlmArgs validation rejects the explicit
+        # conflict with sampler_force_async_worker. Confidential compute may
+        # also enable the async worker at runtime; if so, disable the path
+        # here with a warning.
+        self._use_speculative_beam_history_d2h: bool = args.enable_speculative_beam_history_d2h
         if self._use_speculative_beam_history_d2h and self.async_worker_enabled():
             logger.warning(
-                "TRTLLM_ENABLE_BEAM_SEARCH_SPECULATIVE_D2H is incompatible with "
-                "enable_async_worker=True; disabling the speculative path."
+                "enable_speculative_beam_history_d2h is incompatible with the "
+                "sampler async worker (likely auto-enabled by confidential "
+                "compute); disabling the speculative beam-history D2H path."
             )
             self._use_speculative_beam_history_d2h = False
 
@@ -3154,8 +3156,8 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         Dispatches to one of two D2H strategies based on
         self._use_speculative_beam_history_d2h:
           - Default: _prepare_beam_history_default, _copy_to_host per step.
-          - Speculative (TRTLLM_ENABLE_BEAM_SEARCH_SPECULATIVE_D2H=1):
-            _prepare_beam_history_speculative skips definitely-non-terminal
+          - Speculative (enable_speculative_beam_history_d2h=True):
+            _prepare_beam_history_speculative skips likely-non-terminal
             steps via a host-side predictor and routes the rest through
             side_stream_copier; predictor misses fall back to a synchronous
             .cpu(). side_stream_copier is required for this path only.
@@ -3296,8 +3298,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         device_slices: _BeamHistoryDeviceSlices,
         side_stream_copier: _SideStreamCopier,
     ) -> BeamHistoryBuilder | None:
-        """Speculative D2H strategy (opt-in via
-        TRTLLM_ENABLE_BEAM_SEARCH_SPECULATIVE_D2H=1).
+        """Speculative D2H strategy.
 
         A host-side predictor skips side-stream D2H copies on non-terminal
         steps; misses fall back to a synchronous .cpu() in _builder. All
@@ -3558,7 +3559,8 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             _, cumsum = request.py_stop_words_list
             if -1 in cumsum:
                 cumsum = cumsum[: cumsum.index(-1)]
-            longest_stop_word_len = int(np.max(np.diff(cumsum, prepend=0), initial=0).item())
+            cumsum_arr = np.asarray(cumsum, dtype=np.int32)
+            longest_stop_word_len = int(np.max(np.diff(cumsum_arr, prepend=0), initial=0).item())
             return longest_stop_word_len > 1
         return False
 
@@ -3569,10 +3571,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         num_generated_tokens: int,
         num_tokens: int,
     ) -> bool:
-        """Predict whether this step might finalize the beam history.
-
-        True triggers an eager side-stream D2H copy; False skips it. False
-        negatives fall back to a synchronous .cpu() in _builder.
+        """Predict whether this step might trigger beam history finalization.
 
         Returns True if any of:
           1. Length budget reached (max_new_tokens or max_seq_len).
@@ -3609,25 +3608,23 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         forward it to _record_sampler_event so SamplerEvent.synchronize
         awaits the side stream before any builder is invoked.
         """
-        if not self._use_speculative_beam_history_d2h:
-            builders = [
-                self._prepare_beam_history(req, finish_reasons=finish_reasons[req.py_seq_slot])
-                for req in requests
-            ]
-            return builders, None
-
-        # Speculative path: queue D2H copies onto one shared side-stream
-        # copier; flushed on exit.
-        with self._make_side_stream_copier() as side_stream_copier:
+        # Single `with` for both modes; nullcontext yields None.
+        copier_ctx: AbstractContextManager[_SideStreamCopier | None] = (
+            self._make_side_stream_copier()
+            if self._use_speculative_beam_history_d2h
+            else nullcontext()
+        )
+        with copier_ctx as copier:
             builders = [
                 self._prepare_beam_history(
                     req,
                     finish_reasons=finish_reasons[req.py_seq_slot],
-                    side_stream_copier=side_stream_copier,
+                    side_stream_copier=copier,
                 )
                 for req in requests
             ]
-        return builders, side_stream_copier.record_event()
+        side_stream_event = copier.event if copier is not None else None
+        return builders, side_stream_event
 
     @override
     @nvtx_range("update_requests")

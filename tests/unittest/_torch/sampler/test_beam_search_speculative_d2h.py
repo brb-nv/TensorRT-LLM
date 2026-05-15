@@ -15,7 +15,7 @@
 """End-to-end tests for the beam-history speculative D2H opt-in.
 
 This file covers the code paths gated behind
-`TRTLLM_ENABLE_BEAM_SEARCH_SPECULATIVE_D2H`:
+`TorchLlmArgs.enable_speculative_beam_history_d2h`:
 
 * parity vs the default (synchronous) beam-history D2H path,
 * the predictor-miss fallback in
@@ -35,6 +35,7 @@ from copy import deepcopy
 from typing import Any, Iterable
 
 import pytest
+from pydantic import ValidationError
 from test_beam_search_util import DummyConfigLoader, DummyWeightLoader
 from utils.util import assert_no_cuda_sync
 
@@ -43,8 +44,6 @@ from tensorrt_llm._torch.models.checkpoints import HfCheckpointLoader
 from tensorrt_llm._torch.pyexecutor.sampler import SampleStateTorch, TorchSampler
 from tensorrt_llm.executor.result import GenerationResult
 from tensorrt_llm.llmapi import KvCacheConfig
-
-ENV_VAR = "TRTLLM_ENABLE_BEAM_SEARCH_SPECULATIVE_D2H"
 
 
 @pytest.fixture(scope="module")
@@ -61,6 +60,7 @@ def _build_llm(
     fixed_params: dict[str, Any],
     input_prompts: list[list[int]],
     *,
+    enable_speculative_beam_history_d2h: bool = False,
     sampler_force_async_worker: bool = False,
 ) -> LLM:
     return LLM(
@@ -77,14 +77,8 @@ def _build_llm(
         disable_overlap_scheduler=True,
         cuda_graph_config=None,
         sampler_force_async_worker=sampler_force_async_worker,
+        enable_speculative_beam_history_d2h=enable_speculative_beam_history_d2h,
     )
-
-
-def _set_speculative_env(monkeypatch: pytest.MonkeyPatch, enabled: bool) -> None:
-    if enabled:
-        monkeypatch.setenv(ENV_VAR, "1")
-    else:
-        monkeypatch.delenv(ENV_VAR, raising=False)
 
 
 def _make_sampling_params(
@@ -158,16 +152,16 @@ def _run_with_env(
     sampler_force_async_worker: bool = False,
     sampler_method_patches: dict[str, Any] | None = None,
 ) -> list[GenerationResult]:
-    """Build a fresh LLM with the env var configured, run beam search, tear down.
+    """Build a fresh LLM with the speculative flag configured, run beam search, tear down.
 
-    The env var is read in `TorchSampler.__init__`, so it must be set before
-    the LLM is constructed. `predictor_override` patches
+    Opt-in is via `TorchLlmArgs.enable_speculative_beam_history_d2h`.
+    `predictor_override` patches
     `TorchSampler._predict_beam_search_is_likely_finishing` and
-    `sampler_method_patches` patches arbitrary `TorchSampler` methods; either
-    forces `TLLM_WORKER_USE_SINGLE_PROCESS=1` so class-level patches reach the
-    sampler. `sampler_force_async_worker` enables the AsyncWorkerMixin path.
+    `sampler_method_patches` patches arbitrary `TorchSampler` methods;
+    either forces `TLLM_WORKER_USE_SINGLE_PROCESS=1` so class-level patches
+    reach the sampler. `sampler_force_async_worker` enables the
+    AsyncWorkerMixin path.
     """
-    _set_speculative_env(monkeypatch, speculative)
     needs_single_process = predictor_override is not None or sampler_method_patches
     if needs_single_process:
         # Class-level patches do not cross process boundaries; force the
@@ -183,7 +177,10 @@ def _run_with_env(
 
     gc.collect(2)
     llm = _build_llm(
-        fixed_params, input_prompts, sampler_force_async_worker=sampler_force_async_worker
+        fixed_params,
+        input_prompts,
+        enable_speculative_beam_history_d2h=speculative,
+        sampler_force_async_worker=sampler_force_async_worker,
     )
     try:
         with llm:
@@ -288,7 +285,7 @@ def test_speculative_d2h_predictor_miss_fallback(
 
     assert miss_state["calls"] > 0, (
         "predictor patch was never invoked; the speculative path did not run "
-        "(check that TRTLLM_ENABLE_BEAM_SEARCH_SPECULATIVE_D2H is honored)"
+        "(check that enable_speculative_beam_history_d2h is honored)"
     )
     _assert_outputs_equal(out_on, out_off)
 
@@ -330,63 +327,36 @@ def test_speculative_d2h_predictor_always_hit(
 
     assert hit_state["calls"] > 0, (
         "predictor patch was never invoked; the speculative path did not run "
-        "(check that TRTLLM_ENABLE_BEAM_SEARCH_SPECULATIVE_D2H is honored)"
+        "(check that enable_speculative_beam_history_d2h is honored)"
     )
     _assert_outputs_equal(out_on, out_off)
 
 
 # ---------------------------------------------------------------------------
-# CC guard: speculative path must be force-disabled when async_worker is on.
+# Validator: speculative path must be rejected when sampler_force_async_worker
+# is also set, since the speculative path bypasses the async D2H worker.
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.threadleak(enabled=False)
-def test_speculative_d2h_disabled_when_async_worker_enabled(
+def test_speculative_d2h_rejects_async_worker_combo(
     fixed_params: dict[str, Any],
     input_prompts: list[list[int]],
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Speculative path is bypassed when `sampler_force_async_worker=True`.
+    """`TorchLlmArgs.validate_speculative_beam_history_d2h` must raise when
+    both `enable_speculative_beam_history_d2h=True` and
+    `sampler_force_async_worker=True` are passed.
 
     The speculative path bypasses `_copy_to_host`, which AsyncWorkerMixin
-    relies on, so `TorchSampler.__init__` must disable it whenever the async
-    worker is active. Any call to `_prepare_beam_history_speculative` here
-    means that guard regressed.
+    relies on, so the combination is rejected at config validation time.
     """
-    state = {"speculative_calls": 0, "default_calls": 0}
-
-    speculative_orig = TorchSampler._prepare_beam_history_speculative
-    default_orig = TorchSampler._prepare_beam_history_default
-
-    def _speculative_counter(self, *args, **kwargs):  # type: ignore[no-untyped-def]
-        state["speculative_calls"] += 1
-        return speculative_orig(self, *args, **kwargs)
-
-    def _default_counter(self, *args, **kwargs):  # type: ignore[no-untyped-def]
-        state["default_calls"] += 1
-        return default_orig(self, *args, **kwargs)
-
-    _ = _run_with_env(
-        fixed_params,
-        input_prompts,
-        monkeypatch,
-        speculative=True,
-        stop_token_ids=None,
-        sampler_force_async_worker=True,
-        sampler_method_patches={
-            "_prepare_beam_history_speculative": _speculative_counter,
-            "_prepare_beam_history_default": _default_counter,
-        },
-    )
-
-    assert state["speculative_calls"] == 0, (
-        f"_prepare_beam_history_speculative was called {state['speculative_calls']} time(s) "
-        "even though sampler_force_async_worker=True; the CC guard regressed."
-    )
-    assert state["default_calls"] > 0, (
-        "_prepare_beam_history_default was never called; check that beam search "
-        "actually ran in this configuration."
-    )
+    with pytest.raises(ValidationError, match="enable_speculative_beam_history_d2h"):
+        _build_llm(
+            fixed_params,
+            input_prompts,
+            enable_speculative_beam_history_d2h=True,
+            sampler_force_async_worker=True,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -449,7 +419,7 @@ def test_speculative_d2h_predictor_hit_is_sync_free(
 
     assert hit_state["calls"] > 0, (
         "predictor patch was never invoked; the speculative path did not run "
-        "(check that TRTLLM_ENABLE_BEAM_SEARCH_SPECULATIVE_D2H is honored)"
+        "(check that enable_speculative_beam_history_d2h is honored)"
     )
     assert hook_state["sample_async_called"], "sample_async hook was never invoked"
     assert hook_state["update_requests_called"], "update_requests hook was never invoked"
