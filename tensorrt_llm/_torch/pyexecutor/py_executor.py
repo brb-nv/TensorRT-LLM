@@ -4187,8 +4187,25 @@ class PyExecutor:
 
         self._enqueue_responses(new_responses)
 
-    @nvtx_range("_handle_responses")
-    def _handle_responses(self):
+    @nvtx_range("_build_responses")
+    def _build_responses(
+            self) -> Tuple[List[Tuple[int, LlmResponse]], List, List]:
+        """Build per-request responses and partition ``active_requests``.
+
+        Mutates ``self.active_requests`` to drop streamed-out / finished
+        requests. Does NOT enqueue and does NOT terminate requests. The
+        caller is responsible for invoking ``self._enqueue_responses(...)``
+        followed by ``self._finalize_handled_responses(...)`` in that order;
+        termination must happen after the response is enqueued so the
+        response can still find the originating request.
+
+        Returns a tuple of:
+        - new_responses: list of (req_id, LlmResponse) to be enqueued
+        - requests_to_terminate: finished requests pending termination
+        - requests_finished_by_transfer: requests already terminated by
+          ``_check_disagg_ctx_cache_transfer_status`` (DISAGG_CONTEXT_COMPLETE);
+          included for stats accounting but not to be re-terminated here.
+        """
         new_responses = []
         requests_to_terminate = []
         # Requests terminated by _check_disagg_ctx_cache_transfer_status (DISAGG_CONTEXT_COMPLETE);
@@ -4196,7 +4213,7 @@ class PyExecutor:
         requests_finished_by_transfer = []
         new_active_requests = []
         logger.debug(
-            f'------before _handle_responses, rank = {self.dist.rank}, output = {self.active_requests}'
+            f'------before _build_responses, rank = {self.dist.rank}, output = {self.active_requests}'
         )
 
         batch_token_time = self.perf_manager.get_timestamp()
@@ -4298,11 +4315,30 @@ class PyExecutor:
 
         self.active_requests.clear()
         self.active_requests.extend(new_active_requests)
-        # Request should be terminated after enqueueing response to ensure we can enqueue response successfully.
-        self._enqueue_responses(new_responses)
+        return (new_responses, requests_to_terminate,
+                requests_finished_by_transfer)
+
+    def _finalize_handled_responses(
+            self, requests_to_terminate: List,
+            requests_finished_by_transfer: List) -> List:
+        """Terminate finished requests and return the combined finished list.
+
+        Must be called AFTER ``self._enqueue_responses(...)`` for the same
+        batch so the response can still find the originating request before
+        its resources are released.
+        """
         for request in requests_to_terminate:
             self._terminate_request(request)
         return requests_to_terminate + requests_finished_by_transfer
+
+    @nvtx_range("_handle_responses")
+    def _handle_responses(self):
+        new_responses, requests_to_terminate, requests_finished_by_transfer = (
+            self._build_responses())
+        # Request should be terminated after enqueueing response to ensure we can enqueue response successfully.
+        self._enqueue_responses(new_responses)
+        return self._finalize_handled_responses(requests_to_terminate,
+                                                requests_finished_by_transfer)
 
     def _await_any_response(self,
                             timeout: Optional[float] = None
