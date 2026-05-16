@@ -19,7 +19,7 @@ This file covers the code paths gated behind
 
 * parity vs the default (synchronous) beam-history D2H path,
 * the predictor-miss fallback in
-  `TorchSampler._prepare_beam_history_speculative._builder`
+  `TorchSampler._prepare_beam_history._builder`
   (the synchronous `.cpu()` issued when the host-side predictor
   decided the step is non-terminal but the beam still finalizes),
 * the predictor-hit path that routes copies through the side stream.
@@ -241,8 +241,8 @@ def _pinned_predictor(value: bool) -> tuple[Any, dict[str, int]]:
 
     The counter lets tests assert the patch was actually exercised
     (i.e., the speculative code path was taken), guarding against silent
-    regressions where `_prepare_beam_history_speculative` stops calling
-    the predictor.
+    regressions where `_prepare_beam_history` stops calling the predictor
+    in the speculative branch.
     """
     state = {"calls": 0}
 
@@ -261,10 +261,11 @@ def test_speculative_d2h_predictor_miss_fallback(
 ) -> None:
     """Force every step to be a predictor miss; verify outputs are correct.
 
-    With the predictor pinned to `False`, `_prepare_beam_history_speculative`
-    never queues side-stream copies, so every call into `_builder` takes
-    the synchronous `.cpu()` fallback. This guards the only path under
-    the speculative branch that issues a host-blocking transfer.
+    With the predictor pinned to `False`, the speculative branch of
+    `_prepare_beam_history` never stages side-stream copies, so every
+    call into `_builder` takes the synchronous `.cpu()` fallback. This
+    guards the only path under the speculative branch that issues a
+    host-blocking transfer.
     """
     _always_miss, miss_state = _pinned_predictor(False)
 

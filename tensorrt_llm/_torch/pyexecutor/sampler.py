@@ -1066,17 +1066,13 @@ class _BeamHistoryLogProbsSlices:
 
 
 @dataclass(kw_only=True, frozen=True)
-class _BeamHistoryDeviceSlices:
-    """Device-side beam-history slices. `log_probs` is bound iff log-probs are requested."""
+class _BeamHistoryTensors:
+    """Beam-history tensor slices.
 
-    cache_indirection: torch.Tensor
-    current_path: torch.Tensor
-    log_probs: _BeamHistoryLogProbsSlices | None
-
-
-@dataclass(kw_only=True, frozen=True)
-class _BeamHistoryHostSnapshot:
-    """Host-side beam-history snapshot. `log_probs` is bound iff log-probs are requested."""
+    Used to carry both device-side views (before D2H) and host-side
+    snapshots (after D2H). `log_probs` is bound iff log-probs are
+    requested.
+    """
 
     cache_indirection: torch.Tensor
     current_path: torch.Tensor
@@ -1095,11 +1091,10 @@ def _gather_beam_path(
 class _SideStreamCopier:
     """Batch non-blocking D2H copies onto a private side stream.
 
-    Inside the `with` block, copy_to_host(src) queues a copy and returns
-    a pinned-CPU destination. On exit, all queued copies are issued on
-    the side stream in a single stream-context. record_event() then
-    returns an event recorded after those copies, or None when none
-    were queued.
+    Inside the `with` block, stage_copy_to_host(src) stages a copy and
+    returns a pinned-CPU destination. commit() then issues all staged
+    copies on the side stream in a single stream-context and records
+    (and returns) an event after them, or None when nothing was staged.
 
     Caller contract: src must not be mutated on the main stream, and
     the returned host tensor must not be read, until the event has
@@ -1116,14 +1111,18 @@ class _SideStreamCopier:
         self._tasks: list[tuple[torch.Tensor, torch.Tensor]] = []
         self.event: torch.cuda.Event | None = None
 
-    def copy_to_host(self, src: torch.Tensor) -> torch.Tensor:
-        """Queue a non-blocking D2H copy of src and return its pinned-CPU dst."""
+    def stage_copy_to_host(self, src: torch.Tensor) -> torch.Tensor:
+        """Stage a non-blocking D2H copy of src and return its pinned-CPU dst.
+
+        The copy is not issued until `commit()` runs; the returned host
+        tensor is only valid after the resulting event has been synced.
+        """
         dst = torch.empty_like(src, device="cpu", pin_memory=prefer_pinned())
         self._tasks.append((dst, src))
         return dst
 
-    def record_event(self) -> torch.cuda.Event | None:
-        """Flush the queued copies and record (and return) an event after them, or None if none were queued."""
+    def commit(self) -> torch.cuda.Event | None:
+        """Issue all staged copies and record (and return) an event after them, or None if none were staged."""
         if not self._tasks:
             self.event = None
             return None
@@ -1240,22 +1239,21 @@ class AsyncWorkerMixin:
     def _make_side_stream_copier(self) -> Iterator[_SideStreamCopier]:
         """Yield a fresh copier bound to the shared D2H side stream.
 
-        On exit, queued copies are flushed and an event is recorded;
-        retrieve it from `copier.event` (`None` if nothing was queued).
-        The `@contextmanager` form forces callers to use `with`.
+        Staged copies are committed on normal exit; the resulting event
+        is exposed as `copier.event` (`None` if nothing was staged or if
+        the `with` body raised).
         """
         copier = _SideStreamCopier(self._d2h_side_stream, self._d2h_side_stream_ctx)
-        try:
-            yield copier
-        finally:
-            copier.record_event()
+        yield copier
+        copier.commit()
 
     def _record_sampler_event(
         self, side_stream_event: torch.cuda.Event | None = None
     ) -> SamplerEvent:
-        """Record a SamplerEvent on the main stream. side_stream_event,
-        if given, is forwarded so SamplerEvent.synchronize also awaits
-        the side-stream copies host-side.
+        """Record a SamplerEvent on the main stream.
+
+        side_stream_event, if given, is forwarded so SamplerEvent.synchronize
+        also awaits the side-stream copies host-side.
         """
         cuda_event = torch.cuda.Event()
         cuda_event.record()
@@ -3143,7 +3141,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         request: LlmRequest,
         *,
         finish_reasons: torch.Tensor,
-        side_stream_copier: _SideStreamCopier | None = None,
+        d2h_copier: Callable[[torch.Tensor], torch.Tensor],
     ) -> BeamHistoryBuilder | None:
         """Correct the stored tokens for each beam and return it as a BeamHistory object.
 
@@ -3153,14 +3151,11 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         If logprobs are requested, the function also corrects the stored logprobs for each beam.
         The function returns a BeamHistory object that contains the corrected tokens and logprobs for each beam.
 
-        Dispatches to one of two D2H strategies based on
-        self._use_speculative_beam_history_d2h:
-          - Default: _prepare_beam_history_default, _copy_to_host per step.
-          - Speculative (enable_speculative_beam_history_d2h=True):
-            _prepare_beam_history_speculative skips likely-non-terminal
-            steps via a host-side predictor and routes the rest through
-            side_stream_copier; predictor misses fall back to a synchronous
-            .cpu(). side_stream_copier is required for this path only.
+        D2H copies are issued through `d2h_copier`. When
+        `_use_speculative_beam_history_d2h` is set, a host-side predictor
+        decides per step whether to stage copies via `d2h_copier`;
+        predictor misses fall back to a synchronous `.cpu()` inside
+        `_builder`. Otherwise, copies are issued unconditionally.
 
         Note: To defer the decision whether or not to skip BeamHistory construction until update_requests(), only
               a builder (BeamHistoryBuilder) is returned here. The builder contains host tensors which are
@@ -3171,7 +3166,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             request: The request to create the beam history for
             finish_reasons: The first finish reason encountered for each beam of the request.
                             Shape: (max_tokens, max_beam_width)
-            side_stream_copier: Side-stream copier; required for the speculative path.
+            d2h_copier: Callable performing the D2H copy.
         """
 
         # Gather data used for skipping beam history processing
@@ -3199,7 +3194,6 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         beam_search_store = self.store.beam_search_store
         assert beam_search_store is not None
 
-        # Device-tensor views; the strategies below decide how to D2H them.
         log_probs_device: _BeamHistoryLogProbsSlices | None = None
         if request.py_return_log_probs:
             log_probs_store = self.store.log_probs_store
@@ -3212,7 +3206,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 ].view(-1, 1),
                 cum_logprobs=beam_search_store.cum_log_probs[request.py_seq_slot, :num_beams],
             )
-        device_slices = _BeamHistoryDeviceSlices(
+        device_slices = _BeamHistoryTensors(
             cache_indirection=beam_search_store.cache_indirection[
                 request.py_seq_slot, :num_beams, prompt_length:num_tokens
             ],
@@ -3222,111 +3216,32 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             log_probs=log_probs_device,
         )
 
-        if self._use_speculative_beam_history_d2h:
-            assert side_stream_copier is not None, "speculative path requires a _SideStreamCopier"
-            return self._prepare_beam_history_speculative(
+        # In speculative mode, the predictor may skip the copy; otherwise
+        # always copy. `host_snapshot is None` triggers the .cpu() fallback
+        # in `_builder`, which can only happen on a predictor miss.
+        issue_copy = (
+            not self._use_speculative_beam_history_d2h
+            or self._predict_beam_search_is_likely_finishing(
                 request,
-                need_history=need_history,
-                num_tokens=num_tokens,
                 num_generated_tokens=num_generated_tokens,
-                device_slices=device_slices,
-                side_stream_copier=side_stream_copier,
+                num_tokens=num_tokens,
             )
-        return self._prepare_beam_history_default(
-            request,
-            need_history=need_history,
-            device_slices=device_slices,
         )
 
-    def _prepare_beam_history_default(
-        self,
-        request: LlmRequest,
-        *,
-        need_history: torch.Tensor,
-        device_slices: _BeamHistoryDeviceSlices,
-    ) -> BeamHistoryBuilder | None:
-        """Default D2H strategy: _copy_to_host per beam-search step; _builder
-        reads the host tensors after SamplerEvent.synchronize() in
-        update_requests."""
-        # enqueue async D2H copies
-        cache_indirection = self._copy_to_host(device_slices.cache_indirection)
-        current_path = self._copy_to_host(device_slices.current_path)
-
-        log_probs_host: _BeamHistoryLogProbsSlices | None = None
-        if device_slices.log_probs is not None:
-            log_probs_host = _BeamHistoryLogProbsSlices(
-                sampled_log_probs=self._copy_to_host(device_slices.log_probs.sampled_log_probs),
-                sampled_logprobs_indices=self._copy_to_host(
-                    device_slices.log_probs.sampled_logprobs_indices
-                ),
-                cum_logprobs=self._copy_to_host(device_slices.log_probs.cum_logprobs),
-            )
-
-        def _builder() -> BeamHistory | None:
-            if not need_history.item():
-                return None
-            new_path = _gather_beam_path(
-                current_path=current_path, cache_indirection=cache_indirection
-            )
-            new_logprobs: torch.Tensor | None = None
-            new_logprobs_indices: torch.Tensor | None = None
-            cum_logprobs_out: torch.Tensor | None = None
-            if log_probs_host is not None:
-                new_logprobs, new_logprobs_indices, cum_logprobs_out = (
-                    self._postprocess_beam_logprobs(
-                        request,
-                        cache_indirection=cache_indirection,
-                        log_probs_host=log_probs_host,
-                    )
-                )
-            return BeamHistory(
-                tokens=new_path,
-                logprobs=new_logprobs,
-                logprobs_indices=new_logprobs_indices,
-                cum_logprobs=cum_logprobs_out,
-            )
-
-        return _builder
-
-    def _prepare_beam_history_speculative(
-        self,
-        request: LlmRequest,
-        *,
-        need_history: torch.Tensor,
-        num_tokens: int,
-        num_generated_tokens: int,
-        device_slices: _BeamHistoryDeviceSlices,
-        side_stream_copier: _SideStreamCopier,
-    ) -> BeamHistoryBuilder | None:
-        """Speculative D2H strategy.
-
-        A host-side predictor skips side-stream D2H copies on non-terminal
-        steps; misses fall back to a synchronous .cpu() in _builder. All
-        side-stream copies are queued onto side_stream_copier and flushed
-        when its `with` block exits.
-        """
-        host_snapshot: _BeamHistoryHostSnapshot | None = None
-        if self._predict_beam_search_is_likely_finishing(
-            request,
-            num_generated_tokens=num_generated_tokens,
-            num_tokens=num_tokens,
-        ):
+        host_snapshot: _BeamHistoryTensors | None = None
+        if issue_copy:
             log_probs_host: _BeamHistoryLogProbsSlices | None = None
             if device_slices.log_probs is not None:
                 log_probs_host = _BeamHistoryLogProbsSlices(
-                    sampled_log_probs=side_stream_copier.copy_to_host(
-                        device_slices.log_probs.sampled_log_probs
-                    ),
-                    sampled_logprobs_indices=side_stream_copier.copy_to_host(
+                    sampled_log_probs=d2h_copier(device_slices.log_probs.sampled_log_probs),
+                    sampled_logprobs_indices=d2h_copier(
                         device_slices.log_probs.sampled_logprobs_indices
                     ),
-                    cum_logprobs=side_stream_copier.copy_to_host(
-                        device_slices.log_probs.cum_logprobs
-                    ),
+                    cum_logprobs=d2h_copier(device_slices.log_probs.cum_logprobs),
                 )
-            host_snapshot = _BeamHistoryHostSnapshot(
-                cache_indirection=side_stream_copier.copy_to_host(device_slices.cache_indirection),
-                current_path=side_stream_copier.copy_to_host(device_slices.current_path),
+            host_snapshot = _BeamHistoryTensors(
+                cache_indirection=d2h_copier(device_slices.cache_indirection),
+                current_path=d2h_copier(device_slices.current_path),
                 log_probs=log_probs_host,
             )
 
@@ -3335,12 +3250,11 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 return None
 
             if host_snapshot is not None:
-                # Predictor-hit: side-stream D2H already awaited via SamplerEvent.
                 cache_indirection = host_snapshot.cache_indirection
                 current_path = host_snapshot.current_path
                 log_probs_host = host_snapshot.log_probs
             else:
-                # Predictor-miss fallback: synchronous D2H on the main stream.
+                # Predictor-miss fallback: synchronous .cpu() on the main stream.
                 cache_indirection = device_slices.cache_indirection.cpu()
                 current_path = device_slices.current_path.cpu()
                 log_probs_host = None
@@ -3555,12 +3469,16 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
     @staticmethod
     def _check_stop_words_length(request: LlmRequest) -> bool:
         """Check if the stop words length is greater than 1"""
+        # TODO: cache this on the request (e.g. as `request._py_has_multi_token_stop_words`)
+        # so we don't recompute it per step from `py_stop_words_list`.
         if request.py_stop_words_list is not None:
             _, cumsum = request.py_stop_words_list
             if -1 in cumsum:
                 cumsum = cumsum[: cumsum.index(-1)]
             cumsum_arr = np.asarray(cumsum, dtype=np.int32)
-            longest_stop_word_len = int(np.max(np.diff(cumsum_arr, prepend=0), initial=0).item())
+            longest_stop_word_len = cast(
+                int, np.max(np.diff(cumsum_arr, prepend=0), initial=0).item()
+            )
             return longest_stop_word_len > 1
         return False
 
@@ -3571,7 +3489,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         num_generated_tokens: int,
         num_tokens: int,
     ) -> bool:
-        """Predict whether this step might trigger beam history finalization.
+        """Predict whether this step is likely to trigger beam history finalization.
 
         Returns True if any of:
           1. Length budget reached (max_new_tokens or max_seq_len).
@@ -3615,11 +3533,14 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             else nullcontext()
         )
         with copier_ctx as copier:
+            d2h_copier: Callable[[torch.Tensor], torch.Tensor] = (
+                copier.stage_copy_to_host if copier is not None else self._copy_to_host
+            )
             builders = [
                 self._prepare_beam_history(
                     req,
                     finish_reasons=finish_reasons[req.py_seq_slot],
-                    side_stream_copier=copier,
+                    d2h_copier=d2h_copier,
                 )
                 for req in requests
             ]
