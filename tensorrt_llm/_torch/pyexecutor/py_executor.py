@@ -289,6 +289,7 @@ class PyExecutor:
             max_num_sequences: int,
             drafter: Optional[Drafter] = None,
             disable_overlap_scheduler: bool = False,
+            enable_early_first_token_emission: bool = False,
             max_input_len: int = 0x7fffffff,
             max_batch_size: int = 8,
             max_beam_width: int = 1,
@@ -340,6 +341,7 @@ class PyExecutor:
                                           None)
         self.guided_decoder = guided_decoder
         self.disable_overlap_scheduler = disable_overlap_scheduler
+        self.enable_early_first_token_emission = enable_early_first_token_emission
         self.virtual_memory_pools = virtual_memory_pools
 
         # enqueue and _fetch_new_requests used data
@@ -2766,16 +2768,17 @@ class PyExecutor:
                     self._send_kv_async(
                         self.previous_batch.scheduled_requests.all_requests())
 
-                    # Emit first-token responses early to keep TTFT off
-                    # the sample-kernel critical path. Order matters:
-                    # after `_update_requests` (py_decoding_iter current)
-                    # and after `_send_kv_async` (disagg ctx state advanced).
-                    self._emit_first_token_responses(
-                        self.previous_batch.scheduled_requests)
-                else:
-                    # Symmetric collective for the attention-DP response
-                    # gather; pairs with the call inside the if-branch.
-                    self._enqueue_responses([])
+                if self.enable_early_first_token_emission:
+                    if self.previous_batch is not None and should_process_previous_batch:
+                        # Early first-token emission. Must run after
+                        # `_update_requests` (so `py_decoding_iter` is current)
+                        # and `_send_kv_async` (so disagg ctx state has advanced).
+                        self._emit_first_token_responses(
+                            self.previous_batch.scheduled_requests)
+                    else:
+                        # Pair the attention-DP gather invoked by
+                        # `_emit_first_token_responses` on the active branch.
+                        self._enqueue_responses([])
 
                 # Flush outside the conditional so that all DP ranks
                 # participate in the tp_gather collective even when
@@ -2943,8 +2946,10 @@ class PyExecutor:
 
     def _process_previous_batch(self):
         self._handle_canceled_requests()
-        # iter-1 already emitted earlier in this iteration by `_emit_first_token_responses`.
-        finished_requests = self._handle_responses(emit_first_iter=False)
+        # Skip iter-1 emission when `_emit_first_token_responses` already
+        # handled it.
+        finished_requests = self._handle_responses(
+            emit_first_iter=not self.enable_early_first_token_emission)
         scheduled_requests = self.previous_batch.scheduled_requests
         attn_metadata = getattr(self.model_engine, 'attn_metadata', None)
         kv_cache_dtype_byte_size = getattr(self.model_engine,
@@ -4201,20 +4206,16 @@ class PyExecutor:
 
     @nvtx_range("_emit_first_token_responses")
     def _emit_first_token_responses(self, prev_scheduled_requests):
-        """Emit first-token responses ahead of `_sample_async` to keep
-        them off the TTFT critical path. Termination, cleanup and perf
-        stats remain in `_handle_responses`.
+        """Emit first-token responses ahead of `_sample_async` to reduce
+        TTFT. Termination, cleanup, and perf stats remain in
+        `_handle_responses`. Only invoked when
+        `enable_early_first_token_emission` is set.
         """
         new_responses = []
         for request in prev_scheduled_requests.all_requests():
             if request.py_decoding_iter != 1:
                 continue
             if request.is_attention_dp_dummy or request.is_cuda_graph_dummy:
-                continue
-            if request.py_kv_transfer_timed_out:
-                continue
-            # Disagg gen-only requests are emitted by `_handle_first_token_response`. Skip here.
-            if request.is_generation_only_request() and not request.is_finished:
                 continue
             # Terminal response is issued by `_handle_responses`; an
             # early-emitted response is never final.
@@ -4229,11 +4230,9 @@ class PyExecutor:
                 request) > 0 else []
             request.decoding_iter = request.py_decoding_iter
 
-            # Snapshot first-token generation logits before creating the
-            # response. With overlap scheduling, `exclude_last_generation_logits`
-            # is True, but only the first logits chunk has been appended at
-            # this point (the next `_sample_async` for the current batch has
-            # not run yet). Mirroring what's done in `_handle_first_token_response`.
+            # Snapshot first-token logits before `exclude_last_generation_logits`
+            # would hide them; only the first logits chunk is appended at this
+            # point. Same approach as in `_handle_first_token_response`.
             logits_snapshot = None
             if (self.should_exclude_last_generation_logits
                     and request.py_return_generation_logits):
@@ -4309,13 +4308,15 @@ class PyExecutor:
                 request.update_perf_metrics(self.iter_counter)
 
             request_done = False
-            emit_iter1 = emit_first_iter and request.py_decoding_iter == 1
-            emit_terminal = request.is_finished
-            # `> 1` guard avoids re-emitting iter 1 when stream_interval == 1.
-            emit_streaming = (request.py_decoding_iter > 1
-                              and request.py_decoding_iter %
-                              self.stream_interval == 0)
-            if emit_iter1 or emit_terminal or emit_streaming:
+            should_emit = (request.py_decoding_iter == 1 or request.is_finished
+                           or request.py_decoding_iter % self.stream_interval
+                           == 0)
+            # The early-emit prototype issues the (non-terminal) iter-1
+            # response from `_emit_first_token_responses`; suppress it here.
+            if (not emit_first_iter and request.py_decoding_iter == 1
+                    and not request.is_finished):
+                should_emit = False
+            if should_emit:
                 response = request.create_response(False, self.dist.rank)
                 if response:
                     request_done = request.is_finished

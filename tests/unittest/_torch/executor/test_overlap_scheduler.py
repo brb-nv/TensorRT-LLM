@@ -27,12 +27,15 @@ def create_llm(model_dir,
                sampler_type,
                scheduler_config=None,
                enable_block_reuse=False,
-               stream_interval=1):
+               stream_interval=1,
+               enable_early_first_token_emission=False):
     """Create LLM with specific overlap scheduler setting"""
     if scheduler_config is None:
         scheduler_config = SchedulerConfig()
-    pytorch_config = dict(disable_overlap_scheduler=disable_overlap_scheduler,
-                          sampler_type=sampler_type)
+    pytorch_config = dict(
+        disable_overlap_scheduler=disable_overlap_scheduler,
+        sampler_type=sampler_type,
+        enable_early_first_token_emission=enable_early_first_token_emission)
 
     trt_kv_cache_config = TRT_KvCacheConfig(
         enable_block_reuse=enable_block_reuse)
@@ -170,11 +173,13 @@ def _collect_streaming_chunks(llm, prompts, sampling_params):
 @pytest.mark.parametrize("sampler_type", ["TorchSampler", "TRTLLMSampler"])
 @pytest.mark.parametrize("stream_interval", [1, 4],
                          ids=["stream_each", "stream_every_4"])
+@pytest.mark.parametrize("enable_early_first_token_emission", [False, True],
+                         ids=["early_emit_off", "early_emit_on"])
 @pytest.mark.high_cuda_memory
 @pytest.mark.mpi_ray_parity
-def test_overlap_scheduler_streaming_chunk_parity(model_path, test_case,
-                                                  sampler_type,
-                                                  stream_interval):
+def test_overlap_scheduler_streaming_chunk_parity(
+        model_path, test_case, sampler_type, stream_interval,
+        enable_early_first_token_emission):
     """Streaming chunks must match between overlap on/off."""
     prompts = test_case["prompts"]
     sampling_params = SamplingParams(max_tokens=test_case["max_new_tokens"],
@@ -183,10 +188,13 @@ def test_overlap_scheduler_streaming_chunk_parity(model_path, test_case,
                                      top_p=test_case["top_p"],
                                      n=1)
 
-    with create_llm(model_path,
-                    disable_overlap_scheduler=False,
-                    sampler_type=sampler_type,
-                    stream_interval=stream_interval) as llm:
+    with create_llm(
+            model_path,
+            disable_overlap_scheduler=False,
+            sampler_type=sampler_type,
+            stream_interval=stream_interval,
+            enable_early_first_token_emission=enable_early_first_token_emission
+    ) as llm:
         chunks_with_overlap = _collect_streaming_chunks(llm, prompts,
                                                         sampling_params)
 
@@ -209,16 +217,22 @@ def test_overlap_scheduler_streaming_chunk_parity(model_path, test_case,
 
 
 @pytest.mark.parametrize("sampler_type", ["TorchSampler", "TRTLLMSampler"])
+@pytest.mark.parametrize("enable_early_first_token_emission", [False, True],
+                         ids=["early_emit_off", "early_emit_on"])
 @pytest.mark.high_cuda_memory
 @pytest.mark.mpi_ray_parity
-def test_overlap_scheduler_streaming_single_token(model_path, sampler_type):
+def test_overlap_scheduler_streaming_single_token(
+        model_path, sampler_type, enable_early_first_token_emission):
     """First token also terminates: one chunk, finish_reason set."""
     prompts = ["Hello, my name is", "The capital of France is"]
     sampling_params = SamplingParams(max_tokens=1, n=1)
 
-    with create_llm(model_path,
-                    disable_overlap_scheduler=False,
-                    sampler_type=sampler_type) as llm:
+    with create_llm(
+            model_path,
+            disable_overlap_scheduler=False,
+            sampler_type=sampler_type,
+            enable_early_first_token_emission=enable_early_first_token_emission
+    ) as llm:
         per_request = _collect_streaming_chunks(llm, prompts, sampling_params)
 
     for i, chunks in enumerate(per_request):

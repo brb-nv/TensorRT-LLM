@@ -3816,6 +3816,14 @@ class TorchLlmArgs(BaseLlmArgs):
         "irrespective of confidential compute state.",
         status="prototype")
 
+    enable_early_first_token_emission: bool = Field(
+        default=False,
+        description=
+        "Under the overlap scheduler, emit the first-token response ahead of "
+        "the next sample step to reduce TTFT. No effect when the overlap "
+        "scheduler is disabled.",
+        status="prototype")
+
     enable_iter_perf_stats: bool = Field(
         default=False,
         description="Enable iteration performance statistics.",
@@ -4188,6 +4196,27 @@ class TorchLlmArgs(BaseLlmArgs):
         else:
             self.decoding_config = None
 
+        return self
+
+    @model_validator(mode="after")
+    def validate_early_first_token_emission(self) -> 'TorchLlmArgs':
+        if not self.enable_early_first_token_emission:
+            return self
+        if self.disable_overlap_scheduler:
+            logger.warning(
+                "enable_early_first_token_emission is relevant only when the "
+                "overlap scheduler is enabled; disabling it because "
+                "disable_overlap_scheduler is True.")
+            self.enable_early_first_token_emission = False
+            return self
+        is_disagg = (self.cache_transceiver_config is not None
+                     and self.cache_transceiver_config.backend is not None)
+        if is_disagg:
+            logger.warning(
+                "enable_early_first_token_emission is supported only for "
+                "aggregated workloads; disabling it because "
+                "cache_transceiver_config is configured.")
+            self.enable_early_first_token_emission = False
         return self
 
     @model_validator(mode="after")
