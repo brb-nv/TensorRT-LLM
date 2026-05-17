@@ -4329,10 +4329,31 @@ class PyExecutor:
             request_done = False
             if request.py_decoding_iter == 1 or request.is_finished or \
                     request.py_decoding_iter % self.stream_interval == 0:
+                # Streaming responses are built and indices-snapshotted by
+                # `create_response` at this point. In the overlap loop this
+                # runs before the current iteration's `_sample_async`, so
+                # the iter N logit has not yet been appended and the
+                # `exclude_last_generation_logits` flag (active under
+                # overlap) would drop the most-recent storage entry,
+                # leaving the response with either `generation_logits=None`
+                # (iter 1, only one entry in storage) or the wrong, prior
+                # iteration's logit (iter >= 2). Snapshot the latest
+                # logits chunk via `get_latest_logits_unexcluded` and
+                # overwrite the response attribute directly, mirroring
+                # the WAR in `_handle_first_token_response`. Apply only
+                # for streaming + return_generation_logits requests; the
+                # snapshot returns None for everyone else and the overwrite
+                # is skipped.
+                streaming_gen_logits_snapshot = (
+                    request.py_result.get_latest_logits_unexcluded()
+                    if request.streaming else None)
                 response = request.create_response(False, self.dist.rank)
                 if response:
                     request_done = request.is_finished
                     response.result.cached_tokens = request.cached_tokens
+                    if streaming_gen_logits_snapshot is not None:
+                        response.result.generation_logits = (
+                            streaming_gen_logits_snapshot)
                     if request.py_decoding_iter == 1:
                         first_token_responses.append((req_id, response))
                     else:
