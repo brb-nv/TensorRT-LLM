@@ -62,14 +62,25 @@ The key strategy is to launch the GPU's work for the next step (n+1) immediately
 This concurrent execution pipeline is illustrated in the `PyExecutor`'s logic:
 
 ```python
-# Schedule and launch GPU work for the current step (n)
+# Schedule and launch GPU forward work for the current step (n).
 scheduled_batch, _, _ = self._schedule()
 batch_outputs = self._forward_step(scheduled_batch, previous_tensors_device)
+
+# Materialize step (n-1)'s sampled tokens, then emit step (n-1)
+# responses to clients before launching step (n) sampling so responses
+# reach clients at the earliest possible time. Termination and
+# KV-cache bookkeeping are deferred.
+if self.previous_batch is not None:
+    self._update_requests(self.previous_batch.sample_state)
+    pending = self._emit_previous_batch_responses()
+
+# Launch GPU sampling work for the current step (n).
 sample_state = self._sample_async(scheduled_batch, batch_outputs)
 
-# While the GPU is busy, process the CPU-bound results from the previous step (n-1)
+# Finalize step (n-1): terminate finished requests, update KV-cache
+# resources, record iter stats.
 if self.previous_batch is not None:
-    self._process_previous_batch()
+    self._finalize_previous_batch(*pending)
 ```
 
 This approach effectively reduces GPU idle time and improves overall hardware occupancy. While it introduces one extra decoding step into the pipeline, the resulting throughput gain is a significant trade-off. For this reason, the Overlap Scheduler is enabled by default in TensorRT LLM.

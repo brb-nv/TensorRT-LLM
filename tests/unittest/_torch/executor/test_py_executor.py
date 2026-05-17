@@ -7,9 +7,10 @@ to PyExecutor, including:
 - waiting_queue management
 - is_shutdown state management
 - expected_num_active_requests tracking
+- _emit_previous_batch_responses / _finalize_previous_batch (overlap-loop split)
 """
 
-from unittest.mock import Mock
+from unittest.mock import MagicMock, Mock
 
 import pytest
 
@@ -383,3 +384,160 @@ class TestComputeScheduledTokens:
             context_chunk_size=50, context_remaining_length=50, estimated_reusable_tokens=10
         )
         assert PyExecutor._compute_scheduled_tokens([req0, req1], []) == 20 + 40
+
+
+# ---------------------------------------------------------------------------
+# Tests for the overlap-loop split:
+#   _emit_previous_batch_responses (pre-sample_async)
+#   _finalize_previous_batch       (post-sample_async)
+# ---------------------------------------------------------------------------
+
+BUILT_RESPONSES = [("req-1", "resp-1"), ("req-2", "resp-2")]
+TO_TERMINATE = ["term-A"]
+FINISHED_BY_TRANSFER = ["xfer-B"]
+
+
+@pytest.fixture
+def mock_executor():
+    """MagicMock stand-in for a PyExecutor when invoking the unbound
+    overlap-loop helpers. Child attributes are left auto-created so their
+    method calls surface on the parent's `mock_calls` for ordering checks.
+    """
+    m = MagicMock()
+    m._build_responses.return_value = (BUILT_RESPONSES, TO_TERMINATE,
+                                       FINISHED_BY_TRANSFER)
+    m._finalize_handled_responses.return_value = (TO_TERMINATE +
+                                                  FINISHED_BY_TRANSFER)
+    m.model_engine.attn_metadata = "ATTN_META"
+    m.model_engine.kv_cache_dtype_byte_size = 0.5
+    m.enable_kv_cache_events = False
+    m.enable_iter_perf_stats = False
+    m.active_requests = ["active-req"]
+    return m
+
+
+def _called_names(mock):
+    """Ordered list of method-call names recorded on `mock` and its
+    auto-created children, e.g. `'_build_responses'` or
+    `'resource_manager.update_resources'`."""
+    return [c[0] for c in mock.mock_calls]
+
+
+class TestEmitPreviousBatchResponses:
+    """Pre-sample_async half of the overlap-loop split."""
+
+    def test_call_order(self, mock_executor):
+        PyExecutor._emit_previous_batch_responses(mock_executor)
+        assert _called_names(mock_executor) == [
+            "_handle_canceled_requests",
+            "_build_responses",
+            "_enqueue_responses",
+        ]
+
+    def test_enqueues_built_responses(self, mock_executor):
+        PyExecutor._emit_previous_batch_responses(mock_executor)
+        mock_executor._enqueue_responses.assert_called_once_with(
+            BUILT_RESPONSES)
+
+    def test_returns_deferred_termination_state(self, mock_executor):
+        assert PyExecutor._emit_previous_batch_responses(mock_executor) == (
+            TO_TERMINATE, FINISHED_BY_TRANSFER)
+
+    def test_does_not_terminate(self, mock_executor):
+        """The emit half must defer termination so the response can still
+        find the originating request before its resources are released."""
+        PyExecutor._emit_previous_batch_responses(mock_executor)
+        mock_executor._finalize_handled_responses.assert_not_called()
+        mock_executor._terminate_request.assert_not_called()
+        mock_executor.resource_manager.update_resources.assert_not_called()
+        mock_executor._add_kv_cache_events.assert_not_called()
+        mock_executor._process_iter_stats.assert_not_called()
+
+    def test_empty_build_still_enqueues_for_collective(self, mock_executor):
+        """An empty response list still enqueues so the TP-gather collective
+        participates on every rank."""
+        mock_executor._build_responses.return_value = ([], [], [])
+        result = PyExecutor._emit_previous_batch_responses(mock_executor)
+        mock_executor._enqueue_responses.assert_called_once_with([])
+        assert result == ([], [])
+
+
+class TestFinalizePreviousBatch:
+    """Post-sample_async half of the overlap-loop split."""
+
+    def test_call_order(self, mock_executor):
+        PyExecutor._finalize_previous_batch(mock_executor, ["t"], ["x"])
+        assert _called_names(mock_executor) == [
+            "_finalize_handled_responses",
+            "resource_manager.update_resources",
+        ]
+
+    def test_finalize_forwards_termination_lists(self, mock_executor):
+        PyExecutor._finalize_previous_batch(mock_executor, ["term-A"],
+                                            ["xfer-C"])
+        mock_executor._finalize_handled_responses.assert_called_once_with(
+            ["term-A"], ["xfer-C"])
+
+    def test_update_resources_forwards_engine_attrs(self, mock_executor):
+        prev_sched = MagicMock(name="prev_sched")
+        mock_executor.previous_batch.scheduled_requests = prev_sched
+        mock_executor.model_engine.attn_metadata = "attn-X"
+        mock_executor.model_engine.kv_cache_dtype_byte_size = 2.0
+        PyExecutor._finalize_previous_batch(mock_executor, [], [])
+        mock_executor.resource_manager.update_resources.assert_called_once_with(
+            prev_sched, "attn-X", 2.0)
+
+    def test_missing_model_engine_attrs_fall_back_to_none(self, mock_executor):
+        """`getattr(model_engine, '...', None)` takes the default-None
+        branch when the attribute is absent."""
+        mock_executor.model_engine = MagicMock(spec=[])
+        PyExecutor._finalize_previous_batch(mock_executor, [], [])
+        args, _ = mock_executor.resource_manager.update_resources.call_args
+        # (scheduled_requests, attn_metadata, kv_cache_dtype_byte_size)
+        assert args[1] is None
+        assert args[2] is None
+
+    @pytest.mark.parametrize("enabled,expected_calls", [(False, 0), (True, 1)])
+    def test_kv_cache_events_gated(self, mock_executor, enabled,
+                                   expected_calls):
+        mock_executor.enable_kv_cache_events = enabled
+        PyExecutor._finalize_previous_batch(mock_executor, [], [])
+        assert mock_executor._add_kv_cache_events.call_count == expected_calls
+
+    def test_iter_perf_stats_disabled(self, mock_executor):
+        PyExecutor._finalize_previous_batch(mock_executor, [], [])
+        mock_executor._process_iter_stats.assert_not_called()
+
+    def test_iter_perf_stats_enabled(self, mock_executor):
+        mock_executor.enable_iter_perf_stats = True
+        mock_executor._finalize_handled_responses.return_value = ["f1", "f2"]
+        mock_executor.active_requests = ["a1"]
+        PyExecutor._finalize_previous_batch(mock_executor, ["t"], ["x"])
+        mock_executor._process_iter_stats.assert_called_once_with(
+            ["f1", "f2"], ["a1"], mock_executor.previous_batch)
+
+
+class TestOverlapSplitInvariants:
+    """End-to-end ordering: emit -> (current iter sample_async) -> finalize."""
+
+    def test_full_call_sequence(self, mock_executor):
+        """Responses leave rank 0 before any request is terminated and
+        before the current iter's `_sample_async`."""
+        pending = PyExecutor._emit_previous_batch_responses(mock_executor)
+        mock_executor._sample_async("scheduled_batch", "batch_outputs")
+        PyExecutor._finalize_previous_batch(mock_executor, *pending)
+        assert _called_names(mock_executor) == [
+            "_handle_canceled_requests",
+            "_build_responses",
+            "_enqueue_responses",
+            "_sample_async",
+            "_finalize_handled_responses",
+            "resource_manager.update_resources",
+        ]
+
+    def test_termination_state_threaded_through(self, mock_executor):
+        """Emit's return value is forwarded verbatim into finalize."""
+        pending = PyExecutor._emit_previous_batch_responses(mock_executor)
+        PyExecutor._finalize_previous_batch(mock_executor, *pending)
+        mock_executor._finalize_handled_responses.assert_called_once_with(
+            TO_TERMINATE, FINISHED_BY_TRANSFER)

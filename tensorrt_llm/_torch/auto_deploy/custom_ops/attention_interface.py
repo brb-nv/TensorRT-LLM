@@ -648,11 +648,12 @@ class SequenceInfo:
 
         # NOTE: we keep an extra state slot around to simplify cuda graph padding
         # WHY?
-        # Requests that just finished won't free their used resources immediately. Specifically, the
-        # running order is self.scheduler.schedule_request, self._forward_step() and
-        # self._process_previous_batch() in the PyExecutor. Hence, the current forward step will
-        # remove finished requests but will not remove mamba_cache immediately and therefore it
-        # won't be available in time for padding in the next forward step.
+        # Requests that just finished won't free their used resources immediately. In the
+        # PyExecutor overlap loop, request termination (and the matching KV/cache cleanup)
+        # happens in self._finalize_previous_batch(), which runs after the current step's
+        # self._forward_step(). Hence, the current forward step removes finished requests but
+        # does not remove mamba_cache immediately, so it won't be available in time for
+        # padding in the next forward step.
         self.max_num_state_slots = max_batch_size + 1
 
         # log parameters
