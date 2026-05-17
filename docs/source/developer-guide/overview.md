@@ -66,19 +66,19 @@ This concurrent execution pipeline is illustrated in the `PyExecutor`'s logic:
 scheduled_batch, _, _ = self._schedule()
 batch_outputs = self._forward_step(scheduled_batch, previous_tensors_device)
 
-# Materialize step (n-1)'s sampled tokens, then emit step (n-1)
-# responses to clients before launching step (n) sampling so responses
-# reach clients at the earliest possible time. Termination and
-# KV-cache bookkeeping are deferred.
+# Materialize step (n-1)'s sampled tokens, then emit step (n-1)'s
+# first-token responses to clients before launching step (n)'s
+# sampling to minimize TTFT. Non-first-token responses, termination,
+# and KV-cache bookkeeping are deferred.
 if self.previous_batch is not None:
     self._update_requests(self.previous_batch.sample_state)
-    pending = self._emit_previous_batch_responses()
+    pending = self._emit_previous_batch_first_token_responses()
 
 # Launch GPU sampling work for the current step (n).
 sample_state = self._sample_async(scheduled_batch, batch_outputs)
 
-# Finalize step (n-1): terminate finished requests, update KV-cache
-# resources, record iter stats.
+# Finalize step (n-1): enqueue deferred responses, terminate finished
+# requests, update KV-cache resources, record iter stats.
 if self.previous_batch is not None:
     self._finalize_previous_batch(*pending)
 ```

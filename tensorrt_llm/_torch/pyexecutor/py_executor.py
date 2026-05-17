@@ -2778,14 +2778,15 @@ class PyExecutor:
                 if not self._is_kv_manager_v2:
                     self._pause_requests(scheduled_batch.paused_requests)
 
-                # Build and enqueue previous-batch responses before the
-                # current iteration's _sample_async so responses reach clients
-                # at the earliest possible time. Termination and KV-cache
-                # bookkeeping are deferred to _finalize_previous_batch below.
+                # Build previous-batch responses and emit first-token
+                # responses before the current iteration's _sample_async to
+                # minimize TTFT. Remaining responses, termination, and
+                # KV-cache bookkeeping are deferred to
+                # _finalize_previous_batch below.
                 pending_prev_batch_finalization = None
                 if self.previous_batch is not None and should_process_previous_batch:
                     pending_prev_batch_finalization = (
-                        self._emit_previous_batch_responses())
+                        self._emit_previous_batch_first_token_responses())
                 else:
                     # Participate in the tp_gather/allgather collective on
                     # ranks that skip previous-batch handling.
@@ -2818,6 +2819,11 @@ class PyExecutor:
                         *pending_prev_batch_finalization)
                     self.perf_manager.compute_batch_gpu_times(
                         self.previous_batch.scheduled_requests.all_requests())
+                else:
+                    # Match the second response-handling collective issued
+                    # by _finalize_previous_batch (for deferred non-first-token
+                    # responses) on ranks that skipped previous-batch handling.
+                    self._enqueue_responses([])
 
                 # Call set_exclude_last_generation_logits after previous-batch
                 # responses have been built. If set before, the response of a
@@ -2943,34 +2949,44 @@ class PyExecutor:
 
         return result_tensors, num_accepted_tokens
 
-    def _emit_previous_batch_responses(self) -> Tuple[List, List]:
+    def _emit_previous_batch_first_token_responses(
+            self) -> Tuple[List[Tuple[int, LlmResponse]], List, List]:
         """Pre-sample phase of previous-batch handling for the overlap loop.
 
         Applies cancellations, builds responses for the previous batch, and
-        enqueues them. Termination of finished requests is deferred to
-        `_finalize_previous_batch` so the response can still find the
-        originating request before its resources are released.
+        enqueues only the first-token responses to minimize TTFT. The
+        remaining responses and termination work are deferred to
+        `_finalize_previous_batch`, which runs after the current iteration's
+        `_sample_async`. Termination must happen after enqueue so the
+        response can still find the originating request before its
+        resources are released.
 
-        Returns `(requests_to_terminate, requests_finished_by_transfer)` for
-        the finalize half to consume.
+        Returns `(other_responses, requests_to_terminate,
+        requests_finished_by_transfer)` for the finalize half to consume.
         """
         self._handle_canceled_requests()
-        new_responses, requests_to_terminate, requests_finished_by_transfer = (
+        first_token_responses, other_responses, requests_to_terminate, requests_finished_by_transfer = (
             self._build_responses())
-        # Termination is deferred to _finalize_previous_batch so the response
-        # can still find the originating request.
-        self._enqueue_responses(new_responses)
-        return requests_to_terminate, requests_finished_by_transfer
+        # Enqueue only first-token responses now (pre-sample) to minimize
+        # TTFT. Non-first-token responses are deferred to keep E2E unchanged
+        # while preserving the post-enqueue termination invariant.
+        self._enqueue_responses(first_token_responses)
+        return (other_responses, requests_to_terminate,
+                requests_finished_by_transfer)
 
-    def _finalize_previous_batch(self, requests_to_terminate: List,
+    def _finalize_previous_batch(self,
+                                 other_responses: List[Tuple[int, LlmResponse]],
+                                 requests_to_terminate: List,
                                  requests_finished_by_transfer: List) -> None:
         """Post-sample phase of previous-batch handling for the overlap loop.
 
-        Terminates finished requests, updates KV-cache resources for the
-        previous batch, and optionally emits KV cache events and iter stats.
-        Must run after `_emit_previous_batch_responses` and after the
-        current iteration's `_sample_async`.
+        Enqueues the deferred non-first-token responses, terminates finished
+        requests, updates KV-cache resources for the previous batch, and
+        optionally emits KV cache events and iter stats. Must run after
+        `_emit_previous_batch_first_token_responses` and after the current
+        iteration's `_sample_async`.
         """
+        self._enqueue_responses(other_responses)
         finished_requests = self._finalize_handled_responses(
             requests_to_terminate, requests_finished_by_transfer)
         scheduled_requests = self.previous_batch.scheduled_requests
@@ -4229,24 +4245,32 @@ class PyExecutor:
 
     @nvtx_range("_build_responses")
     def _build_responses(
-            self) -> Tuple[List[Tuple[int, LlmResponse]], List, List]:
+        self
+    ) -> Tuple[List[Tuple[int, LlmResponse]], List[Tuple[int, LlmResponse]],
+               List, List]:
         """Build per-request responses and partition `active_requests`.
 
         Mutates `self.active_requests` to drop streamed-out / finished
         requests. Does NOT enqueue and does NOT terminate. The caller must
-        invoke `self._enqueue_responses(...)` followed by
-        `self._finalize_handled_responses(...)` in that order; termination
-        must happen after enqueue so the response can still find the
-        originating request.
+        invoke `self._enqueue_responses(...)` (for both response lists)
+        followed by `self._finalize_handled_responses(...)`, in that order;
+        termination must happen after enqueue so the response can still
+        find the originating request.
 
         Returns:
-        - new_responses: list of (req_id, LlmResponse) to be enqueued
-        - requests_to_terminate: finished requests pending termination
+        - first_token_responses: (req_id, LlmResponse) for requests whose
+          response is their first token (`py_decoding_iter == 1`). The
+          overlap loop emits these before the current iteration's
+          `_sample_async` to minimize TTFT.
+        - other_responses: (req_id, LlmResponse) for all other responses
+          (streaming intervals, finishing responses past iter 1, etc.).
+        - requests_to_terminate: finished requests pending termination.
         - requests_finished_by_transfer: requests already terminated by
           `_check_disagg_ctx_cache_transfer_status` (DISAGG_CONTEXT_COMPLETE);
           included for stats accounting but not to be re-terminated here.
         """
-        new_responses = []
+        first_token_responses: List[Tuple[int, LlmResponse]] = []
+        other_responses: List[Tuple[int, LlmResponse]] = []
         requests_to_terminate = []
         # Requests terminated by _check_disagg_ctx_cache_transfer_status (DISAGG_CONTEXT_COMPLETE);
         # included in the return value for stats but not re-terminated here.
@@ -4309,7 +4333,10 @@ class PyExecutor:
                 if response:
                     request_done = request.is_finished
                     response.result.cached_tokens = request.cached_tokens
-                    new_responses.append((req_id, response))
+                    if request.py_decoding_iter == 1:
+                        first_token_responses.append((req_id, response))
+                    else:
+                        other_responses.append((req_id, response))
 
             if request_done:
                 if (self.drafter is not None and getattr(
@@ -4355,7 +4382,7 @@ class PyExecutor:
 
         self.active_requests.clear()
         self.active_requests.extend(new_active_requests)
-        return (new_responses, requests_to_terminate,
+        return (first_token_responses, other_responses, requests_to_terminate,
                 requests_finished_by_transfer)
 
     def _finalize_handled_responses(
@@ -4373,10 +4400,13 @@ class PyExecutor:
 
     @nvtx_range("_handle_responses")
     def _handle_responses(self):
-        new_responses, requests_to_terminate, requests_finished_by_transfer = (
+        first_token_responses, other_responses, requests_to_terminate, requests_finished_by_transfer = (
             self._build_responses())
-        # Request should be terminated after enqueueing response to ensure we can enqueue response successfully.
-        self._enqueue_responses(new_responses)
+        # Non-overlap loops do not benefit from emitting the first-token
+        # batch ahead of any sampling, so merge both response lists into a
+        # single enqueue (one collective). Request termination still happens
+        # after enqueue so the response can find the originating request.
+        self._enqueue_responses(first_token_responses + other_responses)
         return self._finalize_handled_responses(requests_to_terminate,
                                                 requests_finished_by_transfer)
 
