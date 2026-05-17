@@ -2778,6 +2778,19 @@ class PyExecutor:
                 if not self._is_kv_manager_v2:
                     self._pause_requests(scheduled_batch.paused_requests)
 
+                # Build and enqueue previous-batch responses before the
+                # current iteration's _sample_async so responses reach clients
+                # at the earliest possible time. Termination and KV-cache
+                # bookkeeping are deferred to _finalize_previous_batch below.
+                pending_prev_batch_finalization = None
+                if self.previous_batch is not None and should_process_previous_batch:
+                    pending_prev_batch_finalization = (
+                        self._emit_previous_batch_responses())
+                else:
+                    # Participate in the tp_gather/allgather collective on
+                    # ranks that skip previous-batch handling.
+                    self._enqueue_responses([])
+
                 if can_queue:
                     guided_decoder_failed_requests = None
                     with self.perf_manager.record_perf_events(
@@ -2800,16 +2813,16 @@ class PyExecutor:
                         scheduled_batch, guided_decoder_failed_requests)
                     self._update_request_states(scheduled_batch)
 
-                if self.previous_batch is not None and should_process_previous_batch:
-                    self._process_previous_batch()
+                if pending_prev_batch_finalization is not None:
+                    self._finalize_previous_batch(
+                        *pending_prev_batch_finalization)
                     self.perf_manager.compute_batch_gpu_times(
                         self.previous_batch.scheduled_requests.all_requests())
-                else:
-                    self._enqueue_responses([])
 
-                # Call set_exclude_last_generation_logits after _process_previous_batch.
-                # If set before, the response of a request may be incorrect, as it will
-                # use the wrong indices for generation logits when streaming is enabled.
+                # Call set_exclude_last_generation_logits after previous-batch
+                # responses have been built. If set before, the response of a
+                # request may be incorrect, as it will use the wrong indices
+                # for generation logits when streaming is enabled.
                 if can_queue:
                     self._update_generation_requests_that_will_complete_next_iteration(
                         scheduled_batch.generation_requests)
@@ -2930,9 +2943,36 @@ class PyExecutor:
 
         return result_tensors, num_accepted_tokens
 
-    def _process_previous_batch(self):
+    def _emit_previous_batch_responses(self) -> Tuple[List, List]:
+        """Pre-sample phase of previous-batch handling for the overlap loop.
+
+        Applies cancellations, builds responses for the previous batch, and
+        enqueues them. Termination of finished requests is deferred to
+        `_finalize_previous_batch` so the response can still find the
+        originating request before its resources are released.
+
+        Returns `(requests_to_terminate, requests_finished_by_transfer)` for
+        the finalize half to consume.
+        """
         self._handle_canceled_requests()
-        finished_requests = self._handle_responses()
+        new_responses, requests_to_terminate, requests_finished_by_transfer = (
+            self._build_responses())
+        # Termination is deferred to _finalize_previous_batch so the response
+        # can still find the originating request.
+        self._enqueue_responses(new_responses)
+        return requests_to_terminate, requests_finished_by_transfer
+
+    def _finalize_previous_batch(self, requests_to_terminate: List,
+                                 requests_finished_by_transfer: List) -> None:
+        """Post-sample phase of previous-batch handling for the overlap loop.
+
+        Terminates finished requests, updates KV-cache resources for the
+        previous batch, and optionally emits KV cache events and iter stats.
+        Must run after `_emit_previous_batch_responses` and after the
+        current iteration's `_sample_async`.
+        """
+        finished_requests = self._finalize_handled_responses(
+            requests_to_terminate, requests_finished_by_transfer)
         scheduled_requests = self.previous_batch.scheduled_requests
         attn_metadata = getattr(self.model_engine, 'attn_metadata', None)
         kv_cache_dtype_byte_size = getattr(self.model_engine,
@@ -4190,20 +4230,20 @@ class PyExecutor:
     @nvtx_range("_build_responses")
     def _build_responses(
             self) -> Tuple[List[Tuple[int, LlmResponse]], List, List]:
-        """Build per-request responses and partition ``active_requests``.
+        """Build per-request responses and partition `active_requests`.
 
-        Mutates ``self.active_requests`` to drop streamed-out / finished
-        requests. Does NOT enqueue and does NOT terminate requests. The
-        caller is responsible for invoking ``self._enqueue_responses(...)``
-        followed by ``self._finalize_handled_responses(...)`` in that order;
-        termination must happen after the response is enqueued so the
-        response can still find the originating request.
+        Mutates `self.active_requests` to drop streamed-out / finished
+        requests. Does NOT enqueue and does NOT terminate. The caller must
+        invoke `self._enqueue_responses(...)` followed by
+        `self._finalize_handled_responses(...)` in that order; termination
+        must happen after enqueue so the response can still find the
+        originating request.
 
-        Returns a tuple of:
+        Returns:
         - new_responses: list of (req_id, LlmResponse) to be enqueued
         - requests_to_terminate: finished requests pending termination
         - requests_finished_by_transfer: requests already terminated by
-          ``_check_disagg_ctx_cache_transfer_status`` (DISAGG_CONTEXT_COMPLETE);
+          `_check_disagg_ctx_cache_transfer_status` (DISAGG_CONTEXT_COMPLETE);
           included for stats accounting but not to be re-terminated here.
         """
         new_responses = []
@@ -4323,9 +4363,9 @@ class PyExecutor:
             requests_finished_by_transfer: List) -> List:
         """Terminate finished requests and return the combined finished list.
 
-        Must be called AFTER ``self._enqueue_responses(...)`` for the same
-        batch so the response can still find the originating request before
-        its resources are released.
+        Must run after `self._enqueue_responses(...)` for the same batch so
+        the response can still find the originating request before its
+        resources are released.
         """
         for request in requests_to_terminate:
             self._terminate_request(request)
