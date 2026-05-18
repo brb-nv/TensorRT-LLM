@@ -1613,18 +1613,60 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
     void* fmha_multi_ctas_kv_scratch_ptr
         = nextWorkspacePtr(workspace_byte_ptr, offset, fmha_multi_ctas_kv_scratch_size);
 
+    // If precomputed (shared-across-layers) buildDecoderInfo outputs are
+    // provided AND every gating condition for the lift is met, redirect the
+    // local workspace pointers to the shared buffers. The kernel-side
+    // logic for the V1 partial lift sets seqQOffsets/seqKVOffsets/tokensInfo
+    // to nullptr to instruct the kernel to skip those writes. The V2 full
+    // lift goes further and skips the kernel call entirely when:
+    //
+    //   * shared_fmha_tile_counter is non-null (per-layer counter
+    //     pre-reset by the metadata), AND
+    //   * either the layer has no rotary embedding (mRotaryEmbeddingDim == 0)
+    //     or shared_rotary_inv_freq_buf is non-null (rotary inv_freq
+    //     pre-expanded by the metadata), AND
+    //   * the kernel's remaining outputs (fmha_bmm1/2 scales) are not
+    //     needed -- they're only consumed by the FP8 context FMHA path,
+    //     which the gate already excludes.
+    //
+    // See EnqueueContextParams<T> in attentionOp.h for the gating contract.
+    bool const liftSeqInfoOutputs = (params.shared_cu_q_seqlens != nullptr) && (params.shared_cu_kv_seqlens != nullptr)
+        && (params.shared_tokens_info != nullptr) && !isCrossAttention() && !mIsMLAEnabled && mEnableContextFMHA
+        && (mCpSize == 1) && !mFP8ContextFMHA && !mFP8ContextMLA
+        && (mRotaryEmbeddingScaleType != tensorrt_llm::kernels::RotaryScalingType::kDYNAMIC);
+    bool const rotaryLifted = (mRotaryEmbeddingDim == 0) || (params.shared_rotary_inv_freq_buf != nullptr);
+    bool const liftAllOutputs = liftSeqInfoOutputs && (params.shared_fmha_tile_counter != nullptr) && rotaryLifted;
+    if (liftSeqInfoOutputs)
+    {
+        cu_q_seqlens = const_cast<int*>(params.shared_cu_q_seqlens);
+        cu_kv_seqlens = const_cast<int*>(params.shared_cu_kv_seqlens);
+        tokens_info = const_cast<int2*>(static_cast<int2 const*>(params.shared_tokens_info));
+    }
+    if (liftAllOutputs)
+    {
+        // Redirect the per-layer workspace pointers for the FMHA tile
+        // counter and rotary inv_freq buffer to the shared (pre-populated)
+        // buffers so downstream kernels see the right values without us
+        // ever calling invokeBuildDecoderInfo.
+        fmha_tile_counter_ptr = params.shared_fmha_tile_counter;
+        if (mRotaryEmbeddingDim > 0)
+        {
+            rotary_inv_freq_buf = const_cast<float*>(params.shared_rotary_inv_freq_buf);
+        }
+    }
+
     // build attention_mask, cu_seqlens, and padding_offset tensors
     // Note: self attn and cross attn should use different params
     // cross attn's seqlen info is from encoder input lengths, not decoder input lengths!
     // moreover, attn mask for cross attn should be set separately (see below)
     BuildDecoderInfoParams<T> decoder_params{};
-    decoder_params.seqQOffsets = cu_q_seqlens;
-    decoder_params.seqKVOffsets = cu_kv_seqlens;
+    decoder_params.seqQOffsets = liftSeqInfoOutputs ? nullptr : cu_q_seqlens;
+    decoder_params.seqKVOffsets = liftSeqInfoOutputs ? nullptr : cu_kv_seqlens;
     decoder_params.seqCpPartialOffsets = cu_cp_partial_seqlens;
     decoder_params.cpSize = mCpSize;
     decoder_params.packedMaskRowOffsets = cu_mask_rows;
     decoder_params.paddingOffsets = padding_offset;
-    decoder_params.tokensInfo = tokens_info;
+    decoder_params.tokensInfo = liftSeqInfoOutputs ? nullptr : tokens_info;
     decoder_params.encoderPaddingOffsets
         = isCrossAttention() ? encoder_padding_offset : nullptr; // cross attention takes offsets from encoder inputs
     decoder_params.attentionMask = isCrossAttention() ? nullptr : attention_mask; // manually set for unfused cross attn
@@ -1659,8 +1701,17 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
     decoder_params.rotaryEmbeddingInvFreqCache = params.rotary_inv_freq;
     decoder_params.rotaryEmbeddingMaxPositions = mRotaryEmbeddingMaxPositions;
 
-    invokeBuildDecoderInfo(decoder_params, stream);
-    sync_check_cuda_error(stream);
+    // Skip the per-layer BuildDecoderInfo kernel entirely when every output
+    // it would produce is already populated by the lifted-once path in the
+    // attention metadata (see EnqueueContextParams<T> in attentionOp.h).
+    // The V1 partial lift only sets seqQOffsets/seqKVOffsets/tokensInfo
+    // to nullptr to skip those writes, but the kernel still launches to
+    // produce rotary_inv_freq_buf / fmha_tile_counter / fmha_bmm1/2.
+    if (!liftAllOutputs)
+    {
+        invokeBuildDecoderInfo(decoder_params, stream);
+        sync_check_cuda_error(stream);
+    }
 
     // In cross attention context phase, the attention mask should be a matrix of all ones.
     // We reassign attention_mask to override what previous invokeBuildDecoderInfo() does
@@ -1753,7 +1804,11 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
         preprocessingParams.kv_cache_buffer = kv_cache_buffer;
         preprocessingParams.kv_cache_block_scales_buffer = kv_scale_cache_buffer;
         preprocessingParams.qkv_bias = params.qkv_bias;
-        preprocessingParams.tokens_info = decoder_params.tokensInfo;
+        // When the seq-info outputs are lifted to a shared per-forward-pass
+        // buffer, decoder_params.tokensInfo was set to nullptr to make the
+        // BuildDecoderInfo kernel skip writing it. Point preprocessing at the
+        // already-populated shared buffer instead.
+        preprocessingParams.tokens_info = liftSeqInfoOutputs ? tokens_info : decoder_params.tokensInfo;
         preprocessingParams.seq_lens = params.context_lengths;
         // Indicate if chunked-context is used (i.e. q_seqlen > kv_seqlen).
         preprocessingParams.cache_seq_lens = params.sequence_lengths;

@@ -79,6 +79,11 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void computeSeqAndPaddingOffsets
     // Fixed Q sequence lengths.
     bool const fixed_q_seqlen = params.seqQLengths == nullptr;
 
+    // Whether to write cumulative Q sequence lengths to global memory. When
+    // the caller precomputes seqQOffsets in a shared per-forward-pass buffer
+    // it passes nullptr here so we skip the redundant per-layer write.
+    bool const calculate_q_offsets = params.seqQOffsets != nullptr;
+
     // Whether to calculate cumulative KV sequence lengths.
     bool const calculate_kv_offsets = params.seqKVOffsets != nullptr;
 
@@ -173,7 +178,10 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void computeSeqAndPaddingOffsets
         // Store the result.
         if (batchIdx <= batchSizeBound && storeSeqOffsets)
         {
-            params.seqQOffsets[batchIdx] = seqQOffset;
+            if (calculate_q_offsets)
+            {
+                params.seqQOffsets[batchIdx] = seqQOffset;
+            }
             if (calculate_packed_mask_row_offsets)
             {
                 params.packedMaskRowOffsets[batchIdx] = packedMaskRowOffset;

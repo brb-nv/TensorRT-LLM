@@ -151,6 +151,56 @@ public:
         int32_t const* helix_position_offsets = nullptr;
         bool const* helix_is_inactive_rank = nullptr;
 
+        // -----------------------------------------------------------------
+        // Precomputed (shared-across-layers) buildDecoderInfo outputs.
+        //
+        // BuildDecoderInfo's prefix-scan + tokens_info outputs are pure
+        // functions of the per-request sequence layout (Q/KV seq lengths,
+        // batch size, num tokens) and are therefore identical for every
+        // attention layer in a single forward pass. The Python attention
+        // metadata can compute them once via torch.ops.trtllm.build_decoder_info
+        // and pass the device pointers here so the per-layer kernel can skip
+        // the corresponding work (set seqQOffsets/seqKVOffsets/tokensInfo to
+        // nullptr in BuildDecoderInfoParams). The kernel still runs for
+        // rotary_inv_freq / fmha_tile_counter / fmha_bmm1/2 scales.
+        //
+        // When any of these is nullptr, the lift is disabled and the
+        // workspace-backed path is used unchanged.
+        //
+        // The lift is enabled in attentionOp.cpp when:
+        //   * non-cross-attention
+        //   * non-MLA
+        //   * mEnableContextFMHA = true
+        //   * mCpSize == 1
+        //   * non-FP8 context FMHA / non-FP8 context MLA
+        //   * non-dynamic rotary scaling
+        // Otherwise the kernel still computes prefix-scan / tokens_info into
+        // the workspace as before, even if these pointers are populated.
+        //
+        // When `shared_cu_q_seqlens`, `shared_cu_kv_seqlens`, and
+        // `shared_tokens_info` are non-null (and the gate above passes),
+        // the per-layer kernel skips the prefix-scan and tokens_info
+        // writes (and uses the supplied pointers as the canonical
+        // values).
+        //
+        // When ALSO `shared_fmha_tile_counter` and either
+        // `shared_rotary_inv_freq_buf` (if rotary_dim > 0) or no rotary
+        // are provided, the per-layer invokeBuildDecoderInfo call is
+        // skipped entirely (full V2 lift).
+        int const* shared_cu_q_seqlens = nullptr;
+        int const* shared_cu_kv_seqlens = nullptr;
+        // Shape [num_tokens]; each element is int2(batch_idx, token_idx_in_seq).
+        void const* shared_tokens_info = nullptr;
+        // Single-element uint32 view into the metadata's per-layer FMHA
+        // tile-counter buffer (one slot per layer). The buffer is
+        // batch-zeroed by the metadata once per forward pass, so the
+        // kernel skips its own counter reset.
+        uint32_t* shared_fmha_tile_counter = nullptr;
+        // Pre-expanded rotary inv_freq buffer. Logical shape is
+        // [batch_size, halfRotaryDim]; consumed by the downstream QKV
+        // preprocessing kernel as `buf[batch_idx * halfDim + j]`.
+        float const* shared_rotary_inv_freq_buf = nullptr;
+
         std::string enqueueContextParamsToString() const
         {
             // variables from the params coming from the runtime

@@ -97,7 +97,26 @@ public:
         std::optional<torch::Tensor> mla_bmm2_scale, std::optional<torch::Tensor> quant_q_buffer,
         std::optional<torch::Tensor> flash_mla_tile_scheduler_metadata,
         std::optional<torch::Tensor> flash_mla_num_splits,
-        std::optional<int64_t> compressed_kv_cache_pool_ptr = std::nullopt) const
+        std::optional<int64_t> compressed_kv_cache_pool_ptr = std::nullopt,
+        // Precomputed (shared-across-layers) BuildDecoderInfo outputs. When
+        // all five are supplied AND the underlying op meets the
+        // non-MLA / non-cross / non-FP8 / non-dynamic-rotary gate (see
+        // EnqueueContextParams), the per-layer kernel skips the prefix-scan,
+        // tokens_info, rotary inv_freq batch-expansion, and FMHA tile counter
+        // reset (i.e. the entire invokeBuildDecoderInfo call is skipped).
+        std::optional<torch::Tensor> shared_cu_q_seqlens = std::nullopt,
+        std::optional<torch::Tensor> shared_cu_kv_seqlens = std::nullopt,
+        std::optional<torch::Tensor> shared_tokens_info = std::nullopt,
+        // Single-element uint32 view into the metadata's per-layer FMHA
+        // tile-counter buffer. The buffer is batch-zeroed once per forward
+        // pass in Python; non-null here means the per-layer kernel call can
+        // skip the counter reset.
+        std::optional<torch::Tensor> shared_fmha_tile_counter = std::nullopt,
+        // Pre-expanded rotary inv_freq buffer (logical shape
+        // [batch_size, halfRotaryDim]); when non-null AND the rotary
+        // config matches the per-layer config, the kernel skips the
+        // batch-expansion write.
+        std::optional<torch::Tensor> shared_rotary_inv_freq_buf = std::nullopt) const
         = 0;
 };
 
@@ -159,8 +178,10 @@ public:
         std::optional<torch::Tensor> fmha_scheduler_counter, std::optional<torch::Tensor> mla_bmm1_scale,
         std::optional<torch::Tensor> mla_bmm2_scale, std::optional<torch::Tensor> quant_q_buffer,
         std::optional<torch::Tensor> flash_mla_tile_scheduler_metadata,
-        std::optional<torch::Tensor> flash_mla_num_splits,
-        std::optional<int64_t> compressed_kv_cache_pool_ptr) const override
+        std::optional<torch::Tensor> flash_mla_num_splits, std::optional<int64_t> compressed_kv_cache_pool_ptr,
+        std::optional<torch::Tensor> shared_cu_q_seqlens, std::optional<torch::Tensor> shared_cu_kv_seqlens,
+        std::optional<torch::Tensor> shared_tokens_info, std::optional<torch::Tensor> shared_fmha_tile_counter,
+        std::optional<torch::Tensor> shared_rotary_inv_freq_buf) const override
     {
         auto stream = at::cuda::getCurrentCUDAStream(qkv_or_q.get_device());
         T* attention_input = static_cast<T*>(qkv_or_q.slice(0, token_offset).data_ptr());
@@ -499,6 +520,31 @@ public:
                 enqueue_params.mrope_rotary_cos_sin
                     = static_cast<float2 const*>(mrope_rotary_cos_sin.value().data_ptr());
             }
+            // Plumb precomputed (per-forward-pass) BuildDecoderInfo outputs so
+            // the per-layer kernel can skip the redundant prefix-scan and
+            // tokens_info writes. enqueueContext only honors these when its
+            // own gating conditions are met (non-MLA, non-cross, non-FP8,
+            // non-CP, non-dynamic-rotary).
+            if (shared_cu_q_seqlens.has_value())
+            {
+                enqueue_params.shared_cu_q_seqlens = shared_cu_q_seqlens->data_ptr<int32_t>();
+            }
+            if (shared_cu_kv_seqlens.has_value())
+            {
+                enqueue_params.shared_cu_kv_seqlens = shared_cu_kv_seqlens->data_ptr<int32_t>();
+            }
+            if (shared_tokens_info.has_value())
+            {
+                enqueue_params.shared_tokens_info = shared_tokens_info->data_ptr();
+            }
+            if (shared_fmha_tile_counter.has_value())
+            {
+                enqueue_params.shared_fmha_tile_counter = static_cast<uint32_t*>(shared_fmha_tile_counter->data_ptr());
+            }
+            if (shared_rotary_inv_freq_buf.has_value())
+            {
+                enqueue_params.shared_rotary_inv_freq_buf = shared_rotary_inv_freq_buf->data_ptr<float>();
+            }
             extractHelixParams(enqueue_params);
             op.enqueueContext<T, KVBlockArray>(enqueue_params, stream);
         }
@@ -671,7 +717,9 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     std::optional<torch::Tensor> flash_mla_tile_scheduler_metadata, std::optional<torch::Tensor> flash_mla_num_splits,
     int64_t sage_attn_num_elts_per_blk_q, int64_t sage_attn_num_elts_per_blk_k, int64_t sage_attn_num_elts_per_blk_v,
     bool sage_attn_qk_int8, int64_t num_contexts, int64_t num_ctx_tokens,
-    std::optional<int64_t> compressed_kv_cache_pool_ptr)
+    std::optional<int64_t> compressed_kv_cache_pool_ptr, std::optional<torch::Tensor> shared_cu_q_seqlens,
+    std::optional<torch::Tensor> shared_cu_kv_seqlens, std::optional<torch::Tensor> shared_tokens_info,
+    std::optional<torch::Tensor> shared_fmha_tile_counter, std::optional<torch::Tensor> shared_rotary_inv_freq_buf)
 {
     TLLM_LOG_TRACE("Attention op starts at layer %d", layer_idx);
     // Use these tensors to infer if the attention is using KV cache
@@ -953,7 +1001,8 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
             spec_decoding_tensor_params, attention_sinks, sparse_kv_indices, sparse_kv_offsets, sparse_attn_indices,
             sparse_attn_offsets, sparse_attn_indices_block_size, num_sparse_topk_value, sparse_mla_topk_lens,
             cu_q_seqlens, cu_kv_seqlens, fmha_scheduler_counter, mla_bmm1_scale, mla_bmm2_scale, quant_q_buffer,
-            flash_mla_tile_scheduler_metadata, flash_mla_num_splits, compressed_kv_cache_pool_ptr);
+            flash_mla_tile_scheduler_metadata, flash_mla_num_splits, compressed_kv_cache_pool_ptr, shared_cu_q_seqlens,
+            shared_cu_kv_seqlens, shared_tokens_info, shared_fmha_tile_counter, shared_rotary_inv_freq_buf);
     }
 
     if ((num_generations > 0) && (attn_input_type != AttentionInputType::ContextOnly))
@@ -972,7 +1021,10 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
             spec_decoding_tensor_params, attention_sinks, sparse_kv_indices, sparse_kv_offsets, sparse_attn_indices,
             sparse_attn_offsets, sparse_attn_indices_block_size, num_sparse_topk_value, sparse_mla_topk_lens,
             cu_q_seqlens, cu_kv_seqlens, fmha_scheduler_counter, mla_bmm1_scale, mla_bmm2_scale, quant_q_buffer,
-            flash_mla_tile_scheduler_metadata, flash_mla_num_splits, compressed_kv_cache_pool_ptr);
+            flash_mla_tile_scheduler_metadata, flash_mla_num_splits, compressed_kv_cache_pool_ptr,
+            /*shared_cu_q_seqlens=*/std::nullopt, /*shared_cu_kv_seqlens=*/std::nullopt,
+            /*shared_tokens_info=*/std::nullopt, /*shared_fmha_tile_counter=*/std::nullopt,
+            /*shared_rotary_inv_freq_buf=*/std::nullopt);
     }
 
     TLLM_LOG_TRACE("Attention op stops at layer %d", layer_idx);

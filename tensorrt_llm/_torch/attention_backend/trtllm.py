@@ -31,6 +31,13 @@ from .trtllm_gen import trtllm_gen_attention
 _TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION = (os.environ.get(
     "TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION", "0") == "1")
 
+# Lift the per-layer BuildDecoderInfo kernel into TrtllmAttentionMetadata.
+# Default ON; set TRTLLM_ENABLE_LIFTED_DECODER_INFO=0 to disable the lift and
+# fall back to the legacy per-layer workspace path. Primarily an A/B knob for
+# validating correctness against the legacy path.
+_TRTLLM_ENABLE_LIFTED_DECODER_INFO = (os.environ.get(
+    "TRTLLM_ENABLE_LIFTED_DECODER_INFO", "1") == "1")
+
 
 @functools.cache
 def generate_spec_decoding_position_offsets(max_num_requests: int,
@@ -57,6 +64,54 @@ def generate_spec_decoding_packed_mask(max_num_requests: int,
         mask[:, blk * 32:blk * 32 + n, blk] = vals
         remaining -= 32
     return mask
+
+
+# Upper bound on `rotary_embedding_dim // 2` for the lifted (shared
+# across layers) rotary inv_freq buffer in TrtllmAttentionMetadata. The
+# downstream QKV preprocessing kernel reads
+# `buf[batch_idx * (rotary_dim // 2) + j]`, so this buffer is over-
+# allocated in the half-dim direction and we only use the contiguous
+# `[batch_idx * halfDim + j]` prefix. 256 covers head_dim up to 512.
+_MAX_HALF_ROTARY_DIM_LIFT = 256
+
+
+def _lifted_decoder_info_kwargs(metadata: "TrtllmAttentionMetadata",
+                                layer_idx: int) -> dict:
+    """Build the precomputed-BuildDecoderInfo kwargs for a thop.attention call.
+
+    Encapsulates the lifted-decoder-info plumbing so we can A/B-toggle the
+    feature in a single place (and so the bounds check on layer_idx vs.
+    `shared_fmha_tile_counters` is uniform). When the lift is disabled or
+    the layer's index would slice past the per-layer counter buffer, all
+    five tensors are passed as None and the C++ side falls back to its
+    legacy per-layer workspace path.
+    """
+    if not metadata._shared_decoder_info_valid:
+        return dict(
+            shared_cu_q_seqlens=None,
+            shared_cu_kv_seqlens=None,
+            shared_tokens_info=None,
+            shared_fmha_tile_counter=None,
+            shared_rotary_inv_freq_buf=None,
+        )
+    tile_counters = metadata.shared_fmha_tile_counters
+    if (tile_counters is not None and 0 <= layer_idx < tile_counters.numel()):
+        fmha_tile_counter = tile_counters[layer_idx:layer_idx + 1]
+    else:
+        # Per-layer counter unavailable (no kv_cache_manager,
+        # num_local_layers==0, or layer_idx out of range). The C++ side
+        # treats nullptr here as "fall back to the workspace counter and
+        # do not skip the BuildDecoderInfo kernel".
+        fmha_tile_counter = None
+    rotary_inv_freq_buf = (metadata.shared_rotary_inv_freq_buf
+                           if metadata._shared_rotary_lifted else None)
+    return dict(
+        shared_cu_q_seqlens=metadata.shared_cu_q_seqlens,
+        shared_cu_kv_seqlens=metadata.shared_cu_kv_seqlens,
+        shared_tokens_info=metadata.shared_tokens_info,
+        shared_fmha_tile_counter=fmha_tile_counter,
+        shared_rotary_inv_freq_buf=rotary_inv_freq_buf,
+    )
 
 
 @dataclass(kw_only=True)
@@ -126,6 +181,62 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     _flash_mla_metadata_valid: bool = field(default=False,
                                             init=False,
                                             repr=False)
+
+    # ------------------------------------------------------------------
+    # Lifted (shared-across-layers) BuildDecoderInfo outputs.
+    #
+    # All outputs of the per-layer BuildDecoderInfo kernel are layer-
+    # invariant once the rotary config is the same across layers (true
+    # for LLaMA-class models). We compute them once per forward pass in
+    # prepare() and pass the device pointers down to thop.attention. The
+    # C++ side skips the per-layer kernel call entirely when:
+    #   * `shared_cu_q_seqlens` / `shared_cu_kv_seqlens` /
+    #     `shared_tokens_info` are non-null (seq-info lift), AND
+    #   * `shared_fmha_tile_counter` (per-layer slice) is non-null, AND
+    #   * `shared_rotary_inv_freq_buf` is non-null OR the layer has no
+    #     rotary embedding (rotary_embedding_dim == 0).
+    # plus the C++-side gating conditions in
+    # EnqueueContextParams<T>::shared_cu_q_seqlens (non-cross, non-MLA,
+    # FMHA enabled, single CP rank, non-FP8, non-dynamic rotary).
+    #
+    # When `enable_lifted_decoder_info` is False or the workload doesn't
+    # qualify, these stay None / invalid and the legacy per-layer
+    # workspace path is used unchanged.
+    #
+    # Default is read from the TRTLLM_ENABLE_LIFTED_DECODER_INFO env var so
+    # downstream code (PyExecutor, tests, benchmarks) can A/B compare
+    # without code changes; explicit constructor args still win.
+    enable_lifted_decoder_info: bool = field(
+        default_factory=lambda: _TRTLLM_ENABLE_LIFTED_DECODER_INFO)
+    shared_cu_q_seqlens: Optional[torch.Tensor] = None
+    shared_cu_kv_seqlens: Optional[torch.Tensor] = None
+    shared_tokens_info: Optional[torch.Tensor] = None
+    # Per-layer reset-to-zero FMHA tile counters. Shape:
+    # [num_local_layers]. We zero this once per forward pass; each
+    # attention layer reads its own slot via mLayerIdx.
+    shared_fmha_tile_counters: Optional[torch.Tensor] = None
+    # Dummy 1-element uint32 buffer used solely to force the
+    # build_decoder_info kernel launch in prepare(), since
+    # isBuildDecoderInfoKernelNeeded() would otherwise short-circuit for
+    # common shapes (batch_size==1 or max_q_seq_len==1) when no other
+    # mandatory output is requested. The kernel resets this to 0; it is
+    # otherwise unused.
+    _shared_decoder_info_dummy_counter: Optional[torch.Tensor] = field(
+        default=None, init=False, repr=False)
+    # Pre-expanded rotary inv_freq buffer. Logical shape used by the
+    # downstream QKV preprocessing kernel is [num_seqs, halfRotaryDim];
+    # we allocate a flat float32 buffer of size
+    # `max_num_sequences * MAX_HALF_ROTARY_DIM_LIFT` and let
+    # build_decoder_info populate the active prefix with stride
+    # `halfRotaryDim`.
+    shared_rotary_inv_freq_buf: Optional[torch.Tensor] = None
+    _shared_decoder_info_valid: bool = field(default=False,
+                                             init=False,
+                                             repr=False)
+    # Set to True in prepare() when the rotary precompute path
+    # succeeded. The C++ side will use shared_rotary_inv_freq_buf and
+    # skip invokeBuildDecoderInfo entirely.
+    _shared_rotary_lifted: bool = field(default=False, init=False, repr=False)
 
     @property
     def max_seq_len(self) -> int:
@@ -218,6 +329,75 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 (0, ),
                 device='cuda',
                 dtype=torch.int8,
+            )
+
+        if self.enable_lifted_decoder_info:
+            self.shared_cu_q_seqlens = self.get_empty(
+                buffers,
+                (self.max_num_sequences + 1, ),
+                cache_name="shared_cu_q_seqlens",
+                dtype=torch.int32,
+                capture_graph=capture_graph,
+            )
+            self.shared_cu_kv_seqlens = self.get_empty(
+                buffers,
+                (self.max_num_sequences + 1, ),
+                cache_name="shared_cu_kv_seqlens",
+                dtype=torch.int32,
+                capture_graph=capture_graph,
+            )
+            # tokens_info is laid out as a flat int32 buffer of length
+            # 2 * max_num_tokens; the C++ side reinterprets it as int2*.
+            self.shared_tokens_info = self.get_empty(
+                buffers,
+                (self.max_num_tokens, 2),
+                cache_name="shared_tokens_info",
+                dtype=torch.int32,
+                capture_graph=capture_graph,
+            )
+            # Per-layer FMHA tile-scheduler counter. The downstream FMHA
+            # kernel atomically increments this counter; we must reset it
+            # to 0 before each layer's attention. By allocating one slot
+            # per local attention layer and resetting the whole buffer
+            # once in prepare(), we let every layer skip its own
+            # BuildDecoderInfo kernel launch.
+            num_local_layers = (self.kv_cache_manager.num_local_layers
+                                if self.kv_cache_manager is not None
+                                and hasattr(self.kv_cache_manager,
+                                            "num_local_layers") else None)
+            if num_local_layers is not None and num_local_layers > 0:
+                # uint32 matches the C++ `uint32_t* fmha_tile_counter`
+                # used by the workspace path so we can pass the slice
+                # directly without a reinterpret.
+                self.shared_fmha_tile_counters = self.get_empty(
+                    buffers,
+                    (num_local_layers, ),
+                    cache_name="shared_fmha_tile_counters",
+                    dtype=torch.uint32,
+                    capture_graph=capture_graph,
+                )
+            # Shared rotary inv_freq buffer (post batch-expansion). The
+            # consumer kernel indexes this as
+            # `buf[batch_idx * halfDim + j]`, so the active prefix must
+            # be contiguous with stride `halfDim`. We allocate a flat
+            # float32 buffer sized for the worst-case
+            # max_num_sequences x _MAX_HALF_ROTARY_DIM_LIFT and pass the
+            # exact prefix to build_decoder_info / per-layer attention
+            # via a view in prepare(). 256 covers head_dim up to 512.
+            self.shared_rotary_inv_freq_buf = self.get_empty(
+                buffers,
+                (self.max_num_sequences * _MAX_HALF_ROTARY_DIM_LIFT, ),
+                cache_name="shared_rotary_inv_freq_buf",
+                dtype=torch.float32,
+                capture_graph=capture_graph,
+            )
+            # See _shared_decoder_info_dummy_counter comment above.
+            self._shared_decoder_info_dummy_counter = self.get_empty(
+                buffers,
+                (1, ),
+                cache_name="shared_decoder_info_dummy_counter",
+                dtype=torch.int32,
+                capture_graph=capture_graph,
             )
 
         if self.kv_cache_manager is not None:
@@ -494,6 +674,194 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         self.prompt_lens_cpu_runtime = self.prompt_lens_cpu[:self.num_seqs]
         self.host_request_types_runtime = self.host_request_types[:self.
                                                                   num_seqs]
+
+        # Lift the per-layer BuildDecoderInfo kernel call out of the
+        # per-layer attention path entirely (V2). For workloads where:
+        #   * the request layout is layer-invariant (always true),
+        #   * the FMHA tile counter can be batch-reset once,
+        #   * the rotary inv_freq buffer can be pre-expanded from a
+        #     layer-invariant rotary config (true for LLaMA-class
+        #     models with non-dynamic scaling),
+        # we can populate every output of BuildDecoderInfo once here
+        # and let the C++ side skip the per-layer launch.
+        #
+        # Note on rotary discovery: we read the rotary config from the
+        # registered attention layers via model_extra_attrs (set up
+        # during model construction). On the very first forward pass
+        # this dict may not yet be set (e.g. when prepare() is called
+        # outside model_extra_attrs() context); we then fall back to
+        # the V1 partial-lift path (seq-info only).
+        self._shared_decoder_info_valid = False
+        self._shared_rotary_lifted = False
+        if (self.enable_lifted_decoder_info
+                and self.shared_cu_q_seqlens is not None and self.num_seqs > 0
+                and self.seq_lens is not None
+                and self.seq_lens.shape[0] >= self.num_seqs
+                and self.seq_lens_cuda is not None):
+            # IMPORTANT: use the per-step Q lengths (`seq_lens`) here, NOT
+            # `prompt_lens`. For generation requests `prompt_lens` holds
+            # the *historical context length* (the original prompt size)
+            # while the actual Q length for this step is 1 (or
+            # draft_len+1 under spec dec). Passing `prompt_lens` makes
+            # the kernel iterate `tokens_info` over millions of imaginary
+            # tokens and corrupt adjacent allocator memory.
+            max_q_seq_len = int(self.seq_lens[:self.num_seqs].max().item())
+
+            # Zero per-layer FMHA tile counters once for the whole pass.
+            if self.shared_fmha_tile_counters is not None:
+                self.shared_fmha_tile_counters.zero_()
+
+            (rotary_dim, rotary_base, rotary_scale, rotary_scaling_type,
+             rotary_max_positions,
+             rotary_inv_freq_cache) = self._discover_lift_rotary_args()
+
+            # If we discovered a usable rotary config AND the precomputed
+            # buf has room for the active [num_seqs, halfDim] prefix,
+            # expose a view sized exactly for this pass.
+            half_dim = rotary_dim // 2
+            rotary_can_lift = (rotary_dim > 0 and half_dim * self.num_seqs
+                               <= self.shared_rotary_inv_freq_buf.numel())
+            shared_rotary_buf_arg: Optional[torch.Tensor] = None
+            if rotary_can_lift:
+                shared_rotary_buf_arg = self.shared_rotary_inv_freq_buf[:self.
+                                                                        num_seqs
+                                                                        *
+                                                                        half_dim].view(
+                                                                            self
+                                                                            .
+                                                                            num_seqs,
+                                                                            half_dim
+                                                                        )
+
+            launched = torch.ops.trtllm.build_decoder_info(
+                seq_q_offsets=self.shared_cu_q_seqlens,
+                seq_kv_offsets=self.shared_cu_kv_seqlens,
+                padding_offsets=None,
+                tokens_info=self.shared_tokens_info,
+                encoder_padding_offsets=None,
+                packed_mask_row_offsets=None,
+                seq_cp_partial_offsets=None,
+                attention_mask=None,
+                seq_q_lengths=self.seq_lens_cuda[:self.num_seqs],
+                seq_kv_lengths=self.kv_lens_cuda_runtime,
+                # Force the kernel launch (otherwise it short-circuits
+                # for batch_size==1 or max_q_seq_len==1). The dummy
+                # counter is the canonical "non-null, ignored" buffer.
+                fmha_tile_counter=self._shared_decoder_info_dummy_counter,
+                dequant_scale_qkv=None,
+                quant_scale_o=None,
+                fmha_bmm1_scale=None,
+                fmha_bmm2_scale=None,
+                rotary_embedding_inv_freq=shared_rotary_buf_arg,
+                rotary_embedding_inv_freq_cache=rotary_inv_freq_cache,
+                cp_size=1,
+                separate_qkv_scales=False,
+                fmha_host_bmm1_scale=1.0,
+                batch_size=self.num_seqs,
+                max_q_seq_length=max_q_seq_len,
+                max_encoder_q_seq_length=0,
+                attention_window_size=0,
+                sink_token_length=0,
+                num_tokens=self.num_tokens,
+                remove_padding=True,
+                attention_mask_type=0,  # kPADDING, unused
+                rotary_embedding_scale=rotary_scale,
+                rotary_embedding_base=rotary_base,
+                rotary_embedding_dim=rotary_dim if rotary_can_lift else 0,
+                rotary_scaling_type=rotary_scaling_type,
+                rotary_embedding_max_positions=rotary_max_positions,
+            )
+            if launched:
+                self._shared_decoder_info_valid = True
+                if rotary_can_lift:
+                    self._shared_rotary_lifted = True
+
+    def _discover_lift_rotary_args(
+            self) -> Tuple[int, float, float, int, int, Optional[torch.Tensor]]:
+        """Pull rotary config from registered TrtllmAttention layers.
+
+        Returns a tuple of
+        (rotary_dim, rotary_base, rotary_scale, rotary_scaling_type,
+         rotary_max_positions, rotary_inv_freq_cache).
+
+        On any of:
+          * no model_extra_attrs context,
+          * no attn_layers registry,
+          * mixed/incompatible rotary configs across registered
+            TrtllmAttention layers,
+          * dynamic rotary scaling on any layer,
+          * MLA layer present (MLA disables the C++ lift),
+          * rotary inv_freq cache missing or not on CUDA,
+        we return rotary_dim=0 and a None inv_freq cache, which makes
+        the caller fall back to the seq-info-only (V1) lift.
+        """
+        extra_attrs = get_model_extra_attrs()
+        if extra_attrs is None:
+            return 0, 10000.0, 1.0, 0, 0, None
+        attn_layers = extra_attrs.get("attn_layers", None)
+        if not attn_layers:
+            return 0, 10000.0, 1.0, 0, 0, None
+
+        # The "attn_layers" registry holds weakrefs to the Attention
+        # *module* (from `_torch/modules/attention.py`), whose `.attn`
+        # attribute is the backend instance (e.g. TrtllmAttention).
+        # We need every registered layer that the C++ side might attempt
+        # to lift (non-MLA, non-cross) to agree on the rotary config.
+        first_backend = None
+        for layer_ref in attn_layers.values():
+            attn_module = layer_ref() if isinstance(layer_ref,
+                                                    weakref.ref) else layer_ref
+            if attn_module is None:
+                continue
+            backend = getattr(attn_module, "attn", None)
+            if not isinstance(backend, TrtllmAttention):
+                # Other backends in the same model -> bail out.
+                return 0, 10000.0, 1.0, 0, 0, None
+            if backend.is_mla_enable:
+                # MLA layers aren't covered by the C++ lift; if any MLA
+                # layer is present we conservatively disable the rotary
+                # precompute (the C++ gate already disables MLA, but
+                # mixing rotary configs in the same buffer is unsafe).
+                return 0, 10000.0, 1.0, 0, 0, None
+            if first_backend is None:
+                first_backend = backend
+                continue
+            if (backend.rope_params.dim != first_backend.rope_params.dim or
+                    backend.rope_params.theta != first_backend.rope_params.theta
+                    or int(backend.rope_params.scale_type) != int(
+                        first_backend.rope_params.scale_type) or
+                    backend.rope_params.scale != first_backend.rope_params.scale
+                    or backend.rope_params.max_positions
+                    != first_backend.rope_params.max_positions):
+                # Heterogeneous rotary configs -> disable lift.
+                return 0, 10000.0, 1.0, 0, 0, None
+
+        if first_backend is None:
+            return 0, 10000.0, 1.0, 0, 0, None
+
+        # Disable lift for dynamic rotary scaling (the C++ gate already
+        # forbids it, but we'd be writing layer-specific values into a
+        # shared buffer which is unsafe).
+        from tensorrt_llm.functional import RotaryScalingType
+        if int(first_backend.rope_params.scale_type) == int(
+                RotaryScalingType.dynamic):
+            return 0, 10000.0, 1.0, 0, 0, None
+
+        # rotary_inv_freq is created on CUDA by create_rope_const_params,
+        # but bail out defensively if the cache isn't present or isn't a
+        # CUDA tensor.
+        inv_freq_cache = first_backend.rotary_inv_freq
+        if inv_freq_cache is None or not inv_freq_cache.is_cuda:
+            return 0, 10000.0, 1.0, 0, 0, None
+
+        return (
+            int(first_backend.rope_params.dim),
+            float(first_backend.rope_params.theta),
+            float(first_backend.rope_params.scale),
+            int(first_backend.rope_params.scale_type),
+            int(first_backend.rope_params.max_positions),
+            inv_freq_cache,
+        )
 
     def prepare_flash_mla(self) -> None:
         # Invalidate the pre-computed metadata so that forward() recomputes it
@@ -1553,6 +1921,12 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 num_contexts=metadata.num_contexts,
                 num_ctx_tokens=metadata.num_ctx_tokens,
                 compressed_kv_cache_pool_ptr=compressed_kv_cache_pool_ptr,
+                # Precomputed BuildDecoderInfo outputs. Honored by the
+                # C++ side only when the gating constraints hold;
+                # otherwise ignored. When all five tensors below are
+                # non-null AND the gates pass, the C++ side skips the
+                # per-layer invokeBuildDecoderInfo call entirely.
+                **_lifted_decoder_info_kwargs(metadata, layer_idx),
             )
 
         if self.print_skip_softmax_stat:

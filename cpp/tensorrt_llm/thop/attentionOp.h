@@ -82,7 +82,16 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     std::optional<torch::Tensor> flash_mla_num_splits = std::nullopt, int64_t sage_attn_num_elts_per_blk_q = 0,
     int64_t sage_attn_num_elts_per_blk_k = 0, int64_t sage_attn_num_elts_per_blk_v = 0, bool sage_attn_qk_int8 = false,
     int64_t num_contexts = 0, int64_t num_ctx_tokens = 0,
-    std::optional<int64_t> compressed_kv_cache_pool_ptr = std::nullopt);
+    std::optional<int64_t> compressed_kv_cache_pool_ptr = std::nullopt,
+    // Precomputed (shared-across-layers) BuildDecoderInfo outputs. See
+    // attentionOp.cpp for the full gating conditions; when all five
+    // tensors are non-null and the C++ gate passes, the per-layer
+    // invokeBuildDecoderInfo call is skipped entirely.
+    std::optional<torch::Tensor> shared_cu_q_seqlens = std::nullopt,
+    std::optional<torch::Tensor> shared_cu_kv_seqlens = std::nullopt,
+    std::optional<torch::Tensor> shared_tokens_info = std::nullopt,
+    std::optional<torch::Tensor> shared_fmha_tile_counter = std::nullopt,
+    std::optional<torch::Tensor> shared_rotary_inv_freq_buf = std::nullopt);
 
 struct KvCachePoolPointers
 {
