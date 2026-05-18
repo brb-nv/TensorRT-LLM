@@ -3883,8 +3883,9 @@ class PyTorchModelEngine(ModelEngine):
         draft_kv_cache_manager = self._get_draft_kv_cache_manager(
             resource_manager)
 
-        attn_metadata = self._set_up_attn_metadata(kv_cache_manager,
-                                                   draft_kv_cache_manager)
+        with nvtx_range("set_up_attn_metadata"):
+            attn_metadata = self._set_up_attn_metadata(kv_cache_manager,
+                                                       draft_kv_cache_manager)
         if self.enable_spec_decode:
             spec_resource_manager = resource_manager.get_resource_manager(
                 ResourceManagerType.SPEC_RESOURCE_MANAGER)
@@ -3962,16 +3963,17 @@ class PyTorchModelEngine(ModelEngine):
                 scheduled_requests, resource_manager,
                 self.runtime_draft_len) as padded_requests:
 
-            maybe_attn_metadata, maybe_spec_metadata, key = self.cuda_graph_runner.maybe_get_cuda_graph(
-                padded_requests,
-                enable_spec_decode=self.enable_spec_decode,
-                attn_metadata=attn_metadata,
-                spec_metadata=spec_metadata,
-                draft_tokens_cuda=self.draft_tokens_cuda
-                if self.is_spec_decode else None,
-                new_tensors_device=new_tensors_device,
-                spec_resource_manager=spec_resource_manager,
-            )
+            with nvtx_range("maybe_get_cuda_graph"):
+                maybe_attn_metadata, maybe_spec_metadata, key = self.cuda_graph_runner.maybe_get_cuda_graph(
+                    padded_requests,
+                    enable_spec_decode=self.enable_spec_decode,
+                    attn_metadata=attn_metadata,
+                    spec_metadata=spec_metadata,
+                    draft_tokens_cuda=self.draft_tokens_cuda
+                    if self.is_spec_decode else None,
+                    new_tensors_device=new_tensors_device,
+                    spec_resource_manager=spec_resource_manager,
+                )
 
             can_run_graph = key is not None
             if can_run_graph:
@@ -4010,55 +4012,69 @@ class PyTorchModelEngine(ModelEngine):
 
             with with_shared_pool(self.cuda_graph_runner.get_graph_pool()):
                 if not can_run_graph:
-                    # Fallback to eager execution if graph was not used
-                    with MoeLoadBalancerIterContext(moe_load_balancer):
-                        outputs = self._forward_step(
-                            inputs,
-                            gather_ids=gather_ids,
-                            gather_context_logits=gather_context_logits)
+                    # Fallback to eager execution if graph was not used. For
+                    # the ctx (prefill) path this is the common branch -- the
+                    # full CUDA-graph runner is decode-only, and prefill goes
+                    # through here. Any per-piece CUDA graphs (piecewise) are
+                    # dispatched inside ``self.model.forward`` below.
+                    with nvtx_range("forward_step.eager"):
+                        with MoeLoadBalancerIterContext(moe_load_balancer):
+                            outputs = self._forward_step(
+                                inputs,
+                                gather_ids=gather_ids,
+                                gather_context_logits=gather_context_logits)
                 else:
                     if self.cuda_graph_runner.needs_capture(key):
+                        with nvtx_range("cuda_graph_runner.capture"):
 
-                        def capture_forward_fn(inputs: Dict[str, Any]):
-                            with MoeLoadBalancerIterContext(moe_load_balancer):
-                                return self._forward_step(
-                                    inputs,
-                                    gather_ids=gather_ids,
-                                    gather_context_logits=gather_context_logits)
+                            def capture_forward_fn(inputs: Dict[str, Any]):
+                                with MoeLoadBalancerIterContext(
+                                        moe_load_balancer):
+                                    return self._forward_step(
+                                        inputs,
+                                        gather_ids=gather_ids,
+                                        gather_context_logits=
+                                        gather_context_logits)
 
-                        def capture_postprocess_fn(inputs: Dict[str, Any]):
-                            self._postprocess_inputs(inputs)
+                            def capture_postprocess_fn(inputs: Dict[str, Any]):
+                                self._postprocess_inputs(inputs)
 
-                        self.cuda_graph_runner.capture(
-                            key,
-                            capture_forward_fn,
-                            inputs,
-                            enable_spec_decode=self.enable_spec_decode,
-                            postprocess_fn=capture_postprocess_fn)
+                            self.cuda_graph_runner.capture(
+                                key,
+                                capture_forward_fn,
+                                inputs,
+                                enable_spec_decode=self.enable_spec_decode,
+                                postprocess_fn=capture_postprocess_fn)
 
                         # Pre-replay: set DSA slot mappings for current batch's draft cache (fixes 2nd warmup)
-                        saved_draft = prepare_attn_metadata_for_draft_replay(
-                            attn_metadata, draft_kv_cache_manager)
-                        try:
-                            outputs = self.cuda_graph_runner.replay(key, inputs)
-                        finally:
-                            restore_attn_metadata_after_draft_replay(
-                                attn_metadata, saved_draft)
-                    else:
-                        saved_draft = prepare_attn_metadata_for_draft_replay(
-                            attn_metadata, draft_kv_cache_manager)
-                        try:
-                            with MoeLoadBalancerIterContext(moe_load_balancer):
+                        with nvtx_range("cuda_graph_runner.replay"):
+                            saved_draft = prepare_attn_metadata_for_draft_replay(
+                                attn_metadata, draft_kv_cache_manager)
+                            try:
                                 outputs = self.cuda_graph_runner.replay(
                                     key, inputs)
-                        finally:
-                            restore_attn_metadata_after_draft_replay(
-                                attn_metadata, saved_draft)
+                            finally:
+                                restore_attn_metadata_after_draft_replay(
+                                    attn_metadata, saved_draft)
+                    else:
+                        with nvtx_range("cuda_graph_runner.replay"):
+                            saved_draft = prepare_attn_metadata_for_draft_replay(
+                                attn_metadata, draft_kv_cache_manager)
+                            try:
+                                with MoeLoadBalancerIterContext(
+                                        moe_load_balancer):
+                                    outputs = self.cuda_graph_runner.replay(
+                                        key, inputs)
+                            finally:
+                                restore_attn_metadata_after_draft_replay(
+                                    attn_metadata, saved_draft)
 
             if self.forward_pass_callable is not None:
-                self.forward_pass_callable()
+                with nvtx_range("forward_pass_callable"):
+                    self.forward_pass_callable()
 
-            self._execute_logit_post_processors(scheduled_requests, outputs)
+            with nvtx_range("execute_logit_post_processors"):
+                self._execute_logit_post_processors(scheduled_requests, outputs)
 
             return outputs
 
@@ -4067,22 +4083,31 @@ class PyTorchModelEngine(ModelEngine):
         return getattr(self.model, 'spec_worker', None)
 
     def model_forward(self, **kwargs):
-        attrs = get_model_extra_attrs()
-        assert attrs is not None, "Model extra attrs is not set"
-        attrs["attention_metadata"] = weakref.ref(kwargs['attn_metadata'])
-        attrs.update(self.model.model_config.extra_attrs)
+        # Split into three sub-ranges so the host work between
+        # ``_prepare_inputs`` and the first model kernel is visible in nsys.
+        # On TinyLlama-1.1B prefill (NVBug 5615248) the bubble between
+        # ``_prepare_inputs`` ending and the first embedding kernel firing
+        # is ~760 us; without these ranges that gap has zero engine NVTX
+        # coverage and is indistinguishable from "no work running".
+        with nvtx_range("model_forward.setup_extra_attrs"):
+            attrs = get_model_extra_attrs()
+            assert attrs is not None, "Model extra attrs is not set"
+            attrs["attention_metadata"] = weakref.ref(kwargs['attn_metadata'])
+            attrs.update(self.model.model_config.extra_attrs)
 
-        if self._torch_compile_backend is not None:
-            # Register aux streams and events to model extra attrs.
-            # The streams and events are list which could be updated during compilation.
-            attrs["aux_streams"] = weakref.ref(self.backend_num_streams)
-            attrs["events"] = weakref.ref(self._torch_compile_backend.events)
-            attrs["global_stream"] = torch.cuda.current_stream()
+            if self._torch_compile_backend is not None:
+                # Register aux streams and events to model extra attrs.
+                # The streams and events are list which could be updated during compilation.
+                attrs["aux_streams"] = weakref.ref(self.backend_num_streams)
+                attrs["events"] = weakref.ref(
+                    self._torch_compile_backend.events)
+                attrs["global_stream"] = torch.cuda.current_stream()
 
-        if is_trace_enabled("TLLM_TRACE_MODEL_FORWARD"):
-            return trace_func(self.model.forward)(**kwargs)
-        else:
-            return self.model.forward(**kwargs)
+        with nvtx_range("model.forward"):
+            if is_trace_enabled("TLLM_TRACE_MODEL_FORWARD"):
+                return trace_func(self.model.forward)(**kwargs)
+            else:
+                return self.model.forward(**kwargs)
 
     @nvtx_range("_forward_step")
     def _forward_step(self,
@@ -4090,7 +4115,8 @@ class PyTorchModelEngine(ModelEngine):
                       *,
                       gather_ids: Optional[torch.Tensor] = None,
                       gather_context_logits: bool = False) -> Dict[str, Any]:
-        inputs = self._preprocess_inputs(inputs)
+        with nvtx_range("_preprocess_inputs"):
+            inputs = self._preprocess_inputs(inputs)
         if inputs.get('spec_metadata', None):
             gather_ids = inputs['spec_metadata'].gather_ids
 

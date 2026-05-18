@@ -9,6 +9,7 @@ from torch._subclasses import FakeTensor
 from torch.fx import GraphModule, Interpreter
 from torch.fx.passes.split_module import split_module
 
+from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.llmapi.utils import enable_llm_debug
 
 from ..utils import (get_model_extra_attrs,
@@ -161,19 +162,36 @@ class PiecewiseRunner(object):
             )
 
     def __call__(self, *args):
-        runtime_num_of_token = None
-        if self.runtime_num_tokens_idx != None:
-            runtime_num_of_token = int(
-                args[self.runtime_num_tokens_idx[0]].shape[
-                    self.runtime_num_tokens_idx[1]])
-        elif isinstance(self.compile_time_num_tokens, int):
-            runtime_num_of_token = self.compile_time_num_tokens
+        # Emit an "entry" range as the very first thing so we can measure
+        # the dispatch path that leads here (Dynamo guards + AOTAutograd
+        # runtime + split GraphModule.forward up to this submod_*) as the
+        # gap between the previous piecewise/attn range end and this range
+        # start. For the FIRST piece in a step the gap is
+        # ``spec_dec.inner_model_call.start`` -> this NVTX start, which
+        # equals the full Dynamo + AOTAutograd + FX entry overhead.
+        with nvtx_range(f"piecewise[{self.name}]|entry"):
+            runtime_num_of_token = None
+            if self.runtime_num_tokens_idx != None:
+                runtime_num_of_token = int(
+                    args[self.runtime_num_tokens_idx[0]].shape[
+                        self.runtime_num_tokens_idx[1]])
+            elif isinstance(self.compile_time_num_tokens, int):
+                runtime_num_of_token = self.compile_time_num_tokens
+
+            # NVTX label used by every code path below so nsys timelines show
+            # one range per piecewise-runner invocation. The suffix tells you
+            # WHICH path was taken (replay/eager/warmup/nocap/capture); the gap
+            # between consecutive ``piecewise[...]`` ranges is the FX
+            # interpreter + any excluded-submodule (e.g. attention) work that
+            # is intentionally NOT in any CUDA graph.
+            _nvtx_base = f"piecewise[{self.name}|n={runtime_num_of_token}]"
 
         if (runtime_num_of_token is None
                 or runtime_num_of_token not in self.entries
                 or not get_piecewise_cuda_graph_flag()
                 or not get_per_request_piecewise_cuda_graph_flag()):
-            return self.default_callable(*args)
+            with nvtx_range(f"{_nvtx_base}|eager"):
+                return self.default_callable(*args)
 
         if self.is_first_runner or self.is_last_runner:
             if self.is_first_runner == self.is_last_runner:
@@ -190,53 +208,58 @@ class PiecewiseRunner(object):
         if entry.cuda_graph is None:
 
             if not get_capture_piecewise_cuda_graph_flag():
-                return entry.callable(*args)
+                with nvtx_range(f"{_nvtx_base}|nocap"):
+                    return entry.callable(*args)
 
             if entry.warmup_count < 3:
                 entry.warmup_count += 1
-                return entry.callable(*args)
+                with nvtx_range(f"{_nvtx_base}|warmup"):
+                    return entry.callable(*args)
 
-            entry.input_addresses = [
-                i.data_ptr() for i in args if isinstance(i, torch.Tensor)
-            ]
+            with nvtx_range(f"{_nvtx_base}|capture"):
+                entry.input_addresses = [
+                    i.data_ptr() for i in args if isinstance(i, torch.Tensor)
+                ]
 
-            graph = torch.cuda.CUDAGraph()
+                graph = torch.cuda.CUDAGraph()
 
-            # Torch's cuda graph will call gc.collect() internally. This will slow down the performance.
-            # We patch it to do nothing.
-            with patch("gc.collect", lambda: None):
-                # TODO: consider to use `make_graphed_callables()` when
-                # it's ready rather than capture it ourselves
-                # Graph Capture would override the stream. We need to setup the stream correctly.
-                extra_attrs = get_model_extra_attrs()
-                with torch.cuda.graph(graph, pool=self.graph_pool_handle):
+                # Torch's cuda graph will call gc.collect() internally. This will slow down the performance.
+                # We patch it to do nothing.
+                with patch("gc.collect", lambda: None):
+                    # TODO: consider to use `make_graphed_callables()` when
+                    # it's ready rather than capture it ourselves
+                    # Graph Capture would override the stream. We need to setup the stream correctly.
+                    extra_attrs = get_model_extra_attrs()
+                    with torch.cuda.graph(graph, pool=self.graph_pool_handle):
+                        extra_attrs["global_stream"] = torch.cuda.current_stream(
+                        )
+                        output = entry.callable(*args)
                     extra_attrs["global_stream"] = torch.cuda.current_stream()
-                    output = entry.callable(*args)
-                extra_attrs["global_stream"] = torch.cuda.current_stream()
 
-            entry.cuda_graph = graph
-            # Mark weak ref here. The intermediate activation tensor should be freed properly.
-            # Here we don't use python native weakref since we still need the object to be alive when the graph is replayed.
-            entry.output = make_weak_ref(output)
-            entry.output_addresses = [
-                i.data_ptr() for i in output if isinstance(i, torch.Tensor)
-            ]
+                entry.cuda_graph = graph
+                # Mark weak ref here. The intermediate activation tensor should be freed properly.
+                # Here we don't use python native weakref since we still need the object to be alive when the graph is replayed.
+                entry.output = make_weak_ref(output)
+                entry.output_addresses = [
+                    i.data_ptr() for i in output if isinstance(i, torch.Tensor)
+                ]
+
+                entry.cuda_graph.replay()
+
+                return output
+
+        with nvtx_range(f"{_nvtx_base}|replay"):
+            if enable_llm_debug():
+                runtime_input_addresses = [
+                    i.data_ptr() for i in args if isinstance(i, torch.Tensor)
+                ]
+
+                assert (entry.input_addresses == runtime_input_addresses
+                        ), f"{entry.input_addresses} vs\n {runtime_input_addresses}"
 
             entry.cuda_graph.replay()
 
-            return output
-
-        if enable_llm_debug():
-            runtime_input_addresses = [
-                i.data_ptr() for i in args if isinstance(i, torch.Tensor)
-            ]
-
-            assert (entry.input_addresses == runtime_input_addresses
-                    ), f"{entry.input_addresses} vs\n {runtime_input_addresses}"
-
-        entry.cuda_graph.replay()
-
-        return entry.output
+            return entry.output
 
 
 def piecewise_optimizer(

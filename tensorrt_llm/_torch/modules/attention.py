@@ -116,24 +116,34 @@ def attn_custom_op_inplace(
     output: torch.Tensor,
     output_sf: Optional[torch.Tensor],
 ) -> None:
-    metadata, attn_layer = extract_extra_attrs(layer_idx, "attn")
-    mask = PredefinedAttentionMask(
-        attention_mask
-    ) if attention_mask != CustomAttentionMask.CUSTOM else CustomAttentionMask(
-        attention_mask)
-    # NVFP4 output cannot be supported by torch compile for TRTLLM backend.
-    attn_layer._attn_impl(q,
-                          k,
-                          v,
-                          metadata,
-                          mask,
-                          mrope_rotary_cos_sin,
-                          mrope_position_deltas,
-                          attention_window_size,
-                          attention_mask_data,
-                          output=output,
-                          output_sf=output_sf,
-                          attention_sinks=attention_sinks)
+    # This custom op is the per-layer attention call. It is intentionally
+    # NOT placed inside any piecewise CUDA graph (see
+    # ``piecewise_optimizer.py::piecewise_optimizer`` which lists it as a
+    # split point), so every layer's attention runs eager between two
+    # piecewise graph pieces. The NVTX range below lets us see (a) which
+    # layer each attention call belongs to and (b) how much host time the
+    # eager attention prologue (computeSeqAndPaddingOffsets,
+    # applyBiasRopeUpdateKVCacheV2, fmha launch) costs relative to the
+    # surrounding piecewise[...] ranges.
+    with nvtx_range(f"attn_custom_op_inplace[layer={layer_idx}]"):
+        metadata, attn_layer = extract_extra_attrs(layer_idx, "attn")
+        mask = PredefinedAttentionMask(
+            attention_mask
+        ) if attention_mask != CustomAttentionMask.CUSTOM else CustomAttentionMask(
+            attention_mask)
+        # NVFP4 output cannot be supported by torch compile for TRTLLM backend.
+        attn_layer._attn_impl(q,
+                              k,
+                              v,
+                              metadata,
+                              mask,
+                              mrope_rotary_cos_sin,
+                              mrope_position_deltas,
+                              attention_window_size,
+                              attention_mask_data,
+                              output=output,
+                              output_sf=output_sf,
+                              attention_sinks=attention_sinks)
 
 
 def _helix_post_process(

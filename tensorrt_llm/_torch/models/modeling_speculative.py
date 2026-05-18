@@ -7,6 +7,7 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import LlamaConfig, PretrainedConfig
 
+from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.logger import logger
 
 from ...functional import PositionEmbeddingType, RotaryScalingType
@@ -1719,14 +1720,32 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
         resource_manager=None,
         **kwargs,
     ) -> torch.Tensor:
-        hidden_states = self.model(
-            input_ids=input_ids,
-            attn_metadata=attn_metadata,
-            position_ids=position_ids,
-            inputs_embeds=inputs_embeds,
-            spec_metadata=spec_metadata,
-            **kwargs,
-        )
+        # NVTX wraps the call into the (torch.compile'd) inner model. This
+        # range is OUTSIDE the compile boundary -- ``self.model`` is the
+        # OptimizedModule returned by ``torch.compile`` in model_engine.py,
+        # so adding NVTX here does NOT cause Dynamo graph breaks.
+        #
+        # For NVBug 5615248: the bubble between ``model.forward`` (engine
+        # side) starting and the first ``piecewise[...|replay]`` NVTX
+        # firing is the sum of:
+        #   (a) Python prologue in this forward before reaching self.model
+        #       -> visible as: model.forward.start -> spec_dec.inner_model_call.start
+        #   (b) OptimizedModule.__call__ + nn.Module hook checks
+        #       + Dynamo eval-frame intercept + guard check
+        #       + compiled wrapper + AOTAutograd runtime
+        #       + split GraphModule.forward dispatch to submod_0
+        #       + PiecewiseRunner.__call__ entry work
+        #       -> visible as: spec_dec.inner_model_call.start
+        #                   -> piecewise[submod_0|...|entry].start
+        with nvtx_range("spec_dec.inner_model_call"):
+            hidden_states = self.model(
+                input_ids=input_ids,
+                attn_metadata=attn_metadata,
+                position_ids=position_ids,
+                inputs_embeds=inputs_embeds,
+                spec_metadata=spec_metadata,
+                **kwargs,
+            )
         if spec_metadata is not None and spec_metadata.is_layer_capture(
                 self.layer_idx):
             spec_metadata.maybe_capture_hidden_states(self.layer_idx,
