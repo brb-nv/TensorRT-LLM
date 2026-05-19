@@ -16,6 +16,7 @@ from tensorrt_llm._utils import get_sm_version, maybe_pin_memory, prefer_pinned
 from tensorrt_llm.bindings.internal import thop
 from tensorrt_llm.functional import AttentionMaskType
 from tensorrt_llm.llmapi import SkipSoftmaxAttentionConfig
+from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from ..utils import (compute_swizzled_sf_shape, get_global_attrs,
@@ -30,6 +31,30 @@ from .trtllm_gen import trtllm_gen_attention
 # Enable TRTLLM-Gen attention backend via environment variable (default: off).
 _TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION = (os.environ.get(
     "TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION", "0") == "1")
+
+# Pre-launch validation of TRT-LLM attention kernel inputs (default: off).
+# Enable to catch out-of-range KV-cache block IDs *before* the kernel launch.
+# Useful for diagnosing CUDA illegal memory access errors originating in XQA /
+# fmha / paged-KV attention kernels (e.g. VSWA + block reuse + disagg paths).
+_TRTLLM_DEBUG_ATTN_INPUTS = (os.environ.get("TLLM_DEBUG_ATTN_INPUTS",
+                                            "0") == "1")
+
+# When the validator catches an out-of-range entry it ALWAYS emits a rich diagnostic
+# dump (see _debug_dump_attn_inputs). This flag controls whether it should ALSO
+# raise a RuntimeError to stop the run immediately.
+#
+# Default: false (warn-only) — let the run continue so we can correlate the
+# validator's offending-step dump with the kernel's *actual* CUDA failure (or
+# successful completion). Set to "1" to bring back the old fail-fast behaviour.
+#
+# This matters because the attention kernel only dereferences a subset of the
+# offsets table per step (the cyclic window for SWA layers), so most validator
+# trips are latent — a placeholder sentinel that the kernel does not happen to
+# read in this step but would read on a step with a shorter kv_len. Warn-only
+# mode keeps the diagnostic value of the validator without short-circuiting
+# the comparison against the kernel's empirical behaviour.
+_TRTLLM_VALIDATE_ATTN_INPUTS_FAIL_FAST = (os.environ.get(
+    "TLLM_VALIDATE_ATTN_INPUTS_FAIL_FAST", "0") == "1")
 
 
 @functools.cache
@@ -1201,6 +1226,218 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             return AttentionMaskType.padding
         raise ValueError("Unexpected attention mask type")
 
+    @staticmethod
+    def _pool_layout_for_validation(
+            kv_cache_manager) -> Optional[Tuple[List[int], List[int], int]]:
+        """Return ``(num_blocks_per_pool, num_layers_per_pool, kv_factor)``.
+
+        ``kv_cache_block_offsets`` stores values in the encoded form
+        ``block_idx * num_layers_in_pool * kv_factor + field_idx`` (with the
+        high bit set when the block lives in the secondary host pool — see
+        ``cpp/include/tensorrt_llm/kernels/kvCacheIndex.h`` and
+        ``WindowBlockManager::setOffsets``). To validate we need the per-pool
+        stride and block count.
+
+        Pool ordering follows the C++ ``std::map<windowSize, WindowSizeMetadata>``
+        iteration order, i.e. **ascending window size**, with the assumption that
+        each unique window size maps to a single pool (true for the standard
+        VSWA path used here; non-VSWA models trivially have a single pool).
+        """
+        if kv_cache_manager is None:
+            return None
+        pool_mapping = getattr(kv_cache_manager, "kv_cache_pool_mapping", None)
+        blocks_per_window = getattr(kv_cache_manager, "blocks_per_window", None)
+        kv_factor = getattr(kv_cache_manager, "kv_factor", 2)
+        if pool_mapping is None or not blocks_per_window:
+            return None
+        pool_indices = pool_mapping[:, 0].detach().cpu().tolist()
+        if not pool_indices:
+            return None
+        num_pools = max(pool_indices) + 1
+        num_layers_per_pool = [0] * num_pools
+        for p in pool_indices:
+            num_layers_per_pool[p] += 1
+        sorted_windows = sorted(blocks_per_window.keys())
+        if len(sorted_windows) != num_pools:
+            # Hybrid models can map multiple pools per window; bail rather
+            # than risk a misleading validation.
+            return None
+        num_blocks_per_pool = [
+            sum(blocks_per_window[w]) for w in sorted_windows
+        ]
+        return num_blocks_per_pool, num_layers_per_pool, kv_factor
+
+    # Mask that clears bit 31 (``KVCacheIndex::kSecondaryPoolFlag``) on a
+    # signed int32 tensor. We use the positive literal ``0x7FFFFFFF`` instead
+    # of constructing ``torch.tensor(1 << 31, dtype=int32)`` — the latter
+    # overflows signed int32 and raises at runtime.
+    _KV_CACHE_INDEX_MASK = 0x7FFFFFFF
+
+    def _decode_stored_offsets(self, raw: "torch.Tensor",
+                               stride: int) -> "torch.Tensor":
+        """Decode ``raw`` stored offsets back to logical block indices.
+
+        The C++ side stores ``flat_index3(block_idx, 0, field_idx, num_layers,
+        kv_factor)`` with the top bit set for secondary-pool blocks. We mask
+        off the secondary-pool flag (bit 31), then divide by the stride to
+        recover the logical block index in the pool.
+        """
+        masked = raw & self._KV_CACHE_INDEX_MASK
+        if stride <= 0:
+            return masked
+        return masked // stride
+
+    def _debug_dump_attn_inputs(self, metadata: "TrtllmAttentionMetadata",
+                                attention_window_size: int,
+                                where: str) -> None:
+        """Dump paged-KV attention inputs for debugging.
+
+        Synchronizes the GPU on purpose to materialize ``kv_cache_block_offsets``
+        on the host so the per-pool / per-seq view is consistent. This is only
+        called on failure paths or when ``TLLM_DEBUG_ATTN_INPUTS=1`` is set, so
+        the cost is acceptable.
+        """
+        try:
+            num_contexts = int(metadata.num_contexts)
+            num_seqs = int(metadata.num_seqs)
+            num_generations = num_seqs - num_contexts
+            tpb = metadata.tokens_per_block
+            kv_lens_cpu = metadata.kv_lens[:num_seqs].tolist(
+            ) if metadata.kv_lens is not None else None
+            prompt_lens_cpu = metadata.prompt_lens_cpu_runtime[:num_seqs].tolist(
+            ) if metadata.prompt_lens_cpu_runtime is not None else None
+            req_ids = list(metadata.request_ids[:num_seqs]) \
+                if metadata.request_ids is not None else None
+            header = (
+                f"[ATTN-DEBUG/{where}] layer_idx={self.layer_idx} "
+                f"attention_window_size={attention_window_size} "
+                f"num_contexts={num_contexts} num_generations={num_generations} "
+                f"num_seqs={num_seqs} tokens_per_block={tpb}")
+            logger.error(header)
+            logger.error(f"[ATTN-DEBUG/{where}] request_ids={req_ids}")
+            logger.error(f"[ATTN-DEBUG/{where}] prompt_lens={prompt_lens_cpu}")
+            logger.error(f"[ATTN-DEBUG/{where}] kv_lens={kv_lens_cpu}")
+            if metadata.kv_cache_manager is not None and hasattr(
+                    metadata.kv_cache_manager, "blocks_per_window"):
+                logger.error(
+                    f"[ATTN-DEBUG/{where}] blocks_per_window="
+                    f"{metadata.kv_cache_manager.blocks_per_window}")
+            offsets = metadata.kv_cache_block_offsets
+            if offsets is None or num_seqs == 0 or tpb is None:
+                return
+            offsets_host = offsets[:, :num_seqs].detach().to(
+                "cpu", non_blocking=False)
+            num_pools = offsets_host.shape[0]
+            max_blocks_per_seq = offsets_host.shape[-1]
+            kv_lens_list = kv_lens_cpu if kv_lens_cpu is not None else [0
+                                                                      ] * num_seqs
+            layout = self._pool_layout_for_validation(metadata.kv_cache_manager)
+            for pool_idx in range(num_pools):
+                if layout is not None:
+                    nblocks, nlayers, kvf = layout
+                    stride = nlayers[pool_idx] * kvf
+                    max_legal_stored = nblocks[pool_idx] * stride
+                    k_offsets_decoded = self._decode_stored_offsets(
+                        offsets_host[pool_idx, :, 0, :], stride)
+                    raw = offsets_host[pool_idx, :, 0, :]
+                    logger.error(
+                        f"[ATTN-DEBUG/{where}] pool={pool_idx} "
+                        f"num_blocks={nblocks[pool_idx]} num_layers={nlayers[pool_idx]} "
+                        f"kv_factor={kvf} stride={stride} max_legal_stored={max_legal_stored} "
+                        f"stored_min={int(raw.min())} stored_max={int(raw.max())} "
+                        f"block_idx_min={int(k_offsets_decoded.min())} "
+                        f"block_idx_max={int(k_offsets_decoded.max())}")
+                else:
+                    stride = 1
+                    raw = offsets_host[pool_idx, :, 0, :]
+                    k_offsets_decoded = raw
+                    logger.error(
+                        f"[ATTN-DEBUG/{where}] pool={pool_idx} (no layout info) "
+                        f"raw_min={int(raw.min())} raw_max={int(raw.max())}")
+                for seq_idx in range(num_seqs):
+                    kv_len = int(kv_lens_list[seq_idx])
+                    used_blocks = min(
+                        max_blocks_per_seq,
+                        (kv_len + tpb - 1) // tpb if kv_len > 0 else 0)
+                    used = k_offsets_decoded[seq_idx, :used_blocks].tolist()
+                    tail = k_offsets_decoded[seq_idx, used_blocks:used_blocks +
+                                             4].tolist()
+                    logger.error(
+                        f"[ATTN-DEBUG/{where}] pool={pool_idx} seq={seq_idx} "
+                        f"kv_len={kv_len} used_blocks={used_blocks} "
+                        f"block_idx[:used]={used} block_idx[used:used+4]={tail}"
+                    )
+        except Exception as dump_err:
+            logger.error(
+                f"[ATTN-DEBUG/{where}] failed to dump diagnostics: {dump_err}")
+
+    def _validate_attn_inputs_pre_launch(
+            self, metadata: "TrtllmAttentionMetadata",
+            attention_window_size: int) -> None:
+        """Validate kv_cache_block_offsets in-range before kernel launch.
+
+        Catches stale / out-of-range KV-cache block IDs that would otherwise
+        manifest as CUDA_ERROR_ILLEGAL_ADDRESS deep inside the XQA / fmha
+        kernels. Only enabled when ``TLLM_DEBUG_ATTN_INPUTS=1``.
+        """
+        offsets = metadata.kv_cache_block_offsets
+        kv_cache_manager = metadata.kv_cache_manager
+        if offsets is None or kv_cache_manager is None:
+            return
+        num_seqs = int(metadata.num_seqs)
+        tpb = metadata.tokens_per_block
+        if num_seqs == 0 or tpb is None:
+            return
+        layout = self._pool_layout_for_validation(kv_cache_manager)
+        if layout is None:
+            return
+        num_blocks_per_pool, num_layers_per_pool, kv_factor = layout
+        offsets_host = offsets[:, :num_seqs].detach().to("cpu",
+                                                         non_blocking=False)
+        bad_pools: List[str] = []
+        for pool_idx in range(offsets_host.shape[0]):
+            stride = num_layers_per_pool[pool_idx] * kv_factor
+            if stride <= 0:
+                continue
+            max_legal_stored = num_blocks_per_pool[pool_idx] * stride
+            raw = offsets_host[pool_idx]
+            # ``raw`` is int32; mask off the secondary-pool flag (bit 31).
+            # ``raw & 0x7FFFFFFF`` produces a non-negative int32 value with the
+            # logical block index encoding (block_idx * stride + field_idx).
+            masked = raw & self._KV_CACHE_INDEX_MASK
+            if int(masked.max()) >= max_legal_stored:
+                bad_pools.append(
+                    f"pool={pool_idx} num_blocks={num_blocks_per_pool[pool_idx]} "
+                    f"num_layers={num_layers_per_pool[pool_idx]} kv_factor={kv_factor} "
+                    f"stride={stride} max_legal_stored={max_legal_stored} "
+                    f"stored_min={int(masked.min())} stored_max={int(masked.max())}"
+                )
+        if bad_pools:
+            self._debug_dump_attn_inputs(
+                metadata,
+                attention_window_size,
+                where="validate_attn_inputs_pre_launch")
+            logger.error(
+                "[ATTN-VALIDATE] To get the full STORE/EVICT/REUSE/SHELF timeline "
+                "for the offending request(s), re-run with "
+                "TRTLLM_KV_CACHE_TRACE=1 and grep `[KV-TRACE]` in the log.")
+            msg = (
+                f"[ATTN-VALIDATE] kv_cache_block_offsets out of range "
+                f"layer_idx={self.layer_idx}: " + "; ".join(bad_pools))
+            if _TRTLLM_VALIDATE_ATTN_INPUTS_FAIL_FAST:
+                # Strict mode: surface immediately so the failing step is the very
+                # last thing in the log. Only useful when you already know the
+                # offending state is fatal for this kernel + this kv_len.
+                raise RuntimeError(msg)
+            # Warn-only (default): some sentinels are latent (kernel skips the
+            # slot under SWA cyclic mode) and would not have crashed in this
+            # particular step. Keeping the run going lets us correlate the
+            # validator's offending-step dump with the kernel's *actual* CUDA
+            # error if/when it later trips. The "attn_kernel_failure" branch in
+            # forward() will fire on the genuine kernel fault.
+            logger.error(msg + " (warn-only; "
+                "set TLLM_VALIDATE_ATTN_INPUTS_FAIL_FAST=1 to raise)")
+
     def _run(
         self,
         q: torch.Tensor,
@@ -1348,6 +1585,9 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         use_sage_attn = (forward_args.sage_attn_num_elts_per_blk_q > 0
                          or forward_args.sage_attn_num_elts_per_blk_k > 0
                          or forward_args.sage_attn_num_elts_per_blk_v > 0)
+        if _TRTLLM_DEBUG_ATTN_INPUTS:
+            self._validate_attn_inputs_pre_launch(metadata,
+                                                  attention_window_size)
         if _TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION and not helix_active and not use_sage_attn and trtllm_gen.is_supported(
                 q=q,
                 num_heads=self.num_heads,
@@ -1658,13 +1898,26 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                                and metadata._seq_lens_cuda is not None):
             metadata.update_blackwell_first_sparse_mask_offset()
 
-        self._run(q, k, v, output, output_sf, metadata, forward_args,
-                  use_paged_context_fmha, sparse_kv_indices, sparse_kv_offsets,
-                  sparse_attn_indices, sparse_attn_offsets,
-                  sparse_attn_indices_block_size, num_sparse_topk,
-                  sparse_mla_topk_lens, compressed_kv_cache_pool_ptr,
-                  skip_softmax_threshold_scale_factor_prefill,
-                  skip_softmax_threshold_scale_factor_decode)
+        try:
+            self._run(q, k, v, output, output_sf, metadata, forward_args,
+                      use_paged_context_fmha, sparse_kv_indices,
+                      sparse_kv_offsets, sparse_attn_indices,
+                      sparse_attn_offsets, sparse_attn_indices_block_size,
+                      num_sparse_topk, sparse_mla_topk_lens,
+                      compressed_kv_cache_pool_ptr,
+                      skip_softmax_threshold_scale_factor_prefill,
+                      skip_softmax_threshold_scale_factor_decode)
+        except RuntimeError:
+            # Surface attention kernel inputs on synchronous CUDA failures
+            # (e.g. CUDA_ERROR_ILLEGAL_ADDRESS from XQA / paged-KV kernels).
+            # With CUDA_LAUNCH_BLOCKING=1, the originating launch is in this
+            # frame so the metadata still corresponds to the failing step.
+            attention_window_size = (forward_args.attention_window_size
+                                     or metadata.max_seq_len)
+            self._debug_dump_attn_inputs(metadata,
+                                        attention_window_size,
+                                        where="attn_kernel_failure")
+            raise
 
         if output_sf is None:
             return output

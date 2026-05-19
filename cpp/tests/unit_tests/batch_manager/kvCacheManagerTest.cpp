@@ -9553,6 +9553,140 @@ TEST_F(KVCacheManagerTest, VSWAEvictedPlaceholderAnchorAllowsTrailingReuse)
     ASSERT_NE(kvCacheManager.findBlocksInReuseTreeByBlockKeys(b6PartialKeys, window), nullptr);
 }
 
+// Regression test for https://nvbugs/6117811.
+//
+// Companion to VSWAEvictedPlaceholderAnchorAllowsTrailingReuse: that test
+// validates that prefix reuse correctly advances past an evicted SWA anchor.
+// What it does NOT check is whether the resulting per-sequence block list
+// — i.e. the data path that ultimately reaches the attention kernel via
+// copyBlockOffsets / kv_cache_block_offsets — is safe to dereference.
+//
+// The bug: when a partial-reuse walk traverses through an evicted OOW anchor,
+// the reused sequence keeps a kPlaceholderBlockId at the anchor's slot in its
+// cacheBlockIds list. WindowBlockManager::setOffsets then writes the sentinel
+// tk::KVCacheIndex::nullIndex (== INT32_MAX) into kv_cache_block_offsets at
+// that slot. The XQA/paged-KV attention kernel iterates [0, ceil(kv_len/tpb))
+// linearly and dereferences every entry; reading the sentinel computes a wildly
+// out-of-bounds pool offset and triggers CUDA_ERROR_ILLEGAL_ADDRESS — see the
+// "ensures accidental use triggers an obvious OOB failure" comment on
+// KVCacheIndex::kInvalidPoolIndex in cpp/include/tensorrt_llm/kernels/kvCacheIndex.h.
+//
+// Production repro: TestGemma3_1BInstruct::test_auto_dtype[True] (VSWA + disagg +
+// block_reuse) under tests/integration/defs/accuracy/test_disaggregated_serving.py.
+//
+// Invariant under test: after a partial-reuse addSequenceBatch that walked past
+// an evicted SWA anchor, every per-sequence cacheBlockIds entry the kernel will
+// touch (i.e. positions [0, ceil(kv_len/tpb))) must reference a real pooled
+// block. Equivalently, the materialized kv_cache_block_offsets tensor must
+// contain no KVCacheIndex::nullIndex within that range.
+TEST_F(KVCacheManagerTest, VSWAEvictedAnchorReuseDoesNotLeakPlaceholderToKernel)
+{
+    // Setup mirrors VSWAEvictedPlaceholderAnchorAllowsTrailingReuse exactly so
+    // any divergence between the two tests is purely about the new invariant.
+    auto constexpr tpb = 4;
+    auto constexpr window = 3 * tpb;  // 12 tokens = 3 blocks
+    auto constexpr numBlocksSeq0 = 7; // 7 blocks = 28 tokens in seq0
+    auto constexpr blocksInPrimaryPool = 16;
+    auto const stream = std::make_shared<tr::CudaStream>();
+    tr::SamplingConfig const samplingConfig{kVSWA_BEAM_WIDTH};
+
+    auto const blocksPerWindow = BlocksPerWindow{{window, {blocksInPrimaryPool, 0}}};
+    KVCacheManager kvCacheManager(2, 2, 64, tpb, blocksPerWindow, 8, kVSWA_BEAM_WIDTH, std::vector<SizeType32>{window},
+        nvinfer1::DataType::kHALF, 0, stream,
+        /*maxSequenceLength=*/128, /*chunkSize=*/128, /*enableBlockReuse=*/true);
+    kvCacheManager.allocatePools(false);
+
+    auto const makeBlockKeys = [&](SizeType32 usableTokens, bool allowPartial)
+    {
+        auto prefixTokens = std::make_shared<VecTokens>(usableTokens);
+        std::iota(prefixTokens->begin(), prefixTokens->end(), kVSWA_FIRST_TOKEN);
+        auto prefixRequest
+            = std::make_shared<LlmRequest>(99, kVSWA_MAX_NEW_TOKENS, prefixTokens, samplingConfig, kVSWA_IS_STREAMING);
+        auto const& uniqueTokens = prefixRequest->getUniqueTokens(kVSWA_BEAM_IDX);
+        auto blockedUniqueTokens = chopVectorIntoBlocks<UniqueToken>(uniqueTokens, usableTokens, tpb, allowPartial);
+        return buildBlockKeys(blockedUniqueTokens, *prefixRequest);
+    };
+
+    // Seq 0: 28-token prefill -> blocks b0..b5 stored in the reuse trie.
+    auto inputTokens0 = std::make_shared<VecTokens>(numBlocksSeq0 * tpb);
+    std::iota(inputTokens0->begin(), inputTokens0->end(), kVSWA_FIRST_TOKEN);
+    auto llmRequest0
+        = std::make_shared<LlmRequest>(0, kVSWA_MAX_NEW_TOKENS, inputTokens0, samplingConfig, kVSWA_IS_STREAMING);
+    kvCacheManager.addSequenceBatch({{{0, numBlocksSeq0 * tpb, kVSWA_BEAM_WIDTH}}}, {std::ref(*llmRequest0)});
+    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*llmRequest0);
+    kvCacheManager.storeContextBlocks(*llmRequest0);
+    EXPECT_NO_THROW(static_cast<void>(kvCacheManager.removeSequence(0, std::nullopt)));
+
+    // Evict the first OOW anchor (b0) so descendant nodes are left value-less.
+    auto const b0Keys = makeBlockKeys(tpb, /*allowPartial=*/false);
+    auto b0Block = kvCacheManager.findBlocksInReuseTreeByBlockKeys(b0Keys, window);
+    ASSERT_NE(b0Block, nullptr);
+    b0Block->detachFromLookupNode();
+    ASSERT_EQ(kvCacheManager.findBlocksInReuseTreeByBlockKeys(b0Keys, window), nullptr);
+
+    // Seq 2: same 28-token prompt -> partial-reuse walk traverses past the
+    // missing anchor and pre-populates b1..b5 into the sequence's block list,
+    // with a kPlaceholderBlockId at slot 0 (the evicted anchor).
+    auto inputTokens2 = std::make_shared<VecTokens>(numBlocksSeq0 * tpb);
+    std::iota(inputTokens2->begin(), inputTokens2->end(), kVSWA_FIRST_TOKEN);
+    auto llmRequest2
+        = std::make_shared<LlmRequest>(2, kVSWA_MAX_NEW_TOKENS, inputTokens2, samplingConfig, kVSWA_IS_STREAMING);
+    kvCacheManager.addSequenceBatch({{{2, numBlocksSeq0 * tpb, kVSWA_BEAM_WIDTH}}}, {std::ref(*llmRequest2)});
+
+    ASSERT_EQ(llmRequest2->getContextCurrentPosition(), 6 * tpb)
+        << "precondition: partial-reuse walk must advance past the missing anchor";
+
+    // INVARIANT 1: the per-sequence cacheBlockIds list (the source of truth that
+    // feeds copyBlockOffsets) must not contain kPlaceholderBlockId at any slot
+    // the attention kernel will touch. The kernel iterates linearly over
+    // ceil(kv_len / tpb) slots from index 0, so any slot inside [0, numBlocks)
+    // is fair game.
+    auto const& seq2 = kvCacheManager.getSequence(2);
+    auto const& cacheBlockIds = seq2.getCacheBlockIds(window).at(kVSWA_BEAM_IDX);
+    ASSERT_FALSE(cacheBlockIds.empty()) << "seq 2 must have at least one block after addSequenceBatch";
+    for (std::size_t i = 0; i < cacheBlockIds.size(); ++i)
+    {
+        EXPECT_NE(cacheBlockIds[i], KVCacheBlock::kPlaceholderBlockId)
+            << "seq 2 cacheBlockIds[" << i
+            << "] is the SWA placeholder sentinel. WindowBlockManager::setOffsets will "
+               "translate this to KVCacheIndex::nullIndex (INT32_MAX). The XQA / paged-KV "
+               "attention kernel dereferences this slot, producing CUDA_ERROR_ILLEGAL_ADDRESS. "
+               "See https://nvbugs/6117811.";
+    }
+
+    // INVARIANT 2: the materialized kv_cache_block_offsets tensor — the exact
+    // input the C++ AttentionOp hands to the kernel via thop.attention — must
+    // not contain KVCacheIndex::nullIndex at any active slot for either K or V.
+    auto const& blockManager = kvCacheManager.getBlockManager();
+    auto const numPools = blockManager.getNumPools();
+    auto const maxBlocksPerSeq = kvCacheManager.getOffsetTableDimensions().maxBlocksPerSeq;
+    tr::ITensor::SharedPtr const kvCacheBlockOffsets = tr::BufferManager::cpu(
+        tr::ITensor::makeShape({numPools, /*maxNumSequences*beamWidth=*/1, 2, maxBlocksPerSeq}),
+        tr::TRTDataType<tk::KVCacheIndex>::value);
+    kvCacheManager.copyBlockOffsets(*kvCacheBlockOffsets, /*outputSlotOffset=*/0, /*requestId=*/2);
+    auto const* const offsetsPtr = tr::bufferCast<tk::KVCacheIndex>(*kvCacheBlockOffsets);
+    auto const offsetsShape = kvCacheBlockOffsets->getShape();
+    auto const numActiveBlocks = static_cast<SizeType32>(cacheBlockIds.size());
+    for (SizeType32 poolIdx = 0; poolIdx < numPools; ++poolIdx)
+    {
+        for (SizeType32 xIdx = 0; xIdx < 2; ++xIdx) // 0=K, 1=V
+        {
+            for (SizeType32 blockSlot = 0; blockSlot < numActiveBlocks; ++blockSlot)
+            {
+                auto const idx = tc::flat_index(offsetsShape.d, poolIdx, 0, xIdx, blockSlot);
+                EXPECT_NE(offsetsPtr[idx].get(), tk::KVCacheIndex::kInvalidPoolIndex)
+                    << "kv_cache_block_offsets[pool=" << poolIdx << ", seq=0, " << (xIdx == 0 ? "K" : "V")
+                    << ", block=" << blockSlot
+                    << "] is KVCacheIndex::nullIndex (INT32_MAX). The XQA / paged-KV attention "
+                       "kernel will dereference this and crash with CUDA_ERROR_ILLEGAL_ADDRESS. "
+                       "See https://nvbugs/6117811.";
+            }
+        }
+    }
+
+    EXPECT_NO_THROW(static_cast<void>(kvCacheManager.removeSequence(2, std::nullopt)));
+}
+
 ///////////////////////////////////////////////////////////////////////////////
 // KvCacheConnector decode-time block allocation tests
 //

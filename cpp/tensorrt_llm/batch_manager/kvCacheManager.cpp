@@ -54,6 +54,33 @@ using BlocksPerWindow = std::map<SizeType32, std::tuple<SizeType32, SizeType32>>
 namespace
 {
 
+//! \brief Diagnostic-only KV-cache lifecycle tracing. Gated on TRTLLM_KV_CACHE_TRACE
+//! (any non-empty value enables it). Off by default → zero runtime cost.
+//!
+//! Trace lines are prefixed with [KV-TRACE] so they are trivially greppable, and the
+//! emitting hotspots (STORE / EVICT / REUSE / SHELF) form a strict timeline that lets
+//! you correlate, for a given offending sequence:
+//!   1. Which previous request originally stored each reused block (STORE → REUSE),
+//!   2. When the SWA anchor block was evicted (EVICT),
+//!   3. Where in the new sequence's per-seq shelf the placeholder sentinel landed
+//!      (SHELF, with the slot index that WindowBlockManager::setOffsets will write
+//!      KVCacheIndex::nullIndex into).
+//!
+//! Use this together with the Python-side ATTN-DEBUG dump in
+//! tensorrt_llm/_torch/attention_backend/trtllm.py to get the full picture from
+//! "block evicted" through "kernel-facing offsets table" without recompiling.
+//!
+//! See https://nvbugs/6117811 for the SWA + partial-reuse + disagg interaction that
+//! exposed the need for this tracing.
+bool kvCacheTraceEnabled()
+{
+    static bool const enabled = []() {
+        auto const* v = std::getenv("TRTLLM_KV_CACHE_TRACE");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    return enabled;
+}
+
 //! \brief Get all blocks in a sequence by traversing backwards from the last block.
 //! \param lastBlock is a BlockPtr to the last block in the sequence to start traversal from
 //! \return Vector of BlockPtr-s in sequence order
@@ -1000,7 +1027,30 @@ void WindowBlockManager::storeContextBlocks(GenerationRequest& sequence, LlmRequ
         beam0Blocks.push_back(std::move(block));
     }
     blockKeys.resize(beam0Blocks.size());
+    auto const blockKeysCopy = blockKeys; // copy before move for [KV-TRACE] logging below
     (void) storeBlocks(std::move(blockKeys), beam0Blocks);
+
+    if (kvCacheTraceEnabled())
+    {
+        // Record originator for each freshly-stored, non-placeholder block, and emit a
+        // STORE line per block so the trace can later correlate "seq X reused block B"
+        // with "seq Y stored block B". We deliberately log AFTER storeBlocks so the
+        // trie state is final and isPlaceholder() reflects the post-store reality.
+        for (std::size_t i = 0; i < beam0Blocks.size(); ++i)
+        {
+            auto const& block = beam0Blocks[i];
+            if (!block || block->isPlaceholder())
+            {
+                continue;
+            }
+            auto const bid = block->getBlockId();
+            mBlockLastStorer[bid] = llmRequest.mRequestId;
+            TLLM_LOG_INFO(
+                "[KV-TRACE] STORE req=%lu win=%d slot=%zu block_id=%d hash=%zx token_count=%zu",
+                llmRequest.mRequestId, mWindowSize, i, bid, block->getHash(),
+                (i < blockKeysCopy.size() ? blockKeysCopy[i].uniqueTokens.size() : 0));
+        }
+    }
 }
 
 void WindowBlockManager::createBlockScalePools(SizeType32 quantBlockSize)
@@ -1269,6 +1319,28 @@ BlockPtr WindowBlockManager::getFreeBlock(GenerationRequest& sequence, executor:
     TLLM_LOG_DEBUG("%s::getFreeBlock - Block %d is now acquired by sequence %d", mLogPrefix.c_str(),
         block->getBlockId(), sequence.getRequestId());
 
+    if (kvCacheTraceEnabled())
+    {
+        // EVICT (for reuse): this block was previously sitting in the eviction queue,
+        // potentially as an out-of-window SWA anchor or as a leaf from a finished
+        // sequence's reuse chain. Log who originally stored it and who is taking it
+        // over now — together with the STORE events above, this gives the full
+        // "stored by req X → evicted → repurposed for req Y" timeline.
+        auto const bid = block->getBlockId();
+        auto const it = mBlockLastStorer.find(bid);
+        LlmRequest::RequestIdType const lastStorer
+            = (it != mBlockLastStorer.end()) ? it->second : static_cast<LlmRequest::RequestIdType>(0);
+        TLLM_LOG_INFO(
+            "[KV-TRACE] EVICT win=%d block_id=%d acquired_by_req=%lu last_stored_by_req=%lu hash=%zx",
+            mWindowSize, bid, sequence.getRequestId(), lastStorer, block->getHash());
+        // Acquiring the block invalidates the previous lineage; drop the entry so
+        // future EVICT/REUSE lines for the same id show fresh ownership.
+        if (it != mBlockLastStorer.end())
+        {
+            mBlockLastStorer.erase(it);
+        }
+    }
+
     return block;
 }
 
@@ -1314,6 +1386,51 @@ void BlockManager::setOffsets(tk::KVCacheIndex* offsetsPtr, nvinfer1::Dims const
     SizeType32 blockIdx, KVCacheBlock::IdType blockId, SizeType32 windowSize) const
 {
     mWindowBlockManagers.at(windowSize).setOffsets(offsetsPtr, offsetsShape, beamIdx, blockIdx, blockId);
+}
+
+void WindowBlockManager::traceShelfIfEnabled(GenerationRequest const& sequence,
+    std::vector<std::vector<KVCacheBlock::IdType>> const& cacheBlocks) const
+{
+    auto const beamWidth = sequence.getBeamWidth();
+    for (SizeType32 beamIdx = 0; beamIdx < beamWidth; ++beamIdx)
+    {
+        if (beamIdx >= static_cast<SizeType32>(cacheBlocks.size()))
+        {
+            break;
+        }
+        auto const& beamCacheBlock = cacheBlocks[beamIdx];
+        std::ostringstream oss;
+        SizeType32 placeholderCount = 0;
+        for (SizeType32 blockIdx = 0; blockIdx < static_cast<SizeType32>(beamCacheBlock.size()); ++blockIdx)
+        {
+            if (blockIdx > 0)
+            {
+                oss << ",";
+            }
+            auto const id = beamCacheBlock.at(blockIdx);
+            if (id == KVCacheBlock::kPlaceholderBlockId)
+            {
+                oss << "PLACEHOLDER";
+                ++placeholderCount;
+            }
+            else
+            {
+                auto const it = mBlockLastStorer.find(id);
+                if (it != mBlockLastStorer.end())
+                {
+                    oss << id << "(by_req=" << it->second << ")";
+                }
+                else
+                {
+                    oss << id;
+                }
+            }
+        }
+        TLLM_LOG_INFO(
+            "[KV-TRACE] SHELF req=%lu win=%d beam=%d num_blocks=%zu num_placeholders=%d shelf=[%s]",
+            sequence.getRequestId(), mWindowSize, beamIdx, beamCacheBlock.size(), placeholderCount,
+            oss.str().c_str());
+    }
 }
 
 void BlockManager::onboardBlock(GenerationRequest& sequence, BlockPtr const& offloadBlock, SizeType32 windowSize,
@@ -1746,6 +1863,18 @@ SizeType32 WindowBlockManager::onboardAndAllocateBlocks(
         {
             TLLM_LOG_DEBUG("%s::onboardAndAllocateBlocks for request %lu - Traversed missing SWA anchor",
                 mLogPrefix.c_str(), sequence.getRequestId());
+            if (kvCacheTraceEnabled())
+            {
+                // This is *the* moment the SWA-evicted-anchor placeholder is grafted
+                // onto the new sequence's per-seq cacheBlockIds. The slot is index `bi`
+                // and the block carries kPlaceholderBlockId. WindowBlockManager::setOffsets
+                // will later translate this slot to KVCacheIndex::nullIndex
+                // (INT32_MAX) in the kernel-facing offsets table.
+                TLLM_LOG_INFO(
+                    "[KV-TRACE] REUSE req=%lu win=%d slot=%d kind=swa_evicted_anchor "
+                    "(placeholder grafted: setOffsets will write KVCacheIndex::nullIndex here)",
+                    sequence.getRequestId(), mWindowSize, bi);
+            }
             addBlockToAllBeams(claimed.block, sequence);
             ++blockItr;
             ++bi;
@@ -1793,6 +1922,25 @@ SizeType32 WindowBlockManager::onboardAndAllocateBlocks(
             // Full match — already claimed in Phase 1
             TLLM_LOG_DEBUG("%s::onboardAndAllocateBlocks for request %lu - Matched full block %d", mLogPrefix.c_str(),
                 sequence.getRequestId(), matchingBlockId);
+        }
+
+        if (kvCacheTraceEnabled())
+        {
+            // Correlate this REUSE with the STORE event (if still tracked) that
+            // originally placed the block in the reuse trie. The originating
+            // request_id is what makes the timeline "seq X reused block B from seq Y"
+            // self-explanatory in the log.
+            auto const it = mBlockLastStorer.find(matchingBlockId);
+            LlmRequest::RequestIdType const lastStorer
+                = (it != mBlockLastStorer.end()) ? it->second : static_cast<LlmRequest::RequestIdType>(0);
+            char const* kind = claimed.isPartialMatch
+                ? (claimed.needsCopy ? "partial_copy" : "partial_leaf")
+                : "full";
+            TLLM_LOG_INFO(
+                "[KV-TRACE] REUSE req=%lu win=%d slot=%d kind=%s block_id=%d last_stored_by_req=%lu hash=%zx "
+                "matched_tokens=%d",
+                sequence.getRequestId(), mWindowSize, bi, kind, matchingBlockId, lastStorer,
+                claimed.block->getHash(), claimed.numMatchedTokens);
         }
 
         onboardBlock(sequence, claimed.block, claimResult.mode, claimResult.directory);
@@ -3502,6 +3650,14 @@ void BlockManager::updateSequenceCacheBlockOffsets(GenerationRequest& sequence, 
             auto const blockId = beamCacheBlock.at(blockIdx);
             mWindowBlockManagers.at(windowSize).setOffsets(offsetsPtr, offsetsShape, beamIdx, blockIdx, blockId);
         }
+    }
+
+    if (kvCacheTraceEnabled())
+    {
+        // SHELF SNAPSHOT: see WindowBlockManager::traceShelfIfEnabled for details.
+        // This is the exact list that WindowBlockManager::setOffsets just translated
+        // into the kernel-facing offsets tensor.
+        mWindowBlockManagers.at(windowSize).traceShelfIfEnabled(sequence, cacheBlocks);
     }
 }
 

@@ -919,6 +919,14 @@ public:
         return mLogPrefix;
     }
 
+    //! \brief Emit a [KV-TRACE] SHELF line describing the finalized per-sequence
+    //! block list for this window, with originator request IDs and explicit
+    //! PLACEHOLDER markers. Caller is responsible for gating on
+    //! kvCacheTraceEnabled(); this method does the formatting and lookup
+    //! against mBlockLastStorer. See https://nvbugs/6117811.
+    void traceShelfIfEnabled(GenerationRequest const& sequence,
+        std::vector<std::vector<KVCacheBlock::IdType>> const& cacheBlocks) const;
+
     [[nodiscard]] SizeType32 getNumFreeBlocks() const;
 
     [[nodiscard]] SizeType32 getNumAllocTotalBlocks() const
@@ -1312,6 +1320,17 @@ private:
     // Whether the indexer K cache stores FP4-packed data (half the byte count
     // per token vs. FP8). Drives the createIndexerKCachePools() formula.
     bool mIndexerKCacheUseFp4{false};
+
+    // Diagnostic-only lineage map: "block id" -> "request that most recently
+    // stored that block in the reuse trie". Populated by storeBlocks() and
+    // consumed by the TRTLLM_KV_CACHE_TRACE logging in storeBlocks(),
+    // claimBlock-based eviction, onboardAndAllocateBlocks, and
+    // updateSequenceCacheBlockOffsets. Never read by production code paths;
+    // exists purely so the trace output can correlate
+    //   "seq X reused block B"  ↔  "block B was stored by seq Y, evicted at t".
+    // See https://nvbugs/6117811 for the SWA-evicted-anchor bug whose lineage
+    // this map exposes.
+    std::unordered_map<KVCacheBlock::IdType, LlmRequest::RequestIdType> mBlockLastStorer;
 
     std::optional<LinearAttentionMetadata> mLinearAttentionMetadata;
 };
