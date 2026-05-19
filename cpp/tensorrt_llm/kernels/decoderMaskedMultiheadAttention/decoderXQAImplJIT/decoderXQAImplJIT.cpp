@@ -545,6 +545,51 @@ void DecoderXQAImplJIT::runImpl(XQAParams const& xqaParams, KVCacheBuffer const&
         auto const gridDim = (isGMMAKernel ? dim3{specDecBlocks, multi_block, nbKVHeads * xqaParams.batch_size}
                                            : dim3{multi_block, nbKVHeads, xqaParams.batch_size});
         dim3 const blockDim(128, 1, isGMMAKernel ? 3 : 2);
+        // Diagnostic: per-launch trace of the multi-block dispatch decision.
+        // Gated on TRTLLM_XQA_LAUNCH_TRACE so we can correlate the chosen
+        // grid shape (the "history-chunking" the kernel will perform) with
+        // the per-step ATTN-DEBUG dump on the Python side.
+        //
+        // We filter to launches with multi_block > 1 by default because:
+        //   1. ~99% of Gemma-style decode launches are single-block and
+        //      uninteresting for the placeholder-sentinel hypothesis.
+        //   2. The history-chunked (multi_block > 1) dispatch is exactly the
+        //      regime where an early-slot KVCacheIndex::nullIndex sentinel
+        //      becomes fatal — see https://nvbugs/6117811.
+        // Set TRTLLM_XQA_LAUNCH_TRACE=all to log every launch (much chattier;
+        // useful only when actively debugging the dispatch).
+        static int const sXqaLaunchTrace = []() -> int
+        {
+            auto const* v = std::getenv("TRTLLM_XQA_LAUNCH_TRACE");
+            if (v == nullptr || v[0] == '\0' || v[0] == '0')
+            {
+                return 0;
+            }
+            // "1" / "multiblock" / default -> multi-block launches only.
+            // "all" / "2" -> every launch.
+            std::string const s(v);
+            if (s == "all" || s == "2")
+            {
+                return 2;
+            }
+            return 1;
+        }();
+        if (sXqaLaunchTrace == 2 || (sXqaLaunchTrace == 1 && multi_block > 1))
+        {
+            TLLM_LOG_INFO(
+                "[XQA-LAUNCH] batch_size=%u num_kv_heads=%u num_q_heads=%u beam_width=%u "
+                "max_past_kv_length=%d cyclic_attention_window_size=%d max_attention_window_size=%d "
+                "is_sliding_window=%d multi_block_mode=%d multi_block=%u specDecBlocks=%u "
+                "isGMMAKernel=%d isHMMAKernel=%d isSpecDec=%d multiprocessor_count=%d "
+                "gridDim=(%u,%u,%u) blockDim=(%u,%u,%u)",
+                static_cast<unsigned>(xqaParams.batch_size), static_cast<unsigned>(xqaParams.num_kv_heads),
+                static_cast<unsigned>(xqaParams.num_q_heads), static_cast<unsigned>(xqaParams.beam_width),
+                xqaParams.max_past_kv_length, xqaParams.cyclic_attention_window_size,
+                xqaParams.max_attention_window_size, static_cast<int>(xqaParams.is_sliding_window),
+                static_cast<int>(xqaParams.multi_block_mode), multi_block, specDecBlocks,
+                static_cast<int>(isGMMAKernel), static_cast<int>(isHMMAKernel), static_cast<int>(isSpecDec),
+                multiprocessor_count, gridDim.x, gridDim.y, gridDim.z, blockDim.x, blockDim.y, blockDim.z);
+        }
         cubinObj->launch(gridDim, blockDim, stream, kernelParams);
     }
     sync_check_cuda_error(stream);

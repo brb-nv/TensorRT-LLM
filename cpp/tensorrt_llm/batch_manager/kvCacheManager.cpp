@@ -54,31 +54,55 @@ using BlocksPerWindow = std::map<SizeType32, std::tuple<SizeType32, SizeType32>>
 namespace
 {
 
-//! \brief Diagnostic-only KV-cache lifecycle tracing. Gated on TRTLLM_KV_CACHE_TRACE
-//! (any non-empty value enables it). Off by default → zero runtime cost.
+//! \brief Diagnostic-only KV-cache lifecycle tracing. Gated on TRTLLM_KV_CACHE_TRACE.
+//! Off by default → zero runtime cost.
 //!
-//! Trace lines are prefixed with [KV-TRACE] so they are trivially greppable, and the
-//! emitting hotspots (STORE / EVICT / REUSE / SHELF) form a strict timeline that lets
-//! you correlate, for a given offending sequence:
-//!   1. Which previous request originally stored each reused block (STORE → REUSE),
-//!   2. When the SWA anchor block was evicted (EVICT),
-//!   3. Where in the new sequence's per-seq shelf the placeholder sentinel landed
-//!      (SHELF, with the slot index that WindowBlockManager::setOffsets will write
-//!      KVCacheIndex::nullIndex into).
+//! Two verbosity levels:
 //!
-//! Use this together with the Python-side ATTN-DEBUG dump in
-//! tensorrt_llm/_torch/attention_backend/trtllm.py to get the full picture from
-//! "block evicted" through "kernel-facing offsets table" without recompiling.
+//!   TRTLLM_KV_CACHE_TRACE=1            (default verbosity; minimal-perturbation mode)
+//!       Log ONLY the placeholder-related events:
+//!         - REUSE lines with kind=swa_evicted_anchor   (each individual graft)
+//!         - SHELF lines with num_placeholders > 0      (per-step final shelf)
+//!       STORE and EVICT are silent. This is the right setting for repro runs
+//!       that need to keep timing close to production while still capturing the
+//!       smoking gun for https://nvbugs/6117811.
 //!
-//! See https://nvbugs/6117811 for the SWA + partial-reuse + disagg interaction that
-//! exposed the need for this tracing.
-bool kvCacheTraceEnabled()
+//!   TRTLLM_KV_CACHE_TRACE=full         (or =all, =2)
+//!       Log every STORE / EVICT / REUSE / SHELF event regardless of placeholder
+//!       state. Useful for full lineage tracing ("which prior request stored
+//!       each of the 49 placeholders' anchor blocks, and when was each one
+//!       evicted?") — but VERY chatty and likely to perturb scheduling enough
+//!       to mask timing-sensitive bugs. Only enable for a targeted lineage run
+//!       after the failure pattern is already confirmed.
+//!
+//! Trace lines are prefixed with [KV-TRACE] so they are trivially greppable.
+int kvCacheTraceLevel()
 {
-    static bool const enabled = []() {
+    static int const level = []() -> int
+    {
         auto const* v = std::getenv("TRTLLM_KV_CACHE_TRACE");
-        return v != nullptr && v[0] != '\0' && v[0] != '0';
+        if (v == nullptr || v[0] == '\0' || v[0] == '0')
+        {
+            return 0;
+        }
+        std::string const s(v);
+        if (s == "full" || s == "all" || s == "2")
+        {
+            return 2;
+        }
+        return 1;
     }();
-    return enabled;
+    return level;
+}
+
+// Convenience predicates so the call sites read clearly.
+inline bool kvCacheTraceEnabled()
+{
+    return kvCacheTraceLevel() >= 1;
+}
+inline bool kvCacheTraceFull()
+{
+    return kvCacheTraceLevel() >= 2;
 }
 
 //! \brief Get all blocks in a sequence by traversing backwards from the last block.
@@ -1032,10 +1056,11 @@ void WindowBlockManager::storeContextBlocks(GenerationRequest& sequence, LlmRequ
 
     if (kvCacheTraceEnabled())
     {
-        // Record originator for each freshly-stored, non-placeholder block, and emit a
-        // STORE line per block so the trace can later correlate "seq X reused block B"
-        // with "seq Y stored block B". We deliberately log AFTER storeBlocks so the
-        // trie state is final and isPlaceholder() reflects the post-store reality.
+        // Record originator in the lineage map regardless of verbosity level —
+        // it costs a single hashmap write per block and we need it to annotate
+        // SHELF / REUSE lines later. STORE lines themselves are very chatty
+        // (one per block per finished request) so only emit them at the full
+        // verbosity level.
         for (std::size_t i = 0; i < beam0Blocks.size(); ++i)
         {
             auto const& block = beam0Blocks[i];
@@ -1045,10 +1070,13 @@ void WindowBlockManager::storeContextBlocks(GenerationRequest& sequence, LlmRequ
             }
             auto const bid = block->getBlockId();
             mBlockLastStorer[bid] = llmRequest.mRequestId;
-            TLLM_LOG_INFO(
-                "[KV-TRACE] STORE req=%lu win=%d slot=%zu block_id=%d hash=%zx token_count=%zu",
-                llmRequest.mRequestId, mWindowSize, i, bid, block->getHash(),
-                (i < blockKeysCopy.size() ? blockKeysCopy[i].uniqueTokens.size() : 0));
+            if (kvCacheTraceFull())
+            {
+                TLLM_LOG_INFO(
+                    "[KV-TRACE] STORE req=%lu win=%d slot=%zu block_id=%d hash=%zx token_count=%zu",
+                    llmRequest.mRequestId, mWindowSize, i, bid, block->getHash(),
+                    (i < blockKeysCopy.size() ? blockKeysCopy[i].uniqueTokens.size() : 0));
+            }
         }
     }
 }
@@ -1323,18 +1351,20 @@ BlockPtr WindowBlockManager::getFreeBlock(GenerationRequest& sequence, executor:
     {
         // EVICT (for reuse): this block was previously sitting in the eviction queue,
         // potentially as an out-of-window SWA anchor or as a leaf from a finished
-        // sequence's reuse chain. Log who originally stored it and who is taking it
-        // over now — together with the STORE events above, this gives the full
-        // "stored by req X → evicted → repurposed for req Y" timeline.
+        // sequence's reuse chain. We always update the lineage map (so that
+        // future SHELF / REUSE lines for the same id show fresh ownership);
+        // the EVICT log line itself only fires at full verbosity since most
+        // evictions are uninteresting routine cache churn.
         auto const bid = block->getBlockId();
         auto const it = mBlockLastStorer.find(bid);
-        LlmRequest::RequestIdType const lastStorer
-            = (it != mBlockLastStorer.end()) ? it->second : static_cast<LlmRequest::RequestIdType>(0);
-        TLLM_LOG_INFO(
-            "[KV-TRACE] EVICT win=%d block_id=%d acquired_by_req=%lu last_stored_by_req=%lu hash=%zx",
-            mWindowSize, bid, sequence.getRequestId(), lastStorer, block->getHash());
-        // Acquiring the block invalidates the previous lineage; drop the entry so
-        // future EVICT/REUSE lines for the same id show fresh ownership.
+        if (kvCacheTraceFull())
+        {
+            LlmRequest::RequestIdType const lastStorer
+                = (it != mBlockLastStorer.end()) ? it->second : static_cast<LlmRequest::RequestIdType>(0);
+            TLLM_LOG_INFO(
+                "[KV-TRACE] EVICT win=%d block_id=%d acquired_by_req=%lu last_stored_by_req=%lu hash=%zx",
+                mWindowSize, bid, sequence.getRequestId(), lastStorer, block->getHash());
+        }
         if (it != mBlockLastStorer.end())
         {
             mBlockLastStorer.erase(it);
@@ -1392,6 +1422,7 @@ void WindowBlockManager::traceShelfIfEnabled(GenerationRequest const& sequence,
     std::vector<std::vector<KVCacheBlock::IdType>> const& cacheBlocks) const
 {
     auto const beamWidth = sequence.getBeamWidth();
+    bool const fullVerbosity = kvCacheTraceFull();
     for (SizeType32 beamIdx = 0; beamIdx < beamWidth; ++beamIdx)
     {
         if (beamIdx >= static_cast<SizeType32>(cacheBlocks.size()))
@@ -1399,8 +1430,26 @@ void WindowBlockManager::traceShelfIfEnabled(GenerationRequest const& sequence,
             break;
         }
         auto const& beamCacheBlock = cacheBlocks[beamIdx];
-        std::ostringstream oss;
+        // First pass: count placeholders so we can skip the (chatty) string
+        // formatting when nothing interesting is on this shelf.
         SizeType32 placeholderCount = 0;
+        for (auto const id : beamCacheBlock)
+        {
+            if (id == KVCacheBlock::kPlaceholderBlockId)
+            {
+                ++placeholderCount;
+            }
+        }
+        if (placeholderCount == 0 && !fullVerbosity)
+        {
+            // Default verbosity: only emit SHELF lines for sequences whose
+            // kernel-facing shelf actually contains a placeholder sentinel.
+            // This is the smoking-gun line for https://nvbugs/6117811 and
+            // skipping clean shelves cuts the trace volume by orders of
+            // magnitude on a normal MMLU run.
+            continue;
+        }
+        std::ostringstream oss;
         for (SizeType32 blockIdx = 0; blockIdx < static_cast<SizeType32>(beamCacheBlock.size()); ++blockIdx)
         {
             if (blockIdx > 0)
@@ -1411,7 +1460,6 @@ void WindowBlockManager::traceShelfIfEnabled(GenerationRequest const& sequence,
             if (id == KVCacheBlock::kPlaceholderBlockId)
             {
                 oss << "PLACEHOLDER";
-                ++placeholderCount;
             }
             else
             {
@@ -1924,12 +1972,14 @@ SizeType32 WindowBlockManager::onboardAndAllocateBlocks(
                 sequence.getRequestId(), matchingBlockId);
         }
 
-        if (kvCacheTraceEnabled())
+        if (kvCacheTraceFull())
         {
-            // Correlate this REUSE with the STORE event (if still tracked) that
-            // originally placed the block in the reuse trie. The originating
-            // request_id is what makes the timeline "seq X reused block B from seq Y"
-            // self-explanatory in the log.
+            // Routine REUSE events (full match or partial match on a block
+            // with a real value) are uninteresting for the placeholder-
+            // sentinel hypothesis and very chatty. Only emit them at full
+            // verbosity. The SWA-evicted-anchor REUSE branch above (which
+            // grafts a placeholder onto the sequence's shelf) is the
+            // interesting case and is emitted at default verbosity.
             auto const it = mBlockLastStorer.find(matchingBlockId);
             LlmRequest::RequestIdType const lastStorer
                 = (it != mBlockLastStorer.end()) ? it->second : static_cast<LlmRequest::RequestIdType>(0);

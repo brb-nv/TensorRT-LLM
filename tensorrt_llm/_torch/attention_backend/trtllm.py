@@ -32,27 +32,43 @@ from .trtllm_gen import trtllm_gen_attention
 _TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION = (os.environ.get(
     "TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION", "0") == "1")
 
-# Pre-launch validation of TRT-LLM attention kernel inputs (default: off).
-# Enable to catch out-of-range KV-cache block IDs *before* the kernel launch.
-# Useful for diagnosing CUDA illegal memory access errors originating in XQA /
-# fmha / paged-KV attention kernels (e.g. VSWA + block reuse + disagg paths).
+# =============================================================================
+# Diagnostic env vars for the attention-kernel KV-cache offsets table.
+# See https://nvbugs/6117811 for the bug class these were added for.
+#
+# All three are off by default and free in the default path. They are layered so
+# you can get progressively more info per run while paying progressively more
+# scheduling perturbation:
+#
+#   TLLM_ATTN_FAILURE_TRACE=1        (cheap, ~1 D->H per step)
+#       Silently snapshot the kernel-facing attention inputs to host once per
+#       step (on layer 0 only — the offsets tensor is shared across layers).
+#       Print NOTHING per step. On kernel failure, dump the snapshot so the
+#       failure narrative does not require touching a poisoned CUDA context.
+#       Use this as the default for repro runs that must keep timing close to
+#       production.
+#
+#   TLLM_DEBUG_ATTN_INPUTS=1         (verbose, several log lines per layer)
+#       In addition to TLLM_ATTN_FAILURE_TRACE behaviour, run the in-range
+#       validator on every layer and emit a per-pool, per-seq dump whenever a
+#       placeholder sentinel is detected. This is the loudest mode and CAN
+#       perturb timing enough to hide the bug; only use it when you have
+#       already confirmed the failure pattern and want a step-by-step
+#       diagnostic.
+#
+#   TLLM_VALIDATE_ATTN_INPUTS_FAIL_FAST=1    (modifier on TLLM_DEBUG_ATTN_INPUTS)
+#       Make the validator raise RuntimeError on first detection instead of
+#       warn-only. Off by default — see commentary in
+#       _validate_attn_inputs_pre_launch for why most validator trips are
+#       latent and should not stop the run.
+# =============================================================================
 _TRTLLM_DEBUG_ATTN_INPUTS = (os.environ.get("TLLM_DEBUG_ATTN_INPUTS",
                                             "0") == "1")
-
-# When the validator catches an out-of-range entry it ALWAYS emits a rich diagnostic
-# dump (see _debug_dump_attn_inputs). This flag controls whether it should ALSO
-# raise a RuntimeError to stop the run immediately.
-#
-# Default: false (warn-only) — let the run continue so we can correlate the
-# validator's offending-step dump with the kernel's *actual* CUDA failure (or
-# successful completion). Set to "1" to bring back the old fail-fast behaviour.
-#
-# This matters because the attention kernel only dereferences a subset of the
-# offsets table per step (the cyclic window for SWA layers), so most validator
-# trips are latent — a placeholder sentinel that the kernel does not happen to
-# read in this step but would read on a step with a shorter kv_len. Warn-only
-# mode keeps the diagnostic value of the validator without short-circuiting
-# the comparison against the kernel's empirical behaviour.
+_TRTLLM_ATTN_FAILURE_TRACE = (os.environ.get("TLLM_ATTN_FAILURE_TRACE",
+                                             "0") == "1")
+# Either flag enables the silent host snapshot needed for the on-failure dump.
+_TRTLLM_ATTN_SNAPSHOT_ENABLED = (_TRTLLM_DEBUG_ATTN_INPUTS
+                                 or _TRTLLM_ATTN_FAILURE_TRACE)
 _TRTLLM_VALIDATE_ATTN_INPUTS_FAIL_FAST = (os.environ.get(
     "TLLM_VALIDATE_ATTN_INPUTS_FAIL_FAST", "0") == "1")
 
@@ -1287,46 +1303,116 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             return masked
         return masked // stride
 
+    @staticmethod
+    def _snapshot_offsets_for_failure_dump(
+            metadata: "TrtllmAttentionMetadata") -> None:
+        """Stash a host-side copy of the kernel-facing attention inputs.
+
+        Called on the *pre-launch* path (when ``TLLM_DEBUG_ATTN_INPUTS=1``) so
+        that, if the kernel later faults and poisons the CUDA context, the
+        failure-path dump can still print the exact inputs the kernel saw
+        without doing a fresh D→H copy (which would itself fail with
+        ``cudaErrorIllegalAddress`` on a poisoned context). The snapshot is
+        attached as ``metadata._attn_failure_snapshot``; the failure dump
+        prefers it over a live ``offsets.to('cpu')`` call.
+        """
+        try:
+            offsets = metadata.kv_cache_block_offsets
+            if offsets is None:
+                metadata._attn_failure_snapshot = None
+                return
+            num_seqs = int(metadata.num_seqs)
+            host_offsets = offsets[:, :num_seqs].detach().to(
+                "cpu", non_blocking=False)
+            kv_lens_host = (metadata.kv_lens[:num_seqs].clone()
+                            if metadata.kv_lens is not None else None)
+            prompt_lens_host = (
+                metadata.prompt_lens_cpu_runtime[:num_seqs].clone()
+                if metadata.prompt_lens_cpu_runtime is not None else None)
+            request_ids = (list(metadata.request_ids[:num_seqs])
+                           if metadata.request_ids is not None else None)
+            metadata._attn_failure_snapshot = {
+                "offsets_host": host_offsets,
+                "kv_lens_host": kv_lens_host,
+                "prompt_lens_host": prompt_lens_host,
+                "request_ids": request_ids,
+                "num_seqs": num_seqs,
+                "num_contexts": int(metadata.num_contexts),
+                "tokens_per_block": metadata.tokens_per_block,
+                "blocks_per_window": (
+                    metadata.kv_cache_manager.blocks_per_window
+                    if metadata.kv_cache_manager is not None
+                    and hasattr(metadata.kv_cache_manager,
+                                "blocks_per_window") else None),
+            }
+        except Exception:
+            metadata._attn_failure_snapshot = None
+
     def _debug_dump_attn_inputs(self, metadata: "TrtllmAttentionMetadata",
                                 attention_window_size: int,
                                 where: str) -> None:
         """Dump paged-KV attention inputs for debugging.
 
-        Synchronizes the GPU on purpose to materialize ``kv_cache_block_offsets``
-        on the host so the per-pool / per-seq view is consistent. This is only
-        called on failure paths or when ``TLLM_DEBUG_ATTN_INPUTS=1`` is set, so
-        the cost is acceptable.
+        Prefers a host-side snapshot saved by ``_snapshot_offsets_for_failure_dump``
+        when available — the snapshot is taken just before the kernel launch on
+        the pre-launch validation path and lets us print the exact inputs the
+        kernel saw even after the CUDA context has been poisoned by an
+        ``cudaErrorIllegalAddress`` fault. On the pre-launch path (where the
+        context is still healthy) we fall back to a fresh D→H copy.
         """
         try:
-            num_contexts = int(metadata.num_contexts)
-            num_seqs = int(metadata.num_seqs)
+            snap = getattr(metadata, "_attn_failure_snapshot", None)
+            using_snapshot = (where == "attn_kernel_failure"
+                              and snap is not None)
+            num_contexts = (snap["num_contexts"] if using_snapshot else int(
+                metadata.num_contexts))
+            num_seqs = (snap["num_seqs"] if using_snapshot else int(
+                metadata.num_seqs))
             num_generations = num_seqs - num_contexts
-            tpb = metadata.tokens_per_block
-            kv_lens_cpu = metadata.kv_lens[:num_seqs].tolist(
-            ) if metadata.kv_lens is not None else None
-            prompt_lens_cpu = metadata.prompt_lens_cpu_runtime[:num_seqs].tolist(
-            ) if metadata.prompt_lens_cpu_runtime is not None else None
-            req_ids = list(metadata.request_ids[:num_seqs]) \
-                if metadata.request_ids is not None else None
+            tpb = (snap["tokens_per_block"] if using_snapshot else
+                   metadata.tokens_per_block)
+            if using_snapshot:
+                kv_lens_cpu = (snap["kv_lens_host"].tolist()
+                               if snap["kv_lens_host"] is not None else None)
+                prompt_lens_cpu = (snap["prompt_lens_host"].tolist()
+                                   if snap["prompt_lens_host"] is not None
+                                   else None)
+                req_ids = snap["request_ids"]
+                blocks_per_window = snap["blocks_per_window"]
+                offsets_host = snap["offsets_host"]
+            else:
+                kv_lens_cpu = metadata.kv_lens[:num_seqs].tolist(
+                ) if metadata.kv_lens is not None else None
+                prompt_lens_cpu = metadata.prompt_lens_cpu_runtime[:num_seqs].tolist(
+                ) if metadata.prompt_lens_cpu_runtime is not None else None
+                req_ids = list(metadata.request_ids[:num_seqs]) \
+                    if metadata.request_ids is not None else None
+                blocks_per_window = (
+                    metadata.kv_cache_manager.blocks_per_window
+                    if metadata.kv_cache_manager is not None
+                    and hasattr(metadata.kv_cache_manager,
+                                "blocks_per_window") else None)
+                offsets = metadata.kv_cache_block_offsets
+                offsets_host = None
+                if offsets is not None and num_seqs > 0:
+                    offsets_host = offsets[:, :num_seqs].detach().to(
+                        "cpu", non_blocking=False)
             header = (
                 f"[ATTN-DEBUG/{where}] layer_idx={self.layer_idx} "
                 f"attention_window_size={attention_window_size} "
                 f"num_contexts={num_contexts} num_generations={num_generations} "
-                f"num_seqs={num_seqs} tokens_per_block={tpb}")
+                f"num_seqs={num_seqs} tokens_per_block={tpb} "
+                f"snapshot={'yes' if using_snapshot else 'no'}")
             logger.error(header)
             logger.error(f"[ATTN-DEBUG/{where}] request_ids={req_ids}")
             logger.error(f"[ATTN-DEBUG/{where}] prompt_lens={prompt_lens_cpu}")
             logger.error(f"[ATTN-DEBUG/{where}] kv_lens={kv_lens_cpu}")
-            if metadata.kv_cache_manager is not None and hasattr(
-                    metadata.kv_cache_manager, "blocks_per_window"):
+            if blocks_per_window is not None:
                 logger.error(
-                    f"[ATTN-DEBUG/{where}] blocks_per_window="
-                    f"{metadata.kv_cache_manager.blocks_per_window}")
-            offsets = metadata.kv_cache_block_offsets
-            if offsets is None or num_seqs == 0 or tpb is None:
+                    f"[ATTN-DEBUG/{where}] blocks_per_window={blocks_per_window}"
+                )
+            if offsets_host is None or num_seqs == 0 or tpb is None:
                 return
-            offsets_host = offsets[:, :num_seqs].detach().to(
-                "cpu", non_blocking=False)
             num_pools = offsets_host.shape[0]
             max_blocks_per_seq = offsets_host.shape[-1]
             kv_lens_list = kv_lens_cpu if kv_lens_cpu is not None else [0
@@ -1418,9 +1504,13 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 attention_window_size,
                 where="validate_attn_inputs_pre_launch")
             logger.error(
-                "[ATTN-VALIDATE] To get the full STORE/EVICT/REUSE/SHELF timeline "
-                "for the offending request(s), re-run with "
-                "TRTLLM_KV_CACHE_TRACE=1 and grep `[KV-TRACE]` in the log.")
+                "[ATTN-VALIDATE] To capture the SHELF dump for any "
+                "placeholder-bearing step (minimal scheduling overhead), "
+                "re-run with TRTLLM_KV_CACHE_TRACE=1 (requires C++ rebuild) "
+                "and grep `[KV-TRACE] SHELF`. Use TRTLLM_KV_CACHE_TRACE=full "
+                "to also include STORE/EVICT/REUSE lineage (chatty). "
+                "Set TRTLLM_XQA_LAUNCH_TRACE=1 to log only multi-block XQA "
+                "launches (`[XQA-LAUNCH]`).")
             msg = (
                 f"[ATTN-VALIDATE] kv_cache_block_offsets out of range "
                 f"layer_idx={self.layer_idx}: " + "; ".join(bad_pools))
@@ -1585,6 +1675,22 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         use_sage_attn = (forward_args.sage_attn_num_elts_per_blk_q > 0
                          or forward_args.sage_attn_num_elts_per_blk_k > 0
                          or forward_args.sage_attn_num_elts_per_blk_v > 0)
+        # Snapshot kernel-facing inputs to host once per step (on layer 0 only —
+        # the offsets tensor is shared across all layers in a single forward
+        # step). This is the cheap diagnostic that survives a poisoned CUDA
+        # context: one D->H copy per step, no logging cost. The on-failure dump
+        # reads this snapshot when the live tensor cannot be copied. See
+        # https://nvbugs/6117811 for the diagnostic this enables.
+        #
+        # Both the snapshot call and the get_local_layer_idx() lookup that
+        # gates it are skipped entirely when the env vars are unset so the
+        # default path adds zero per-call overhead.
+        if _TRTLLM_ATTN_SNAPSHOT_ENABLED:
+            if self.get_local_layer_idx(metadata) == 0:
+                self._snapshot_offsets_for_failure_dump(metadata)
+        # The verbose pre-launch validator is gated on the stricter env var. It
+        # runs per layer because the layer-local `attention_window_size` affects
+        # which slots the kernel will read; the warning it emits is per-layer.
         if _TRTLLM_DEBUG_ATTN_INPUTS:
             self._validate_attn_inputs_pre_launch(metadata,
                                                   attention_window_size)
@@ -1898,7 +2004,32 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                                and metadata._seq_lens_cuda is not None):
             metadata.update_blackwell_first_sparse_mask_offset()
 
-        try:
+        if _TRTLLM_ATTN_SNAPSHOT_ENABLED:
+            # Debug mode: wrap the kernel launch in a try/except so that on a
+            # synchronous CUDA failure (e.g. CUDA_ERROR_ILLEGAL_ADDRESS from
+            # XQA / paged-KV) we can dump the host snapshot before re-raising.
+            # Only built when one of the snapshot env vars is set — keeping
+            # this wrapper on the default path costs a per-call exception
+            # frame setup and adds enough scheduling jitter to potentially
+            # mask the (timing-sensitive) bug it is here to catch.
+            try:
+                self._run(q, k, v, output, output_sf, metadata, forward_args,
+                          use_paged_context_fmha, sparse_kv_indices,
+                          sparse_kv_offsets, sparse_attn_indices,
+                          sparse_attn_offsets, sparse_attn_indices_block_size,
+                          num_sparse_topk, sparse_mla_topk_lens,
+                          compressed_kv_cache_pool_ptr,
+                          skip_softmax_threshold_scale_factor_prefill,
+                          skip_softmax_threshold_scale_factor_decode)
+            except RuntimeError:
+                attention_window_size = (forward_args.attention_window_size
+                                         or metadata.max_seq_len)
+                self._debug_dump_attn_inputs(
+                    metadata,
+                    attention_window_size,
+                    where="attn_kernel_failure")
+                raise
+        else:
             self._run(q, k, v, output, output_sf, metadata, forward_args,
                       use_paged_context_fmha, sparse_kv_indices,
                       sparse_kv_offsets, sparse_attn_indices,
@@ -1907,17 +2038,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                       compressed_kv_cache_pool_ptr,
                       skip_softmax_threshold_scale_factor_prefill,
                       skip_softmax_threshold_scale_factor_decode)
-        except RuntimeError:
-            # Surface attention kernel inputs on synchronous CUDA failures
-            # (e.g. CUDA_ERROR_ILLEGAL_ADDRESS from XQA / paged-KV kernels).
-            # With CUDA_LAUNCH_BLOCKING=1, the originating launch is in this
-            # frame so the metadata still corresponds to the failing step.
-            attention_window_size = (forward_args.attention_window_size
-                                     or metadata.max_seq_len)
-            self._debug_dump_attn_inputs(metadata,
-                                        attention_window_size,
-                                        where="attn_kernel_failure")
-            raise
 
         if output_sf is None:
             return output
