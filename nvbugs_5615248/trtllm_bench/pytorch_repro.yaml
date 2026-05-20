@@ -1,0 +1,43 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Repro config: PyTorch backend for the NVBug 5615248 TRT-vs-PyT comparison.
+#
+# This is the FEATURE leg. It mirrors the customer's
+# max_seq_len=128-equivalent + piecewise-CUDA-graph scenario, sized to match
+# the prebuilt TinyLlama TRT engine geometry (max_seq_len=129,
+# max_batch_size=1, max_beam_width=10) so the PyT-vs-TRT comparison stays
+# apples-to-apples on the same workload.
+#
+# Two PyTorch-only opt-ins are turned ON here so customer-side numbers
+# include both optimizations:
+#   * enable_early_first_token_response=true: under the overlap scheduler,
+#     emit the first-token response ahead of the next step (TTFT cut).
+#   * enable_speculative_beam_history_d2h=true: beam-search opt-in that
+#     skips per-step beam-history D2H copies on likely-non-terminal
+#     steps (E2E / ITL cut on beam-search workloads).
+#
+# Notes:
+#   * `backend` is set via `--backend pytorch` on the trtllm-bench CLI.
+#   * `tensor_parallel_size` / `pipeline_parallel_size` come from `--tp` / `--pp`.
+
+max_beam_width: 10
+max_batch_size: 1
+max_seq_len: 129
+
+enable_chunked_prefill: true
+
+cuda_graph_config:
+  max_batch_size: 128
+  enable_padding: true
+
+kv_cache_config:
+  enable_block_reuse: true
+
+torch_compile_config:
+  enable_piecewise_cuda_graph: true
+  capture_num_tokens: [1, 2, 4, 8, 16, 32, 64, 96, 100, 104, 112, 120, 127, 128]
+
+# Feature flags under test for this repro.
+enable_early_first_token_response: true
+enable_speculative_beam_history_d2h: true
