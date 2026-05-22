@@ -5,6 +5,7 @@
 
 # sed-substituted runtime YAMLs produced by launch_*.sh
 configs/.runtime_*.yaml
+configs_0521/**/.runtime_*.yaml
 
 # Server logs, PID files, KV transceiver csvs (regenerated each run)
 logs/

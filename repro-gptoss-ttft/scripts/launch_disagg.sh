@@ -51,6 +51,13 @@ export HF_DATASETS_OFFLINE="${HF_DATASETS_OFFLINE:-1}"
 # returns an empty list and benchmark_serving's --save-request-time-breakdown
 # is a no-op even though the server-level return_perf_metrics: true is set.
 export TRTLLM_KVCACHE_TIME_OUTPUT_PATH="${TRTLLM_KVCACHE_TIME_OUTPUT_PATH:-${LOG_DIR}/disagg_kvcache_time}"
+# Enable disagg gen-side handoff diagnostic logging in py_executor. Each
+# request emits one `[disagg-dbg]` line in gen.log at first-token time with a
+# fine-grained breakdown of gen_queue_ms (arrival->init->xfer_done->promote->
+# first-token). The executor also emits a one-shot startup banner so we can
+# confirm the env var reached the MPI-spawned worker (it is propagated via
+# trtllm-serve's MpiPoolSession). Set to 0 to disable.
+export TRTLLM_DEBUG_DISAGG_GEN_TIMING="${TRTLLM_DEBUG_DISAGG_GEN_TIMING:-1}"
 # Optional: bypass the harmony chat handler used for gpt-oss on BOTH ctx and
 # gen workers. When set to 1, /v1/chat/completions routes to openai_chat (HF
 # jinja chat template + plain detokenize) instead of chat_harmony. Both

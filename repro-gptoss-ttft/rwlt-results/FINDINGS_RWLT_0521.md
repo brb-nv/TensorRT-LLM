@@ -405,3 +405,217 @@ repro-gptoss-ttft/
   once a turn produces a slightly different assistant message the rest
   of the conversation diverges in output length but not in TTFT (we
   pair on `(conversation_id, conversation_idx)`).
+
+---
+
+## Round 6 update (later 2026-05-21): UCX & stream_interval ablations
+
+Round 5 identified the residual disagg gap as `gen_queue_ms ≈
+kv_transfer_gen_ms` (~75-90 ms p50) and proposed three Tier-A ablations
+to attribute it. Round 6 ran two of those ablations
+(UCX backend, `stream_interval=1`) and produced a sharper hypothesis
+about where the remaining wait actually lives. The third
+(`num_postprocess_workers=0`) is in flight.
+
+### Headline results
+
+| run | p50 client TTFT (ms) | p90 (ms) | mean Δ vs agg (ms) | p50 Δ (ms) |
+|---|---:|---:|---:|---:|
+| agg (baseline) | 180.4 | 233.3 | — | — |
+| disagg ref (NIXL, si=20, npp=4) | 288.8 | 493.1 | 127.6 | 106.0 |
+| disagg UCX backend | 292.7 | 575.3 | 147.1 | 112.9 |
+| **disagg si=1** | **210.0** | **404.3** | **52.4** | **28.4** |
+
+`stream_interval=1` recovers ~75-80 ms median Δ TTFT across all
+trajectories (uniform improvement: 4/5 trajectories drop to near
+parity; agent-073 actually beats agg). The byte-side `Transmissions`
+time from the transceiver CSV is identical between `ref` and `si1`
+(p50 = 73 ms in both), so the savings come entirely from the
+post-transceiver path — specifically the SSE emission cadence.
+
+### Two hypotheses falsified, one bug identified
+
+1. **"NIXL is adding overhead on top of UCX"** — falsified. UCX is
+   worse than NIXL at every percentile (transceiver `Transmissions`
+   p90: NIXL 214 ms vs UCX 307 ms, +43%; p99: 349 vs 511 ms). NIXL is
+   the right default. The default `cache_transceiver_config.backend:
+   DEFAULT` (= NIXL with UCX sub-backend) is faster than `backend: UCX`
+   on this workload.
+
+2. **"stream_interval matters only for inter-token latency, not TTFT"**
+   — falsified. With overlap scheduler ON (the default), the
+   `py_decoding_iter == 1` first-token fast-path in `_handle_responses`
+   is shadowed by an earlier `continue` (`py_executor.py:3909-3917`):
+
+   ```text
+   iter N:    promote (TRANS_COMPLETE -> GENERATION_IN_PROGRESS,
+              py_decoding_iter=1).  Early-continue skips response emit.
+   iter N+1:  py_decoding_iter still 1 (or 2 with overlap).
+              Early-continue still skips OR response gate sees
+              decoding_iter=2.
+   iter N+2..N+19 (stream_interval=20):
+              decoding_iter % 20 != 0 -> NO SSE frame leaves gen.
+   iter N+20: first SSE frame -> proxy -> client.
+   ```
+
+   ~19 iters × ~5 ms/iter ≈ 95 ms of delay before the first token
+   crosses to the client. Measured saving from `si=20` -> `si=1` is
+   75-80 ms (consistent; small gap is SSE+proxy hop).
+
+   **Real bug, not just a tuning lever.** The intended behavior is for
+   `py_decoding_iter == 1` to bypass `stream_interval`, but the
+   overlap-scheduler short-circuit hides it. Fix candidates: hoist the
+   first-token emission to before the overlap-early-continue, or
+   teach the early-continue to let `py_decoding_iter == 1 OR
+   is_finished` through.
+
+3. **"gen worker is busy decoding while waiting"** — partially
+   falsified. The transceiver `Transmissions` time (the actual byte
+   transfer wall-clock as the cache transceiver measures it) tracks
+   `kv_xfer_ms` from `/perf_metrics` almost exactly (NIXL p50=73 ms
+   vs perf_metrics p50=75 ms). So `wait_ms ≈ kv_xfer_ms ≈
+   Transmissions` — the wait is genuinely *inside the transceiver*,
+   not in some pre-transfer scheduling gap. The gen worker isn't
+   "busy"; it's waiting on the transceiver to finish.
+
+### New puzzle: per-block transceiver overhead on agent-056
+
+After si=1, four trajectories collapse to ±35 ms median Δ. One
+trajectory (agent-056) still carries +190 ms median residual:
+
+| conv | n | NIXL ref Δ | UCX Δ | **si=1 Δ** |
+|---|---:|---:|---:|---:|
+| agent-010 | 79 | +93.1 | +101.7 | **+11.8** |
+| agent-011 | 63 | +83.9 | +89.0 | **+3.2** |
+| agent-051 | 47 | +111.1 | +112.0 | **+32.2** |
+| **agent-056** | 61 | **+262.4** | **+364.2** | **+190.0** |
+| agent-073 | 68 | +64.2 | +67.7 | **−15.7** |
+
+agent-056 is unusual: 60-80k reused tokens per turn (vs 30-45k for
+others), small fresh delta per turn (often <500 tokens). The
+transceiver `Transmissions` time on its worst rows shows **effective
+bandwidth of 0.09-1 Gbps** (NVLink should support 500+ Gbps):
+
+```text
+turn  fresh  reused   kv_xfer  kv_bw      delta(si=1)
+ 60     83   81603    332.7    0.09 Gbps  +305.6
+ 44     83   75966    316.7    0.10 Gbps  +285.1
+ 47    112   76677    278.3    0.15 Gbps  +252.1
+ 54    122   78225    285.8    0.18 Gbps  +260.1
+```
+
+A 83-token fresh delta should not take 332 ms to transfer. Strong
+evidence of per-block fixed overhead in the cache transceiver: the
+trajectory has many reused blocks, and even when only a small number
+are *new* to gen, the transceiver appears to scale with #blocks
+rather than #bytes. Next: instrument the transceiver to log
+`num_blocks_transferred` alongside `Transmissions` and check
+`Transmissions / num_blocks` on agent-056 vs the rest.
+
+### Diagnostic instrumentation landed this round
+
+Gated by `TRTLLM_DEBUG_DISAGG_GEN_TIMING=1`
+(default-off, allocation-free when off):
+
+- `tensorrt_llm/_torch/pyexecutor/llm_request.py`: 5 `py_dbg_*`
+  timestamp fields on `LlmRequest` for arrival / xfer_init /
+  xfer_done / promote.
+- `tensorrt_llm/_torch/pyexecutor/py_executor.py`:
+  `_disagg_dbg_enabled()` gate, one-shot startup banner (so the user
+  can confirm the env var reached the MPI-spawned worker), per-request
+  `[disagg-dbg] req=<id> ...` emit at first-token time with a
+  five-component breakdown of `gen_queue_ms`. Emit point is **before**
+  the overlap-early-continue (which is where the original placement
+  silently dropped the log; see fix in commit log).
+- The env var is forwarded automatically because
+  `MpiPoolSession._start_mpi_pool` allowlists `TRTLLM*` / `TLLM*`
+  prefixes.
+
+The instrumentation was not ultimately needed to draw the round 6
+conclusions (the transceiver CSV proved sufficient), but it's
+permanent code that will be useful for follow-up gen-side investigations.
+
+### Repro safety: drain-on-teardown
+
+`scripts/stop_disagg.sh` now drains `/perf_metrics` automatically
+before killing the workers. Reading `/perf_metrics` is destructive
+(pops the worker deques), so this MUST run exactly once per session.
+The liveness probe uses `/health` (idempotent), NOT `/perf_metrics`
+— hitting `/perf_metrics` as a probe was a bug in an earlier
+iteration that silently discarded an entire run's records.
+
+If you forget the `DRAIN_OUT_DIR=...` env var, the script falls back
+to `LOG_DIR` (which `launch_disagg.sh` sets per-run).
+
+### Per-request side-by-side joiner
+
+`scripts/per_request_side_by_side.py` joins `rwlt_requests.jsonl` and
+`/perf_metrics_proxy.json` from a paired (agg, disagg) session and
+emits one row per request with `(fresh, reused, kv_xfer_ms, wait_ms,
+ttft_agg, ttft_disagg, delta_ttft)`. Pair by `(conversation_id,
+conversation_idx)` after sorting each session's rwlt rows by
+`start_time` (valid at concurrency=1).
+
+Outputs:
+- `rwlt-results/side_by_side_round5.tsv` (317 rows, joined from
+  `agg_round5_patched_top5_0521` and `disagg_round5_patched_top5_0521`).
+- `rwlt-results/side_by_side_si1.tsv` (318 rows, joined using
+  transceiver CSV in place of `/perf_metrics` because that run's drain
+  was lost to the earlier bug; the join key is row index since both
+  files are written in completion order at concurrency=1).
+
+### File map additions (round 6)
+
+```text
+repro-gptoss-ttft/
+├── configs_0521/round6/                        # round 6 ablation configs
+│   ├── repro_agg_tp1_eagle3.yaml               # = round5 agg (unchanged)
+│   ├── repro_disagg_ctx_tp1.yaml               # = round5 ctx (unchanged)
+│   ├── repro_disagg_ctx_tp1_ucx.yaml           # ctx with UCX backend
+│   ├── repro_disagg_gen_tp1_pp4_si20_ucx.yaml  # gen UCX (ablation A)
+│   ├── repro_disagg_gen_tp1_pp4_si1.yaml       # gen si=1   (ablation B)
+│   ├── repro_disagg_gen_tp1_pp0_si20.yaml      # gen npp=0  (ablation C)
+│   └── repro_disagg_proxy.yaml
+├── scripts/
+│   ├── per_request_side_by_side.py             # (new) per-request joiner
+│   ├── launch_disagg.sh                        # (updated) defaults
+│                                               # TRTLLM_DEBUG_DISAGG_GEN_TIMING=1
+│   └── stop_disagg.sh                          # (updated) auto-drains
+│                                               # /perf_metrics (uses /health
+│                                               # for liveness)
+└── rwlt-results/
+    ├── disagg_round6_ref/                      # NIXL backend baseline (re-run)
+    ├── disagg_round6_ucx/                      # ablation A: UCX backend
+    ├── disagg_round6_si1/                      # ablation B: stream_interval=1
+    ├── side_by_side_round5.tsv                 # joined per-request table (round 5)
+    └── side_by_side_si1.tsv                    # joined per-request table (si=1)
+```
+
+### Recommendations
+
+1. **Ship `stream_interval=1` as the disagg gen default for low-latency
+   workloads.** Uniform 75-80 ms p50 TTFT win at concurrency 1. Worth
+   re-validating at higher concurrency since si=1 means more SSE frames
+   per second (more postproc IPC traffic), but at conc=1 it's strictly
+   better with no measured downside.
+
+2. **File a bug for the overlap-scheduler shadowing the
+   `py_decoding_iter == 1` first-token fast-path.** This is independent
+   of disagg; agg with overlap also pays the same penalty whenever
+   `stream_interval > 1`. One-line fix candidate: hoist the
+   `py_decoding_iter == 1` clause out of (or above) the overlap
+   early-continue in `_handle_responses`.
+
+3. **Drop UCX as an ablation direction.** NIXL is uniformly faster on
+   this workload — no further investigation needed there.
+
+4. **Next investigation: per-block transceiver overhead on long-context
+   trajectories.** agent-056's residual Δ at si=1 is the clearest
+   remaining attribution gap. Measure `Transmissions / num_blocks` to
+   either confirm the per-block hypothesis or rule it out.
+
+5. **Bake drain-on-teardown into all future scripts** that touch
+   `/perf_metrics`. The endpoint's destructive read semantics are easy
+   to violate by accident (we lost two runs' worth of data to this).
+   The new `stop_disagg.sh` and the `/health` liveness check guard
+   against the most common form of the bug.

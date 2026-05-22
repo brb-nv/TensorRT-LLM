@@ -1,0 +1,51 @@
+{
+  "phase": 0,
+  "concurrency": 1,
+  "requests": {
+    "total": 318,
+    "measured": 318,
+    "successful": 318,
+    "failed": 0
+  },
+  "measurement_duration_s": 232.030463184994,
+  "tokens_server": {
+    "input": 13686091,
+    "output": 89750,
+    "cached": 13337996,
+    "cache_hit_rate": 0.9745657836119898,
+    "avg_input_per_request": 43038.022012578615,
+    "avg_output_per_request": 282.2327044025157,
+    "median_output_per_request": 117.5
+  },
+  "tokens_client": {
+    "output": 84393,
+    "avg_output_per_request": 265.3867924528302
+  },
+  "throughput": {
+    "output_client_tok_s": 367.0026523551098,
+    "output_server_tok_s": 386.8026584442226,
+    "total_server_tok_s": 59370.82920451162
+  },
+  "ttft_s": {
+    "p50": 0.29269609799666796,
+    "p95": 0.6220477579016006,
+    "p99": 0.7396709135764102
+  },
+  "output_speed_per_request_local_tok_s": {
+    "p5": 397.0863265287158,
+    "p25": 511.4174523118924,
+    "p50": 609.3915905089649,
+    "p95": 253815.10850734424
+  },
+  "output_speed_per_request_sse_tok_s": {
+    "p5": 516.1209388119223,
+    "p25": 579.896124073939,
+    "p50": 706.8376976377018,
+    "p95": 385378.6887124613
+  },
+  "e2e_latency_s": {
+    "p50": 0.5207485635000921,
+    "p95": 2.159289907753188,
+    "p99": 3.5600377225605184
+  }
+}
