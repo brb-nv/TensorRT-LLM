@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -34,10 +34,29 @@
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <future>
 #include <numeric>
+
+namespace
+{
+// [TTFT-INVESTIGATION 2026-05-22] Per-phase wall-clock breakdown for the
+// cache transceiver format()/unformat() paths. Logs are always emitted at
+// INFO level so they end up in the worker's stderr (gen.log / ctx.log) and
+// can be grep'd post-hoc:
+//   grep '\[disagg-prof\] format'   ctx.log
+//   grep '\[disagg-prof\] unformat' gen.log
+// Cost per log line is sub-microsecond; we issue at most one per request,
+// so leaving this on by default during the round-7 investigation is fine.
+// Schema is space-separated key=value pairs so a one-liner awk/python parser
+// can pull it into a CSV.
+inline double dbgElapsedMs(std::chrono::steady_clock::time_point start, std::chrono::steady_clock::time_point end)
+{
+    return std::chrono::duration<double, std::milli>(end - start).count();
+}
+} // namespace
 
 namespace tensorrt_llm::batch_manager
 {
@@ -176,9 +195,40 @@ void sendAllBuffers(TransferSession& session, int deviceId,
 namespace tensorrt_llm::batch_manager::kv_cache_manager
 {
 
+// [TTFT-INVESTIGATION 2026-05-22] Out of getBlockRangeForSending we want
+// to attribute time across (a) the reuse-tree branch (the hot path
+// suspected of dominating disagg `kv_xfer_ms`) and (b) the fallback /
+// all-block-ids branch. We stash sub-phase ms in this thread_local and
+// the calling format() reads it.
+namespace
+{
+struct DbgGetBlockRangeForSendingTiming
+{
+    char const* path = "unknown";
+    // Reuse-tree branch sub-phases (populated indirectly via
+    // dbgFromReuseTreeTiming()).
+    double findTreeMs = 0.0;
+    double chainWalkMs = 0.0;
+    double finalizeMs = 0.0;
+    int numBlocksCollected = 0;
+    // Fallback branch sub-phases.
+    double fallbackFromAllIdsMs = 0.0;
+    double fallbackSliceMs = 0.0;
+};
+
+inline DbgGetBlockRangeForSendingTiming& dbgGetBlockRangeForSendingTiming() noexcept
+{
+    thread_local DbgGetBlockRangeForSendingTiming t;
+    return t;
+}
+} // namespace
+
 BlockRange getBlockRangeForSending(BaseKVCacheManager* cacheManager, LlmRequest const& llmRequest,
     BlockKey const& lastBlockKey, int32_t indexFromEnd, bool recvSideHasCP, SizeType32 ppSize)
 {
+    auto& dbg = dbgGetBlockRangeForSendingTiming();
+    dbg = DbgGetBlockRangeForSendingTiming{};
+
     auto poolNum = cacheManager->getBlockManager().getNumPools(
         /*includeBlockScalePools=*/false, /*includeIndexerKCachePools=*/false);
 
@@ -189,10 +239,14 @@ BlockRange getBlockRangeForSending(BaseKVCacheManager* cacheManager, LlmRequest 
     if (poolNum > 1 || !cacheManager->isEnableBlockReuse() || !cacheManager->isEnablePartialReuse()
         || lastBlockKey.uniqueTokens.size() == 0 || recvSideHasCP || ppSize > 1)
     {
+        dbg.path = "fallback_all_ids";
         // disable reuse path, and vwsa don't support reuse.
         bool needSendAllForWindow = common::getEnvKVCacheTransferAllBlocksForWindow();
 
+        auto const dbgT0 = std::chrono::steady_clock::now();
         auto blockRange = BlockRange::fromAllBlockIds(*cacheManager, llmRequest.mRequestId);
+        auto const dbgT1 = std::chrono::steady_clock::now();
+        dbg.fallbackFromAllIdsMs = dbgElapsedMs(dbgT0, dbgT1);
 
         auto const& windowsMetadata = cacheManager->getBlockManager().getWindowSizesMetadata();
 
@@ -216,12 +270,24 @@ BlockRange getBlockRangeForSending(BaseKVCacheManager* cacheManager, LlmRequest 
                 std::vector<SizeType32>(
                     blockIdsPerWindow.at(windowSize).begin() + startBlockIdx, blockIdsPerWindow.at(windowSize).end()));
         }
+        auto const dbgT2 = std::chrono::steady_clock::now();
+        dbg.fallbackSliceMs = dbgElapsedMs(dbgT1, dbgT2);
 
         return blockRange;
     }
 
+    dbg.path = "reuse_tree";
     TLLM_CHECK_WITH_INFO(lastBlockKey.uniqueTokens.size() > 0, "lastBlockKey must be non-empty when reuse is enabled");
-    return BlockRange::fromReuseTree(*cacheManager, lastBlockKey, indexFromEnd);
+    auto result = BlockRange::fromReuseTree(*cacheManager, lastBlockKey, indexFromEnd);
+    auto const& reuseDbg = dbgFromReuseTreeTiming();
+    if (reuseDbg.valid)
+    {
+        dbg.findTreeMs = reuseDbg.findTreeMs;
+        dbg.chainWalkMs = reuseDbg.chainWalkMs;
+        dbg.finalizeMs = reuseDbg.finalizeMs;
+        dbg.numBlocksCollected = reuseDbg.numBlocksCollected;
+    }
+    return result;
 }
 
 BlockRange getBlockRangeForReceiving(BaseKVCacheManager* cacheManager, LlmRequest const& llmRequest,
@@ -335,6 +401,18 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
     TLLM_LOG_DEBUG(
         mpi::MpiComm::world().getRank(), "Start sending KV cache for request ID: %ld.", llmRequest.mRequestId);
 
+    // [TTFT-INVESTIGATION 2026-05-22] Per-phase wall-clock breakdown. See
+    // comment at the top of this file.
+    auto const dbgPhaseStart = std::chrono::steady_clock::now();
+    auto dbgPhaseLast = dbgPhaseStart;
+    auto const dbgMark = [&dbgPhaseLast]()
+    {
+        auto const now = std::chrono::steady_clock::now();
+        double const ms = dbgElapsedMs(dbgPhaseLast, now);
+        dbgPhaseLast = now;
+        return ms;
+    };
+
     TLLM_CHECK_WITH_INFO(llmRequest.mSamplingConfig.beamWidth == 1, "Currently, only beam width 1 is supported.");
     auto const& connections = session.getConnections();
     auto const& selfConfig = session.getSelfState().getCacheState().value();
@@ -363,6 +441,7 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
     bool const recvSideHasCP = destConfig.getParallelConfig().mContextParallelism > 1;
     auto blockRange
         = getBlockRangeForSending(mCacheManager, llmRequest, lastBlockKey, indexFromEnd, recvSideHasCP, ppSize);
+    [[maybe_unused]] double const dbgBlockrangeMs = dbgMark();
     auto const numPools
         = blockManager.getNumPools(/*includeBlockScalePools=*/false, /*includeIndexerKCachePools=*/false);
     // TODO(oargov): are we sure the other side has the same number of pools? this might not hold for pp_size>1...
@@ -432,6 +511,28 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
         }
         TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), "inputKvCacheBlocks size: %ld,blockNum: %d , windowSizes: %ld",
             inputKvCacheBlocksPerWindow.size(), blockNum, windowSizes.size());
+        [[maybe_unused]] double const dbgWalkMs = dbgMark();
+
+        // [TTFT-INVESTIGATION 2026-05-22 / reuse-confirmation] Build a
+        // compact per-window block-count string so the summary log shows
+        // exactly which window contributed how many blocks to the gather.
+        // GPT-OSS-style VSWA has two pools (SWA + Full); we want to see
+        // both counts to confirm whether the full-attention pool really
+        // walks the whole prefix every turn.
+        std::string dbgPerWindowBlocks;
+        {
+            bool first = true;
+            for (auto const& [windowSize, blocks] : inputKvCacheBlocksPerWindow)
+            {
+                if (!first)
+                {
+                    dbgPerWindowBlocks += ",";
+                }
+                dbgPerWindowBlocks
+                    += std::to_string(static_cast<long long>(windowSize)) + ":" + std::to_string(blocks.size());
+                first = false;
+            }
+        }
 
         if (inputKvCacheBlocksPerWindow.size() > 1)
         {
@@ -552,6 +653,7 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
 
         bufferManager.getStream().synchronize();
         session.setTime(TransferSession::kTimePreprocess);
+        double const dbgSplitMs = dbgMark();
 
         auto preAllocSendBuffer = mCacheTransBufferManager->getSendBuffer(cacheBufferId);
         if (preAllocSendBuffer != nullptr)
@@ -564,9 +666,40 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
             targetInfo, pickUpConnections);
 
         session.setTime(TransferSession::kTimeTransmissions);
+        double const dbgSendMs = dbgMark();
 
         mCacheTransBufferManager->freeBufferIndexForSend(cacheBufferId);
         session.setTime(TransferSession::kTimePostprocess);
+
+        // [TTFT-INVESTIGATION 2026-05-22] One-line per-request summary, INFO
+        // level so it lands in the worker's stderr (ctx.log). Keys are stable
+        // and space-separated for easy awk/python parsing. The
+        // `per_window_blocks` field is the smoking gun for "is reuse
+        // actually skipping blocks on the ctx side": for VSWA gpt-oss the
+        // expected shape is `<swa>:<small>,<full>:<grows-with-turn>` if the
+        // full-window pool drags the whole prefix; if reuse is working, the
+        // full-window count should match `num_new_allocated_blocks`.
+        // `prepopulated_tokens` / `prompt_len` show how much of the prompt
+        // ctx itself was able to skip prefilling (ctx-side reuse).
+        double const dbgTotalMs = dbgElapsedMs(dbgPhaseStart, std::chrono::steady_clock::now());
+        // [TTFT-INVESTIGATION 2026-05-22] Pull sub-phase timing from
+        // getBlockRangeForSending so we can attribute blockrange_ms across
+        // (a) findBlocksInReuseTreeByBlockKey (the suspected hot path),
+        // (b) the getPrevBlock() chain walk, and (c) the BlockRange ctor
+        // finalize step. For the fallback (non-reuse) branch the relevant
+        // breakdown is fromAllBlockIds + the window slicing loop instead.
+        auto const& dbgGBR = dbgGetBlockRangeForSendingTiming();
+        TLLM_LOG_INFO(
+            "[disagg-prof] format ctx_req=%ld pools=%d blocks=%d bytes=%zu targets=%zu per_window_blocks=%s "
+            "prepopulated_tokens=%d prompt_len=%d reuse_enabled=%d blockrange_ms=%.3f walk_ms=%.3f "
+            "split_ms=%.3f send_ms=%.3f total_ms=%.3f "
+            "br_path=%s br_find_tree_ms=%.3f br_chain_walk_ms=%.3f br_finalize_ms=%.3f "
+            "br_num_blocks_collected=%d br_fallback_from_all_ids_ms=%.3f br_fallback_slice_ms=%.3f",
+            llmRequest.mRequestId, static_cast<int>(numPools), blockNum, allCacheBlockSize, targetNum,
+            dbgPerWindowBlocks.c_str(), llmRequest.getPrepopulatedPromptLen(), llmRequest.getPromptLen(),
+            mCacheManager->isEnableBlockReuse() ? 1 : 0, dbgBlockrangeMs, dbgWalkMs, dbgSplitMs, dbgSendMs, dbgTotalMs,
+            dbgGBR.path, dbgGBR.findTreeMs, dbgGBR.chainWalkMs, dbgGBR.finalizeMs, dbgGBR.numBlocksCollected,
+            dbgGBR.fallbackFromAllIdsMs, dbgGBR.fallbackSliceMs);
     }
     TLLM_LOG_DEBUG(
         mpi::MpiComm::world().getRank(), "End the sending of KV cache for the request ID:%ld ", llmRequest.mRequestId);
@@ -580,6 +713,20 @@ void CacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& sess
     auto const ctxReqId = llmRequest.getContextPhaseParams().value().getReqId();
     TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
         "Start receiving KV cache for request ID: %ld, context request ID: %ld.", llmRequest.mRequestId, ctxReqId);
+
+    // [TTFT-INVESTIGATION 2026-05-22] Per-phase wall-clock breakdown on the
+    // gen receiver. The big unknown going into round 7 was where inside
+    // `Transmissions` the time goes. See top-of-file comment.
+    auto const dbgPhaseStart = std::chrono::steady_clock::now();
+    auto dbgPhaseLast = dbgPhaseStart;
+    auto const dbgMark = [&dbgPhaseLast]()
+    {
+        auto const now = std::chrono::steady_clock::now();
+        double const ms = dbgElapsedMs(dbgPhaseLast, now);
+        dbgPhaseLast = now;
+        return ms;
+    };
+
     auto const& connections = session.getConnections();
     auto const& selfConfig = session.getSelfState().getCacheState().value();
     auto const& destConfig = session.getOtherState().getCacheState().value();
@@ -589,6 +736,7 @@ void CacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& sess
     bool const recvSideHasCP = selfConfig.getParallelConfig().mContextParallelism > 1;
     auto blockRange = getBlockRangeForReceiving(mCacheManager, llmRequest, destConfig.getEnableBlockReuse(),
         destConfig.getEnablePartialReuse(), recvSideHasCP, srcPpSize);
+    [[maybe_unused]] double const dbgBlockrangeMs = dbgMark();
 
     auto pickRecvConnResult
         = pickRecvConnections(connections.size(), selfConfig, selfIdx, destConfig, session.getCounterPartRanks());
@@ -627,7 +775,58 @@ void CacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& sess
     }
     TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), "outputBuffersPerWindow size: %ld,blockNum: %d , windowSizes: %ld",
         outputBuffersPerWindow.size(), blockNum, windowSizes.size());
-    TLLM_CHECK(!outputBuffersPerWindow.empty());
+    [[maybe_unused]] double const dbgWalkMs = dbgMark();
+
+    // [TTFT-INVESTIGATION 2026-05-22 / reuse-confirmation] Per-window block
+    // counts on the gen receiver: same format as on ctx, so we can compare
+    // ctx vs gen side-by-side. For VSWA gpt-oss, if `getBlockRangeForReceiving`
+    // bypasses the optimized "skip reused blocks" path
+    // (cacheFormatter.cpp:235 only fires when poolNum == 1), the full-window
+    // block count should match `getCacheBlockIds(fullWindow).size()` -- i.e.
+    // the entire prefix, including blocks the gen worker already holds.
+    std::string dbgPerWindowBlocks;
+    {
+        bool first = true;
+        for (auto const& [windowSize, blocks] : outputBuffersPerWindow)
+        {
+            if (!first)
+            {
+                dbgPerWindowBlocks += ",";
+            }
+            dbgPerWindowBlocks
+                += std::to_string(static_cast<long long>(windowSize)) + ":" + std::to_string(blocks.size());
+            first = false;
+        }
+    }
+    // Also walk the raw sequence on gen to count how many blocks the
+    // BlockManager has assigned to this request per window -- this is what
+    // `BlockRange::fromAllBlockIds` reflects, and answers the user's question
+    // "are we even getting reuse with this model?". If `seq_blocks` >>
+    // `gen_perf_metrics.num_new_allocated_blocks`, gen IS holding the cached
+    // prefix; the per-window-blocks count tells us whether the transceiver
+    // is also dragging it through every turn.
+    std::string dbgSeqBlocks;
+    try
+    {
+        bool first = true;
+        for (auto const& windowSize : windowSizes)
+        {
+            auto const& cacheBlockIds = mCacheManager->getCacheBlockIds(llmRequest.mRequestId, windowSize);
+            size_t const seqLen = cacheBlockIds.empty() ? 0 : cacheBlockIds.at(0).size();
+            if (!first)
+            {
+                dbgSeqBlocks += ",";
+            }
+            dbgSeqBlocks += std::to_string(static_cast<long long>(windowSize)) + ":" + std::to_string(seqLen);
+            first = false;
+        }
+    }
+    catch (std::exception const& e)
+    {
+        // getSequence() can throw if the sequence isn't registered yet (race
+        // with addRequest); swallow so the prof log still emits.
+        dbgSeqBlocks = std::string("err:") + e.what();
+    }
     if (outputBuffersPerWindow.size() > 1)
     {
         // We only support limited case for VSWA.
@@ -821,6 +1020,12 @@ void CacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& sess
                 bufferManager.getStream().synchronize();
             }
             session.setTime(TransferSession::kTimePreprocess);
+            double const dbgAllocMs = dbgMark();
+            // Capture via reference so the closing log line at the end of the
+            // non-layerwise branch can pick the latest value (we add two more
+            // `dbgMark()`s below for recv and concat).
+            double dbgRecvMs = 0.0;
+            double dbgConcatMs = 0.0;
 
             runtime::ITensor::SharedPtr preAllocRecvBuffer = nullptr;
             if (cacheBufferId.has_value())
@@ -927,6 +1132,7 @@ void CacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& sess
                 recvBufferFun(deviceId, 0);
             }
             session.setTime(TransferSession::kTimeTransmissions);
+            dbgRecvMs = dbgMark();
 
             {
                 NVTX3_SCOPED_RANGE(formatInputConcatenate);
@@ -941,6 +1147,40 @@ void CacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& sess
                 }
             }
             session.setTime(TransferSession::kTimePostprocess);
+            dbgConcatMs = dbgMark();
+
+            // [TTFT-INVESTIGATION 2026-05-22] One-line per-request summary,
+            // INFO level so it lands in the worker's stderr (gen.log). Keys
+            // are stable and space-separated for easy awk/python parsing.
+            // `total_ms` should approximately match the `Transmissions` cell
+            // in `disagg_kvcache_time/rank_*_recv.csv` plus the small
+            // blockrange+walk+alloc prefix.
+            //
+            // [reuse-confirmation fields]
+            //   per_window_blocks: <window>:<blocks-in-blockRange-after-slicing>
+            //   seq_window_blocks: <window>:<blocks-in-sequence-from-BlockManager>
+            //     If seq_window_blocks for the full window grows with turn
+            //     number (e.g. 300 -> 1700), gen DOES hold the cached prefix
+            //     (reuse is in effect on the gen side). If
+            //     per_window_blocks for the same window also grows alongside,
+            //     the transceiver is dragging the entire prefix through the
+            //     transfer path every turn -- that is the
+            //     `getBlockRangeForReceiving` VSWA fallback firing.
+            //   prepopulated_tokens: how many tokens gen's KV cache manager
+            //     thinks were satisfied from its own cache (== reused
+            //     tokens; divide by tokens_per_block to compare to
+            //     num_reused_blocks in the perf metrics).
+            double const dbgTotalMs = dbgElapsedMs(dbgPhaseStart, std::chrono::steady_clock::now());
+            TLLM_LOG_INFO(
+                "[disagg-prof] unformat gen_req=%ld ctx_req=%ld pools=%d blocks=%zu bytes=%zu targets=%zu "
+                "per_window_blocks=%s seq_window_blocks=%s prepopulated_tokens=%d prompt_len=%d "
+                "gen_reuse_enabled=%d src_reuse_enabled=%d "
+                "blockrange_ms=%.3f walk_ms=%.3f alloc_ms=%.3f recv_ms=%.3f concat_ms=%.3f total_ms=%.3f",
+                llmRequest.mRequestId, ctxReqId, static_cast<int>(numPools), blockNum, cacheBlockSizeSum, targetNum,
+                dbgPerWindowBlocks.c_str(), dbgSeqBlocks.c_str(), llmRequest.getPrepopulatedPromptLen(),
+                llmRequest.getPromptLen(), mCacheManager->isEnableBlockReuse() ? 1 : 0,
+                destConfig.getEnableBlockReuse() ? 1 : 0, dbgBlockrangeMs, dbgWalkMs, dbgAllocMs, dbgRecvMs,
+                dbgConcatMs, dbgTotalMs);
         }
     }
 

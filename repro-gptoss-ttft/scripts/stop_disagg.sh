@@ -13,11 +13,26 @@ PID_DIR="logs/pids"
 # exactly once per session before teardown. Without this, perf_metrics_proxy.
 # json is never written for the run, even if the rwlt client ran successfully.
 #
-# Output directory:
-#   - DRAIN_OUT_DIR env var (preferred; set by callers that use per-run dirs)
-#   - otherwise LOG_DIR from launch_disagg.sh (defaults to logs/)
-#   - otherwise the literal "logs/" directory next to scripts/
+# Output directory resolution (first match wins):
+#   1. DRAIN_OUT_DIR env var (explicit override; rarely needed)
+#   2. LOG_DIR env var (caller passes same LOG_DIR they used for launch)
+#   3. logs/pids/last_log_dir (persisted by launch_disagg.sh -- AUTO; this
+#      is what makes the common case "just bash stop_disagg.sh" do the right
+#      thing without needing to re-set LOG_DIR)
+#   4. logs/ fallback (last-resort, also warned about loudly)
+LAST_LOG_DIR_FILE="${PID_DIR}/last_log_dir"
+if [[ -z "${DRAIN_OUT_DIR:-}" && -z "${LOG_DIR:-}" && -f "${LAST_LOG_DIR_FILE}" ]]; then
+  LOG_DIR="$(cat "${LAST_LOG_DIR_FILE}")"
+  echo "[stop_disagg] inheriting LOG_DIR=${LOG_DIR} from ${LAST_LOG_DIR_FILE}"
+fi
 DRAIN_OUT_DIR="${DRAIN_OUT_DIR:-${LOG_DIR:-${REPRO_DIR}/logs}}"
+if [[ "${DRAIN_OUT_DIR}" == "${REPRO_DIR}/logs" || "${DRAIN_OUT_DIR}" == "logs" ]]; then
+  echo "WARNING: DRAIN_OUT_DIR resolved to the default '${DRAIN_OUT_DIR}'. " \
+       "If this run used a per-run LOG_DIR (e.g. rwlt-results/<run>/), the " \
+       "drained perf_metrics will land in the wrong place. Pass LOG_DIR=... " \
+       "or DRAIN_OUT_DIR=... to stop_disagg.sh, or rely on the auto-inherit " \
+       "via logs/pids/last_log_dir (written by launch_disagg.sh)." >&2
+fi
 # CRITICAL: /perf_metrics is destructive (reading it pops the deque), so we
 # MUST NOT hit it as a liveness probe -- doing so silently discards the
 # session's records. Use /health (idempotent) for the liveness check, and

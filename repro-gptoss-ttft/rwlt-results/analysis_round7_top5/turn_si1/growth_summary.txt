@@ -1,0 +1,29 @@
+=== Per-trajectory early-half vs late-half median (ms) ===
+      conv   n             delta_e/l              xfer_e/l        reused_blk_e/l
+       010  79     +68.7/   +194.0     +37.3/   +154.1      +977/    +1765
+       011  63     +47.5/   +133.8     +27.6/   +102.3      +735/    +1470
+       051  47     +66.1/   +162.8     +40.6/   +127.6      +952/    +1602
+       056  61    +227.8/   +339.1    +185.8/   +290.8     +1740/    +2377
+       073  68     +32.0/   +122.7     +12.9/    +89.8      +613/    +1221
+
+=== Per-tertile xfer cost (ms / block) by num_reused_blk ===
+  If per-block cost is byte-driven, ratio is ~flat.
+  If per-block bookkeeping scales with cached prefix length,
+  ratio grows monotonically from low->high tertile.
+
+      conv    bucket    n    med xfer/new_blk(ms)
+       010      low    26                   1.660
+       010      mid    26                   5.931
+       010      high   27                   8.986
+       011      low    21                   0.957
+       011      mid    21                   3.426
+       011      high   21                  10.420
+       051      low    15                   0.901
+       051      mid    15                   6.689
+       051      high   17                   6.949
+       056      low    20                   6.882
+       056      mid    20                  18.183
+       056      high   21                  29.968
+       073      low    22                   0.455
+       073      mid    22                   3.129
+       073      high   24                   6.329

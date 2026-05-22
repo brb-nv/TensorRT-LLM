@@ -19,8 +19,33 @@
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 
+#include <chrono>
+
 namespace tensorrt_llm::batch_manager::kv_cache_manager
 {
+
+// [TTFT-INVESTIGATION 2026-05-22] Per-phase wall-clock breakdown for
+// BlockRange::fromReuseTree, so the disagg transceiver path
+// (cacheFormatter::format) can attribute its ctx-side block-range cost
+// across (a) the radix-tree walk in findBlocksInReuseTreeByBlockKey,
+// (b) the getPrevBlock() chain walk, and (c) the finalize/ctor step.
+// Written once per fromReuseTree call; read once in the caller. Cost is
+// 3x std::chrono::steady_clock::now() (sub-microsecond on x86), one
+// per request.
+struct DbgFromReuseTreeTiming
+{
+    double findTreeMs = 0.0;
+    double chainWalkMs = 0.0;
+    double finalizeMs = 0.0;
+    int numBlocksCollected = 0;
+    bool valid = false;
+};
+
+inline DbgFromReuseTreeTiming& dbgFromReuseTreeTiming() noexcept
+{
+    thread_local DbgFromReuseTreeTiming t;
+    return t;
+}
 
 class BlockIterator;
 
@@ -78,12 +103,21 @@ public:
         TLLM_CHECK_WITH_INFO(poolNum == 1, "Reuse tree is not supported for multiple pools or variable window size");
 
         auto windowSize = cacheManager.getBlockManager().getWindowSizesMetadata().begin()->first;
+
+        // [TTFT-INVESTIGATION 2026-05-22] Phase A: radix-tree walk
+        // (suspected hot path -- O(prefix_blocks) under
+        // mCachedBlocksRootMutex).
+        auto& dbg = dbgFromReuseTreeTiming();
+        auto const dbgT0 = std::chrono::steady_clock::now();
         // Find the last block in the reuse tree for the provided full sequence of block keys
         auto lastBlock = cacheManager.findBlocksInReuseTreeByBlockKey(lastBlockKey, windowSize);
+        auto const dbgT1 = std::chrono::steady_clock::now();
         // TODO: handle the case where the last block is not found
         TLLM_CHECK_WITH_INFO(lastBlock, "Couldn't find the requested block in the reuse tree");
         int32_t const numBlocksToCollect = indexFromEnd + 1;
 
+        // [TTFT-INVESTIGATION 2026-05-22] Phase B: getPrevBlock() chain
+        // walk (numBlocksToCollect hops, expected cheap).
         std::vector<SizeType32> blockIds;
         blockIds.reserve(numBlocksToCollect);
         for (int32_t i = 0; i < numBlocksToCollect; ++i)
@@ -97,11 +131,21 @@ public:
                 lastBlock = lastBlock->getPrevBlock();
             }
         }
+        auto const dbgT2 = std::chrono::steady_clock::now();
         // Reverse to chronological order: oldest to newest
         std::reverse(blockIds.begin(), blockIds.end());
         std::unordered_map<SizeType32, std::vector<SizeType32>> blockIdsPerWindow;
         blockIdsPerWindow[windowSize] = blockIds;
-        return BlockRange(cacheManager, blockIdsPerWindow, 0);
+        BlockRange result(cacheManager, blockIdsPerWindow, 0);
+        auto const dbgT3 = std::chrono::steady_clock::now();
+
+        // [TTFT-INVESTIGATION 2026-05-22] Phase C: finalize/ctor.
+        dbg.findTreeMs = std::chrono::duration<double, std::milli>(dbgT1 - dbgT0).count();
+        dbg.chainWalkMs = std::chrono::duration<double, std::milli>(dbgT2 - dbgT1).count();
+        dbg.finalizeMs = std::chrono::duration<double, std::milli>(dbgT3 - dbgT2).count();
+        dbg.numBlocksCollected = numBlocksToCollect;
+        dbg.valid = true;
+        return result;
     }
 
     void setBlockIdsForWindow(SizeType32 windowSize, std::vector<SizeType32> blockIds)

@@ -680,6 +680,13 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_dbg_xfer_done_time = None
         self.py_dbg_promote_time = None
         self.py_dbg_first_token_logged = False
+        # Gen-side KV pool occupancy sampled at arrival, used to investigate
+        # whether per-request KV transfer latency grows with cumulative
+        # conversation prefix held in the gen-side pool. See
+        # repro-gptoss-ttft/rwlt-results/FINDINGS_RWLT_0522.md for the
+        # round-7 hypothesis that motivated these fields.
+        self.py_dbg_gen_pool_free_blocks_at_arrival = None
+        self.py_dbg_gen_pool_used_blocks_at_arrival = None
 
         # Performance timing info (step metrics, GPU events, context GPU timing)
         # Lazily created only when return_perf_metrics is enabled to avoid

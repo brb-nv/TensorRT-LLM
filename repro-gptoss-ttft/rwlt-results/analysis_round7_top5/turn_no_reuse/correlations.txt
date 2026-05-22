@@ -1,0 +1,33 @@
+=== Pearson r ===
+
+POOLED (n=318)
+            target     num_new_blk   num_total_blk  num_reused_blk   kv_size_bytes            turn      reused_tok           fresh
+        kv_xfer_ms          +0.334          +0.898            +nan          +0.898          +0.546          +0.869          +0.015
+     delta_ttft_ms          +0.290          +0.880            +nan          +0.880          +0.563          +0.866          -0.114
+           wait_ms          +0.329          +0.907            +nan          +0.907          +0.557          +0.878          +0.006
+
+PER-TRAJECTORY (n>=5)
+  target = kv_xfer_ms
+        conv    n     num_new_blk   num_total_blk  num_reused_blk   kv_size_bytes            turn      reused_tok           fresh
+         010   79          -0.126          +0.967            +nan          +0.967          +0.963          +0.955          -0.165
+         011   63          -0.302          +0.975            +nan          +0.975          +0.994          +0.966          -0.300
+         051   47          +0.200          +0.985            +nan          +0.985          +0.991          +0.971          -0.352
+         056   61          -0.312          +0.702            +nan          +0.702          +0.637          +0.620          +0.203
+         073   68          -0.110          +0.947            +nan          +0.947          +0.934          +0.934          -0.069
+
+  target = delta_ttft_ms
+        conv    n     num_new_blk   num_total_blk  num_reused_blk   kv_size_bytes            turn      reused_tok           fresh
+         010   79          -0.121          +0.888            +nan          +0.888          +0.889          +0.879          -0.189
+         011   63          -0.293          +0.977            +nan          +0.977          +0.993          +0.968          -0.299
+         051   47          +0.202          +0.982            +nan          +0.982          +0.980          +0.969          -0.354
+         056   61          -0.180          +0.723            +nan          +0.723          +0.598          +0.700          -0.174
+         073   68          -0.110          +0.962            +nan          +0.962          +0.950          +0.946          -0.055
+
+  target = wait_ms
+        conv    n     num_new_blk   num_total_blk  num_reused_blk   kv_size_bytes            turn      reused_tok           fresh
+         010   79          -0.126          +0.971            +nan          +0.971          +0.966          +0.958          -0.172
+         011   63          -0.302          +0.978            +nan          +0.978          +0.994          +0.970          -0.304
+         051   47          +0.198          +0.987            +nan          +0.987          +0.991          +0.972          -0.350
+         056   61          -0.318          +0.727            +nan          +0.727          +0.660          +0.647          +0.179
+         073   68          -0.110          +0.954            +nan          +0.954          +0.941          +0.940          -0.066
+

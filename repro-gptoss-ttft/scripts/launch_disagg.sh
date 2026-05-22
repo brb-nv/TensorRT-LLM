@@ -42,6 +42,12 @@ LOG_DIR="${LOG_DIR:-${REPO_ROOT}/logs}"
 PID_DIR="${REPO_ROOT}/logs/pids"
 mkdir -p "${LOG_DIR}" "${PID_DIR}"
 
+# Persist LOG_DIR so stop_disagg.sh / drain_perf_metrics.sh can default to the
+# same per-run directory without the caller having to repeat the env var on
+# teardown. Without this, forgetting LOG_DIR on stop silently drains
+# /perf_metrics into the fallback `logs/` dir, away from the per-run results.
+echo "${LOG_DIR}" > "${PID_DIR}/last_log_dir"
+
 # Belt-and-suspenders: prevent any HF download attempt from worker / proxy.
 export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
 export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"

@@ -253,12 +253,19 @@ class AsyncTransferManager:
         return len(self._requests_in_transfer) > 0
 
 
-# Diagnostic logging gate for disagg gen-side handoff timing. Set the env
-# variable TRTLLM_DEBUG_DISAGG_GEN_TIMING=1 to enable per-request stamps and
-# the one-line summary log emitted at first-token time. Default is False
-# (allocation-free, no logging).
+# Diagnostic logging gate for disagg gen-side handoff timing. Enables per-
+# request stamps and the one-line [disagg-dbg] summary log at first-token
+# time on the gen worker.
+#
+# TEMPORARY: HARD-WIRED ON (round 7, 2026-05-22). The env-var-gated
+# version (TRTLLM_DEBUG_DISAGG_GEN_TIMING) repeatedly failed to emit even
+# when the env var demonstrably reached the worker (it appeared in the
+# startup banner but the per-request log never fired), so we removed the
+# env-var read. The function is kept (rather than inlined) so every call
+# site remains a single `if _disagg_dbg_enabled():` to flip back to gated
+# or default-off once the investigation closes.
 def _disagg_dbg_enabled() -> bool:
-    return os.getenv("TRTLLM_DEBUG_DISAGG_GEN_TIMING", "0") == "1"
+    return True
 
 
 class PyExecutor:
@@ -309,16 +316,15 @@ class PyExecutor:
         logger.info(
             f"[PyExecutor] execution_stream initialized: {self.execution_stream}. "
         )
-        # One-shot startup banner so disagg debug instrumentation users can
-        # confirm the env var actually reached the MPI-spawned worker process.
-        # Always emitted (cheap) — the value reflects what os.getenv sees.
-        # NB: tensorrt_llm.logger uses *args concatenation, not printf-style,
-        # so we pre-format with f-strings.
-        _dbg_env = os.getenv("TRTLLM_DEBUG_DISAGG_GEN_TIMING", "0")
+        # TEMPORARY: one-shot startup banner so disagg-dbg log readers can
+        # confirm in the worker log that this version has _disagg_dbg_enabled()
+        # hard-wired to True (round 7, 2026-05-22). Restore the env-var gate
+        # in `_disagg_dbg_enabled` once the investigation closes.
         _dbg_state = "ENABLED" if _disagg_dbg_enabled() else "disabled"
         logger.info(
-            f"[PyExecutor] TRTLLM_DEBUG_DISAGG_GEN_TIMING={_dbg_env} "
-            f"(disagg-dbg {_dbg_state})")
+            f"[PyExecutor] disagg-dbg gate is hard-wired ON "
+            f"(_disagg_dbg_enabled() -> {_disagg_dbg_enabled()}, "
+            f"state={_dbg_state})")
 
         self.peft_cache_config = peft_cache_config
 
@@ -3259,14 +3265,45 @@ class PyExecutor:
                 spec_resource_manager.add_dummy_requests([0])
             self.active_requests.append(llm_request)
 
+    def _sample_gen_pool_occupancy(self):
+        """Return ``(free_blocks, used_blocks)`` of the gen-side KV pool.
+
+        Returns ``(None, None)`` if the KV cache manager is not available
+        (e.g. wrong rank, or stats are not yet warmed up). Used only by the
+        disagg gen-side diagnostic logging path, so any failure here must
+        degrade gracefully -- never raise into the main scheduling loop.
+        """
+        kv_mgr = self.resource_manager.resource_managers.get(
+            ResourceManagerType.KV_CACHE_MANAGER, None)
+        if kv_mgr is None:
+            return None, None
+        try:
+            stats = kv_mgr.get_kv_cache_stats()
+        except Exception:
+            return None, None
+        free_blocks = getattr(stats, "free_num_blocks", None)
+        used_blocks = getattr(stats, "used_num_blocks", None)
+        if used_blocks is None:
+            total = getattr(stats, "max_num_blocks", None)
+            if total is not None and free_blocks is not None:
+                used_blocks = total - free_blocks
+        return free_blocks, used_blocks
+
     @nvtx_range("_prepare_disagg_gen_init")
     def _prepare_disagg_gen_init(self, fitting_disagg_gen_init_requests):
         if fitting_disagg_gen_init_requests:
             if _disagg_dbg_enabled():
                 now = time.time()
+                # Sample the gen-side KV pool occupancy ONCE per batch of
+                # arriving disagg-gen requests; cheap (a single C++ stats
+                # call) and lets us correlate per-request kv_xfer_ms with
+                # how full the gen pool already is from prior turns.
+                pool_free, pool_used = self._sample_gen_pool_occupancy()
                 for req in fitting_disagg_gen_init_requests:
                     if req.py_dbg_arrival_time is None:
                         req.py_dbg_arrival_time = now
+                        req.py_dbg_gen_pool_free_blocks_at_arrival = pool_free
+                        req.py_dbg_gen_pool_used_blocks_at_arrival = pool_used
             disagg_gen_init_to_prepare = ScheduledRequests()
             disagg_gen_init_to_prepare.context_requests_last_chunk = fitting_disagg_gen_init_requests
 
@@ -3878,7 +3915,7 @@ class PyExecutor:
             # early-continue below, because with the overlap scheduler ON
             # (default) disagg gen requests at py_decoding_iter <= 1 are
             # short-circuited and would never reach the post-continue code.
-            # Gated by TRTLLM_DEBUG_DISAGG_GEN_TIMING=1.
+            # Gated by _disagg_dbg_enabled() (hard-wired ON, round 7).
             if (_disagg_dbg_enabled()
                     and request.py_decoding_iter == 1
                     and not request.py_dbg_first_token_logged
@@ -3893,6 +3930,13 @@ class PyExecutor:
                 def _ms(a, b):
                     return ((b - a) * 1000.0) if (a is not None and b is not None) else float("nan")
 
+                pool_free = request.py_dbg_gen_pool_free_blocks_at_arrival
+                pool_used = request.py_dbg_gen_pool_used_blocks_at_arrival
+                pool_free_s = (f"{pool_free}"
+                               if pool_free is not None else "?")
+                pool_used_s = (f"{pool_used}"
+                               if pool_used is not None else "?")
+
                 logger.info(
                     f"[disagg-dbg] req={request.py_request_id} "
                     f"iter={self.iter_counter} "
@@ -3900,7 +3944,9 @@ class PyExecutor:
                     f"init_to_xfer_done={_ms(t_init, t_done):.2f}ms "
                     f"xfer_done_to_promote={_ms(t_done, t_prom):.2f}ms "
                     f"promote_to_first_token={_ms(t_prom, t_now):.2f}ms "
-                    f"TOTAL_gen_queue={_ms(t_arr, t_now):.2f}ms")
+                    f"TOTAL_gen_queue={_ms(t_arr, t_now):.2f}ms "
+                    f"gen_pool_free_blocks_at_arrival={pool_free_s} "
+                    f"gen_pool_used_blocks_at_arrival={pool_used_s}")
 
             if request.is_generation_only_request() and not request.is_finished:
                 # If request is in transmission, so we don't need to emit a response
