@@ -253,6 +253,14 @@ class AsyncTransferManager:
         return len(self._requests_in_transfer) > 0
 
 
+# Diagnostic logging gate for disagg gen-side handoff timing. Set the env
+# variable TRTLLM_DEBUG_DISAGG_GEN_TIMING=1 to enable per-request stamps and
+# the one-line summary log emitted at first-token time. Default is False
+# (allocation-free, no logging).
+def _disagg_dbg_enabled() -> bool:
+    return os.getenv("TRTLLM_DEBUG_DISAGG_GEN_TIMING", "0") == "1"
+
+
 class PyExecutor:
     # Minimum number of async micro batches for async PP execution.
     # This is a trade-off between memory usage and performance.
@@ -301,6 +309,16 @@ class PyExecutor:
         logger.info(
             f"[PyExecutor] execution_stream initialized: {self.execution_stream}. "
         )
+        # One-shot startup banner so disagg debug instrumentation users can
+        # confirm the env var actually reached the MPI-spawned worker process.
+        # Always emitted (cheap) — the value reflects what os.getenv sees.
+        # NB: tensorrt_llm.logger uses *args concatenation, not printf-style,
+        # so we pre-format with f-strings.
+        _dbg_env = os.getenv("TRTLLM_DEBUG_DISAGG_GEN_TIMING", "0")
+        _dbg_state = "ENABLED" if _disagg_dbg_enabled() else "disabled"
+        logger.info(
+            f"[PyExecutor] TRTLLM_DEBUG_DISAGG_GEN_TIMING={_dbg_env} "
+            f"(disagg-dbg {_dbg_state})")
 
         self.peft_cache_config = peft_cache_config
 
@@ -3244,6 +3262,11 @@ class PyExecutor:
     @nvtx_range("_prepare_disagg_gen_init")
     def _prepare_disagg_gen_init(self, fitting_disagg_gen_init_requests):
         if fitting_disagg_gen_init_requests:
+            if _disagg_dbg_enabled():
+                now = time.time()
+                for req in fitting_disagg_gen_init_requests:
+                    if req.py_dbg_arrival_time is None:
+                        req.py_dbg_arrival_time = now
             disagg_gen_init_to_prepare = ScheduledRequests()
             disagg_gen_init_to_prepare.context_requests_last_chunk = fitting_disagg_gen_init_requests
 
@@ -3267,6 +3290,15 @@ class PyExecutor:
         for req in scheduled_batch.generation_requests:
             if req.is_disagg_generation_transmission_complete:
                 cache_trans_complete_requests.append(req)
+        if _disagg_dbg_enabled() and cache_trans_complete_requests:
+            # Stamp the first iter where we observed TRANS_COMPLETE (this is
+            # one iter after the transceiver actually finished). xfer_done is
+            # approximated by this observation time; the exact transceiver
+            # completion time is not exposed at python level today.
+            now = time.time()
+            for req in cache_trans_complete_requests:
+                if req.py_dbg_xfer_done_time is None:
+                    req.py_dbg_xfer_done_time = now
         if len(cache_trans_complete_requests) > 0:
             requests = ScheduledRequests()
             requests.context_requests_last_chunk = cache_trans_complete_requests
@@ -3278,6 +3310,8 @@ class PyExecutor:
         for req in scheduled_batch.generation_requests:
             if req.is_disagg_generation_transmission_complete:
                 req.state = LlmRequestState.GENERATION_IN_PROGRESS
+                if _disagg_dbg_enabled() and req.py_dbg_promote_time is None:
+                    req.py_dbg_promote_time = time.time()
                 req.context_current_position = req.prompt_len
                 req.decoding_iter = 1
                 req.py_decoding_iter = 1
@@ -3341,6 +3375,14 @@ class PyExecutor:
             for req in new_gen_reqs:
                 req.state = LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
             return
+
+        # Stamp init-time before kicking off the (a)sync transfer so we can
+        # attribute the wait between init and transceiver-complete-observed.
+        if _disagg_dbg_enabled():
+            now = time.time()
+            for req in new_gen_reqs:
+                if req.py_dbg_xfer_init_time is None:
+                    req.py_dbg_xfer_init_time = now
 
         if os.getenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP") == "1":
             for req in new_gen_reqs:
@@ -3829,6 +3871,36 @@ class PyExecutor:
                         error_msg=f"Request {request.py_request_id} timed out",
                         requests=[request])
                 continue
+
+            # Disagg gen handoff diagnostic log. Emit one line per request at
+            # the FIRST iter where _handle_responses sees the request after
+            # promotion (py_decoding_iter == 1). Must be done BEFORE the
+            # early-continue below, because with the overlap scheduler ON
+            # (default) disagg gen requests at py_decoding_iter <= 1 are
+            # short-circuited and would never reach the post-continue code.
+            # Gated by TRTLLM_DEBUG_DISAGG_GEN_TIMING=1.
+            if (_disagg_dbg_enabled()
+                    and request.py_decoding_iter == 1
+                    and not request.py_dbg_first_token_logged
+                    and request.py_dbg_arrival_time is not None):
+                request.py_dbg_first_token_logged = True
+                t_now = time.time()
+                t_arr = request.py_dbg_arrival_time
+                t_init = request.py_dbg_xfer_init_time
+                t_done = request.py_dbg_xfer_done_time
+                t_prom = request.py_dbg_promote_time
+
+                def _ms(a, b):
+                    return ((b - a) * 1000.0) if (a is not None and b is not None) else float("nan")
+
+                logger.info(
+                    f"[disagg-dbg] req={request.py_request_id} "
+                    f"iter={self.iter_counter} "
+                    f"arrival_to_init={_ms(t_arr, t_init):.2f}ms "
+                    f"init_to_xfer_done={_ms(t_init, t_done):.2f}ms "
+                    f"xfer_done_to_promote={_ms(t_done, t_prom):.2f}ms "
+                    f"promote_to_first_token={_ms(t_prom, t_now):.2f}ms "
+                    f"TOTAL_gen_queue={_ms(t_arr, t_now):.2f}ms")
 
             if request.is_generation_only_request() and not request.is_finished:
                 # If request is in transmission, so we don't need to emit a response

@@ -671,6 +671,15 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.is_cuda_graph_dummy = False
         self.py_kv_transfer_start_time = None
         self.py_kv_transfer_timed_out = False
+        # Disagg gen-side handoff diagnostic timestamps (steady_clock seconds).
+        # Stamped only when TRTLLM_DEBUG_DISAGG_GEN_TIMING=1 to keep the
+        # default path allocation-free. Used to attribute gen_queue_ms to
+        # transceiver-init / transfer-complete / promote / schedule sub-stages.
+        self.py_dbg_arrival_time = None
+        self.py_dbg_xfer_init_time = None
+        self.py_dbg_xfer_done_time = None
+        self.py_dbg_promote_time = None
+        self.py_dbg_first_token_logged = False
 
         # Performance timing info (step metrics, GPU events, context GPU timing)
         # Lazily created only when return_perf_metrics is enabled to avoid
