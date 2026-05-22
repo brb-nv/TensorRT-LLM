@@ -32,8 +32,9 @@ for arg in "$@"; do
   esac
 done
 
-SRC_CONFIG="${REPO_ROOT}/configs/${CONFIG_NAME}.yaml"
-RUN_CONFIG="${REPO_ROOT}/configs/.runtime_${CONFIG_NAME}.yaml"
+CONFIG_DIR="${CONFIG_DIR:-configs}"
+SRC_CONFIG="${REPO_ROOT}/${CONFIG_DIR}/${CONFIG_NAME}.yaml"
+RUN_CONFIG="${REPO_ROOT}/${CONFIG_DIR}/.runtime_${CONFIG_NAME}.yaml"
 
 # Default to the shared local checkpoint to avoid HF downloads.
 MODEL="${MODEL:-/home/scratch.trt_llm_data_ci/llm-models/gpt_oss/gpt-oss-120b}"
@@ -56,6 +57,12 @@ export HF_DATASETS_OFFLINE="${HF_DATASETS_OFFLINE:-1}"
 # server-level return_perf_metrics: true setting -- see
 # tensorrt_llm/serve/openai_server.py:1383 vs 1045-1050.)
 export TRTLLM_KVCACHE_TIME_OUTPUT_PATH="${TRTLLM_KVCACHE_TIME_OUTPUT_PATH:-${LOG_DIR}/agg_kvcache_time}"
+# Optional: bypass the harmony chat handler used for gpt-oss. When set to 1,
+# /v1/chat/completions routes to openai_chat (HF jinja chat template + plain
+# detokenize) instead of chat_harmony (harmony-formatted token stream). Use to
+# isolate harmony-adapter overhead from the overall TTFT gap. See
+# tensorrt_llm/serve/openai_server.py line ~369.
+export DISABLE_HARMONY_ADAPTER="${DISABLE_HARMONY_ADAPTER:-}"
 
 if [[ ! -f "${SRC_CONFIG}" ]]; then
   echo "ERROR: ${SRC_CONFIG} not found" >&2
@@ -67,6 +74,7 @@ fi
 EAGLE_CKPT="${EAGLE_CKPT:-/home/scratch.simengl_sw_3/trt_repos/hf_models/nvidia/gpt-oss-120b-Eagle3-v3}"
 sed "s|EAGLE_CKPT_PLACEHOLDER|${EAGLE_CKPT}|g" "${SRC_CONFIG}" > "${RUN_CONFIG}"
 echo "Resolved config -> ${RUN_CONFIG}"
+echo "  config dir=${CONFIG_DIR}"
 echo "  EAGLE_CKPT=${EAGLE_CKPT}"
 echo "  CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-<unset>}"
 echo "  MODEL=${MODEL}"

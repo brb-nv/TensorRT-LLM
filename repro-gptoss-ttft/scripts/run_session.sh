@@ -44,8 +44,8 @@ case "${LAYOUT}" in
   *) echo "ERROR: layout must be 'agg' or 'disagg', got ${LAYOUT}" >&2; exit 2 ;;
 esac
 case "${CLIENT}" in
-  rwlt_smoke|rwlt_baseline|bench_serving) ;;
-  *) echo "ERROR: client must be rwlt_smoke|rwlt_baseline|bench_serving, got ${CLIENT}" >&2; exit 2 ;;
+  rwlt_*|bench_serving) ;;
+  *) echo "ERROR: client must match 'rwlt_*' or be 'bench_serving', got ${CLIENT}" >&2; exit 2 ;;
 esac
 
 teardown() {
@@ -79,12 +79,25 @@ fi
 
 echo "[run_session] running client: ${CLIENT} (label=${LABEL}) ..."
 case "${CLIENT}" in
-  rwlt_smoke|rwlt_baseline)
+  rwlt_*)
     "${REPRO_DIR}/scripts/run_rwlt.sh" "${LABEL}" "${BASE_URL_V1}" "${CLIENT}" "$@"
+    RESULTS_DIR="${REPRO_DIR}/rwlt-results/${LABEL}"
     ;;
   bench_serving)
     "${REPRO_DIR}/scripts/bench_ttft.sh" "${LABEL}" "${BASE_URL_HTTP}" "$@"
+    RESULTS_DIR="${REPRO_DIR}/results/${LABEL}"
     ;;
 esac
+
+# Drain /perf_metrics into the results dir BEFORE teardown. Reading is
+# destructive (pops the worker-side deque and the proxy's joined deque), so
+# this must run exactly once and only after the client finishes.
+# Opt-out via DRAIN_PERF_METRICS=0 for sessions where /perf_metrics is known
+# to be unavailable (e.g. legacy server builds).
+if [[ "${DRAIN_PERF_METRICS:-1}" == "1" && -n "${RESULTS_DIR:-}" ]]; then
+  echo "[run_session] draining /perf_metrics -> ${RESULTS_DIR} ..."
+  "${REPRO_DIR}/scripts/drain_perf_metrics.sh" "${LAYOUT}" "${RESULTS_DIR}" || \
+    echo "[run_session] WARNING: drain_perf_metrics.sh failed (continuing)" >&2
+fi
 
 echo "[run_session] client finished. (teardown will run on exit)"

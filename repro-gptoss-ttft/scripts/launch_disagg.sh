@@ -37,6 +37,7 @@ SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-openai/gpt-oss-120b}"
 CTX_CONFIG_BASE="${CTX_CONFIG_BASE:-repro_disagg_ctx_tp1}"
 GEN_CONFIG_BASE="${GEN_CONFIG_BASE:-repro_disagg_gen_tp1}"
 PROXY_CONFIG_BASE="${PROXY_CONFIG_BASE:-repro_disagg_proxy}"
+CONFIG_DIR="${CONFIG_DIR:-configs}"
 LOG_DIR="${LOG_DIR:-${REPO_ROOT}/logs}"
 PID_DIR="${REPO_ROOT}/logs/pids"
 mkdir -p "${LOG_DIR}" "${PID_DIR}"
@@ -50,11 +51,17 @@ export HF_DATASETS_OFFLINE="${HF_DATASETS_OFFLINE:-1}"
 # returns an empty list and benchmark_serving's --save-request-time-breakdown
 # is a no-op even though the server-level return_perf_metrics: true is set.
 export TRTLLM_KVCACHE_TIME_OUTPUT_PATH="${TRTLLM_KVCACHE_TIME_OUTPUT_PATH:-${LOG_DIR}/disagg_kvcache_time}"
+# Optional: bypass the harmony chat handler used for gpt-oss on BOTH ctx and
+# gen workers. When set to 1, /v1/chat/completions routes to openai_chat (HF
+# jinja chat template + plain detokenize) instead of chat_harmony. Both
+# workers must agree, otherwise prefix tokenization diverges across the
+# ctx->gen handoff. See tensorrt_llm/serve/openai_server.py line ~369.
+export DISABLE_HARMONY_ADAPTER="${DISABLE_HARMONY_ADAPTER:-}"
 
 resolve_config() {
   local base="$1"
-  local src="${REPO_ROOT}/configs/${base}.yaml"
-  local out="${REPO_ROOT}/configs/.runtime_${base}.yaml"
+  local src="${REPO_ROOT}/${CONFIG_DIR}/${base}.yaml"
+  local out="${REPO_ROOT}/${CONFIG_DIR}/.runtime_${base}.yaml"
   if [[ ! -f "${src}" ]]; then
     echo "ERROR: ${src} not found" >&2
     return 1
@@ -85,8 +92,9 @@ wait_for_health() {
 
 CTX_RUN_CONFIG="$(resolve_config "${CTX_CONFIG_BASE}")"
 GEN_RUN_CONFIG="$(resolve_config "${GEN_CONFIG_BASE}")"
-PROXY_CONFIG="${REPO_ROOT}/configs/${PROXY_CONFIG_BASE}.yaml"
+PROXY_CONFIG="${REPO_ROOT}/${CONFIG_DIR}/${PROXY_CONFIG_BASE}.yaml"
 
+echo "config dir -> ${CONFIG_DIR}"
 echo "ctx config -> ${CTX_RUN_CONFIG} (GPU ${CTX_GPU})"
 echo "gen config -> ${GEN_RUN_CONFIG} (GPU ${GEN_GPU})"
 echo "proxy     -> ${PROXY_CONFIG}"
