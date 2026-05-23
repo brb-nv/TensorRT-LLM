@@ -1,0 +1,91 @@
+# Round 9 (2026-05-22) verification: disaggregated ctx with KV cache reuse
+# ON, identical to round 7 ctx except for one added field:
+# `max_attention_window: [128, 131072]` in kv_cache_config.
+#
+# Background: round 7 disagg was +40 ms p50 slower than round 7 agg on
+# multi-turn RWLT (gpt-oss-120b). Round 7b instrumentation pinned the
+# regression to a single ctx-side call:
+#   KVCacheManager::findBlocksInReuseTreeByBlockKey
+# reached through the `br_path=reuse_tree` branch of
+# `getBlockRangeForSending` in cacheFormatter.cpp. That branch is taken
+# whenever `pools == 1 && reuse=true`.
+#
+# GPT-OSS has hybrid attention (sliding window 128 + full 131072). Without
+# explicit `max_attention_window`, the KVCacheManager defaults to a single
+# window across all layers -> `pools=1` -> slow path. With the explicit
+# `[128, 131072]`, the WindowBlockManager instantiates TWO separate pools
+# (one per distinct window) -> `pools=2` -> the `poolNum > 1` short-circuit
+# in cacheFormatter.cpp forces br_path=fallback_all_ids -> the hot function
+# is structurally bypassed AND sliding-window memory drops from ~300 to
+# ~5 blocks per request.
+#
+# Verified result (n=318):
+#   - ctx [disagg-prof] reports pools=2, per_window_blocks=128:5,131072:N
+#   - ctx br_path=fallback_all_ids for 318/318 requests (was reuse_tree in r7)
+#   - br_find_tree_ms p50 = 0.0 ms (was ~10 ms p50 in r7, up to 250 ms tail)
+#   - KV bytes per req halved: 383 MB -> 190 MB
+#   - disagg TTFT p50: 208.4 ms (r7) -> 136.6 ms (r9)
+#   - agg TTFT essentially unchanged (180.7 -> 183.4 ms)
+#   - disagg - agg delta p50: +24.6 ms (r7) -> -46.7 ms (r9, disagg FASTER)
+#
+# Known risk: the fallback_all_ids path calls
+# BlockRange::fromAllBlockIds(... , llmRequest.mRequestId), which does
+# cacheManager->getSequence(requestId) -> mSequences.at(requestId). In
+# round 7c we hit std::out_of_range here because the sequence was removed
+# from mSequences before format() ran. That round forced the fallback
+# path with reuse=true on ctx, so the executor used reuse-on lifecycle
+# semantics and removed early. Here ctx is NATIVELY reuse=false, so the
+# executor should keep the sequence around until KV transfer completes
+# (this is a production-tested config). If we still hit the out-of-range,
+# we have a real bug in the disagg ctx sequence lifecycle to file.
+#
+# Used by: scripts/launch_disagg.sh (ctx role on port 8001)
+backend: pytorch
+tensor_parallel_size: 1
+pipeline_parallel_size: 1
+moe_expert_parallel_size: 1
+max_batch_size: 1
+max_num_tokens: 20000
+max_seq_len: 131072
+stream_interval: 20
+trust_remote_code: true
+disable_overlap_scheduler: false
+enable_chunked_prefill: true
+enable_attention_dp: false
+num_postprocess_workers: 4
+sampler_type: TorchSampler
+scheduler_config:
+  capacity_scheduler_policy: MAX_UTILIZATION
+  context_chunking_policy: FIRST_COME_FIRST_SERVED
+kv_cache_config:
+  event_buffer_max_size: 16384
+  dtype: fp8
+  free_gpu_memory_fraction: 0.9
+  enable_block_reuse: true       # <-- round9: reuse ON on ctx (back to round7 baseline). The slow findBlocksInReuseTreeByBlockKey radix walk is NOT hit despite reuse=on, because the explicit max_attention_window below splits the WindowBlockManager into pools=2 which forces br_path=fallback_all_ids in cacheFormatter.cpp.
+  # See repro_agg_tp1_eagle3.yaml for why [128, 131072] (not the
+  # [128, 32768] value used by the GSM8K integration test at
+  # tests/integration/defs/accuracy/test_disaggregated_serving.py:1420).
+  # NEW in round9 (vs round8): explicitly set instead of relying on model default.
+  max_attention_window: [128, 131072]
+moe_config:
+  backend: TRTLLM
+cuda_graph_config: null
+cache_transceiver_config:
+  max_tokens_in_buffer: 131072
+  backend: DEFAULT
+speculative_config:
+  decoding_type: Eagle3
+  max_draft_len: 3
+  speculative_model: EAGLE_CKPT_PLACEHOLDER
+  eagle3_one_model: true
+  eagle3_layers_to_capture:
+  - 23
+  - 29
+  - 35
+enable_iter_perf_stats: true
+enable_iter_req_stats: true
+print_iter_log: true
+return_perf_metrics: true
+perf_metrics_max_requests: 20000
+iter_stats_max_iterations: 20000
+request_stats_max_iterations: 20000

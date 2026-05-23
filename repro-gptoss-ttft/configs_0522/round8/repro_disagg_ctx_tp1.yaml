@@ -1,0 +1,82 @@
+# Round 8 (2026-05-22) ablation: KV cache reuse OFF on BOTH ctx and gen.
+#
+# Hypothesis under test (paired with round8 gen + agg configs):
+#
+#   (1) With reuse=false on both ctx and gen, the disagg vs agg TTFT gap
+#       should COLLAPSE to (roughly) the wall-clock cost of streaming the
+#       full prefix KV across NIXL/IB once per turn. The radix-tree walk
+#       in WindowBlockManager::findBlocksInReuseTreeByBlockKey -- which
+#       round 7b/7c instrumentation showed dominates disagg-ctx
+#       kv_xfer_ms (~7-15 ms for ~3000-block prefixes) -- is no longer
+#       triggered.
+#
+#   (2) Structurally, ctx no longer takes the reuse_tree codepath in
+#       cacheFormatter::getBlockRangeForSending. The gate is line 239 in
+#       cacheFormatter.cpp:
+#         if (... || !cacheManager->isEnableBlockReuse() || ...) {
+#             dbg.path = "fallback_all_ids";
+#             // -> BlockRange::fromAllBlockIds, no findBlocksInReuseTreeByBlockKey
+#         }
+#       So [disagg-prof] should report br_path=fallback_all_ids for every
+#       request, and the slow_blockkey_walk canary in
+#       findBlocksInReuseTreeByBlockKey should never fire.
+#
+# Compare round8 disagg vs round8 agg (NOT round7 agg) -- round7 agg has
+# reuse=true and will look artificially fast next to round8 disagg.
+#
+# Known risk: the fallback_all_ids path calls
+# BlockRange::fromAllBlockIds(... , llmRequest.mRequestId), which does
+# cacheManager->getSequence(requestId) -> mSequences.at(requestId). In
+# round 7c we hit std::out_of_range here because the sequence was removed
+# from mSequences before format() ran. That round forced the fallback
+# path with reuse=true on ctx, so the executor used reuse-on lifecycle
+# semantics and removed early. Here ctx is NATIVELY reuse=false, so the
+# executor should keep the sequence around until KV transfer completes
+# (this is a production-tested config). If we still hit the out-of-range,
+# we have a real bug in the disagg ctx sequence lifecycle to file.
+#
+# Used by: scripts/launch_disagg.sh (ctx role on port 8001)
+backend: pytorch
+tensor_parallel_size: 1
+pipeline_parallel_size: 1
+moe_expert_parallel_size: 1
+max_batch_size: 1
+max_num_tokens: 20000
+max_seq_len: 131072
+stream_interval: 20
+trust_remote_code: true
+disable_overlap_scheduler: false
+enable_chunked_prefill: true
+enable_attention_dp: false
+num_postprocess_workers: 4
+sampler_type: TorchSampler
+scheduler_config:
+  capacity_scheduler_policy: MAX_UTILIZATION
+  context_chunking_policy: FIRST_COME_FIRST_SERVED
+kv_cache_config:
+  event_buffer_max_size: 16384
+  dtype: fp8
+  free_gpu_memory_fraction: 0.9
+  enable_block_reuse: false      # <-- round8 ablation: reuse OFF on ctx (vs round7 ctx which has reuse=true)
+moe_config:
+  backend: TRTLLM
+cuda_graph_config: null
+cache_transceiver_config:
+  max_tokens_in_buffer: 131072
+  backend: DEFAULT
+speculative_config:
+  decoding_type: Eagle3
+  max_draft_len: 3
+  speculative_model: EAGLE_CKPT_PLACEHOLDER
+  eagle3_one_model: true
+  eagle3_layers_to_capture:
+  - 23
+  - 29
+  - 35
+enable_iter_perf_stats: true
+enable_iter_req_stats: true
+print_iter_log: true
+return_perf_metrics: true
+perf_metrics_max_requests: 20000
+iter_stats_max_iterations: 20000
+request_stats_max_iterations: 20000

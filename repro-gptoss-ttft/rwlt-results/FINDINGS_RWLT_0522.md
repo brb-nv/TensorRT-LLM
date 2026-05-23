@@ -895,3 +895,214 @@ the follow-up PR.
 This is a living document. Append round 7 ablation results below as
 they come in; do not edit the analysis above (it's the reference
 baseline for the ablation interpretation).
+
+---
+
+# Round 8 (2026-05-22 PM): structural ablation — `reuse=OFF` on both ctx and gen
+
+## Hypothesis being tested
+
+Round 7b localized the bottleneck to a single ctx-side function call
+(`KVCacheManager::findBlocksInReuseTreeByBlockKey`) reached only through the
+`br_path=reuse_tree` branch of `getBlockRangeForSending`. Round 7b also
+proved the `gen-side enable_block_reuse=false` ablation is not a real test:
+gen still populates `lastBlockKey` regardless, so ctx still hits
+`reuse_tree`. Round 8 is the structural ablation: turn off `enable_block_reuse`
+on BOTH workers (and on the agg comparator, to keep things apples-to-apples).
+This forces the `br_path=fallback_all_ids` branch in `cacheFormatter.cpp`,
+structurally bypassing the suspect call.
+
+## Configs
+
+[`configs_0522/round8/`](../configs_0522/round8/):
+
+- `repro_agg_tp1_eagle3.yaml`: agg with `enable_block_reuse: false`
+- `repro_disagg_ctx_tp1.yaml`: disagg ctx with `enable_block_reuse: false`
+- `repro_disagg_gen_tp1_pp4_si1.yaml`: disagg gen with `enable_block_reuse: false`
+- `repro_disagg_proxy.yaml`: unchanged from round 7
+
+Identical to round 7 in every other respect (TP/PP layout, max_seq_len,
+stream_interval, Eagle3, etc.) — only the reuse flag differs.
+
+## Result (n=318 matched turns, `rwlt_round1_top5_signed`)
+
+| Metric | Round 7 baseline (reuse ON) | Round 8 (reuse OFF both) | Δ |
+|---|---|---|---|
+| `br_path` distribution on ctx | `reuse_tree` 318/318 | `fallback_all_ids` 318/318 | path switched as designed |
+| `br_find_tree_ms` p50 | ~10 ms (up to 250 ms at 80k ISL) | **0.000 ms** | hot function structurally bypassed |
+| `[disagg-prof] format total_ms` p50 (warm req, 9574 prepop) | 10.9 ms | **1.0 ms** | -10x |
+| ctx KV bytes per request (300-block req) | 383 MB | 383 MB | unchanged (single pool, full prefix) |
+| agg TTFT p50 | 180.7 ms | **798.5 ms** | **+4.4x WORSE** (lost reuse) |
+| disagg TTFT p50 | 208.4 ms | 747.6 ms | +3.6x (also lost reuse) |
+| disagg − agg TTFT p50 | **+24.6 ms** (disagg slower) | **-48.5 ms** (disagg faster) | sign flipped |
+| disagg − agg TTFT mean | +39.6 ms | -38.8 ms | sign flipped |
+
+## Interpretation
+
+Round 8 proves the +40 ms disagg-vs-agg gap in round 7 is caused by the
+`findBlocksInReuseTreeByBlockKey` walk and nothing else. When the call is
+structurally unreachable, disagg becomes -49 ms p50 *faster* than agg
+(the expected sign: disagg gets prefill parallelism via separate ctx/gen).
+
+But round 8 is not a deployable fix — both sides lose 4x in absolute TTFT
+because every turn now does a full cold prefill (no warm-prefix reuse).
+It confirms the bottleneck, doesn't fix it.
+
+## Per-conversation breakdown
+
+See [`diff_round8_agg_vs_disagg.tsv`](diff_round8_agg_vs_disagg.tsv). All 5
+conversations show the same pattern: disagg wins on every warm turn by a
+consistent ~45-55 ms; the only positive deltas are on the first turn of
+each conversation where disagg pays the first-request connection-setup cost.
+
+---
+
+# Round 9 (2026-05-22 PM): the actual fix — explicit `max_attention_window`
+
+## What changed vs round 7
+
+The configs in [`configs_0522/round9/`](../configs_0522/round9/) are
+**identical to round 7** in every respect (reuse ON everywhere, same TP/PP,
+same Eagle3) except **one** added line in every `kv_cache_config`:
+
+```yaml
+max_attention_window: [128, 131072]
+```
+
+This is the per-layer-type attention window for GPT-OSS hybrid attention
+(alternating sliding-window 128 + full-attention 131072). Without setting
+it, the KVCacheManager defaults to a single window covering all layers,
+which collapses both layer types into a single block pool.
+
+## Result (n=318 matched turns)
+
+| Metric | Round 7 (implicit window) | Round 9 (explicit window) | Δ |
+|---|---|---|---|
+| `pools` reported by ctx | 1 | **2** | per-layer-type pooling activated |
+| `per_window_blocks` (first req, 9573-token prompt) | `131080:300` | `128:5, 131072:300` | sliding-window layer only needs 5 blocks |
+| KV bytes per req (300-block warm req) | 383 MB | **190 MB** | -50% memory |
+| `br_path` distribution on ctx | `reuse_tree` 318/318 | **`fallback_all_ids` 318/318** | hot path bypassed |
+| `br_find_tree_ms` p50 | ~10 ms (up to 250 ms tail) | **0.000 ms** | hot function entirely skipped |
+| `[disagg-prof] format total_ms` p50 (warm req, 9574 prepop) | 10.9 ms | **0.65 ms** | -17x |
+| `slow_blockkey_walk` canary count | 0 (logging not present in r7) | **0** (logging present, no hits) | confirmed |
+| agg TTFT p50 | 180.7 ms | 183.4 ms | +1.5% (noise) |
+| disagg TTFT p50 | 208.4 ms | **136.6 ms** | **-34.5%** (-72 ms) |
+| disagg − agg TTFT p50 | **+24.6 ms** (disagg slower) | **-46.7 ms** (disagg faster) | sign flipped, magnitude doubled |
+| disagg − agg TTFT mean | +39.6 ms | -46.2 ms | sign flipped |
+
+## Root cause, mechanically
+
+The branch in `cpp/tensorrt_llm/batch_manager/cacheFormatter.cpp`
+that selects between the two code paths:
+
+```cpp
+if (poolNum > 1 || !cacheManager->isEnableBlockReuse() || !cacheManager->isEnablePartialReuse()
+    || lastBlockKey.uniqueTokens.size() == 0 || recvSideHasCP || ppSize > 1)
+{
+    dbg.path = "fallback_all_ids";   // cheap: BlockRange::fromAllBlockIds
+}
+else
+{
+    dbg.path = "reuse_tree";          // expensive: BlockRange::fromReuseTree
+                                      //   -> KVCacheManager::findBlocksInReuseTreeByBlockKey
+                                      //   -> radix-tree walk under mLastBlocksInTreeMutex
+}
+```
+
+In round 7, GPT-OSS reports `poolNum=1` because there is one default
+window covering all layers, so the `poolNum > 1` short-circuit doesn't
+trigger. With `reuse` flags on and a non-empty `lastBlockKey`, every
+ctx-side `format()` calls `fromReuseTree` → walks the radix tree from
+the root, matching `lastBlockKey.uniqueTokens` block-by-block to find
+the request's leaf. Cost is O(prefix length) under a global mutex.
+
+In round 9, the explicit `max_attention_window: [128, 131072]` causes
+the WindowBlockManager to instantiate **two separate pools** (one per
+distinct window size), so `poolNum=2` and the `poolNum > 1` clause
+forces `fallback_all_ids`. The hot function is never called.
+
+## Why this is also a memory win
+
+The sliding-window layer with window=128 only needs ~5 blocks per
+request (128 / 32 tokens per block + slack) regardless of prefix
+length. In round 7 it was wastefully allocated like a full-attention
+layer (~300 blocks for a 9573-token prompt). Halving KV memory has
+no direct TTFT effect on this benchmark but raises the
+free_gpu_memory_fraction headroom for higher concurrency.
+
+## Per-conversation breakdown
+
+See [`diff_round9_agg_vs_disagg.tsv`](diff_round9_agg_vs_disagg.tsv)
+(per-turn columns) and
+[`round9_per_turn_by_conv.txt`](round9_per_turn_by_conv.txt)
+(formatted side-by-side).
+
+| Conversation | Turns | Δ_TTFT p50 | Δ_TTFT mean | Disagg slower turns |
+|---|---|---|---|---|
+| `aa-rwlt-coding-agent-010` | 79 | -50.0 ms | -53.0 ms | 1 (+4 ms, turn 56) |
+| `aa-rwlt-coding-agent-073` | 68 | -51.4 ms | -54.8 ms | 0 |
+| `aa-rwlt-coding-agent-011` | 63 | -51.4 ms | -53.0 ms | 0 |
+| `aa-rwlt-coding-agent-056` | 61 | -37.7 ms | -20.0 ms | 4 (cold-start turns 0-3) |
+| `aa-rwlt-coding-agent-051` | 47 | -45.1 ms | -47.2 ms | 0 |
+
+313 / 318 turns are negative (disagg faster). The 5 positive deltas
+are all on the very first or first-few turns of agent-056, where
+disagg pays one-time first-request connection-setup overhead. The
+agent-056 turn-0 spike (+883 ms) is a cold-start artifact, not a
+warm-state regression — see the per-turn file for full context.
+
+ITL (decode speed) is essentially unchanged R7 → R9 (~1.7 ms agg,
+~2.6 ms disagg in both rounds) — the fix is purely a TTFT-side
+improvement; decode is unaffected.
+
+## Action items
+
+1. **Document the GPT-OSS deployment requirement**: any `trtllm-serve`
+   deployment of `gpt-oss-120b` (or any hybrid-attention model) MUST set
+   `max_attention_window` explicitly to the per-layer-type windows.
+   Without it, ctx-side disagg incurs a +40 ms p50 TTFT regression that
+   grows super-linearly with prefix length.
+
+2. **Update integration test reference**:
+   [`tests/integration/defs/accuracy/test_disaggregated_serving.py:1420`](../../tests/integration/defs/accuracy/test_disaggregated_serving.py)
+   uses `[128, 32768]` sized for GSM8K's shorter context. If the test
+   ever runs with longer prompts, that ceiling needs to match
+   `max_seq_len`.
+
+3. **Engine-level fix (optional, longer term)**: the engine could detect
+   hybrid-attention models from the architecture config and auto-set
+   `max_attention_window` accordingly, so users never have to know this
+   knob exists. Until then, this is a config gotcha.
+
+4. **The F1 cache patch (drafted then reverted in round 7d) is still
+   relevant** for any model that legitimately runs with `pools=1` AND
+   `reuse=ON` — for those workloads the radix walk remains O(prefix)
+   per send. Not urgent for GPT-OSS now that the config fix exists.
+
+## Reproduction commands
+
+```bash
+# Round 9 disagg
+cd /home/bbuddharaju/scratch/TensorRT-LLM_AA_RWLT/repro-gptoss-ttft && \
+CTX_GPU=0 GEN_GPU=1 \
+CONFIG_DIR=configs_0522/round9 \
+CTX_CONFIG_BASE=repro_disagg_ctx_tp1 \
+GEN_CONFIG_BASE=repro_disagg_gen_tp1_pp4_si1 \
+PROXY_CONFIG_BASE=repro_disagg_proxy \
+LOG_DIR=$(pwd)/rwlt-results/disagg_round9_reuse_top5/logs \
+scripts/run_session.sh disagg rwlt_round1_top5_signed disagg_round9_reuse_top5
+
+# Round 9 agg comparator
+cd /home/bbuddharaju/scratch/TensorRT-LLM_AA_RWLT/repro-gptoss-ttft && \
+CONFIG_DIR=configs_0522/round9 \
+AGG_CONFIG_BASE=repro_agg_tp1_eagle3 \
+LOG_DIR=$(pwd)/rwlt-results/agg_round9_reuse_top5/logs \
+scripts/run_session.sh agg rwlt_round1_top5_signed agg_round9_reuse_top5
+
+# Per-turn comparison
+python scripts/diff_rwlt_runs.py \
+  rwlt-results/agg_round9_reuse_top5/rwlt_requests.jsonl \
+  rwlt-results/disagg_round9_reuse_top5/rwlt_requests.jsonl \
+  --label-a agg_r9 --label-b disagg_r9 \
+  --per-turn-out rwlt-results/diff_round9_agg_vs_disagg.tsv
+```

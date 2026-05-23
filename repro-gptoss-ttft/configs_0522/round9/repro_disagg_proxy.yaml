@@ -1,0 +1,17 @@
+# Round 7 proxy config (identical to round6).
+#
+# perf_metrics_max_requests must be set so DisaggPerfMetricsCollector keeps a
+# non-zero deque; without it /perf_metrics returns []. See
+# tensorrt_llm/serve/perf_metrics.py::DisaggPerfMetricsCollector.
+hostname: localhost
+port: 8000
+backend: pytorch
+perf_metrics_max_requests: 20000
+context_servers:
+  num_instances: 1
+  urls:
+    - "localhost:8001"
+generation_servers:
+  num_instances: 1
+  urls:
+    - "localhost:8002"
