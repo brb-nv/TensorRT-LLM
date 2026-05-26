@@ -122,6 +122,18 @@ def _filter_piecewise_capture_num_tokens(
     `unrecordable` is the sorted unique set of input entries above the
     ceiling but within `max_num_tokens`.
     """
+    import os
+    import sys
+    import traceback
+    sentinel = (
+        "[NVBUGS-6153575-SENTINEL] _filter_piecewise_capture_num_tokens "
+        f"reached (pid={os.getpid()})"
+    )
+    print(sentinel, file=sys.stderr, flush=True)
+    traceback.print_stack(file=sys.stderr)
+    sys.stderr.flush()
+    raise RuntimeError(sentinel)
+
     max_capturable_num_tokens = max(
         0, max_batch_size * (max_seq_len - 1 - num_extra_decoding_steps))
     piecewise_capacity_limit = min(max_num_tokens, max_capturable_num_tokens)
