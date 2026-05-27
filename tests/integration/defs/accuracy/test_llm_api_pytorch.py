@@ -4668,6 +4668,30 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
 
+    @skip_pre_blackwell
+    @pytest.mark.parametrize("tokens_per_block", [16, 32, 64],
+                             ids=["p16", "p32", "p64"])
+    def test_bf16_tokens_per_block(self, tokens_per_block):
+        # Regression test for nvbugs/6134372: on SM100, setting
+        # tokens_per_block to a value with no matching trtllm-gen FMHA cubin
+        # (originally only P32 was shipped) caused the attention backend to
+        # fall back to the unfused thop.attention path. That path computes
+        # its workspace from max_blocks_per_sequence * num_attention_heads
+        # and OOMs with multi-TB allocations during executor warmup.
+        # P16/P32/P64 cubins must all be present in the build for this to
+        # pass; P32 is the upstream default, P16 and P64 were added for
+        # this bug.
+        kv_cache_config = KvCacheConfig(tokens_per_block=tokens_per_block,
+                                        free_gpu_memory_fraction=0.3)
+        with LLM(f"{llm_models_root()}/Qwen3/Qwen3-8B",
+                 kv_cache_config=kv_cache_config,
+                 max_batch_size=64,
+                 max_num_tokens=32768) as llm:
+            sampling_params = SamplingParams(max_tokens=8)
+            outputs = llm.generate(["Hello, how are you?"], sampling_params)
+            assert len(outputs) == 1
+            assert len(outputs[0].outputs[0].token_ids) > 0
+
     @parametrize_with_ids(
         "eagle3_one_model,enable_chunked_prefill,enable_max_concurrency,enable_draft_len_schedule",
         [
