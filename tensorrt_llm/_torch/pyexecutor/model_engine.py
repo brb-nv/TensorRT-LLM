@@ -27,6 +27,7 @@ from tensorrt_llm.llmapi.llm_args import (CudaGraphConfig, TorchCompileConfig,
                                           TorchLlmArgs)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_helper import LoraConfig
+from tensorrt_llm.lora_layout_metadata import merge_moe_shared_flags_for_batch
 from tensorrt_llm.lora_manager import LoraModelConfig
 from tensorrt_llm.mapping import CpType, Mapping
 
@@ -3670,12 +3671,15 @@ class PyTorchModelEngine(ModelEngine):
             peft_table = peft_cache_manager.get_and_reset_batch_peft_table(
             ) if peft_cache_manager is not None else None
             return peft_table and self._get_eager_lora_params_from_requests(
-                scheduled_requests, attn_metadata, peft_table)
+                scheduled_requests, attn_metadata, peft_table,
+                peft_cache_manager)
 
     def _get_eager_lora_params_from_requests(
-            self, scheduled_requests: ScheduledRequests,
+            self,
+            scheduled_requests: ScheduledRequests,
             attn_metadata: AttentionMetadata,
-            peft_table: Dict[int, list[TaskLayerModuleConfig]]):
+            peft_table: Dict[int, list[TaskLayerModuleConfig]],
+            peft_cache_manager: Optional[PeftCacheManager] = None):
         '''
         Eager mode LoRA parameter preparation logic.
 
@@ -3690,6 +3694,12 @@ class PyTorchModelEngine(ModelEngine):
                 }
             }
         }
+
+        When `peft_cache_manager` is supplied and one or more active LoRA uids
+        carry `lora_layout.json` layout metadata, `lora_params` also contains a
+        top-level `moe_shared_flags` dict consumed by the fused-MoE op. All
+        active uids in a single batch must agree on the flags, otherwise this
+        raises.
         '''
         lora_params = {}
         tmp_lora_params = {}
@@ -3788,6 +3798,22 @@ class PyTorchModelEngine(ModelEngine):
             lora_params['host_request_types'] = host_request_types
             lora_params['prompt_lens_cpu'] = prompt_lens_cpu
             lora_params['num_seqs'] = num_seqs
+
+            # MoE shared-outer flags: forward per-uid kernel flags from
+            # optional `lora_layout.json` layout metadata into `lora_params`
+            # for the fused-MoE op.
+            if peft_cache_manager is not None:
+                lora_manager = peft_cache_manager.get_lora_manager()
+                active_uids = sorted({
+                    str(req.lora_task_id)
+                    for req in request_list if req.lora_task_id is not None
+                })
+                moe_flags = merge_moe_shared_flags_for_batch(
+                    active_uids,
+                    lora_manager.get_moe_shared_flags,
+                )
+                if moe_flags is not None:
+                    lora_params['moe_shared_flags'] = moe_flags
 
         return lora_params
 
