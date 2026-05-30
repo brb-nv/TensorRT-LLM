@@ -14,6 +14,8 @@ import torch
 import torch._dynamo.config
 
 import tensorrt_llm.bindings.internal.userbuffers as ub
+from tensorrt_llm._torch.peft.lora.moe_utils import (
+    merge_moe_shared_flags_for_batch, shared_sides_to_kernel_flags)
 from tensorrt_llm._utils import (is_trace_enabled, maybe_pin_memory, nvtx_range,
                                  prefer_pinned, release_gc, torch_dtype_to_str,
                                  trace_func)
@@ -29,7 +31,6 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_helper import LoraConfig
 from tensorrt_llm.lora_manager import LoraModelConfig
 from tensorrt_llm.mapping import CpType, Mapping
-from tensorrt_llm.moe_lora_shared import merge_moe_shared_flags_for_batch
 
 from ..attention_backend.interface import (AttentionMetadata,
                                            AttentionRuntimeFeatures)
@@ -3799,8 +3800,9 @@ class PyTorchModelEngine(ModelEngine):
             lora_params['prompt_lens_cpu'] = prompt_lens_cpu
             lora_params['num_seqs'] = num_seqs
 
-            # MoE shared-outer flags: forward the per-uid kernel flags detected
-            # at load time into `lora_params` for the fused-MoE op.
+            # MoE shared-outer flags: translate the per-uid shared sides
+            # detected at load time into fused-MoE kernel flags and forward them
+            # into `lora_params`.
             if peft_cache_manager is not None:
                 lora_manager = peft_cache_manager.get_lora_manager()
                 active_uids = sorted({
@@ -3809,7 +3811,8 @@ class PyTorchModelEngine(ModelEngine):
                 })
                 moe_flags = merge_moe_shared_flags_for_batch(
                     active_uids,
-                    lora_manager.get_moe_shared_flags,
+                    lambda uid: shared_sides_to_kernel_flags(
+                        lora_manager.get_moe_shared_sides(uid)),
                 )
                 if moe_flags is not None:
                     lora_params['moe_shared_flags'] = moe_flags
