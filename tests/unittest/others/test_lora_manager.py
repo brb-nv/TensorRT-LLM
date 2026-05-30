@@ -29,9 +29,9 @@ from unittest.mock import MagicMock
 import torch
 from safetensors.torch import save_file
 
-from tensorrt_llm.lora_layout_metadata import LORA_LAYOUT_FILENAME, LoraLayoutError, all_false_flags
 from tensorrt_llm.lora_manager import LoraManager
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.moe_lora_shared import all_false_flags
 
 
 @dataclass
@@ -193,13 +193,15 @@ def _create_dummy_moe_hf_lora_adapter(
     rank: int = 8,
     num_layers: int = 2,
     num_experts: int = 4,
-    layout_metadata: dict | None = None,
+    make_shared_outer: bool = False,
 ):
     """Create a minimal HF-format MoE LoRA adapter on disk.
 
     The on-disk weights are always materialized per-expert, as the C++ LoRA
-    cache row size requires. The optional `layout_metadata` dict only marks
-    per-side sharing for the runtime kernel flags.
+    cache row size requires. When `make_shared_outer` is True, the "outer" side
+    of each module is identical across experts (A for the up-projections w1/w3,
+    B for the down-projection w2), as a replicated shared-outer adapter looks on
+    disk.
     """
     config = {
         "r": rank,
@@ -214,13 +216,23 @@ def _create_dummy_moe_hf_lora_adapter(
 
     weights = {}
     for layer_idx in range(num_layers):
+        # Per-layer shared "outer" matrices, cloned per expert so the on-disk
+        # slices are bit-identical without sharing storage.
+        if make_shared_outer:
+            shared_a = {
+                "w1": torch.randn(rank, hidden_size, dtype=torch.float16),
+                "w3": torch.randn(rank, hidden_size, dtype=torch.float16),
+            }
+            shared_b_w2 = torch.randn(hidden_size, rank, dtype=torch.float16)
         for expert_idx in range(num_experts):
             base = f"base_model.model.model.layers.{layer_idx}.mlp.experts.{expert_idx}"
             # Up-projections (w1, w3): in_dim=hidden, out_dim=intermediate.
             for module in ("w1", "w3"):
-                weights[f"{base}.{module}.lora_A.weight"] = torch.randn(
-                    rank, hidden_size, dtype=torch.float16
-                )
+                if make_shared_outer:
+                    a = shared_a[module].clone()
+                else:
+                    a = torch.randn(rank, hidden_size, dtype=torch.float16)
+                weights[f"{base}.{module}.lora_A.weight"] = a
                 weights[f"{base}.{module}.lora_B.weight"] = torch.randn(
                     intermediate_size, rank, dtype=torch.float16
                 )
@@ -228,20 +240,18 @@ def _create_dummy_moe_hf_lora_adapter(
             weights[f"{base}.w2.lora_A.weight"] = torch.randn(
                 rank, intermediate_size, dtype=torch.float16
             )
-            weights[f"{base}.w2.lora_B.weight"] = torch.randn(
-                hidden_size, rank, dtype=torch.float16
-            )
+            if make_shared_outer:
+                b_w2 = shared_b_w2.clone()
+            else:
+                b_w2 = torch.randn(hidden_size, rank, dtype=torch.float16)
+            weights[f"{base}.w2.lora_B.weight"] = b_w2
 
     save_file(weights, str(adapter_dir / "adapter_model.safetensors"))
-
-    if layout_metadata is not None:
-        with open(adapter_dir / LORA_LAYOUT_FILENAME, "w") as f:
-            json.dump(layout_metadata, f)
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
 class TestLoraManagerMoeSharedFlags(unittest.TestCase):
-    """Tests for `lora_layout.json` layout metadata in the HF MoE loader."""
+    """Tests for MoE shared-outer detection in the HF LoRA loader."""
 
     def _create_manager(self):
         # cpp_peft_cache_manager mocked so the manager skips the
@@ -254,43 +264,44 @@ class TestLoraManagerMoeSharedFlags(unittest.TestCase):
             cpp_peft_cache_manager=MagicMock(),
         )
 
-    def test_no_layout_metadata_yields_all_false_flags(self):
+    def test_per_expert_weights_yield_all_false_flags(self):
+        # Per-expert random weights: detection finds no shared side, so the
+        # flags stay all-False (the default per-expert kernel path).
         manager = self._create_manager()
         model_config = MockMoeModelConfig()
         with tempfile.TemporaryDirectory() as tmpdir:
-            adapter_dir = Path(tmpdir) / "adapter_no_layout_metadata"
+            adapter_dir = Path(tmpdir) / "adapter_per_expert"
             adapter_dir.mkdir()
             _create_dummy_moe_hf_lora_adapter(adapter_dir)
             manager.load_from_hf(
                 model_dirs=[str(adapter_dir)],
                 model_config=model_config,
-                uids=["uid-no-layout"],
+                uids=["uid-per-expert"],
             )
-        self.assertEqual(manager.get_moe_shared_flags("uid-no-layout"), all_false_flags())
+        self.assertEqual(manager.get_moe_shared_flags("uid-per-expert"), all_false_flags())
 
-    def test_layout_metadata_flags_propagate_to_manager(self):
+    def test_unknown_uid_returns_all_false(self):
+        manager = self._create_manager()
+        self.assertEqual(manager.get_moe_shared_flags("never-loaded"), all_false_flags())
+
+    def test_shared_outer_flags_auto_detected_from_weights(self):
+        # The loader detects the shared-outer side from the replicated expert
+        # slices and sets the kernel flags.
         manager = self._create_manager()
         model_config = MockMoeModelConfig()
-        layout_metadata = {
-            "version": 1,
-            "moe_shared_outer": {
-                "moe_h_to_4h": {"shared_side": "A"},
-                "moe_gate": {"shared_side": "A"},
-                "moe_4h_to_h": {"shared_side": "B"},
-            },
-        }
         with tempfile.TemporaryDirectory() as tmpdir:
-            adapter_dir = Path(tmpdir) / "adapter_shared_outer"
+            adapter_dir = Path(tmpdir) / "adapter_shared_outer_auto"
             adapter_dir.mkdir()
-            _create_dummy_moe_hf_lora_adapter(adapter_dir, layout_metadata=layout_metadata)
+            _create_dummy_moe_hf_lora_adapter(adapter_dir, make_shared_outer=True)
             manager.load_from_hf(
                 model_dirs=[str(adapter_dir)],
                 model_config=model_config,
-                uids=["uid-shared"],
+                uids=["uid-auto"],
             )
-        flags = manager.get_moe_shared_flags("uid-shared")
+        # w1 (moe_h_to_4h) -> gated, w3 (moe_gate) -> fc1 share A; w2
+        # (moe_4h_to_h) -> fc2 shares B.
         self.assertEqual(
-            flags,
+            manager.get_moe_shared_flags("uid-auto"),
             {
                 "fc1_shared_a": True,
                 "fc1_shared_b": False,
@@ -300,61 +311,6 @@ class TestLoraManagerMoeSharedFlags(unittest.TestCase):
                 "gated_shared_b": False,
             },
         )
-
-    def test_layout_metadata_does_not_change_cached_weights(self):
-        # Loading with vs without layout metadata produces bit-identical
-        # `_cpp_lora_weights` rows. Layout metadata is non-weight data; shared
-        # sides are still load-time replicated to match the C++ cache.
-        manager_a = self._create_manager()
-        manager_b = self._create_manager()
-        model_config = MockMoeModelConfig()
-        layout_metadata = {
-            "version": 1,
-            "moe_shared_outer": {
-                "moe_h_to_4h": {"shared_side": "A"},
-            },
-        }
-        with tempfile.TemporaryDirectory() as tmpdir:
-            adapter_dir_a = Path(tmpdir) / "adapter_a"
-            adapter_dir_b = Path(tmpdir) / "adapter_b"
-            adapter_dir_a.mkdir()
-            adapter_dir_b.mkdir()
-            torch.manual_seed(0)
-            _create_dummy_moe_hf_lora_adapter(adapter_dir_a)
-            torch.manual_seed(0)
-            _create_dummy_moe_hf_lora_adapter(adapter_dir_b, layout_metadata=layout_metadata)
-            manager_a.load_from_hf(
-                model_dirs=[str(adapter_dir_a)], model_config=model_config, uids=["uid-a"]
-            )
-            manager_b.load_from_hf(
-                model_dirs=[str(adapter_dir_b)], model_config=model_config, uids=["uid-b"]
-            )
-        self.assertTrue(
-            torch.equal(manager_a.cpp_lora_weights["uid-a"], manager_b.cpp_lora_weights["uid-b"])
-        )
-
-    def test_unknown_uid_returns_all_false(self):
-        manager = self._create_manager()
-        self.assertEqual(manager.get_moe_shared_flags("never-loaded"), all_false_flags())
-
-    def test_malformed_layout_metadata_raises(self):
-        manager = self._create_manager()
-        model_config = MockMoeModelConfig()
-        with tempfile.TemporaryDirectory() as tmpdir:
-            adapter_dir = Path(tmpdir) / "adapter_bad_layout"
-            adapter_dir.mkdir()
-            _create_dummy_moe_hf_lora_adapter(adapter_dir)
-            with open(adapter_dir / LORA_LAYOUT_FILENAME, "w") as f:
-                json.dump(
-                    {"moe_shared_outer": {"not_a_module": {"shared_side": "A"}}},
-                    f,
-                )
-            with self.assertRaises(LoraLayoutError):
-                manager.load_from_hf(
-                    model_dirs=[str(adapter_dir)],
-                    model_config=model_config,
-                    uids=["uid-bad"],
-                )
 
 
 if __name__ == "__main__":

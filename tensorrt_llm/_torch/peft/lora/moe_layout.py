@@ -16,17 +16,6 @@ SharedSide = Literal["A", "B", None]
 MOE_LORA_MODULES: tuple[str, ...] = ("moe_h_to_4h", "moe_4h_to_h", "moe_gate")
 MOE_LORA_MODULE_NAMES: frozenset[str] = frozenset(MOE_LORA_MODULES)
 
-# Canonical mapping of modules to their "outer" side (shared across experts).
-# moe_h_to_4h and moe_gate are up-projections (hidden to intermediate); their
-# outer (residual-stream-side) matrix is A, shape [rank, hidden]. moe_4h_to_h
-# is the down-projection (intermediate to hidden); its outer matrix is B, shape
-# [hidden, rank].
-DEFAULT_SHARED_SIDE: dict[str, SharedSide] = {
-    "moe_h_to_4h": "A",
-    "moe_gate": "A",
-    "moe_4h_to_h": "B",
-}
-
 
 def make_per_expert_lora(
     num_experts: int,

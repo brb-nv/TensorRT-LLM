@@ -10,7 +10,6 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.peft.lora.moe_layout import (
-    DEFAULT_SHARED_SIDE,
     MOE_LORA_MODULES,
     make_per_expert_lora,
     reference_moe_lora_delta,
@@ -20,13 +19,6 @@ from tensorrt_llm._torch.peft.lora.validation import MOE_LORA_MODULE_NAMES
 
 def test_moe_lora_module_names_aligned_with_validator():
     assert MOE_LORA_MODULE_NAMES == frozenset(MOE_LORA_MODULES)
-
-
-def test_default_shared_side_assignment():
-    # Up-projections share A (residual-stream side); down-projection shares B.
-    assert DEFAULT_SHARED_SIDE["moe_h_to_4h"] == "A"
-    assert DEFAULT_SHARED_SIDE["moe_gate"] == "A"
-    assert DEFAULT_SHARED_SIDE["moe_4h_to_h"] == "B"
 
 
 def test_make_per_expert_lora_shapes_per_expert():

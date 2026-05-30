@@ -27,9 +27,9 @@ from tensorrt_llm.llmapi.llm_args import (CudaGraphConfig, TorchCompileConfig,
                                           TorchLlmArgs)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_helper import LoraConfig
-from tensorrt_llm.lora_layout_metadata import merge_moe_shared_flags_for_batch
 from tensorrt_llm.lora_manager import LoraModelConfig
 from tensorrt_llm.mapping import CpType, Mapping
+from tensorrt_llm.moe_lora_shared import merge_moe_shared_flags_for_batch
 
 from ..attention_backend.interface import (AttentionMetadata,
                                            AttentionRuntimeFeatures)
@@ -3696,7 +3696,7 @@ class PyTorchModelEngine(ModelEngine):
         }
 
         When `peft_cache_manager` is supplied and one or more active LoRA uids
-        carry `lora_layout.json` layout metadata, `lora_params` also contains a
+        have a detected MoE shared-outer side, `lora_params` also contains a
         top-level `moe_shared_flags` dict consumed by the fused-MoE op. All
         active uids in a single batch must agree on the flags, otherwise this
         raises.
@@ -3799,9 +3799,8 @@ class PyTorchModelEngine(ModelEngine):
             lora_params['prompt_lens_cpu'] = prompt_lens_cpu
             lora_params['num_seqs'] = num_seqs
 
-            # MoE shared-outer flags: forward per-uid kernel flags from
-            # optional `lora_layout.json` layout metadata into `lora_params`
-            # for the fused-MoE op.
+            # MoE shared-outer flags: forward the per-uid kernel flags detected
+            # at load time into `lora_params` for the fused-MoE op.
             if peft_cache_manager is not None:
                 lora_manager = peft_cache_manager.get_lora_manager()
                 active_uids = sorted({
