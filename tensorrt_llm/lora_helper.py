@@ -29,28 +29,28 @@ logger = logging.getLogger(__name__)
 # counterintuitive: moe_h_to_4h is gate_proj (w1, silu side) and uses the
 # `gated` slot; moe_gate is up_proj (w3, linear side) and uses `fc1`. Must match
 # `slot_to_kernel` in `fused_moe_cutlass._extract_moe_lora_tensors`.
-MODULE_SHARED_FLAG: Dict[str, str] = {
+MOE_MODULE_SHARED_FLAG: Dict[str, str] = {
     "moe_h_to_4h": "gated_shared_a",
     "moe_gate": "fc1_shared_a",
     "moe_4h_to_h": "fc2_shared_b",
 }
 
 
-def all_false_flags() -> Dict[str, bool]:
+def all_false_moe_shared_flags() -> Dict[str, bool]:
     """Return a fresh kernel flag dict, one key per module, all set to False.
 
     The default for adapters with no shared side. Only each module's residual
     side is representable, so the mirror flags (fc1_shared_b, fc2_shared_a,
     gated_shared_b) are always false and omitted.
     """
-    return {flag: False for flag in MODULE_SHARED_FLAG.values()}
+    return {flag: False for flag in MOE_MODULE_SHARED_FLAG.values()}
 
 
-def shared_sides_to_kernel_flags(
+def moe_shared_sides_to_kernel_flags(
         shared_sides: Dict[str, tuple]) -> Dict[str, bool]:
     """Translate per-module shared sides into the kernel flag dict.
 
-    Only each module's residual-stream side (see `MODULE_SHARED_FLAG`) can be
+    Only each module's residual-stream side (see `MOE_MODULE_SHARED_FLAG`) can be
     shared; a detected non-canonical sharing (or an unknown module) is ignored.
 
     Args:
@@ -58,12 +58,12 @@ def shared_sides_to_kernel_flags(
             shared_b) pair, as detected by the LoRA loader.
 
     Returns:
-        The kernel flag dict (see `all_false_flags`), each flag True iff that
+        The kernel flag dict (see `all_false_moe_shared_flags`), each flag True iff that
         module's residual side is shared across experts.
     """
-    flags = all_false_flags()
+    flags = all_false_moe_shared_flags()
     for module_name, (shared_a, shared_b) in shared_sides.items():
-        flag_name = MODULE_SHARED_FLAG.get(module_name)
+        flag_name = MOE_MODULE_SHARED_FLAG.get(module_name)
         if flag_name is None:
             continue
         # Only the module's canonical residual side has a kernel flag, so we
@@ -87,17 +87,20 @@ def merge_moe_shared_flags_for_batch(
 ) -> Optional[Dict[str, bool]]:
     """Merge per-adapter MoE shared-outer flags for one fused-MoE call.
 
+    The op applies one global flag set per call, so a side is marked shared only
+    when every active adapter shares it (the intersection of the per-uid flags).
+    Where adapters disagree, that side falls back to the per-expert read, which
+    stays correct for all of them because shared sides are replicated per expert
+    in the LoRA cache. This lets a batch freely mix shared-outer and per-expert
+    adapters.
+
     Args:
         active_uids: LoRA task ids present in the current batch.
         get_flags: Callable returning the kernel flag dict for a uid.
 
     Returns:
         The flag dict to set as `lora_params['moe_shared_flags']`, or None
-        when there are no active uids or every flag is False.
-
-    Raises:
-        ValueError: when more than one uid is active and their flag dicts
-            differ. The fused-MoE op applies one global flag set per call.
+        when there are no active uids or no side is shared by all of them.
     """
     uids = list(active_uids)
     if not uids:
@@ -106,12 +109,10 @@ def merge_moe_shared_flags_for_batch(
     for uid in uids:
         flags = get_flags(uid)
         if merged is None:
-            merged = flags
-        elif merged != flags:
-            raise ValueError(
-                "MoE LoRA shared-outer flags must match across all adapters "
-                f"in a batch; got mismatched flags for active uids {uids}. "
-                "The fused-MoE op applies one global flag set per call.")
+            merged = dict(flags)
+        else:
+            for key in merged:
+                merged[key] = merged[key] and flags.get(key, False)
     assert merged is not None
     return merged if any(merged.values()) else None
 

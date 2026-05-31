@@ -7,7 +7,7 @@ from typing import Literal
 
 import torch
 
-from tensorrt_llm.lora_helper import MODULE_SHARED_FLAG, LoraConfig
+from tensorrt_llm.lora_helper import MOE_MODULE_SHARED_FLAG, LoraConfig
 
 SharedSide = Literal["A", "B", None]
 
@@ -26,7 +26,7 @@ def has_moe_lora_targets(lora_config: LoraConfig | None) -> bool:
     if lora_config is None:
         return False
     targets = _normalize_targets(lora_config.lora_target_modules)
-    return bool(MODULE_SHARED_FLAG.keys() & targets)
+    return bool(MOE_MODULE_SHARED_FLAG.keys() & targets)
 
 
 def check_moe_lora_supported(
@@ -66,7 +66,7 @@ def check_moe_lora_supported(
         raise ValueError(
             f"{prefix}Routed-expert MoE LoRA requires moe_backend='CUTLASS'; got "
             f"moe_backend={moe_backend_name!r}. Disable LoRA on MoE modules "
-            f"(remove {sorted(MODULE_SHARED_FLAG)} from "
+            f"(remove {sorted(MOE_MODULE_SHARED_FLAG)} from "
             "lora_config.lora_target_modules) or switch to the Cutlass MoE backend."
         )
 

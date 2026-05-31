@@ -3695,11 +3695,11 @@ class PyTorchModelEngine(ModelEngine):
             }
         }
 
-        When `peft_cache_manager` is supplied and one or more active LoRA uids
-        have a detected MoE shared-outer side, `lora_params` also contains a
-        top-level `moe_shared_flags` dict consumed by the fused-MoE op. All
-        active uids in a single batch must agree on the flags, otherwise this
-        raises.
+        When `peft_cache_manager` is supplied and the active LoRA uids share a
+        MoE side in common, `lora_params` also contains a top-level
+        `moe_shared_flags` dict consumed by the fused-MoE op. A side is marked
+        shared only when every active uid shares it; mixed batches fall back to
+        the per-expert read where adapters disagree.
         '''
         lora_params = {}
         tmp_lora_params = {}

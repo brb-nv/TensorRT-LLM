@@ -21,10 +21,10 @@ from ._utils import pad_vocab_size, release_gc, str_dtype_to_torch, torch_to_num
 from .layers.linear import ColumnLinear
 from .lora_helper import (
     LoraConfig,
-    all_false_flags,
+    all_false_moe_shared_flags,
     get_default_trtllm_modules_to_hf_modules,
     get_missing_qkv_modules_from_lora_modules,
-    shared_sides_to_kernel_flags,
+    moe_shared_sides_to_kernel_flags,
 )
 from .mapping import Mapping
 from .models.convert_utils import get_model_path, load_state_dict, split_matrix_tp
@@ -1237,18 +1237,22 @@ class LoraManager(object):
                         )
                     )
 
-            moe_shared_flags = shared_sides_to_kernel_flags(moe_shared_sides)
+            moe_shared_flags = moe_shared_sides_to_kernel_flags(moe_shared_sides)
             self._uid_to_moe_shared_flags[uid] = moe_shared_flags
             active = sorted(k for k, v in moe_shared_flags.items() if v)
             if active:
                 logger.info(
                     "MoE LoRA adapter '%s': detected shared-outer sides %s; "
                     "the fused-MoE kernel will read one slice per shared side.",
-                    uid, active)
+                    uid,
+                    active,
+                )
             elif moe_shared_sides:
                 logger.debug(
                     "MoE LoRA adapter '%s': no shared-outer side detected; "
-                    "using the per-expert path.", uid)
+                    "using the per-expert path.",
+                    uid,
+                )
 
             max_weight_size = max(w.size(0) for w in self._cpp_lora_weights[uid])
             self._cpp_lora_weights[uid] = torch.stack(
@@ -1292,7 +1296,7 @@ class LoraManager(object):
         when the uid is unknown to this manager, preserving the default
         per-expert kernel offset behavior. See `lora_helper` for the flags.
         """
-        return dict(self._uid_to_moe_shared_flags.get(uid) or all_false_flags())
+        return dict(self._uid_to_moe_shared_flags.get(uid) or all_false_moe_shared_flags())
 
     def _generate_uid(self):
         while str(self._lora_uid_counter) in self._lora_uid_to_low_ranks:

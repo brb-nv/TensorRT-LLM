@@ -16,15 +16,15 @@ from tensorrt_llm._torch.peft.lora.moe_utils import (
     reference_moe_lora_delta,
 )
 from tensorrt_llm.lora_helper import (
-    MODULE_SHARED_FLAG,
-    all_false_flags,
+    MOE_MODULE_SHARED_FLAG,
+    all_false_moe_shared_flags,
     merge_moe_shared_flags_for_batch,
-    shared_sides_to_kernel_flags,
+    moe_shared_sides_to_kernel_flags,
 )
 
 
 def test_moe_lora_module_names():
-    assert set(MODULE_SHARED_FLAG) == {"moe_h_to_4h", "moe_gate", "moe_4h_to_h"}
+    assert set(MOE_MODULE_SHARED_FLAG) == {"moe_h_to_4h", "moe_gate", "moe_4h_to_h"}
 
 
 # ---------- validation ----------
@@ -63,7 +63,7 @@ def test_has_moe_lora_targets_attn_only():
     assert has_moe_lora_targets(cfg) is False
 
 
-@pytest.mark.parametrize("name", sorted(MODULE_SHARED_FLAG))
+@pytest.mark.parametrize("name", sorted(MOE_MODULE_SHARED_FLAG))
 def test_has_moe_lora_targets_each_module(name):
     cfg = _FakeLoraConfig(["attn_q", name])
     assert has_moe_lora_targets(cfg) is True
@@ -152,74 +152,98 @@ def test_check_moe_lora_layer_idx_in_message():
         )
 
 
-# ---------- shared_sides_to_kernel_flags ----------
+# ---------- moe_shared_sides_to_kernel_flags ----------
 
 
-def test_all_false_flags_has_three_canonical_keys():
-    flags = all_false_flags()
+def test_all_false_moe_shared_flags_has_three_canonical_keys():
+    flags = all_false_moe_shared_flags()
     assert set(flags) == {"fc1_shared_a", "gated_shared_a", "fc2_shared_b"}
     assert not any(flags.values())
 
 
-def test_shared_sides_to_kernel_flags_empty():
-    assert shared_sides_to_kernel_flags({}) == all_false_flags()
+def test_moe_shared_sides_to_kernel_flags_empty():
+    assert moe_shared_sides_to_kernel_flags({}) == all_false_moe_shared_flags()
 
 
-def test_shared_sides_to_kernel_flags_canonical():
+def test_moe_shared_sides_to_kernel_flags_canonical():
     shared_sides = {
         "moe_h_to_4h": (True, False),
         "moe_gate": (True, False),
         "moe_4h_to_h": (False, True),
     }
-    assert shared_sides_to_kernel_flags(shared_sides) == {
+    assert moe_shared_sides_to_kernel_flags(shared_sides) == {
         "fc1_shared_a": True,
         "gated_shared_a": True,
         "fc2_shared_b": True,
     }
 
 
-def test_shared_sides_to_kernel_flags_ignores_unknown_module():
-    assert shared_sides_to_kernel_flags({"attn_q": (True, True)}) == all_false_flags()
+def test_moe_shared_sides_to_kernel_flags_ignores_unknown_module():
+    assert (
+        moe_shared_sides_to_kernel_flags({"attn_q": (True, True)}) == all_false_moe_shared_flags()
+    )
 
 
-def test_shared_sides_to_kernel_flags_ignores_non_canonical_side():
+def test_moe_shared_sides_to_kernel_flags_ignores_non_canonical_side():
     # moe_gate shares its residual side via A; a detected B-share is ignored.
-    assert shared_sides_to_kernel_flags({"moe_gate": (False, True)}) == all_false_flags()
+    assert (
+        moe_shared_sides_to_kernel_flags({"moe_gate": (False, True)})
+        == all_false_moe_shared_flags()
+    )
 
 
 # ---------- merge_moe_shared_flags_for_batch ----------
 
 
 def test_merge_returns_none_for_no_uids():
-    assert merge_moe_shared_flags_for_batch([], lambda uid: all_false_flags()) is None
+    assert merge_moe_shared_flags_for_batch([], lambda uid: all_false_moe_shared_flags()) is None
 
 
 def test_merge_returns_none_when_all_flags_false():
-    flags = all_false_flags()
+    flags = all_false_moe_shared_flags()
     assert merge_moe_shared_flags_for_batch(["a"], lambda uid: flags) is None
 
 
 def test_merge_single_uid_with_shared_flags():
-    expected = all_false_flags()
+    expected = all_false_moe_shared_flags()
     expected["gated_shared_a"] = True
     assert merge_moe_shared_flags_for_batch(["uid-1"], lambda uid: expected) == expected
 
 
 def test_merge_multiple_uids_matching_flags():
-    expected = all_false_flags()
+    expected = all_false_moe_shared_flags()
     expected["fc2_shared_b"] = True
     assert merge_moe_shared_flags_for_batch(["a", "b"], lambda uid: expected) == expected
 
 
-def test_merge_multiple_uids_raises_on_mismatch():
-    flags_a = all_false_flags()
+def test_merge_intersects_when_one_uid_shares_and_another_does_not():
+    # uid 'a' shares fc2_shared_b, uid 'b' shares nothing: the batch falls back
+    # to the per-expert read everywhere (intersection is all-False -> None).
+    flags_a = all_false_moe_shared_flags()
     flags_a["fc2_shared_b"] = True
-    flags_b = all_false_flags()
-    with pytest.raises(ValueError, match="must match across all adapters"):
-        merge_moe_shared_flags_for_batch(
-            ["a", "b"],
-            lambda uid: flags_a if uid == "a" else flags_b,
-        )
+    flags_b = all_false_moe_shared_flags()
+    result = merge_moe_shared_flags_for_batch(
+        ["a", "b"],
+        lambda uid: flags_a if uid == "a" else flags_b,
+    )
+    assert result is None
+
+
+def test_merge_drops_sides_not_shared_by_all():
+    # 'a' shares fc1_shared_a + fc2_shared_b; 'b' shares only fc1_shared_a.
+    # Only the common side (fc1_shared_a) survives the intersection.
+    flags_a = all_false_moe_shared_flags()
+    flags_a["fc1_shared_a"] = True
+    flags_a["fc2_shared_b"] = True
+    flags_b = all_false_moe_shared_flags()
+    flags_b["fc1_shared_a"] = True
+    expected = all_false_moe_shared_flags()
+    expected["fc1_shared_a"] = True
+    result = merge_moe_shared_flags_for_batch(
+        ["a", "b"],
+        lambda uid: flags_a if uid == "a" else flags_b,
+    )
+    assert result == expected
 
 
 # ---------- synthetic adapter tooling ----------
