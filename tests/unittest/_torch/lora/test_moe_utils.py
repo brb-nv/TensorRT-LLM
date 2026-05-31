@@ -10,13 +10,15 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.peft.lora.moe_utils import (
-    MODULE_SHARED_FLAG,
-    all_false_flags,
     check_moe_lora_supported,
     has_moe_lora_targets,
     make_per_expert_lora,
-    merge_moe_shared_flags_for_batch,
     reference_moe_lora_delta,
+)
+from tensorrt_llm.lora_helper import (
+    MODULE_SHARED_FLAG,
+    all_false_flags,
+    merge_moe_shared_flags_for_batch,
     shared_sides_to_kernel_flags,
 )
 

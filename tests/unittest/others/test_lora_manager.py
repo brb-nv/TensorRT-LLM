@@ -29,6 +29,7 @@ from unittest.mock import MagicMock
 import torch
 from safetensors.torch import save_file
 
+from tensorrt_llm.lora_helper import all_false_flags
 from tensorrt_llm.lora_manager import LoraManager
 from tensorrt_llm.mapping import Mapping
 
@@ -263,9 +264,9 @@ class TestLoraManagerMoeSharedFlags(unittest.TestCase):
             cpp_peft_cache_manager=MagicMock(),
         )
 
-    def test_per_expert_weights_yield_no_shared_sides(self):
-        # Per-expert random weights: detection finds no shared side (empty map,
-        # the default per-expert kernel path).
+    def test_per_expert_weights_yield_all_false_flags(self):
+        # Per-expert random weights: detection finds no shared side, so the
+        # flags stay all-False (the default per-expert kernel path).
         manager = self._create_manager()
         model_config = MockMoeModelConfig()
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -277,15 +278,17 @@ class TestLoraManagerMoeSharedFlags(unittest.TestCase):
                 model_config=model_config,
                 uids=["uid-per-expert"],
             )
-        self.assertEqual(manager.get_moe_shared_sides("uid-per-expert"), {})
+        self.assertEqual(manager.get_moe_shared_flags("uid-per-expert"),
+                         all_false_flags())
 
-    def test_unknown_uid_returns_empty(self):
+    def test_unknown_uid_returns_all_false(self):
         manager = self._create_manager()
-        self.assertEqual(manager.get_moe_shared_sides("never-loaded"), {})
+        self.assertEqual(manager.get_moe_shared_flags("never-loaded"),
+                         all_false_flags())
 
-    def test_shared_outer_sides_auto_detected_from_weights(self):
+    def test_shared_outer_flags_auto_detected_from_weights(self):
         # The loader detects the shared-outer side from the replicated expert
-        # slices and records it per module.
+        # slices and builds the kernel flags.
         manager = self._create_manager()
         model_config = MockMoeModelConfig()
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -297,14 +300,14 @@ class TestLoraManagerMoeSharedFlags(unittest.TestCase):
                 model_config=model_config,
                 uids=["uid-auto"],
             )
-        # Up-projections (w1=moe_h_to_4h, w3=moe_gate) share A; down-projection
-        # (w2=moe_4h_to_h) shares B.
+        # Up-projections (w1=moe_h_to_4h, w3=moe_gate) share A -> gated/fc1
+        # _shared_a; down-projection (w2=moe_4h_to_h) shares B -> fc2_shared_b.
         self.assertEqual(
-            manager.get_moe_shared_sides("uid-auto"),
+            manager.get_moe_shared_flags("uid-auto"),
             {
-                "moe_h_to_4h": (True, False),
-                "moe_gate": (True, False),
-                "moe_4h_to_h": (False, True),
+                "gated_shared_a": True,
+                "fc1_shared_a": True,
+                "fc2_shared_b": True,
             },
         )
 

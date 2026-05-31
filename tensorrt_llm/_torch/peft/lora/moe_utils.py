@@ -1,36 +1,15 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Routed-expert (MoE) LoRA utilities for the PyTorch backend.
+"""Routed-expert (MoE) LoRA validation and synthetic-adapter tooling."""
 
-A module is "shared-outer" when one side (`A` or `B`) is shared across all
-experts (the "outer", residual-stream side) and the other stays per-expert. The
-fused-MoE op honors this via `LoraParams::*_shared_a/b`, zero-offsetting the
-per-expert pointer arithmetic in the kernel's `setupLoraWorkspace`. The shared
-side is detected at load time (in `LoraManager`) as expert slices that are all
-identical, which is how a shared-outer adapter looks once its shared matrix is
-replicated across experts.
-"""
-
-from collections.abc import Callable, Iterable
+from collections.abc import Iterable
 from typing import Literal
 
 import torch
 
-from tensorrt_llm.lora_helper import LoraConfig
+from tensorrt_llm.lora_helper import MODULE_SHARED_FLAG, LoraConfig
 
 SharedSide = Literal["A", "B", None]
-
-# Routed-expert MoE LoRA modules supported by the MVP, each mapped to the one
-# kernel flag that marks its residual-stream side shared across experts (A for
-# the up-projections, B for the down-projection). The slot names are
-# counterintuitive: moe_h_to_4h is gate_proj (w1, silu side) and uses the
-# `gated` slot; moe_gate is up_proj (w3, linear side) and uses `fc1`. Must match
-# `slot_to_kernel` in `fused_moe_cutlass._extract_moe_lora_tensors`.
-MODULE_SHARED_FLAG: dict[str, str] = {
-    "moe_h_to_4h": "gated_shared_a",
-    "moe_gate": "fc1_shared_a",
-    "moe_4h_to_h": "fc2_shared_b",
-}
 
 
 # ---------------------------------------------------------------------------
@@ -112,84 +91,6 @@ def check_moe_lora_supported(
                 "FP8/FP4/INT4/INT8 base weights combined with MoE LoRA are not "
                 "supported yet."
             )
-
-
-# ---------------------------------------------------------------------------
-# Kernel flags
-# ---------------------------------------------------------------------------
-
-
-def all_false_flags() -> dict[str, bool]:
-    """Return a fresh kernel flag dict, one key per module, all set to False.
-
-    The default for adapters with no shared side. Only each module's residual
-    side is representable, so the mirror flags (fc1_shared_b, fc2_shared_a,
-    gated_shared_b) are always false and omitted.
-    """
-    return {flag: False for flag in MODULE_SHARED_FLAG.values()}
-
-
-def shared_sides_to_kernel_flags(
-    shared_sides: dict[str, tuple[bool, bool]],
-) -> dict[str, bool]:
-    """Translate per-module shared sides into the kernel flag dict.
-
-    Only each module's residual-stream side (see `MODULE_SHARED_FLAG`) can be
-    shared; a detected non-canonical sharing (or an unknown module) is ignored.
-
-    Args:
-        shared_sides: Mapping from MoE LoRA module name to its (shared_a,
-            shared_b) pair, as reported by `LoraManager.get_moe_shared_sides`.
-
-    Returns:
-        The kernel flag dict (see `all_false_flags`), each flag True iff that
-        module's residual side is shared across experts.
-    """
-    flags = all_false_flags()
-    for module_name, (shared_a, shared_b) in shared_sides.items():
-        flag_name = MODULE_SHARED_FLAG.get(module_name)
-        if flag_name is None:
-            continue
-        shared = shared_a if flag_name.endswith("_a") else shared_b
-        if shared:
-            flags[flag_name] = True
-    return flags
-
-
-def merge_moe_shared_flags_for_batch(
-    active_uids: Iterable[str],
-    get_flags: Callable[[str], dict[str, bool]],
-) -> dict[str, bool] | None:
-    """Merge per-adapter MoE shared-outer flags for one fused-MoE call.
-
-    Args:
-        active_uids: LoRA task ids present in the current batch.
-        get_flags: Callable returning the kernel flag dict for a uid.
-
-    Returns:
-        The flag dict to set as `lora_params['moe_shared_flags']`, or None
-        when there are no active uids or every flag is False.
-
-    Raises:
-        ValueError: when more than one uid is active and their flag dicts
-            differ. The fused-MoE op applies one global flag set per call.
-    """
-    uids = list(active_uids)
-    if not uids:
-        return None
-    merged: dict[str, bool] | None = None
-    for uid in uids:
-        flags = get_flags(uid)
-        if merged is None:
-            merged = flags
-        elif merged != flags:
-            raise ValueError(
-                "MoE LoRA shared-outer flags must match across all adapters "
-                f"in a batch; got mismatched flags for active uids {uids}. "
-                "The fused-MoE op applies one global flag set per call."
-            )
-    assert merged is not None
-    return merged if any(merged.values()) else None
 
 
 # ---------------------------------------------------------------------------

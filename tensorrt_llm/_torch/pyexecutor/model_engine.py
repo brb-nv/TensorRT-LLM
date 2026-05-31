@@ -14,8 +14,6 @@ import torch
 import torch._dynamo.config
 
 import tensorrt_llm.bindings.internal.userbuffers as ub
-from tensorrt_llm._torch.peft.lora.moe_utils import (
-    merge_moe_shared_flags_for_batch, shared_sides_to_kernel_flags)
 from tensorrt_llm._utils import (is_trace_enabled, maybe_pin_memory, nvtx_range,
                                  prefer_pinned, release_gc, torch_dtype_to_str,
                                  trace_func)
@@ -28,7 +26,8 @@ from tensorrt_llm.inputs.registry import (create_input_processor,
 from tensorrt_llm.llmapi.llm_args import (CudaGraphConfig, TorchCompileConfig,
                                           TorchLlmArgs)
 from tensorrt_llm.logger import logger
-from tensorrt_llm.lora_helper import LoraConfig
+from tensorrt_llm.lora_helper import (LoraConfig,
+                                      merge_moe_shared_flags_for_batch)
 from tensorrt_llm.lora_manager import LoraModelConfig
 from tensorrt_llm.mapping import CpType, Mapping
 
@@ -3811,8 +3810,7 @@ class PyTorchModelEngine(ModelEngine):
                 })
                 moe_flags = merge_moe_shared_flags_for_batch(
                     active_uids,
-                    lambda uid: shared_sides_to_kernel_flags(
-                        lora_manager.get_moe_shared_sides(uid)),
+                    lora_manager.get_moe_shared_flags,
                 )
                 if moe_flags is not None:
                     lora_params['moe_shared_flags'] = moe_flags
