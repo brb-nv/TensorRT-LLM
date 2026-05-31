@@ -20,33 +20,17 @@ from tensorrt_llm.lora_helper import LoraConfig
 
 SharedSide = Literal["A", "B", None]
 
-# Routed-expert MoE LoRA modules supported by the MVP (single source of truth).
-MOE_LORA_MODULES: tuple[str, ...] = ("moe_h_to_4h", "moe_4h_to_h", "moe_gate")
-MOE_LORA_MODULE_NAMES: frozenset[str] = frozenset(MOE_LORA_MODULES)
-
-# Mapping from the TRT-LLM LoRA module name to the kernel-side slot the
-# fused-MoE op loads it into. Must match `slot_to_kernel` in
-# `fused_moe_cutlass._extract_moe_lora_tensors`. The names are counterintuitive:
-# `moe_h_to_4h` is gate_proj (w1, the SwiGLU silu side) and maps to the `gated`
-# slot, while `moe_gate` is up_proj (w3, the linear side) and maps to `fc1`.
-#   moe_h_to_4h (gate_proj, w1) -> gated
-#   moe_gate    (up_proj,   w3) -> fc1
-#   moe_4h_to_h (down_proj,  w2) -> fc2
-MODULE_TO_KERNEL_PREFIX: dict[str, str] = {
-    "moe_h_to_4h": "gated",
-    "moe_gate": "fc1",
-    "moe_4h_to_h": "fc2",
+# Routed-expert MoE LoRA modules supported by the MVP, each mapped to the one
+# kernel flag that marks its residual-stream side shared across experts (A for
+# the up-projections, B for the down-projection). The slot names are
+# counterintuitive: moe_h_to_4h is gate_proj (w1, silu side) and uses the
+# `gated` slot; moe_gate is up_proj (w3, linear side) and uses `fc1`. Must match
+# `slot_to_kernel` in `fused_moe_cutlass._extract_moe_lora_tensors`.
+MODULE_SHARED_FLAG: dict[str, str] = {
+    "moe_h_to_4h": "gated_shared_a",
+    "moe_gate": "fc1_shared_a",
+    "moe_4h_to_h": "fc2_shared_b",
 }
-
-# Per-side boolean flags accepted by `torch.ops.trtllm.fused_moe`.
-KERNEL_FLAG_KEYS = (
-    "fc1_shared_a",
-    "fc1_shared_b",
-    "fc2_shared_a",
-    "fc2_shared_b",
-    "gated_shared_a",
-    "gated_shared_b",
-)
 
 
 # ---------------------------------------------------------------------------
@@ -63,7 +47,7 @@ def has_moe_lora_targets(lora_config: LoraConfig | None) -> bool:
     if lora_config is None:
         return False
     targets = _normalize_targets(lora_config.lora_target_modules)
-    return bool(MOE_LORA_MODULE_NAMES & targets)
+    return bool(MODULE_SHARED_FLAG.keys() & targets)
 
 
 def check_moe_lora_supported(
@@ -103,7 +87,7 @@ def check_moe_lora_supported(
         raise ValueError(
             f"{prefix}Routed-expert MoE LoRA requires moe_backend='CUTLASS'; got "
             f"moe_backend={moe_backend_name!r}. Disable LoRA on MoE modules "
-            f"(remove {sorted(MOE_LORA_MODULE_NAMES)} from "
+            f"(remove {sorted(MODULE_SHARED_FLAG)} from "
             "lora_config.lora_target_modules) or switch to the Cutlass MoE backend."
         )
 
@@ -136,36 +120,39 @@ def check_moe_lora_supported(
 
 
 def all_false_flags() -> dict[str, bool]:
-    """Return a fresh dict of the six kernel flag keys, all set to False.
+    """Return a fresh kernel flag dict, one key per module, all set to False.
 
-    Used as the default for adapters with no shared side.
+    The default for adapters with no shared side. Only each module's residual
+    side is representable, so the mirror flags (fc1_shared_b, fc2_shared_a,
+    gated_shared_b) are always false and omitted.
     """
-    return {key: False for key in KERNEL_FLAG_KEYS}
+    return {flag: False for flag in MODULE_SHARED_FLAG.values()}
 
 
 def shared_sides_to_kernel_flags(
     shared_sides: dict[str, tuple[bool, bool]],
 ) -> dict[str, bool]:
-    """Translate per-module shared sides into the six-bool kernel flag dict.
+    """Translate per-module shared sides into the kernel flag dict.
+
+    Only each module's residual-stream side (see `MODULE_SHARED_FLAG`) can be
+    shared; a detected non-canonical sharing (or an unknown module) is ignored.
 
     Args:
         shared_sides: Mapping from MoE LoRA module name to its (shared_a,
             shared_b) pair, as reported by `LoraManager.get_moe_shared_sides`.
-            Unknown module names are ignored.
 
     Returns:
-        Dict with the six keys defined by `KERNEL_FLAG_KEYS`, each True iff that
-        side of that module is shared across experts.
+        The kernel flag dict (see `all_false_flags`), each flag True iff that
+        module's residual side is shared across experts.
     """
     flags = all_false_flags()
     for module_name, (shared_a, shared_b) in shared_sides.items():
-        prefix = MODULE_TO_KERNEL_PREFIX.get(module_name)
-        if prefix is None:
+        flag_name = MODULE_SHARED_FLAG.get(module_name)
+        if flag_name is None:
             continue
-        if shared_a:
-            flags[f"{prefix}_shared_a"] = True
-        if shared_b:
-            flags[f"{prefix}_shared_b"] = True
+        shared = shared_a if flag_name.endswith("_a") else shared_b
+        if shared:
+            flags[flag_name] = True
     return flags
 
 
@@ -177,7 +164,7 @@ def merge_moe_shared_flags_for_batch(
 
     Args:
         active_uids: LoRA task ids present in the current batch.
-        get_flags: Callable returning the six-bool flag dict for a uid.
+        get_flags: Callable returning the kernel flag dict for a uid.
 
     Returns:
         The flag dict to set as `lora_params['moe_shared_flags']`, or None

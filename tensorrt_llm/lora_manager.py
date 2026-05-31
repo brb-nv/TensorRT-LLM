@@ -66,11 +66,12 @@ def _is_moe_module_weights(module_weights: Dict) -> bool:
 
 
 def _all_experts_identical(stacked: torch.Tensor) -> bool:
-    """Return True iff `stacked` has at least two experts that are all equal.
+    """Return True iff `stacked` has multiple experts and every slice is equal.
 
     A stacked `[num_experts, ...]` LoRA matrix whose expert slices are all
     identical is the "shared-outer" side of a routed-expert adapter once its
-    shared matrix has been replicated across experts.
+    shared matrix has been replicated across experts. Fewer than two experts is
+    never treated as shared.
     """
     if stacked.ndim < 1 or stacked.shape[0] < 2:
         return False

@@ -10,9 +10,7 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.peft.lora.moe_utils import (
-    MODULE_TO_KERNEL_PREFIX,
-    MOE_LORA_MODULE_NAMES,
-    MOE_LORA_MODULES,
+    MODULE_SHARED_FLAG,
     all_false_flags,
     check_moe_lora_supported,
     has_moe_lora_targets,
@@ -23,9 +21,8 @@ from tensorrt_llm._torch.peft.lora.moe_utils import (
 )
 
 
-def test_module_name_constants_are_consistent():
-    assert MOE_LORA_MODULE_NAMES == frozenset(MOE_LORA_MODULES)
-    assert set(MODULE_TO_KERNEL_PREFIX) == set(MOE_LORA_MODULES)
+def test_moe_lora_module_names():
+    assert set(MODULE_SHARED_FLAG) == {"moe_h_to_4h", "moe_gate", "moe_4h_to_h"}
 
 
 # ---------- validation ----------
@@ -64,7 +61,7 @@ def test_has_moe_lora_targets_attn_only():
     assert has_moe_lora_targets(cfg) is False
 
 
-@pytest.mark.parametrize("name", sorted(MOE_LORA_MODULE_NAMES))
+@pytest.mark.parametrize("name", sorted(MODULE_SHARED_FLAG))
 def test_has_moe_lora_targets_each_module(name):
     cfg = _FakeLoraConfig(["attn_q", name])
     assert has_moe_lora_targets(cfg) is True
@@ -156,9 +153,9 @@ def test_check_moe_lora_layer_idx_in_message():
 # ---------- shared_sides_to_kernel_flags ----------
 
 
-def test_all_false_flags_has_six_keys():
+def test_all_false_flags_has_three_canonical_keys():
     flags = all_false_flags()
-    assert len(flags) == 6
+    assert set(flags) == {"fc1_shared_a", "gated_shared_a", "fc2_shared_b"}
     assert not any(flags.values())
 
 
@@ -174,16 +171,18 @@ def test_shared_sides_to_kernel_flags_canonical():
     }
     assert shared_sides_to_kernel_flags(shared_sides) == {
         "fc1_shared_a": True,
-        "fc1_shared_b": False,
-        "fc2_shared_a": False,
-        "fc2_shared_b": True,
         "gated_shared_a": True,
-        "gated_shared_b": False,
+        "fc2_shared_b": True,
     }
 
 
 def test_shared_sides_to_kernel_flags_ignores_unknown_module():
     assert shared_sides_to_kernel_flags({"attn_q": (True, True)}) == all_false_flags()
+
+
+def test_shared_sides_to_kernel_flags_ignores_non_canonical_side():
+    # moe_gate shares its residual side via A; a detected B-share is ignored.
+    assert shared_sides_to_kernel_flags({"moe_gate": (False, True)}) == all_false_flags()
 
 
 # ---------- merge_moe_shared_flags_for_batch ----------
