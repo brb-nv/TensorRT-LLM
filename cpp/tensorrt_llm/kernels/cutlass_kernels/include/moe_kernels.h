@@ -16,6 +16,7 @@
 
 #pragma once
 #include "./moe_gemm_kernels.h"
+#include "tensorrt_llm/kernels/cutlass_kernels/include/moe_lora_device_path.h"
 #include "cutlass/gemm/gemm.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
@@ -57,6 +58,19 @@ struct LoraParams
     int32_t const* gated_lora_ranks = nullptr;
     void const* const* gated_lora_weight_ptrs = nullptr;
 
+    // Routed-expert MoE LoRA shared-outer flags. When a side is shared across
+    // experts, the kernel zero-offsets the corresponding pointer arithmetic in
+    // setupLoraWorkspace, so a single unreplicated weight buffer (e.g.
+    // A: [rank, in_dim] for up-projections, B: [out_dim, rank] for down) is
+    // read by every expert. When false (default), the kernel applies the
+    // standard `weight_index * dim * lora_rank` per-expert offset.
+    bool fc1_shared_a = false;
+    bool fc1_shared_b = false;
+    bool fc2_shared_a = false;
+    bool fc2_shared_b = false;
+    bool gated_shared_a = false;
+    bool gated_shared_b = false;
+
     // used to calculate split group gemm workspace
     int num_reqs;
 
@@ -67,6 +81,19 @@ struct LoraParams
     void* workspace;
 
     cudaEvent_t* memcpy_event_ptr;
+
+    // Phase 6b.C: device-side capture-safe LoRA path scratch. When
+    // `device_path.enabled` is true the kernel uses launchMoeLoraPointerExpand
+    // + launchMoeLoraProblemBuilder + cudaGraph(SplitK)GroupedGemm instead of
+    // the legacy host-pointer LoraImpl::run path. The struct's pointers refer
+    // to persistent allocations owned by the calling FusedMoeRunner (their
+    // addresses are stable across CUDA-graph captures and replays).
+    //
+    // 6b.C.2.a: the struct is populated and propagated end-to-end, but the
+    // kernel does not branch on it yet -- runMoe still drives the legacy
+    // host path. 6b.C.2.b flips setupLoraWorkspace / loraFC1 / loraFC2 to
+    // consume these buffers behind the env-flag toggle.
+    ::tensorrt_llm::kernels::cutlass_kernels::MoeLoraDevicePath device_path;
 
     LoraParams() = default;
 

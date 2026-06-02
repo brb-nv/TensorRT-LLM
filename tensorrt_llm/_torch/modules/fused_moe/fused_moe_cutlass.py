@@ -15,7 +15,7 @@ from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
 from ...distributed import allgather
 from ...expert_statistic import ExpertStatistic
 from ...model_config import ModelConfig
-from ...peft.lora.layer import LoraModuleType
+from ...peft.lora.layer import LoraModuleType, MoeLoraLayer
 from ...utils import (ActivationType, AuxStreamType, EventType,
                       Fp4QuantizedTensor)
 from .interface import AlltoallMethodType, MoE
@@ -360,6 +360,13 @@ class CutlassFusedMoE(MoE):
         # so forward_impl can reject stray lora_params instead of ignoring them.
         self._moe_lora_enabled = self._has_moe_lora_targets(model_config)
 
+        # Discovery-only marker submodule. The actual LoRA GEMMs are fused into
+        # torch.ops.trtllm.fused_moe; MoeLoraLayer exists purely so that
+        # CudaGraphLoraManager and the target-module validator can find this MoE
+        # layer via `isinstance(child, LoraLayer)` traversal and read its
+        # lora_module_types / output_hidden_sizes when building slot tables.
+        self.lora = self._maybe_make_lora_marker(model_config)
+
         self._weights_created = False
         if not model_config.skip_create_weights_in_init:
             self.create_weights()
@@ -378,6 +385,35 @@ class CutlassFusedMoE(MoE):
             return False
         targets = set(getattr(lora_config, "lora_target_modules", []) or [])
         return any(name in targets for name in self._MOE_LORA_MODULE_NAMES)
+
+    def _maybe_make_lora_marker(
+            self, model_config: ModelConfig) -> Optional[MoeLoraLayer]:
+        """Construct a `MoeLoraLayer` marker iff this MoE layer is in the LoRA
+        target-module set. The marker is a discovery-only submodule; the actual
+        LoRA application is fused into `torch.ops.trtllm.fused_moe`.
+
+        The `output_hidden_sizes` recorded here are the per-token outputs of the
+        LoRA-side GEMM (not per-expert weight shapes): MOE_H_TO_4H / MOE_GATE
+        produce `intermediate_size`, MOE_4H_TO_H produces `hidden_size`.
+        """
+        lora_config = getattr(model_config, "lora_config", None)
+        if lora_config is None:
+            return None
+        targets = set(getattr(lora_config, "lora_target_modules", []) or [])
+        active_modules: List[LoraModuleType] = []
+        active_out_sizes: List[int] = []
+        for name in self._MOE_LORA_MODULE_NAMES:
+            if name not in targets:
+                continue
+            module_type = LoraModuleType.from_string(name)
+            if name == "moe_4h_to_h":
+                active_out_sizes.append(self.hidden_size)
+            else:
+                active_out_sizes.append(self.intermediate_size)
+            active_modules.append(module_type)
+        if not active_modules:
+            return None
+        return MoeLoraLayer(active_modules, active_out_sizes)
 
     def _moe_lora_active(self, lora_params: Optional[Dict]) -> bool:
         """Return True when lora_params carries routed-expert MoE LoRA tensors
@@ -407,6 +443,11 @@ class CutlassFusedMoE(MoE):
         """
         if not lora_params:
             return None
+        # Slot-indexed (CUDA-graph decode) path: the per-token expansion is
+        # driven inside the op by token_to_slot indexed into stable slot
+        # tables owned by CudaGraphLoraParams (see _extract_moe_lora_tensors_cuda_graph).
+        if lora_params.get("use_cuda_graph_mode", False):
+            return self._extract_moe_lora_tensors_cuda_graph(lora_params)
         layer_params = lora_params.get(
             self.layer_idx, {}) if self.layer_idx is not None else {}
         if not layer_params:
@@ -485,6 +526,84 @@ class CutlassFusedMoE(MoE):
             lora_params["prompt_lens_cpu"][:num_seqs].contiguous(),
             "lora_max_low_rank":
             active_max_rank,
+        }
+
+    def _extract_moe_lora_tensors_cuda_graph(
+            self, lora_params: Dict) -> Optional[Dict[str, object]]:
+        """CUDA-graph slot-indexed extraction for routed-expert MoE LoRA.
+
+        Pulls per-module slot tables and `token_to_slot` out of
+        `CudaGraphLoraParams` and returns the slot-indexed kwargs accepted by
+        `torch.ops.trtllm.fused_moe`. Returns None when this layer does not
+        carry any MoE LoRA modules in the graph layer map.
+
+        Returned tensor addresses are stable across captures and replays: they
+        come from persistent pinned host buffers owned by `CudaGraphLoraParams`
+        and the per-module packed pointer cache. Uses the same module->kernel
+        slot convention as the per-request path (moe_h_to_4h -> fc1,
+        moe_gate -> gated, moe_4h_to_h -> fc2).
+        """
+        if self.layer_idx is None:
+            return None
+        cuda_graph_params = lora_params.get("cuda_graph_params")
+        if cuda_graph_params is None:
+            return None
+
+        slot_to_kernel = {
+            int(LoraModuleType.MOE_H_TO_4H): "fc1",
+            int(LoraModuleType.MOE_GATE): "gated",
+            int(LoraModuleType.MOE_4H_TO_H): "fc2",
+        }
+        slot_ranks: Dict[str, Optional[torch.Tensor]] = {
+            "fc1": None,
+            "fc2": None,
+            "gated": None,
+        }
+        slot_ptrs: Dict[str, Optional[torch.Tensor]] = {
+            "fc1": None,
+            "fc2": None,
+            "gated": None,
+        }
+        for module_id_int, slot in slot_to_kernel.items():
+            inputs = cuda_graph_params.get_moe_slot_inputs(
+                self.layer_idx, module_id_int)
+            if inputs is None:
+                continue
+            slot_ranks[slot], slot_ptrs[slot] = inputs
+
+        if slot_ranks["fc1"] is None or slot_ranks["fc2"] is None:
+            return None
+
+        num_seqs = lora_params["num_seqs"]
+        tokens_per_seq = getattr(cuda_graph_params, "max_tokens_per_seq", 1)
+        num_tokens = num_seqs * max(int(tokens_per_seq), 1)
+        token_to_slot = cuda_graph_params.token_to_slot_host[:
+                                                             num_tokens].contiguous(
+                                                             )
+
+        # Active max rank: the largest rank actually populated in the slot table.
+        # `slot_ranks_host` is shared across modules so a single max suffices.
+        try:
+            active_max_rank = int(
+                cuda_graph_params.slot_ranks_host.max().item())
+        except (RuntimeError, ValueError):
+            active_max_rank = 0
+        if active_max_rank <= 0:
+            return None
+
+        return {
+            "fc1_slot_lora_ranks": slot_ranks["fc1"].contiguous(),
+            "fc1_slot_lora_weight_ptrs": slot_ptrs["fc1"].contiguous(),
+            "fc2_slot_lora_ranks": slot_ranks["fc2"].contiguous(),
+            "fc2_slot_lora_weight_ptrs": slot_ptrs["fc2"].contiguous(),
+            "gated_slot_lora_ranks":
+            (slot_ranks["gated"].contiguous()
+             if slot_ranks["gated"] is not None else None),
+            "gated_slot_lora_weight_ptrs":
+            (slot_ptrs["gated"].contiguous()
+             if slot_ptrs["gated"] is not None else None),
+            "token_to_slot": token_to_slot,
+            "lora_max_low_rank": active_max_rank,
         }
 
     def _check_configs(self):
