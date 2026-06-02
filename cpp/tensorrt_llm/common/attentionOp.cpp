@@ -1082,6 +1082,7 @@ int AttentionOp::mlaGeneration(
     if (mUseTllmGen)
     {
         TLLM_CHECK_WITH_INFO(mTllmGenFMHARunner.get(), "mTllmGenFMHARunner not initialized.");
+        TLLM_LOG_DEBUG("TRTLLM-Gen MLA kernels are selected in the generation phase.");
         TllmGenFmhaRunnerParams tllmRunnerParams{};
 
         // Parameters to select kernels.
@@ -1204,6 +1205,7 @@ int AttentionOp::mlaGeneration(
     }
     else if (mUseGenFlashMLA)
     {
+        TLLM_LOG_DEBUG("FlashMLA kernels are selected in the generation phase.");
         static constexpr int TileSchedulerMetaDataSize = 8;
 
         int const num_q_heads = mNumHeads / mCpSize;
@@ -1345,6 +1347,7 @@ int AttentionOp::mlaGeneration(
         }
 
         // Use FMHA otherwise.
+        TLLM_LOG_DEBUG("FMHA (FusedMHARunnerV2) kernels are selected in the MLA generation phase.");
         MHARunnerParams fmhaParams{};
         fmhaParams.b = batch_beam;
         fmhaParams.numGroupedHeads = params.head_num;
