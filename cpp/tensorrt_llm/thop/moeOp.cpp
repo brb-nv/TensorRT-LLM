@@ -1102,9 +1102,10 @@ private:
         at::Tensor ldd_out;           // int64  [P_max]
         at::Tensor splitk_offsets;    // int64  [P_max + 1]
 
-        // GEMM data-flow buffers.
+        // GEMM data-flow buffers. The split-K in-GEMM's partial-sum scratch is
+        // allocated internally by cuda_graph_split_k_grouped_gemm, so only the
+        // low-rank intermediate is owned here.
         at::Tensor lowrank_workspace; // dtype  [P_max * max_lora_rank]
-        at::Tensor splitk_workspace;  // float  [P_max * max_lora_rank * splitk_slices]
 
         // Pinned-host single GemmCoord upper bounds; required by the
         // cuda_graph_*_grouped_gemm wrappers for kernel selection.
@@ -1535,7 +1536,6 @@ private:
         auto const dev_int8_opts = at::TensorOptions().dtype(at::kByte).device(at::kCUDA);
         auto const dev_int32_opts = at::TensorOptions().dtype(at::kInt).device(at::kCUDA);
         auto const dev_int64_opts = at::TensorOptions().dtype(at::kLong).device(at::kCUDA);
-        auto const dev_float_opts = at::TensorOptions().dtype(at::kFloat).device(at::kCUDA);
         auto const dev_dtype_opts = at::TensorOptions().dtype(dtype_scalar).device(at::kCUDA);
         auto const pinned_int8_opts = at::TensorOptions().dtype(at::kByte).pinned_memory(true);
 
@@ -1566,7 +1566,6 @@ private:
             mod.splitk_offsets = at::empty({new_capacity + 1}, dev_int64_opts);
 
             mod.lowrank_workspace = at::empty({new_capacity * new_max_lora_rank}, dev_dtype_opts);
-            mod.splitk_workspace = at::empty({new_capacity * new_max_lora_rank * splitk_slices}, dev_float_opts);
 
             mod.host_max_problem_in = at::empty({gemm_coord_bytes}, pinned_int8_opts);
             mod.host_max_problem_out = at::empty({gemm_coord_bytes}, pinned_int8_opts);
@@ -1590,8 +1589,8 @@ private:
     // attached to LoraParams. The buffers are owned by FusedMoeRunner, so the
     // resulting pointers stay valid as long as the runner outlives the
     // LoraParams use. dim_a/dim_b, ranks_src_dev, and out_hidden_size are filled
-    // in by buildMoeLoraParams; output_base_dev is unused because the output
-    // base is passed directly to runMoeLoraDeviceModule at the call site.
+    // in by buildMoeLoraParams; the output base is passed directly to
+    // runMoeLoraDeviceModule at the call site.
     void populateLoraDevicePathModule(
         LoraDevicePathBuffers& mod, ::tensorrt_llm::kernels::cutlass_kernels::MoeLoraDevicePathModule& out) const
     {
@@ -1613,13 +1612,10 @@ private:
         out.splitk_offsets_dev = mod.splitk_offsets.data_ptr<int64_t>();
 
         out.lowrank_workspace_dev = mod.lowrank_workspace.data_ptr();
-        out.splitk_workspace_dev = mod.splitk_workspace.data_ptr();
         out.host_max_problem_in_pinned = mod.host_max_problem_in.data_ptr();
         out.host_max_problem_out_pinned = mod.host_max_problem_out.data_ptr();
 
-        // Set by buildMoeLoraParams (out_hidden_size) and the loraFC1/loraFC2
-        // call sites (output base); left at defaults here.
-        out.output_base_dev = nullptr;
+        // out_hidden_size is set by buildMoeLoraParams; default it here.
         out.out_hidden_size = 0;
     }
 
@@ -1909,11 +1905,11 @@ private:
             }
 
             // Per-module dim_a/dim_b describe the LoRA adapter shape the
-            // pointer-expand kernel offsets into; per-module output_base
-            // (and out_hidden_size) describe the LoRA delta sink the
-            // problem-builder kernel writes into. The runner overrides
-            // output_base_dev with lora_fc1_result_ / lora_fc2_result_ /
-            // lora_gated_out at the loraFC1/loraFC2 call sites so the
+            // pointer-expand kernel offsets into; per-module out_hidden_size
+            // describes the LoRA delta sink the problem-builder kernel writes
+            // into. The runner passes the output base (lora_fc1_result_ /
+            // lora_fc2_result_ / lora_gated_out) directly to
+            // runMoeLoraDeviceModule at the loraFC1/loraFC2 call sites so the
             // GEMMs land where the downstream bias/reorder kernels expect.
             //
             // For fc1 (and gated): adapter A is [hidden, rank], B is [rank, inter].

@@ -72,13 +72,15 @@ using MoeLoraDeviceRunFn = void (*)(MoeLoraDevicePathModule const& mod, int64_t 
 //   lda/ldb/ldd_*    -> int64_t*                  (device, [P_max])
 //   splitk_offsets   -> int64_t*                  (device, [P_max + 1])
 //   lowrank_ws_dev   -> void*                     (device, [P_max, max_lora_rank, dtype_bytes])
-//   splitk_ws_dev    -> void*                     (device, [P_max, max_lora_rank * splitk_slices], fp32)
 //   host_max_*       -> cutlass::gemm::GemmCoord* (pinned host, [1])
 //
-// output_base_dev points at the device buffer that consumes this module's LoRA
-// delta (lora_fc1_result_, lora_fc2_result_, or lora_gated_result_).
-// out_hidden_size is the trailing dimension of that buffer; it is inter_size
-// for fc1/gated and hidden_size for fc2.
+// The split-K in-GEMM's partial-sum scratch is allocated internally by the
+// cuda_graph_split_k_grouped_gemm wrapper (sized from the host max-problem
+// hint); only the per-problem splitk_offsets are produced here.
+//
+// out_hidden_size is the trailing dimension of the module's output buffer; it
+// is inter_size for fc1/gated and hidden_size for fc2. The output base address
+// itself is passed directly to runMoeLoraDeviceModule at the call site.
 struct MoeLoraDevicePathModule
 {
     // Per-source-token (rank, A_ptr, B_ptr) device mirrors, staged via a
@@ -113,9 +115,9 @@ struct MoeLoraDevicePathModule
     int64_t* ldd_out_dev = nullptr;
     int64_t* splitk_offsets_dev = nullptr;
 
-    // Workspaces that participate in the in/out GEMM data flow.
+    // Low-rank intermediate workspace shared between the in- and out-GEMM. The
+    // split-K partial-sum scratch is owned by the GEMM wrapper, not here.
     void* lowrank_workspace_dev = nullptr;
-    void* splitk_workspace_dev = nullptr;
 
     // Host (pinned) per-call max problem size hints, required by the
     // cuda_graph_*_grouped_gemm wrappers for kernel selection. The
@@ -124,8 +126,9 @@ struct MoeLoraDevicePathModule
     void* host_max_problem_in_pinned = nullptr;
     void* host_max_problem_out_pinned = nullptr;
 
-    // Module-local data-flow knobs.
-    void* output_base_dev = nullptr;
+    // Trailing dimension of the module's output buffer (inter_size for
+    // fc1/gated, hidden_size for fc2). The output base address is supplied
+    // directly to runMoeLoraDeviceModule at the call site.
     int64_t out_hidden_size = 0;
 };
 
