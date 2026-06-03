@@ -35,6 +35,31 @@ requires_cuda_and_op = pytest.mark.skipif(
     reason="Requires CUDA and built TensorRT-LLM C++ extension (torch.ops.trtllm.fused_moe).",
 )
 
+
+@pytest.fixture(autouse=True)
+def _isolate_moe_runner_cache():
+    """Give every test a fresh cached FusedMoeRunner and release captured graphs
+    / device scratch afterward.
+
+    The MoE LoRA device path keeps persistent per-runner scratch (slot tables,
+    pointer arrays, low-rank workspace) on the module-level MoERunner cache, and
+    these tests leak the CUDA graphs they capture. Without isolation, a test that
+    grows the cached runner's slot tables (e.g. max_lora_size 1 -> 2) while an
+    earlier test's captured graph still references the old device scratch
+    corrupts that scratch, producing an illegal memory access in the next
+    forward (see TRTLLM-12507). Clearing the cache before each test forces a
+    fresh runner; clearing + empty_cache afterward releases the leaked graph
+    pools so they cannot alias later allocations.
+    """
+    from tensorrt_llm._torch.custom_ops.torch_custom_ops import MoERunner
+
+    MoERunner.runner_dict.clear()
+    yield
+    MoERunner.runner_dict.clear()
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+
 # Adapters drawn from N(0, 1) blow up the SwiGLU intermediate at these shapes;
 # scale them down so the legitimate output stays O(1)-O(10) and the bf16 noise
 # stays well under the tolerance (see the rationale in test_moe_lora_op.py).
