@@ -39,9 +39,8 @@ namespace kernels::cutlass_kernels
 //   ptrs_out:  int64 [num_tokens * 2], per-source-token (A_ptr, B_ptr).
 //
 // These outputs match the (ranks_src, ptrs_src) inputs that
-// launchMoeLoraPointerExpand consumes, so the slot-expand kernel produces the
-// per-source-token tables entirely on-device (a capture-safe replacement for a
-// host-side per-token materialization).
+// launchMoeLoraPointerExpand consumes, so its results feed directly into the
+// pointer-expand stage.
 struct MoeLoraSlotExpandModule
 {
     int32_t const* slot_ranks = nullptr;

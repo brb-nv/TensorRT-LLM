@@ -92,11 +92,11 @@ void launchMoeLoraSlotExpand(int32_t const* token_to_slot, int64_t num_tokens, i
     }
     TLLM_CHECK_WITH_INFO(token_to_slot != nullptr, "token_to_slot must be non-null");
     TLLM_CHECK_WITH_INFO(num_slots > 0, "num_slots must be positive");
-    TLLM_CHECK_WITH_INFO(fc1.slot_ranks != nullptr && fc1.slot_ptrs != nullptr && fc1.ranks_out != nullptr
-            && fc1.ptrs_out != nullptr,
+    TLLM_CHECK_WITH_INFO(
+        fc1.slot_ranks != nullptr && fc1.slot_ptrs != nullptr && fc1.ranks_out != nullptr && fc1.ptrs_out != nullptr,
         "fc1 slot-expand module is missing a buffer");
-    TLLM_CHECK_WITH_INFO(fc2.slot_ranks != nullptr && fc2.slot_ptrs != nullptr && fc2.ranks_out != nullptr
-            && fc2.ptrs_out != nullptr,
+    TLLM_CHECK_WITH_INFO(
+        fc2.slot_ranks != nullptr && fc2.slot_ptrs != nullptr && fc2.ranks_out != nullptr && fc2.ptrs_out != nullptr,
         "fc2 slot-expand module is missing a buffer");
 
     bool const has_gated = gated != nullptr;

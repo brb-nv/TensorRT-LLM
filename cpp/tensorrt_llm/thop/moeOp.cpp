@@ -323,16 +323,11 @@ public:
         mGemm2Profiles = mKernelRunner->getTactics(MoeGemmId::GEMM_2);
         cuInit(0);
 
-        // Device-LoRA-path activation story (see runMoe / buildMoeLoraParams):
-        //   * The slot-indexed (CUDA-graph) schema ALWAYS uses the device path,
-        //     regardless of this env var: slot-indexed inputs are only ever
-        //     produced for CUDA-graph capture, which the legacy host path cannot
-        //     support (it does a host-side cudaEventSynchronize). So the device
-        //     path is auto-enabled whenever fc1_slot_lora_ranks is provided.
-        //   * The per-request (eager) schema uses the legacy host path by
-        //     default; this env var opts it into the device path too (useful for
-        //     testing the device path in eager mode). Any non-empty value other
-        //     than "0"/"OFF"/"off" enables it, mirroring LORA_USE_UNIFIED_GEMM.
+        // Device-LoRA-path opt-in for the per-request (eager) schema. Any
+        // non-empty value other than "0"/"OFF"/"off" enables it, matching
+        // LORA_USE_UNIFIED_GEMM. The slot-indexed (CUDA-graph) schema always
+        // uses the device path regardless, since the host path is not
+        // capturable (it does a host-side cudaEventSynchronize).
         if (char const* envv = std::getenv("TLLM_MOE_LORA_USE_DEVICE_PATH"))
         {
             std::string val(envv);
@@ -1064,23 +1059,19 @@ private:
     int64_t mLoraHostBufCapacity = 0;
 
     // ---- Slot-indexed (CUDA-graph) device-source buffers ----
-    // For the slot-indexed schema the per-source-token (rank, A_ptr, B_ptr)
-    // tables are produced on-device by launchMoeLoraSlotExpand, which reads the
-    // device-resident slot tables and token_to_slot below and writes into the
-    // mLoraExpand*Device mirrors above. The slot tables and token_to_slot are
-    // refreshed each step by a captured async H2D from the caller's stable
-    // pinned-host buffers (owned by CudaGraphLoraParams and updated in place),
-    // so replaying the captured graph picks up new adapter assignments without
-    // re-capture. All are persistent and address-stable across captures.
-    // token_to_slot is sized at max_num_tokens (with the expand buffers); the
-    // slot tables are sized at max_lora_size (the adapter-slot pool).
-    at::Tensor mLoraTokenToSlotDevice;     // [max_num_tokens]       int32
-    at::Tensor mLoraSlotFC1RanksDevice;    // [max_lora_size]        int32
-    at::Tensor mLoraSlotFC1PtrsDevice;     // [max_lora_size * 3]    int64
-    at::Tensor mLoraSlotFC2RanksDevice;    // [max_lora_size]        int32
-    at::Tensor mLoraSlotFC2PtrsDevice;     // [max_lora_size * 3]    int64
-    at::Tensor mLoraSlotGatedRanksDevice;  // [max_lora_size]        int32
-    at::Tensor mLoraSlotGatedPtrsDevice;   // [max_lora_size * 3]    int64
+    // launchMoeLoraSlotExpand reads these device-resident slot tables and
+    // token_to_slot and writes the per-source-token (rank, A_ptr, B_ptr) tables
+    // into the mLoraExpand*Device mirrors above. A captured async H2D refreshes
+    // them each step from the caller's stable pinned-host buffers, so replaying
+    // the graph picks up new adapter assignments without re-capture.
+    // token_to_slot is sized at max_num_tokens; the slot tables at max_lora_size.
+    at::Tensor mLoraTokenToSlotDevice;    // [max_num_tokens]       int32
+    at::Tensor mLoraSlotFC1RanksDevice;   // [max_lora_size]        int32
+    at::Tensor mLoraSlotFC1PtrsDevice;    // [max_lora_size * 3]    int64
+    at::Tensor mLoraSlotFC2RanksDevice;   // [max_lora_size]        int32
+    at::Tensor mLoraSlotFC2PtrsDevice;    // [max_lora_size * 3]    int64
+    at::Tensor mLoraSlotGatedRanksDevice; // [max_lora_size]        int32
+    at::Tensor mLoraSlotGatedPtrsDevice;  // [max_lora_size * 3]    int64
     // Highest max_lora_size we have reserved slot-table storage for.
     int64_t mLoraSlotTableCapacity = 0;
 
@@ -1089,8 +1080,7 @@ private:
     // at::Tensor members are allocated by ensureLoraDeviceScratch and reused
     // across calls so the addresses baked into a captured graph remain valid
     // for replay. Pointers from these tensors are packed into
-    // LoraParams::device_path by buildMoeLoraParams when mUseDeviceLoraPath is
-    // true.
+    // LoraParams::device_path by buildMoeLoraParams when the device path is taken.
     struct LoraDevicePathBuffers
     {
         // Per-permuted-row (rank, A_ptr + offset, B_ptr + offset).
@@ -1379,22 +1369,16 @@ private:
     // exercises routed-expert MoE LoRA. It is idempotent at or below the
     // current capacity.
 public:
-    // Pre-size every MoE-LoRA scratch buffer to the worst case so that no
-    // (re)allocation happens later during CUDA-graph capture/replay. This
-    // covers BOTH:
-    //   * the pinned-host + device-mirror per-token expansion buffers (used by
-    //     the legacy host path and the device path), sized at max_num_tokens, and
-    //   * the device-path grouped-GEMM scratch, sized at
-    //     max_num_tokens * experts_per_token permuted rows.
+    // Pre-size every MoE-LoRA scratch buffer to the worst case so no
+    // (re)allocation happens during CUDA-graph capture or replay: the
+    // pinned-host and device-mirror expansion buffers (max_num_tokens), the
+    // slot tables (max_lora_size), and the device grouped-GEMM scratch
+    // (max_num_tokens * experts_per_token). Idempotent and grow-only.
     //
-    // Callers (the CUDA-graph LoRA warmup, see CudaGraphLoraManager) must invoke
-    // this once with the engine's worst-case shape before any graph capture that
-    // exercises routed-expert MoE LoRA. It is idempotent and grow-only, so
-    // repeated or smaller calls are no-ops. experts_per_token is the routing
-    // top_k; max_lora_rank is the largest LoRA rank across adapters; max_lora_size
-    // is the adapter-slot pool size (for the slot-indexed device tables); has_gated
-    // is true for gated activations (e.g. SwiGLU), which need a third module's
-    // device scratch.
+    // Call once during warmup, before any graph capture that exercises MoE
+    // LoRA. experts_per_token is the routing top_k; max_lora_rank is the largest
+    // LoRA rank across adapters; max_lora_size is the adapter-slot pool size;
+    // has_gated is true for gated activations (e.g. SwiGLU).
     void reserveLoraHostBuffers(
         int64_t max_num_tokens, int64_t experts_per_token, int64_t max_lora_rank, int64_t max_lora_size, bool has_gated)
     {
@@ -1419,13 +1403,10 @@ public:
             mLoraSlotTableCapacity = max_lora_size;
         }
 
-        // Device-path grouped-GEMM scratch. This method is the CUDA-graph
-        // warmup hook, and CUDA-graph (slot-indexed) MoE LoRA always takes the
-        // device path (see the constructor's activation-story comment), so we
-        // pre-size the device scratch unconditionally here rather than gating on
-        // the env-var opt-in. Without this, the first capture would trigger a
-        // lazy device-scratch allocation and the in-capture realloc guard would
-        // fire.
+        // Device grouped-GEMM scratch. CUDA-graph (slot-indexed) MoE LoRA always
+        // takes the device path, so pre-size it unconditionally rather than
+        // gating on the env-var opt-in. Otherwise the first capture would
+        // trigger a lazy allocation that the in-capture realloc guard rejects.
         TORCH_CHECK(max_lora_rank > 0, "max_lora_rank must be positive to reserve MoE-LoRA device scratch; got ",
             max_lora_rank);
         int64_t const dtype_bytes = static_cast<int64_t>(common::getDTypeSize(loraTypeFromActDtype(mActivationDtype)));
@@ -1447,11 +1428,9 @@ private:
             return;
         }
         TORCH_CHECK(false, "MoE LoRA scratch (current capacity ", current, ") is too small for ", requested,
-            " entries during CUDA graph capture. Growing it now would invalidate addresses baked into "
-            "previously captured graphs. Call FusedMoeRunner.reserve_lora_host_buffers(max_num_tokens, "
-            "experts_per_token, max_lora_rank, has_gated) during warmup (before capture) with the engine's "
-            "worst-case shape. The CUDA-graph LoRA warmup does this automatically; reaching here means the "
-            "reserved capacity was too small.");
+            " entries during CUDA graph capture. Growing it would invalidate addresses baked into "
+            "already-captured graphs. Call FusedMoeRunner.reserve_lora_host_buffers() during warmup, before "
+            "capture, with the engine's worst-case shape.");
     }
 
     // Internal helper: (re)allocate the six pinned-host + six device tensor
@@ -1792,8 +1771,8 @@ private:
             TORCH_CHECK(fc2_slot_lora_ranks->size(0) == num_slots,
                 "MoE LoRA fc2_slot_lora_ranks must match fc1 max_lora_size (", num_slots, "); got ",
                 fc2_slot_lora_ranks->size(0));
-            TORCH_CHECK(token_to_slot->size(0) >= num_tokens, "MoE LoRA token_to_slot length (",
-                token_to_slot->size(0), ") must be >= num_tokens (", num_tokens, ").");
+            TORCH_CHECK(token_to_slot->size(0) >= num_tokens, "MoE LoRA token_to_slot length (", token_to_slot->size(0),
+                ") must be >= num_tokens (", num_tokens, ").");
 
             // Ensure the device slot tables can hold num_slots entries.
             if (num_slots > mLoraSlotTableCapacity)

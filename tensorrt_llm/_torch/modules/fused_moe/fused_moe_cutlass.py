@@ -418,28 +418,20 @@ class CutlassFusedMoE(MoE):
     def reserve_moe_lora_cuda_graph_workspace(self, max_num_tokens: int,
                                               max_lora_rank: int,
                                               max_lora_size: int) -> None:
-        """Pre-size the C++ FusedMoeRunner's routed-expert MoE-LoRA scratch to
-        the engine's worst case, so no (re)allocation happens later during CUDA
-        graph capture/replay.
+        """Pre-size the C++ FusedMoeRunner's MoE-LoRA scratch to the engine's
+        worst case so no (re)allocation happens during CUDA graph capture or
+        replay (which would dangle addresses baked into earlier graphs).
 
-        The capture-safe device LoRA path bakes the addresses of persistent
-        pinned-host and device buffers into the captured graph; if those buffers
-        were grown lazily on a later, larger call, the addresses recorded in
-        earlier graphs would dangle. This method reserves them up front. It is a
-        no-op for layers without MoE LoRA targets, for quantized layers (MoE
-        LoRA requires unquantized fp16/bf16), and is idempotent / grow-only on
-        the C++ side.
-
-        Must be called during warmup, before any CUDA graph capture that
-        exercises routed-expert MoE LoRA. `CudaGraphLoraManager` does this
-        automatically.
+        No-op for layers without MoE LoRA targets and for quantized layers (MoE
+        LoRA requires unquantized fp16/bf16); idempotent and grow-only. Call
+        during warmup, before any capture that exercises MoE LoRA;
+        CudaGraphLoraManager does this automatically.
 
         Args:
-            max_num_tokens: Worst-case number of tokens in a captured forward
+            max_num_tokens: Worst-case tokens in a captured forward
                 (max_batch_size * max_tokens_per_seq).
             max_lora_rank: Largest LoRA rank across adapters.
-            max_lora_size: Adapter-slot pool size (for the slot-indexed device
-                tables consumed by the on-device slot->token expansion).
+            max_lora_size: Adapter-slot pool size for the slot-indexed device tables.
         """
         if not self._moe_lora_enabled or max_num_tokens <= 0:
             return
@@ -656,14 +648,11 @@ class CutlassFusedMoE(MoE):
                                                              num_tokens].contiguous(
                                                              )
 
-        # Pass the GLOBAL max LoRA rank (cuda_graph_params.max_rank), not the
-        # per-step active max. The device path uses this only to size the
-        # low-rank workspace row strides that get baked into the captured graph;
-        # using the global max keeps those strides valid for any per-slot rank
-        # up to the configured maximum across replays. The actual per-token rank
-        # is read on-device from the slot table, so a smaller rank simply runs a
-        # smaller GEMM. (Returning None here only matters at capture time; if no
-        # LoRA is configured at all, max_rank is 0 and we skip the path.)
+        # Pass the global max LoRA rank, not the per-step active max: the device
+        # path uses it only to size the low-rank workspace strides baked into the
+        # captured graph, so the global max keeps them valid for any per-slot
+        # rank across replays. The actual per-token rank is read on-device from
+        # the slot table, so a smaller rank just runs a smaller GEMM.
         max_rank = int(getattr(cuda_graph_params, "max_rank", 0))
         if max_rank <= 0:
             return None
