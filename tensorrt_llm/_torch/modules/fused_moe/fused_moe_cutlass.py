@@ -415,6 +415,77 @@ class CutlassFusedMoE(MoE):
             return None
         return MoeLoraLayer(active_modules, active_out_sizes)
 
+    def reserve_moe_lora_cuda_graph_workspace(self, max_num_tokens: int,
+                                              max_lora_rank: int) -> None:
+        """Pre-size the C++ FusedMoeRunner's routed-expert MoE-LoRA scratch to
+        the engine's worst case, so no (re)allocation happens later during CUDA
+        graph capture/replay.
+
+        The capture-safe device LoRA path bakes the addresses of persistent
+        pinned-host and device buffers into the captured graph; if those buffers
+        were grown lazily on a later, larger call, the addresses recorded in
+        earlier graphs would dangle. This method reserves them up front. It is a
+        no-op for layers without MoE LoRA targets, for quantized layers (MoE
+        LoRA requires unquantized fp16/bf16), and is idempotent / grow-only on
+        the C++ side.
+
+        Must be called during warmup, before any CUDA graph capture that
+        exercises routed-expert MoE LoRA. `CudaGraphLoraManager` does this
+        automatically.
+
+        Args:
+            max_num_tokens: Worst-case number of tokens in a captured forward
+                (max_batch_size * max_tokens_per_seq).
+            max_lora_rank: Largest LoRA rank across adapters.
+        """
+        if not self._moe_lora_enabled or max_num_tokens <= 0:
+            return
+        # MoE LoRA only runs on the unquantized fp16/bf16 path (the C++ op
+        # rejects quantized weights), so a quantized layer can never reach the
+        # LoRA scratch; skip and let the (impossible) runtime path error loudly.
+        if getattr(self, "has_any_quant", False):
+            return
+        # Weights must exist to read the runner's weight dtype. If they have not
+        # been created yet, skip; the lazy sizing + in-capture guard still
+        # protect correctness.
+        if getattr(self, "w3_w1_weight", None) is None:
+            return
+
+        from ...custom_ops.torch_custom_ops import MoERunner
+
+        # Build the MoERunner with the same instance key the functional
+        # torch.ops.trtllm.fused_moe op uses, so we reserve on the *same* cached
+        # C++ FusedMoeRunner that capture will use. For the unquantized LoRA
+        # path x/weight/output dtypes all equal self.dtype and every quant flag
+        # is False. If a runtime call ever uses a different key, the C++
+        # capture guard surfaces a clear error rather than corrupting replay.
+        weight_dtype = self.w3_w1_weight.dtype
+        runner = MoERunner(
+            x_dtype=self.dtype,
+            weight_dtype=weight_dtype,
+            output_dtype=self.dtype,
+            top_k=self.routing_method.experts_per_token,
+            tp_size=self.tp_size,
+            tp_rank=self.tp_rank,
+            ep_size=self.ep_size,
+            ep_rank=self.ep_rank,
+            cluster_size=self.cluster_size,
+            cluster_rank=self.cluster_rank,
+            use_deepseek_fp8_block_scale=False,
+            use_w4_group_scaling=False,
+            use_int8_woq_per_channel=False,
+            use_mxfp8_act_scaling=False,
+            min_latency_mode=False,
+            use_fused_finalize=self.use_fused_finalize,
+            activation_type=self.activation_type,
+        )
+        runner.fused_moe_runner.reserve_lora_host_buffers(
+            int(max_num_tokens),
+            int(self.routing_method.experts_per_token),
+            int(max_lora_rank),
+            bool(self.is_gated_activation),
+        )
+
     def _moe_lora_active(self, lora_params: Optional[Dict]) -> bool:
         """Return True when lora_params carries routed-expert MoE LoRA tensors
         for this layer, meaning run_moe would fuse a LoRA delta.

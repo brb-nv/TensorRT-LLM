@@ -322,9 +322,16 @@ public:
         mGemm2Profiles = mKernelRunner->getTactics(MoeGemmId::GEMM_2);
         cuInit(0);
 
-        // Device-LoRA-path opt-in. Any non-empty value other than "0" or "OFF"
-        // enables the capture-safe device path, mirroring LORA_USE_UNIFIED_GEMM.
-        // Without it, MoE LoRA runs the legacy host path.
+        // Device-LoRA-path activation story (see runMoe / buildMoeLoraParams):
+        //   * The slot-indexed (CUDA-graph) schema ALWAYS uses the device path,
+        //     regardless of this env var: slot-indexed inputs are only ever
+        //     produced for CUDA-graph capture, which the legacy host path cannot
+        //     support (it does a host-side cudaEventSynchronize). So the device
+        //     path is auto-enabled whenever fc1_slot_lora_ranks is provided.
+        //   * The per-request (eager) schema uses the legacy host path by
+        //     default; this env var opts it into the device path too (useful for
+        //     testing the device path in eager mode). Any non-empty value other
+        //     than "0"/"OFF"/"off" enables it, mirroring LORA_USE_UNIFIED_GEMM.
         if (char const* envv = std::getenv("TLLM_MOE_LORA_USE_DEVICE_PATH"))
         {
             std::string val(envv);
@@ -579,6 +586,14 @@ public:
         bool const is_gated_act = isGatedActivation(base_activation_type);
         if (lora_active)
         {
+            // The per-request and slot-indexed schemas are mutually exclusive:
+            // each drives a different token->adapter expansion inside
+            // buildMoeLoraParams, and supplying both is ambiguous. The Python
+            // wrapper (torch_custom_ops.fused_moe) rejects this too, but the op
+            // is public, so enforce it here as well for direct C++/op callers.
+            TORCH_CHECK(!(lora_per_request && lora_slot_indexed),
+                "MoE LoRA: the per-request (fc1_lora_ranks, ...) and slot-indexed (fc1_slot_lora_ranks, ..., "
+                "token_to_slot) input schemas are mutually exclusive. Provide exactly one, not both.");
             // Conservative rejections (min-latency, alltoall, quant, graph capture).
             TORCH_CHECK(!min_latency_mode, "MoE LoRA is not supported in min-latency mode.");
             TORCH_CHECK(!enable_alltoall,
@@ -594,12 +609,17 @@ public:
             // run-length encoding in LoraImpl::run, none of which is capturable.
             // The device path (launchMoeLoraPointerExpand and
             // runMoeLoraDeviceModule in moe_kernels.cu) runs entirely on the
-            // stream, so capture is allowed only when it is enabled.
-            TORCH_CHECK(mUseDeviceLoraPath || !tensorrt_llm::common::isCapturing(stream),
-                "MoE LoRA + CUDA graph capture requires the device LoRA path "
-                "(set TLLM_MOE_LORA_USE_DEVICE_PATH=1). The legacy host path performs a host-side "
-                "cudaEventSynchronize after a D2H pointer-expansion copy, which is not capturable. "
-                "Either enable the device path, run LoRA eagerly, or disable MoE LoRA when capturing.");
+            // stream. The slot-indexed schema implies the device path (see the
+            // constructor's activation-story comment), so capture is allowed
+            // whenever the device path will be taken: env-var opt-in OR
+            // slot-indexed inputs.
+            bool const use_device_path = mUseDeviceLoraPath || lora_slot_indexed;
+            TORCH_CHECK(use_device_path || !tensorrt_llm::common::isCapturing(stream),
+                "MoE LoRA + CUDA graph capture requires the device LoRA path. The per-request schema runs "
+                "the legacy host path by default, which performs a host-side cudaEventSynchronize after a "
+                "D2H pointer-expansion copy and is not capturable. Use the slot-indexed schema (which always "
+                "takes the device path), set TLLM_MOE_LORA_USE_DEVICE_PATH=1, run LoRA eagerly, or disable "
+                "MoE LoRA when capturing.");
         }
         // Build LoraParams up-front so we can compute the required cuBLAS workspace before allocation.
         auto lora_params_opt = buildMoeLoraParams(fc1_lora_ranks, fc1_lora_weight_ptrs, fc2_lora_ranks,
@@ -1097,6 +1117,13 @@ private:
     // construction time. Selects the capture-safe device LoRA path.
     bool mUseDeviceLoraPath = false;
 
+    // Split-K slice count for the device-path low-rank in-GEMM. Mirrors the
+    // value LoraImpl uses internally so the device-path split-K workspace is
+    // sized identically. Shared between buildMoeLoraParams (lazy sizing) and
+    // reserveLoraHostBuffers (warmup pre-sizing) so both reserve the same
+    // amount of scratch.
+    static constexpr int64_t kDevicePathSplitKSlices = 16;
+
     void freeProfileWorkspace()
     {
         if (mProfileWorkspace != nullptr)
@@ -1373,19 +1400,71 @@ private:
     // exercises routed-expert MoE LoRA. It is idempotent at or below the
     // current capacity.
 public:
-    void reserveLoraHostBuffers(int64_t max_num_tokens)
+    // Pre-size every MoE-LoRA scratch buffer to the worst case so that no
+    // (re)allocation happens later during CUDA-graph capture/replay. This
+    // covers BOTH:
+    //   * the pinned-host + device-mirror per-token expansion buffers (used by
+    //     the legacy host path and the device path), sized at max_num_tokens, and
+    //   * the device-path grouped-GEMM scratch, sized at
+    //     max_num_tokens * experts_per_token permuted rows.
+    //
+    // Callers (the CUDA-graph LoRA warmup, see CudaGraphLoraManager) must invoke
+    // this once with the engine's worst-case shape before any graph capture that
+    // exercises routed-expert MoE LoRA. It is idempotent and grow-only, so
+    // repeated or smaller calls are no-ops. experts_per_token is the routing
+    // top_k; max_lora_rank is the largest LoRA rank across adapters; has_gated
+    // is true for gated activations (e.g. SwiGLU), which need a third module's
+    // device scratch.
+    void reserveLoraHostBuffers(
+        int64_t max_num_tokens, int64_t experts_per_token, int64_t max_lora_rank, bool has_gated)
     {
         std::lock_guard<std::mutex> lock(mMutex);
         TORCH_CHECK(max_num_tokens > 0, "max_num_tokens must be positive; got ", max_num_tokens);
-        if (max_num_tokens <= mLoraHostBufCapacity)
+        TORCH_CHECK(experts_per_token > 0, "experts_per_token must be positive; got ", experts_per_token);
+
+        // Host pinned + device-mirror expansion buffers. Needed by both the
+        // legacy host path and the device path.
+        if (max_num_tokens > mLoraHostBufCapacity)
         {
-            return;
+            ensureLoraExpandBuffers(max_num_tokens);
+            mLoraHostBufCapacity = max_num_tokens;
         }
-        ensureLoraExpandBuffers(max_num_tokens);
-        mLoraHostBufCapacity = max_num_tokens;
+
+        // Device-path grouped-GEMM scratch. This method is the CUDA-graph
+        // warmup hook, and CUDA-graph (slot-indexed) MoE LoRA always takes the
+        // device path (see the constructor's activation-story comment), so we
+        // pre-size the device scratch unconditionally here rather than gating on
+        // the env-var opt-in. Without this, the first capture would trigger a
+        // lazy device-scratch allocation and the in-capture realloc guard would
+        // fire.
+        TORCH_CHECK(max_lora_rank > 0, "max_lora_rank must be positive to reserve MoE-LoRA device scratch; got ",
+            max_lora_rank);
+        int64_t const dtype_bytes = static_cast<int64_t>(common::getDTypeSize(loraTypeFromActDtype(mActivationDtype)));
+        int64_t const capacity = max_num_tokens * experts_per_token;
+        ensureLoraDeviceScratch(capacity, max_lora_rank, dtype_bytes, kDevicePathSplitKSlices, has_gated);
     }
 
 private:
+    // Guard against reallocating MoE-LoRA scratch while a CUDA graph is being
+    // captured on `stream`. Reallocation would hand out fresh device/pinned
+    // addresses, silently invalidating the copies and kernels already recorded
+    // into earlier captured graphs (which keep replaying against the old
+    // addresses). Convert that silent corruption into a loud, actionable error.
+    // No-op when not capturing or when stream is null (warmup pre-sizing).
+    void checkLoraReallocSafeDuringCapture(cudaStream_t stream, int64_t requested, int64_t current) const
+    {
+        if (stream == nullptr || !tensorrt_llm::common::isCapturing(stream))
+        {
+            return;
+        }
+        TORCH_CHECK(false, "MoE LoRA scratch (current capacity ", current, ") is too small for ", requested,
+            " entries during CUDA graph capture. Growing it now would invalidate addresses baked into "
+            "previously captured graphs. Call FusedMoeRunner.reserve_lora_host_buffers(max_num_tokens, "
+            "experts_per_token, max_lora_rank, has_gated) during warmup (before capture) with the engine's "
+            "worst-case shape. The CUDA-graph LoRA warmup does this automatically; reaching here means the "
+            "reserved capacity was too small.");
+    }
+
     // Internal helper: (re)allocate the six pinned-host + six device tensor
     // pairs to hold capacity expanded tokens. Called by reserveLoraHostBuffers
     // (public warmup) and by buildMoeLoraParams (lazy on first capture-sized
@@ -1427,8 +1506,8 @@ private:
     //
     // The host-side max-problem-size pins hold one GemmCoord each; the value is
     // a worst-case upper bound, independent of per-call data.
-    void ensureLoraDeviceScratch(
-        int64_t capacity, int64_t max_lora_rank, int64_t dtype_bytes, int64_t splitk_slices, bool has_gated)
+    void ensureLoraDeviceScratch(int64_t capacity, int64_t max_lora_rank, int64_t dtype_bytes, int64_t splitk_slices,
+        bool has_gated, cudaStream_t stream = nullptr)
     {
         TORCH_CHECK(capacity > 0, "device-path capacity must be positive; got ", capacity);
         TORCH_CHECK(max_lora_rank > 0, "device-path max_lora_rank must be positive; got ", max_lora_rank);
@@ -1442,6 +1521,8 @@ private:
         {
             return;
         }
+        // Refuse to grow device scratch mid-capture (see helper for rationale).
+        checkLoraReallocSafeDuringCapture(stream, capacity, mLoraDeviceScratchCapacity);
 
         // Grow each field to the requested upper bound and remember the
         // dtype/rank/splitk combo so subsequent calls can early-exit.
@@ -1620,6 +1701,7 @@ private:
             // Reserve is idempotent at-or-below current capacity.
             if (num_tokens > mLoraHostBufCapacity)
             {
+                checkLoraReallocSafeDuringCapture(stream, num_tokens, mLoraHostBufCapacity);
                 ensureLoraExpandBuffers(num_tokens);
                 mLoraHostBufCapacity = num_tokens;
             }
@@ -1674,6 +1756,7 @@ private:
             // during warmup to avoid the lazy reallocation here.
             if (num_tokens > mLoraHostBufCapacity)
             {
+                checkLoraReallocSafeDuringCapture(stream, num_tokens, mLoraHostBufCapacity);
                 ensureLoraExpandBuffers(num_tokens);
                 mLoraHostBufCapacity = num_tokens;
             }
@@ -1742,17 +1825,20 @@ private:
         };
 
         // Device-LoRA-path scratch. Allocate the per-module device-resident
-        // buffers and pack their pointers into lora_params.device_path. Gated on
-        // the env-var so callers that do not opt in see no behavior change.
-        if (mUseDeviceLoraPath)
+        // buffers and pack their pointers into lora_params.device_path. The
+        // device path is taken when the env-var opts in (per-request eager
+        // testing) OR when the slot-indexed schema is used (CUDA-graph decode),
+        // since slot-indexed inputs always require the capture-safe device path.
+        bool const use_device_path = mUseDeviceLoraPath || has_slot_indexed;
+        if (use_device_path)
         {
             int64_t const dtype_bytes = static_cast<int64_t>(common::getDTypeSize(loraTypeFromActDtype(act_dtype)));
-            // Mirror LoraImpl's default split-K slice count so the device-path
-            // workspace is sized identically.
-            constexpr int64_t kDevicePathSplitKSlices = 16;
             int64_t const capacity = num_tokens * static_cast<int64_t>(experts_per_token);
+            // Pass stream so a mid-capture resize (which would invalidate
+            // previously captured graphs) is rejected with a clear error
+            // rather than silently corrupting replay.
             ensureLoraDeviceScratch(capacity, lora_max_low_rank, dtype_bytes, kDevicePathSplitKSlices,
-                /*has_gated=*/has_gated);
+                /*has_gated=*/has_gated, stream);
 
             auto& dp = lora_params.device_path;
             dp.enabled = true;
@@ -2186,5 +2272,6 @@ TORCH_LIBRARY(trtllm, m)
         .def("get_tactic_num", &tensorrt_llm::torch_ext::FusedMoeRunner::getTacticNum)
         .def("run_moe", &tensorrt_llm::torch_ext::FusedMoeRunner::runMoe)
         .def("run_moe_min_latency", &tensorrt_llm::torch_ext::FusedMoeRunner::runMoeMinLantency)
+        .def("reserve_lora_host_buffers", &tensorrt_llm::torch_ext::FusedMoeRunner::reserveLoraHostBuffers)
         .def("clear_workspaces", &tensorrt_llm::torch_ext::FusedMoeRunner::clearWorkspaces);
 }
