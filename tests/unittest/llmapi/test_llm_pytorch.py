@@ -40,6 +40,7 @@ from utils.util import (force_ampere, similar, similarity_score,
                         skip_gpu_memory_less_than_138gb, skip_ray)
 from utils.llm_data import llm_models_root
 from tensorrt_llm.lora_helper import LoraConfig
+from tensorrt_llm.llmapi.llm_args import MoeConfig
 from tensorrt_llm.executor.request import LoRARequest
 import tempfile
 
@@ -1091,6 +1092,121 @@ def test_qwen_moe_shared_expert_lora():
             "logprobs) -- shared expert LoRA not applied")
     finally:
         llm.shutdown()
+
+
+@skip_gpu_memory_less_than_40gb
+@pytest.mark.part0
+@test_lora_with_and_without_cuda_graph
+def test_qwen_moe_routed_expert_multi_lora_varying_ranks(cuda_graph_config):
+    """Routed-expert MoE LoRA on Qwen1.5-MoE (PyTorch CUTLASS backend) with five
+    dummy adapters of varying LoRA rank, exercised with and without CUDA graphs.
+
+    Unlike ``test_qwen_moe_shared_expert_lora`` (which targets the shared-expert
+    ``mlp_*`` modules), this targets the *routed* experts
+    (``moe_h_to_4h`` / ``moe_gate`` / ``moe_4h_to_h``). When ``cuda_graph_config``
+    is set this drives the capture-safe slot-indexed device path and
+    ``CudaGraphLoraManager`` (multiple adapters share a single captured decode
+    graph); when it is ``None`` it drives the eager device/host path. The five
+    adapters carry different ranks (with ``max_lora_rank`` covering the largest)
+    so the per-slot rank handling is exercised under one captured graph.
+
+    Adapters are fabricated with HF PEFT on the expert projections
+    (``gate_proj`` / ``up_proj`` / ``down_proj``); because the default
+    TRT-LLM<->HF module map only knows ``w1`` / ``w2`` / ``w3`` for routed
+    experts, an explicit mapping for the PEFT projection names is supplied.
+    PEFT zero-inits ``lora_B`` (a no-op delta), so ``lora_B`` is randomized to
+    make each adapter actually perturb the routed-expert output, letting us
+    assert the LoRA is applied through the routed path rather than silently
+    dropped.
+    """
+    model_dir = f"{llm_models_root()}/Qwen1.5-MoE-A2.7B-Chat"
+
+    # Five adapters with varying ranks; max_lora_rank must cover the largest.
+    ranks = [8, 16, 32, 16, 64]
+    max_rank = max(ranks)
+
+    # HF expert-projection names -> routed-expert TRT-LLM module ids. The
+    # default map only carries w1/w2/w3, so PEFT's gate/up/down names need an
+    # explicit entry. (gate_proj->w1->moe_h_to_4h, up_proj->w3->moe_gate,
+    # down_proj->w2->moe_4h_to_h.)
+    hf_modules = ["gate_proj", "up_proj", "down_proj"]
+    target_modules = ["moe_h_to_4h", "moe_gate", "moe_4h_to_h"]
+    trtllm_modules_to_hf_modules = {
+        "moe_h_to_4h": "gate_proj",
+        "moe_gate": "up_proj",
+        "moe_4h_to_h": "down_proj",
+    }
+
+    with tempfile.TemporaryDirectory() as lora_dir:
+        # One base copy on CPU; PEFT injects/strips adapters in place via
+        # unload(), so we avoid reloading the (large) MoE checkpoint per rank.
+        base = AutoModelForCausalLM.from_pretrained(model_dir,
+                                                    dtype=torch.bfloat16,
+                                                    device_map="cpu")
+        lora_paths = []
+        for i, r in enumerate(ranks):
+            peft_lora_config = PeftLoraConfig(r=r,
+                                              lora_alpha=2 * r,
+                                              target_modules=hf_modules,
+                                              bias="none",
+                                              task_type="CAUSAL_LM")
+            lora_model = get_peft_model(base, peft_lora_config)
+            # Randomize lora_B (PEFT zero-inits it) so the adapter has a real,
+            # rank-dependent effect on the routed-expert output.
+            torch.manual_seed(1000 + i)
+            for name, param in lora_model.named_parameters():
+                if "lora_B" in name:
+                    param.data.normal_(mean=0.0, std=0.02)
+            lora_path = f"{lora_dir}/lora_{i}"
+            lora_model.save_pretrained(lora_path)
+            lora_paths.append(lora_path)
+            # Strip the adapter layers, returning a clean base for the next rank.
+            base = lora_model.unload()
+        del base
+        torch.cuda.empty_cache()
+
+        lora_config = LoraConfig(
+            lora_dir=lora_paths,
+            lora_target_modules=target_modules,
+            trtllm_modules_to_hf_modules=trtllm_modules_to_hf_modules,
+            max_lora_rank=max_rank,
+            max_loras=len(ranks),
+            max_cpu_loras=len(ranks),
+        )
+        llm = LLM(model=model_dir,
+                  lora_config=lora_config,
+                  moe_config=MoeConfig(backend="CUTLASS"),
+                  cuda_graph_config=cuda_graph_config)
+        try:
+            sampling_params = SamplingParams(max_tokens=20, temperature=0.0)
+            prompt = "What is your name?"
+
+            base_out = llm.generate([prompt],
+                                    sampling_params,
+                                    lora_request=None)
+            base_tokens = list(base_out[0].outputs[0].token_ids)
+
+            # Batch all five adapters in one call so multiple distinct adapters
+            # are routed through a single (captured, when enabled) decode graph.
+            lora_requests = [
+                LoRARequest(f"moe-lora-{i}", i, path)
+                for i, path in enumerate(lora_paths)
+            ]
+            outputs = llm.generate([prompt] * len(lora_requests),
+                                   sampling_params,
+                                   lora_request=lora_requests)
+
+            assert len(outputs) == len(lora_requests)
+            any_differs = False
+            for out in outputs:
+                assert out.outputs[0].text is not None
+                if list(out.outputs[0].token_ids) != base_tokens:
+                    any_differs = True
+            assert any_differs, (
+                "All routed-expert MoE LoRA adapters produced output identical "
+                "to the base model; routed-expert LoRA was likely not applied.")
+        finally:
+            llm.shutdown()
 
 
 class TestLlmError:
