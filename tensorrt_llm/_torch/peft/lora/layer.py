@@ -546,14 +546,14 @@ class MoeLoraLayer(LoraLayer):
     """Marker LoraLayer for routed-expert MoE modules.
 
     Routed-expert LoRA is *fused* into the MoE kernel
-    (`torch.ops.trtllm.fused_moe` with LoRA kwargs); the actual GEMMs are not
-    performed by `LoraLayer.forward`. This subclass exists so that
-    `CudaGraphLoraManager._initialize_from_model` and the LoRA target-module
-    validator can discover MoE LoRA layers via `isinstance(module, LoraLayer)`
-    and inspect their `lora_module_types` / `output_hidden_sizes`, without
+    (torch.ops.trtllm.fused_moe with LoRA kwargs); the actual GEMMs are not
+    performed by LoraLayer.forward. This subclass exists so that
+    CudaGraphLoraManager._initialize_from_model and the LoRA target-module
+    validator can discover MoE LoRA layers via isinstance(module, LoraLayer)
+    and inspect their lora_module_types / output_hidden_sizes, without
     altering the standalone LoraLayer call semantics elsewhere in the model.
 
-    Calling `forward()` directly is a programming error: the MoE module owns
+    Calling forward() directly is a programming error: the MoE module owns
     LoRA application.
     """
 

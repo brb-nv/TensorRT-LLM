@@ -175,10 +175,10 @@ protected:
         int64_t* ptrs_dev = upload(ptrs);
 
         MoeLoraGemmGroupArrays out;
-        out.problem_sizes_in = reinterpret_cast<cutlass::gemm::GemmCoord*>(
-            allocZero<int8_t>(P * sizeof(cutlass::gemm::GemmCoord)));
-        out.problem_sizes_out = reinterpret_cast<cutlass::gemm::GemmCoord*>(
-            allocZero<int8_t>(P * sizeof(cutlass::gemm::GemmCoord)));
+        out.problem_sizes_in
+            = reinterpret_cast<cutlass::gemm::GemmCoord*>(allocZero<int8_t>(P * sizeof(cutlass::gemm::GemmCoord)));
+        out.problem_sizes_out
+            = reinterpret_cast<cutlass::gemm::GemmCoord*>(allocZero<int8_t>(P * sizeof(cutlass::gemm::GemmCoord)));
         out.a_ptrs_in = reinterpret_cast<void**>(allocZero<int64_t>(P));
         out.b_ptrs_in = reinterpret_cast<void**>(allocZero<int64_t>(P));
         out.d_ptrs_in = reinterpret_cast<void**>(allocZero<int64_t>(P));
@@ -197,7 +197,8 @@ protected:
         TLLM_CUDA_CHECK(cudaStreamSynchronize(mStream));
 
         // Compare device outputs to host reference.
-        auto check_int64 = [&](char const* name, int64_t* dev, std::vector<int64_t> const& ref_vec) {
+        auto check_int64 = [&](char const* name, int64_t* dev, std::vector<int64_t> const& ref_vec)
+        {
             std::vector<int64_t> host(ref_vec.size(), 0);
             deviceDownload(dev, host);
             for (size_t i = 0; i < ref_vec.size(); ++i)
@@ -205,14 +206,14 @@ protected:
                 EXPECT_EQ(host[i], ref_vec[i]) << name << " mismatch at i=" << i;
             }
         };
-        auto check_ptr_array = [&](char const* name, void** dev, std::vector<int64_t> const& ref_vec) {
-            check_int64(name, reinterpret_cast<int64_t*>(dev), ref_vec);
-        };
-        auto check_problem_sizes = [&](char const* name, cutlass::gemm::GemmCoord* dev,
-                                       std::vector<cutlass::gemm::GemmCoord> const& ref_vec) {
+        auto check_ptr_array = [&](char const* name, void** dev, std::vector<int64_t> const& ref_vec)
+        { check_int64(name, reinterpret_cast<int64_t*>(dev), ref_vec); };
+        auto check_problem_sizes
+            = [&](char const* name, cutlass::gemm::GemmCoord* dev, std::vector<cutlass::gemm::GemmCoord> const& ref_vec)
+        {
             std::vector<cutlass::gemm::GemmCoord> host(ref_vec.size());
-            TLLM_CUDA_CHECK(
-                cudaMemcpy(host.data(), dev, ref_vec.size() * sizeof(cutlass::gemm::GemmCoord), cudaMemcpyDeviceToHost));
+            TLLM_CUDA_CHECK(cudaMemcpy(
+                host.data(), dev, ref_vec.size() * sizeof(cutlass::gemm::GemmCoord), cudaMemcpyDeviceToHost));
             for (size_t i = 0; i < ref_vec.size(); ++i)
             {
                 EXPECT_EQ(host[i].m(), ref_vec[i].m()) << name << " M mismatch at i=" << i;
@@ -244,8 +245,7 @@ protected:
 // we use easily-distinguishable patterns to catch indexing mistakes.
 int64_t fakeAdapter(int tag, int32_t i, int side)
 {
-    return (static_cast<int64_t>(tag) << 56) | (static_cast<int64_t>(side) << 48)
-        | (static_cast<int64_t>(i + 1) << 32);
+    return (static_cast<int64_t>(tag) << 56) | (static_cast<int64_t>(side) << 48) | (static_cast<int64_t>(i + 1) << 32);
 }
 
 TEST_F(MoeLoraProblemBuilderTest, Bf16Smoke)

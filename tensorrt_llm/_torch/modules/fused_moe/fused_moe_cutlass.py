@@ -363,7 +363,7 @@ class CutlassFusedMoE(MoE):
         # Discovery-only marker submodule. The actual LoRA GEMMs are fused into
         # torch.ops.trtllm.fused_moe; MoeLoraLayer exists purely so that
         # CudaGraphLoraManager and the target-module validator can find this MoE
-        # layer via `isinstance(child, LoraLayer)` traversal and read its
+        # layer via isinstance(child, LoraLayer) traversal and read its
         # lora_module_types / output_hidden_sizes when building slot tables.
         self.lora = self._maybe_make_lora_marker(model_config)
 
@@ -388,13 +388,13 @@ class CutlassFusedMoE(MoE):
 
     def _maybe_make_lora_marker(
             self, model_config: ModelConfig) -> Optional[MoeLoraLayer]:
-        """Construct a `MoeLoraLayer` marker iff this MoE layer is in the LoRA
+        """Construct a MoeLoraLayer marker iff this MoE layer is in the LoRA
         target-module set. The marker is a discovery-only submodule; the actual
-        LoRA application is fused into `torch.ops.trtllm.fused_moe`.
+        LoRA application is fused into torch.ops.trtllm.fused_moe.
 
-        The `output_hidden_sizes` recorded here are the per-token outputs of the
+        The output_hidden_sizes recorded here are the per-token outputs of the
         LoRA-side GEMM (not per-expert weight shapes): MOE_H_TO_4H / MOE_GATE
-        produce `intermediate_size`, MOE_4H_TO_H produces `hidden_size`.
+        produce intermediate_size, MOE_4H_TO_H produces hidden_size.
         """
         lora_config = getattr(model_config, "lora_config", None)
         if lora_config is None:
@@ -532,13 +532,13 @@ class CutlassFusedMoE(MoE):
             self, lora_params: Dict) -> Optional[Dict[str, object]]:
         """CUDA-graph slot-indexed extraction for routed-expert MoE LoRA.
 
-        Pulls per-module slot tables and `token_to_slot` out of
-        `CudaGraphLoraParams` and returns the slot-indexed kwargs accepted by
-        `torch.ops.trtllm.fused_moe`. Returns None when this layer does not
+        Pulls per-module slot tables and token_to_slot out of
+        CudaGraphLoraParams and returns the slot-indexed kwargs accepted by
+        torch.ops.trtllm.fused_moe. Returns None when this layer does not
         carry any MoE LoRA modules in the graph layer map.
 
         Returned tensor addresses are stable across captures and replays: they
-        come from persistent pinned host buffers owned by `CudaGraphLoraParams`
+        come from persistent pinned host buffers owned by CudaGraphLoraParams
         and the per-module packed pointer cache. Uses the same module->kernel
         slot convention as the per-request path (moe_h_to_4h -> fc1,
         moe_gate -> gated, moe_4h_to_h -> fc2).
@@ -582,7 +582,7 @@ class CutlassFusedMoE(MoE):
                                                              )
 
         # Active max rank: the largest rank actually populated in the slot table.
-        # `slot_ranks_host` is shared across modules so a single max suffices.
+        # slot_ranks_host is shared across modules so a single max suffices.
         try:
             active_max_rank = int(
                 cuda_graph_params.slot_ranks_host.max().item())
@@ -592,18 +592,24 @@ class CutlassFusedMoE(MoE):
             return None
 
         return {
-            "fc1_slot_lora_ranks": slot_ranks["fc1"].contiguous(),
-            "fc1_slot_lora_weight_ptrs": slot_ptrs["fc1"].contiguous(),
-            "fc2_slot_lora_ranks": slot_ranks["fc2"].contiguous(),
-            "fc2_slot_lora_weight_ptrs": slot_ptrs["fc2"].contiguous(),
+            "fc1_slot_lora_ranks":
+            slot_ranks["fc1"].contiguous(),
+            "fc1_slot_lora_weight_ptrs":
+            slot_ptrs["fc1"].contiguous(),
+            "fc2_slot_lora_ranks":
+            slot_ranks["fc2"].contiguous(),
+            "fc2_slot_lora_weight_ptrs":
+            slot_ptrs["fc2"].contiguous(),
             "gated_slot_lora_ranks":
             (slot_ranks["gated"].contiguous()
              if slot_ranks["gated"] is not None else None),
             "gated_slot_lora_weight_ptrs":
             (slot_ptrs["gated"].contiguous()
              if slot_ptrs["gated"] is not None else None),
-            "token_to_slot": token_to_slot,
-            "lora_max_low_rank": active_max_rank,
+            "token_to_slot":
+            token_to_slot,
+            "lora_max_low_rank":
+            active_max_rank,
         }
 
     def _check_configs(self):

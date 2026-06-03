@@ -22,6 +22,7 @@
 #include <cstdint>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels::cutlass_kernels
 {
 
@@ -43,17 +44,15 @@ constexpr int kBlockSize = 256;
 constexpr int kMaxExpertsInSmem = 1024;
 
 // Per-module expansion. Inlined into the main kernel so we only pay one
-// `permuted_rows[i]` / expert lookup per output row.
-__device__ inline void expandOneModule(MoeLoraExpandModule const& mod, int64_t i, int32_t source_index,
-    int64_t weight_index, int64_t lora_dtype_bytes)
+// permuted_rows[i] and expert lookup per output row.
+__device__ inline void expandOneModule(
+    MoeLoraExpandModule const& mod, int64_t i, int32_t source_index, int64_t weight_index, int64_t lora_dtype_bytes)
 {
     int32_t const rank = mod.ranks_src[source_index];
 
-    // Per-expert byte offsets. The shared flag zeroes the stride so all
-    // experts read the same (unreplicated) buffer; otherwise we apply
-    // `weight_index * dim * rank * sizeof(scalar)`.
-    int64_t const a_stride = mod.shared_a ? int64_t{0} : weight_index * mod.dim_a * rank * lora_dtype_bytes;
-    int64_t const b_stride = mod.shared_b ? int64_t{0} : weight_index * mod.dim_b * rank * lora_dtype_bytes;
+    // Per-expert byte offsets: weight_index * dim * rank * sizeof(scalar).
+    int64_t const a_stride = weight_index * mod.dim_a * rank * lora_dtype_bytes;
+    int64_t const b_stride = weight_index * mod.dim_b * rank * lora_dtype_bytes;
 
     int64_t const a_src = mod.ptrs_src[2 * source_index + 0];
     int64_t const b_src = mod.ptrs_src[2 * source_index + 1];
@@ -72,19 +71,19 @@ __device__ inline void expandOneModule(MoeLoraExpandModule const& mod, int64_t i
 //  2) Computes source_index = permuted_rows[i] % num_rows.
 //  3) Calls expandOneModule for fc1, fc2, and (optionally) gated.
 //
-// The kernel deliberately does NOT compute a global "any-token-has-lora"
-// reduction: the consumer in 6b.C is cudaGraphGroupedGemm, which treats
-// rank=0 as a per-token zero contribution natively, so we don't need the
-// host-side `all_token_without_lora` early-exit anymore.
+// The kernel does not compute a global "any-token-has-lora" reduction: the
+// consumer, cudaGraphGroupedGemm, treats rank 0 as a per-token zero
+// contribution natively, so the host-side all_token_without_lora early-exit is
+// unnecessary.
 __global__ void moeLoraPointerExpandKernel(int32_t const* __restrict__ permuted_rows,
     int64_t const* __restrict__ expert_first_token_offset, int32_t num_experts_per_node, int32_t start_expert,
     int64_t num_rows, int64_t expanded_num_rows, int64_t lora_dtype_bytes, MoeLoraExpandModule fc1,
     MoeLoraExpandModule fc2, MoeLoraExpandModule gated, bool has_gated)
 {
     // Stage expert_first_token_offset in shared memory once per block. The
-    // [num_experts_per_node + 1] array is small (≤ 8KB at our cap) and
-    // every thread in the block needs at least one entry, so SMEM staging
-    // amortizes the cost across the block.
+    // [num_experts_per_node + 1] array is small (<= 8KB at our cap) and every
+    // thread in the block needs at least one entry, so staging it in shared
+    // memory amortizes the cost across the block.
     extern __shared__ int64_t smem_first_token_offset[];
     bool const use_smem = num_experts_per_node + 1 <= kMaxExpertsInSmem;
     if (use_smem)
@@ -120,7 +119,7 @@ __global__ void moeLoraPointerExpandKernel(int32_t const* __restrict__ permuted_
     // permutation leaves at the tail) get expert_idx == num_experts_per_node
     // and we drop them: their entries in the output arrays are read-don't-
     // care anyway, but writing past the end is undefined behavior. The
-    // bounds check on `i >= expanded_num_rows` already gates the buffer
+    // bounds check on i >= expanded_num_rows already gates the buffer
     // size; this clamp protects against weight_index drifting off the
     // expert table when expert_first_token_offset is monotonically saturated.
     if (expert_idx >= num_experts_per_node)
@@ -160,9 +159,9 @@ void launchMoeLoraPointerExpand(int32_t const* permuted_rows, int64_t const* exp
     MoeLoraExpandModule const gated_arg = has_gated ? *gated : MoeLoraExpandModule{};
 
     int64_t const grid = (expanded_num_rows + kBlockSize - 1) / kBlockSize;
-    // Reserve SMEM only when the expert table actually fits. Above the cap
-    // the kernel falls back to global-memory reads (still correct, no SMEM
-    // staging) -- we pass 0 bytes so we don't allocate SMEM we won't touch.
+    // Reserve shared memory only when the expert table fits. Above the cap the
+    // kernel falls back to global-memory reads (still correct, no staging), so
+    // we pass 0 bytes to avoid allocating shared memory we will not touch.
     int const smem_entries = num_experts_per_node + 1;
     size_t const smem_bytes
         = (smem_entries <= kMaxExpertsInSmem) ? static_cast<size_t>(smem_entries) * sizeof(int64_t) : 0;
@@ -174,4 +173,5 @@ void launchMoeLoraPointerExpand(int32_t const* permuted_rows, int64_t const* exp
 }
 
 } // namespace kernels::cutlass_kernels
+
 TRTLLM_NAMESPACE_END

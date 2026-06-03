@@ -93,8 +93,8 @@ def _build_lora_slot_buffers(
 ):
     """Pack LoRA into the slot-indexed CPU tensors used by the CUDA-graph path.
 
-    Uses a single adapter slot (``max_lora_size == 1``) and routes every token
-    to slot 0 via ``token_to_slot``. The per-token expansion the op performs
+    Uses a single adapter slot (max_lora_size == 1) and routes every token
+    to slot 0 via token_to_slot. The per-token expansion the op performs
     from these tables is identical to the single-request per-request path, so
     the two schemas must produce bit-identical kernel inputs (and outputs).
     """
@@ -229,10 +229,20 @@ def test_moe_lora_slot_indexed_matches_per_request():
     )
 
     per_request_kwargs = _build_lora_request_buffers(
-        num_tokens, fc1_adapter["A"], fc1_adapter["B"], fc2_adapter["A"], fc2_adapter["B"], rank=rank
+        num_tokens,
+        fc1_adapter["A"],
+        fc1_adapter["B"],
+        fc2_adapter["A"],
+        fc2_adapter["B"],
+        rank=rank,
     )
     slot_kwargs = _build_lora_slot_buffers(
-        num_tokens, fc1_adapter["A"], fc1_adapter["B"], fc2_adapter["A"], fc2_adapter["B"], rank=rank
+        num_tokens,
+        fc1_adapter["A"],
+        fc1_adapter["B"],
+        fc2_adapter["A"],
+        fc2_adapter["B"],
+        rank=rank,
     )
 
     out_per_request = _call_fused_moe(
@@ -268,18 +278,26 @@ def test_moe_lora_rejects_mixed_per_request_and_slot_indexed():
         num_experts, rank, inter_size, hidden_size, dtype=dtype, device=device, seed=11
     )
     mixed = _build_lora_request_buffers(
-        num_tokens, fc1_adapter["A"], fc1_adapter["B"], fc2_adapter["A"], fc2_adapter["B"], rank=rank
+        num_tokens,
+        fc1_adapter["A"],
+        fc1_adapter["B"],
+        fc2_adapter["A"],
+        fc2_adapter["B"],
+        rank=rank,
     )
     mixed.update(
         _build_lora_slot_buffers(
-            num_tokens, fc1_adapter["A"], fc1_adapter["B"], fc2_adapter["A"], fc2_adapter["B"], rank=rank
+            num_tokens,
+            fc1_adapter["A"],
+            fc1_adapter["B"],
+            fc2_adapter["A"],
+            fc2_adapter["B"],
+            rank=rank,
         )
     )
 
     with pytest.raises((RuntimeError, ValueError)):
-        _call_fused_moe(
-            x, w3_w1, w2, topk_ids, topk_scores, output_dtype=dtype, lora_kwargs=mixed
-        )
+        _call_fused_moe(x, w3_w1, w2, topk_ids, topk_scores, output_dtype=dtype, lora_kwargs=mixed)
 
 
 @requires_cuda_and_op

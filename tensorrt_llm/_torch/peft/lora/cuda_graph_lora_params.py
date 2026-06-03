@@ -395,24 +395,21 @@ class CudaGraphLoraParams:
 
         Used by the routed-expert MoE LoRA path in CUDA-graph decode mode. The
         returned tensors are pinned host views over the persistent buffers held
-        by this instance — their `.data_ptr()` is stable across CUDA graph
+        by this instance, so their data_ptr() is stable across CUDA graph
         captures and replays.
 
         Args:
             layer_idx: Decoder layer index.
-            module_id: One of `MOE_H_TO_4H`, `MOE_4H_TO_H`, `MOE_GATE`
-                (`LoraModuleType` int values).
+            module_id: One of the MOE_H_TO_4H, MOE_4H_TO_H, or MOE_GATE
+                LoraModuleType int values.
 
         Returns:
-            A tuple `(slot_ranks_host, slot_weight_ptrs_host)` where
-              - `slot_ranks_host`: `[max_lora_size]` int32 (alias to
-                `self.slot_ranks_host`; same rank-per-slot as the rest of the
-                LoRA infra).
-              - `slot_weight_ptrs_host`: `[max_lora_size, 3]` int64. Columns
-                are `(A_ptr, B_ptr, dora_ptr)` with `dora_ptr` always 0 (DoRA
-                with MoE is rejected upstream by `lora_manager.py`).
-            Returns `None` if `(layer_idx, module_id)` is not in this layer
-            map (e.g. the model has no MoE LoRA on that layer).
+            A tuple (slot_ranks_host, slot_weight_ptrs_host), where
+            slot_ranks_host is [max_lora_size] int32 (an alias to
+            self.slot_ranks_host), and slot_weight_ptrs_host is
+            [max_lora_size, 3] int64 with columns (A_ptr, B_ptr, dora_ptr).
+            dora_ptr is always 0, since DoRA with MoE is rejected upstream.
+            Returns None if (layer_idx, module_id) is not in this layer's map.
         """
         key = self.layer_module2key.get((layer_idx, module_id))
         if key is None:
@@ -421,10 +418,10 @@ class CudaGraphLoraParams:
         if layer_param is None:
             return None
         local_module_id = key.module_ids.index(module_id)
-        # Slice `[max_lora_size]` views for the requested module.
+        # Slice [max_lora_size] views for the requested module.
         ptrs_a = layer_param.h_b_ptrs[local_module_id]
         ptrs_b = layer_param.h_b_prime_ptrs[local_module_id]
-        # Pack into `[max_lora_size, 3]`. We allocate a new tensor here because
+        # Pack into [max_lora_size, 3]. We allocate a new tensor here because
         # the existing storage isn't laid out as (A, B, dora) per slot. To
         # keep this graph-capture safe, cache the packed buffer per (layer_idx,
         # module_id) so its address is stable across calls.

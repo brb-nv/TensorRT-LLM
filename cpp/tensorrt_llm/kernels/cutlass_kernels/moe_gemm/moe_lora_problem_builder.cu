@@ -22,6 +22,7 @@
 #include <cstdint>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels::cutlass_kernels
 {
 
@@ -35,17 +36,16 @@ namespace
 constexpr int kBlockSize = 256;
 
 // One thread per permuted row writes all 13 output arrays. Each output
-// stream is contiguous (a[i] for thread-id `i`), so the loads/stores
+// stream is contiguous (a[i] for thread-id i), so the loads/stores
 // coalesce. There is no inter-thread communication.
 __global__ void moeLoraProblemBuilderKernel(int32_t const* __restrict__ ranks, int64_t const* __restrict__ ptrs,
     int64_t input_base, int64_t lowrank_workspace, int64_t output_base, int64_t num_permuted_tokens,
-    int64_t in_hidden_size, int64_t out_hidden_size, int64_t max_lora_rank, int64_t dtype_bytes,
-    int64_t splitk_slices, cutlass::gemm::GemmCoord* __restrict__ problem_sizes_in,
-    cutlass::gemm::GemmCoord* __restrict__ problem_sizes_out, void** __restrict__ a_ptrs_in,
-    void** __restrict__ b_ptrs_in, void** __restrict__ d_ptrs_in, void** __restrict__ b_ptrs_out,
-    void** __restrict__ d_ptrs_out, int64_t* __restrict__ lda_in, int64_t* __restrict__ ldb_in,
-    int64_t* __restrict__ ldd_in, int64_t* __restrict__ ldb_out, int64_t* __restrict__ ldd_out,
-    int64_t* __restrict__ splitk_offsets)
+    int64_t in_hidden_size, int64_t out_hidden_size, int64_t max_lora_rank, int64_t dtype_bytes, int64_t splitk_slices,
+    cutlass::gemm::GemmCoord* __restrict__ problem_sizes_in, cutlass::gemm::GemmCoord* __restrict__ problem_sizes_out,
+    void** __restrict__ a_ptrs_in, void** __restrict__ b_ptrs_in, void** __restrict__ d_ptrs_in,
+    void** __restrict__ b_ptrs_out, void** __restrict__ d_ptrs_out, int64_t* __restrict__ lda_in,
+    int64_t* __restrict__ ldb_in, int64_t* __restrict__ ldd_in, int64_t* __restrict__ ldb_out,
+    int64_t* __restrict__ ldd_out, int64_t* __restrict__ splitk_offsets)
 {
     int64_t const i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i >= num_permuted_tokens)
@@ -63,8 +63,8 @@ __global__ void moeLoraProblemBuilderKernel(int32_t const* __restrict__ ranks, i
     int64_t const a_ptr_bits = ptrs[2 * i + 0];
     int64_t const b_ptr_bits = ptrs[2 * i + 1];
 
-    // Problem sizes: each permuted token gets its own (M=1) GEMM. This
-    // matches the worst-case "no RLE" scheduling -- a future perf
+    // Problem sizes: each permuted token gets its own (M=1) GEMM. This matches
+    // worst-case scheduling with no run-length aggregation; a future
     // optimization can aggregate consecutive identical-adapter tokens.
     problem_sizes_in[i] = cutlass::gemm::GemmCoord(1, rank, static_cast<int>(in_hidden_size));
     problem_sizes_out[i] = cutlass::gemm::GemmCoord(1, static_cast<int>(out_hidden_size), rank);
@@ -146,4 +146,5 @@ void launchMoeLoraProblemBuilder(int32_t const* ranks_dev, int64_t const* ptrs_d
 }
 
 } // namespace kernels::cutlass_kernels
+
 TRTLLM_NAMESPACE_END

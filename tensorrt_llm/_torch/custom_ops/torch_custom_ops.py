@@ -232,7 +232,7 @@ def fused_moe(
     use_dynamic_fc2_scale: bool = False,
     # Routed-expert LoRA inputs (all optional; presence of fc1_lora_ranks activates LoRA).
     # Each *_ranks   : CPU int32  [num_seqs]
-    # Each *_weights : CPU int64  [num_seqs, 3]  -- (A_ptr, B_ptr, DoRA_ptr unused)
+    # Each *_weights : CPU int64  [num_seqs, 3], holding (A_ptr, B_ptr, DoRA_ptr); DoRA unused.
     fc1_lora_ranks: Optional[torch.Tensor] = None,
     fc1_lora_weight_ptrs: Optional[torch.Tensor] = None,
     fc2_lora_ranks: Optional[torch.Tensor] = None,

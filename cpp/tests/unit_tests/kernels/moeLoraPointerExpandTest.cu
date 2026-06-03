@@ -36,8 +36,6 @@ struct RefModule
     std::vector<int64_t> ptrs_src;
     int64_t dim_a;
     int64_t dim_b;
-    bool shared_a;
-    bool shared_b;
     std::vector<int32_t> ranks_out;
     std::vector<int64_t> ptrs_out;
 };
@@ -49,10 +47,8 @@ void cpuExpand(std::vector<int32_t> const& permuted_rows, std::vector<int64_t> c
     auto expand_one = [&](RefModule& mod, int64_t i, int32_t source_index, int64_t weight_index)
     {
         int32_t const rank = mod.ranks_src[source_index];
-        int64_t const a_stride
-            = mod.shared_a ? int64_t{0} : weight_index * mod.dim_a * rank * lora_dtype_bytes;
-        int64_t const b_stride
-            = mod.shared_b ? int64_t{0} : weight_index * mod.dim_b * rank * lora_dtype_bytes;
+        int64_t const a_stride = weight_index * mod.dim_a * rank * lora_dtype_bytes;
+        int64_t const b_stride = weight_index * mod.dim_b * rank * lora_dtype_bytes;
         mod.ptrs_out[2 * i + 0] = mod.ptrs_src[2 * source_index + 0] + a_stride;
         mod.ptrs_out[2 * i + 1] = mod.ptrs_src[2 * source_index + 1] + b_stride;
         mod.ranks_out[i] = rank;
@@ -153,11 +149,10 @@ protected:
         return p;
     }
 
-    // Run the kernel against `ref` and assert the device outputs match.
-    void runAndCompare(std::vector<int32_t> const& permuted_rows,
-        std::vector<int64_t> const& expert_first_token_offset, int32_t num_experts_per_node, int32_t start_expert,
-        int64_t num_rows, int64_t expanded_num_rows, int64_t lora_dtype_bytes, RefModule& fc1_ref, RefModule& fc2_ref,
-        RefModule* gated_ref)
+    // Run the kernel against ref and assert the device outputs match.
+    void runAndCompare(std::vector<int32_t> const& permuted_rows, std::vector<int64_t> const& expert_first_token_offset,
+        int32_t num_experts_per_node, int32_t start_expert, int64_t num_rows, int64_t expanded_num_rows,
+        int64_t lora_dtype_bytes, RefModule& fc1_ref, RefModule& fc2_ref, RefModule* gated_ref)
     {
         cpuExpand(permuted_rows, expert_first_token_offset, num_experts_per_node, start_expert, num_rows,
             expanded_num_rows, lora_dtype_bytes, fc1_ref, fc2_ref, gated_ref);
@@ -165,14 +160,13 @@ protected:
         auto* permuted_rows_dev = upload(permuted_rows);
         auto* offsets_dev = upload(expert_first_token_offset);
 
-        auto build_module = [&](RefModule const& r) {
+        auto build_module = [&](RefModule const& r)
+        {
             MoeLoraExpandModule m;
             m.ranks_src = upload(r.ranks_src);
             m.ptrs_src = upload(r.ptrs_src);
             m.dim_a = r.dim_a;
             m.dim_b = r.dim_b;
-            m.shared_a = r.shared_a;
-            m.shared_b = r.shared_b;
             m.ranks_out = allocZero<int32_t>(expanded_num_rows);
             m.ptrs_out = allocZero<int64_t>(expanded_num_rows * 2);
             return m;
@@ -193,7 +187,8 @@ protected:
         TLLM_CUDA_CHECK(cudaStreamSynchronize(mStream));
 
         // Compare per-module.
-        auto compare = [&](RefModule const& ref_mod, MoeLoraExpandModule const& dev_mod, char const* name) {
+        auto compare = [&](RefModule const& ref_mod, MoeLoraExpandModule const& dev_mod, char const* name)
+        {
             std::vector<int32_t> host_ranks(expanded_num_rows, 0);
             std::vector<int64_t> host_ptrs(expanded_num_rows * 2, 0);
             deviceDownload(dev_mod.ranks_out, host_ranks);
@@ -201,10 +196,8 @@ protected:
             for (int64_t i = 0; i < expanded_num_rows; ++i)
             {
                 EXPECT_EQ(host_ranks[i], ref_mod.ranks_out[i]) << name << " rank mismatch at i=" << i;
-                EXPECT_EQ(host_ptrs[2 * i + 0], ref_mod.ptrs_out[2 * i + 0])
-                    << name << " A ptr mismatch at i=" << i;
-                EXPECT_EQ(host_ptrs[2 * i + 1], ref_mod.ptrs_out[2 * i + 1])
-                    << name << " B ptr mismatch at i=" << i;
+                EXPECT_EQ(host_ptrs[2 * i + 0], ref_mod.ptrs_out[2 * i + 0]) << name << " A ptr mismatch at i=" << i;
+                EXPECT_EQ(host_ptrs[2 * i + 1], ref_mod.ptrs_out[2 * i + 1]) << name << " B ptr mismatch at i=" << i;
             }
         };
 
@@ -220,18 +213,17 @@ protected:
     std::vector<void*> mAllocations;
 };
 
-// Helper: build a "fake but distinct" pointer for source token `s` of module
-// `tag`. Encoding the (tag, s, side) lets the test cheaply verify the
+// Helper: build a "fake but distinct" pointer for source token s of module
+// tag. Encoding the (tag, s, side) lets the test cheaply verify the
 // kernel reads the right slot of ptrs_src. The high bits guarantee
 // (ptr + per-expert-byte-offset) doesn't alias another (tag, s, side).
 int64_t fakePtr(int tag, int32_t s, int side)
 {
-    return (static_cast<int64_t>(tag) << 56) | (static_cast<int64_t>(side) << 48)
-        | (static_cast<int64_t>(s + 1) << 32);
+    return (static_cast<int64_t>(tag) << 56) | (static_cast<int64_t>(side) << 48) | (static_cast<int64_t>(s + 1) << 32);
 }
 
 // Smallest non-trivial case: 4 source tokens, 3 experts, top_k=2 so the
-// permuted batch has 8 rows. Per-expert (no shared) and no gated.
+// permuted batch has 8 rows. Per-expert, no gated.
 TEST_F(MoeLoraPointerExpandTest, PerExpertNoGated)
 {
     int32_t const num_experts_per_node = 3;
@@ -248,8 +240,6 @@ TEST_F(MoeLoraPointerExpandTest, PerExpertNoGated)
     RefModule fc1{};
     fc1.dim_a = 16; // "hidden_size"
     fc1.dim_b = 32; // "inter_size"
-    fc1.shared_a = false;
-    fc1.shared_b = false;
     fc1.ranks_src = {2, 0, 4, 1};
     fc1.ptrs_src.resize(num_rows * 2);
     for (int32_t s = 0; s < num_rows; ++s)
@@ -261,8 +251,6 @@ TEST_F(MoeLoraPointerExpandTest, PerExpertNoGated)
     RefModule fc2{};
     fc2.dim_a = 32;
     fc2.dim_b = 16;
-    fc2.shared_a = false;
-    fc2.shared_b = false;
     fc2.ranks_src = {1, 2, 0, 3};
     fc2.ptrs_src.resize(num_rows * 2);
     for (int32_t s = 0; s < num_rows; ++s)
@@ -275,7 +263,7 @@ TEST_F(MoeLoraPointerExpandTest, PerExpertNoGated)
         expanded_num_rows, /*lora_dtype_bytes=*/2, fc1, fc2, /*gated=*/nullptr);
 }
 
-// Gated activation: three modules, exercises the `gated` arg path.
+// Gated activation: three modules, exercises the gated arg path.
 TEST_F(MoeLoraPointerExpandTest, GatedActivation)
 {
     int32_t const num_experts_per_node = 4;
@@ -286,12 +274,11 @@ TEST_F(MoeLoraPointerExpandTest, GatedActivation)
     std::vector<int32_t> permuted_rows = {0, 5, 1, 6, 2, 7, 3, 8, 4, 9};
     std::vector<int64_t> expert_first_token_offset = {0, 2, 5, 7, 10};
 
-    auto build_basic = [&](int tag, int64_t dim_a, int64_t dim_b) {
+    auto build_basic = [&](int tag, int64_t dim_a, int64_t dim_b)
+    {
         RefModule m{};
         m.dim_a = dim_a;
         m.dim_b = dim_b;
-        m.shared_a = false;
-        m.shared_b = false;
         m.ranks_src = {3, 0, 1, 4, 2};
         m.ptrs_src.resize(num_rows * 2);
         for (int32_t s = 0; s < num_rows; ++s)
@@ -305,59 +292,6 @@ TEST_F(MoeLoraPointerExpandTest, GatedActivation)
     RefModule fc1 = build_basic(/*tag=*/1, /*hidden=*/8, /*inter=*/24);
     RefModule fc2 = build_basic(/*tag=*/2, /*inter=*/24, /*hidden=*/8);
     RefModule gated = build_basic(/*tag=*/3, /*hidden=*/8, /*inter=*/24);
-    runAndCompare(permuted_rows, expert_first_token_offset, num_experts_per_node, start_expert, num_rows,
-        expanded_num_rows, /*lora_dtype_bytes=*/2, fc1, fc2, &gated);
-}
-
-// Shared-outer LoRA: each module exercises a different (shared_a, shared_b)
-// combination so a single test covers the full 2x2 flag matrix across the
-// three modules.
-TEST_F(MoeLoraPointerExpandTest, SharedOuterFlags)
-{
-    int32_t const num_experts_per_node = 2;
-    int32_t const start_expert = 0;
-    int64_t const num_rows = 3;
-    int64_t const expanded_num_rows = 6;
-
-    std::vector<int32_t> permuted_rows = {0, 3, 1, 4, 2, 5};
-    std::vector<int64_t> expert_first_token_offset = {0, 3, 6};
-
-    RefModule fc1{};
-    fc1.dim_a = 8;
-    fc1.dim_b = 12;
-    fc1.shared_a = true; // A side shared across experts
-    fc1.shared_b = false;
-    fc1.ranks_src = {1, 2, 3};
-    fc1.ptrs_src = {
-        fakePtr(1, 0, 0), fakePtr(1, 0, 1),
-        fakePtr(1, 1, 0), fakePtr(1, 1, 1),
-        fakePtr(1, 2, 0), fakePtr(1, 2, 1),
-    };
-
-    RefModule fc2{};
-    fc2.dim_a = 12;
-    fc2.dim_b = 8;
-    fc2.shared_a = false;
-    fc2.shared_b = true; // B side shared across experts
-    fc2.ranks_src = {2, 1, 3};
-    fc2.ptrs_src = {
-        fakePtr(2, 0, 0), fakePtr(2, 0, 1),
-        fakePtr(2, 1, 0), fakePtr(2, 1, 1),
-        fakePtr(2, 2, 0), fakePtr(2, 2, 1),
-    };
-
-    RefModule gated{};
-    gated.dim_a = 8;
-    gated.dim_b = 12;
-    gated.shared_a = true; // both shared
-    gated.shared_b = true;
-    gated.ranks_src = {3, 3, 3};
-    gated.ptrs_src = {
-        fakePtr(3, 0, 0), fakePtr(3, 0, 1),
-        fakePtr(3, 1, 0), fakePtr(3, 1, 1),
-        fakePtr(3, 2, 0), fakePtr(3, 2, 1),
-    };
-
     runAndCompare(permuted_rows, expert_first_token_offset, num_experts_per_node, start_expert, num_rows,
         expanded_num_rows, /*lora_dtype_bytes=*/2, fc1, fc2, &gated);
 }
@@ -377,8 +311,6 @@ TEST_F(MoeLoraPointerExpandTest, Fp32StrideBytes)
     RefModule fc1{};
     fc1.dim_a = 4;
     fc1.dim_b = 8;
-    fc1.shared_a = false;
-    fc1.shared_b = false;
     fc1.ranks_src = {2, 3};
     fc1.ptrs_src = {fakePtr(1, 0, 0), fakePtr(1, 0, 1), fakePtr(1, 1, 0), fakePtr(1, 1, 1)};
 
