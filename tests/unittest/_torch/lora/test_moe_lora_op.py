@@ -352,10 +352,14 @@ def test_moe_lora_rejects_overlong_context_lengths():
     # Single context request (host_request_types == 0) whose declared context
     # length exceeds the op's token count, so the expansion overruns by design.
     lora_kwargs["host_request_types"] = torch.zeros(1, dtype=torch.int32, device="cpu")
-    lora_kwargs["host_context_lengths"] = torch.tensor([2 * num_tokens], dtype=torch.int32, device="cpu")
+    lora_kwargs["host_context_lengths"] = torch.tensor(
+        [2 * num_tokens], dtype=torch.int32, device="cpu"
+    )
 
     with pytest.raises((RuntimeError, ValueError)):
-        _call_fused_moe(x, w3_w1, w2, topk_ids, topk_scores, output_dtype=dtype, lora_kwargs=lora_kwargs)
+        _call_fused_moe(
+            x, w3_w1, w2, topk_ids, topk_scores, output_dtype=dtype, lora_kwargs=lora_kwargs
+        )
 
 
 @requires_cuda_and_op
