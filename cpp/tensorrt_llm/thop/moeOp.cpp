@@ -1345,6 +1345,13 @@ private:
             auto const req_type = static_cast<MoeLoraRequestType>(req_types[req_id]);
             int64_t const repeat
                 = (req_type == MoeLoraRequestType::kGENERATION) ? int64_t{1} : static_cast<int64_t>(ctx_lens[req_id]);
+            // Guard the destination writes BEFORE producing them. expand_*_data
+            // point at fixed-capacity pinned buffers sized for num_tokens, so a
+            // malformed host_context_lengths (summing past num_tokens) must be a
+            // clean error rather than an out-of-bounds write into pinned memory.
+            TORCH_CHECK(produced + repeat <= num_tokens, "MoE LoRA per-request expansion overran the ", num_tokens,
+                "-token buffer at request ", req_id, " (produced ", produced, " + ", repeat,
+                "). Check host_request_types / host_context_lengths against the op's token count.");
             for (int64_t i = 0; i < repeat; ++i)
             {
                 int64_t const t = produced + i;
