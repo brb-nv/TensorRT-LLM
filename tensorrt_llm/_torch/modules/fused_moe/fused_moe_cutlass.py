@@ -416,7 +416,8 @@ class CutlassFusedMoE(MoE):
         return MoeLoraLayer(active_modules, active_out_sizes)
 
     def reserve_moe_lora_cuda_graph_workspace(self, max_num_tokens: int,
-                                              max_lora_rank: int) -> None:
+                                              max_lora_rank: int,
+                                              max_lora_size: int) -> None:
         """Pre-size the C++ FusedMoeRunner's routed-expert MoE-LoRA scratch to
         the engine's worst case, so no (re)allocation happens later during CUDA
         graph capture/replay.
@@ -437,6 +438,8 @@ class CutlassFusedMoE(MoE):
             max_num_tokens: Worst-case number of tokens in a captured forward
                 (max_batch_size * max_tokens_per_seq).
             max_lora_rank: Largest LoRA rank across adapters.
+            max_lora_size: Adapter-slot pool size (for the slot-indexed device
+                tables consumed by the on-device slot->token expansion).
         """
         if not self._moe_lora_enabled or max_num_tokens <= 0:
             return
@@ -483,6 +486,7 @@ class CutlassFusedMoE(MoE):
             int(max_num_tokens),
             int(self.routing_method.experts_per_token),
             int(max_lora_rank),
+            int(max_lora_size),
             bool(self.is_gated_activation),
         )
 
@@ -652,14 +656,16 @@ class CutlassFusedMoE(MoE):
                                                              num_tokens].contiguous(
                                                              )
 
-        # Active max rank: the largest rank actually populated in the slot table.
-        # slot_ranks_host is shared across modules so a single max suffices.
-        try:
-            active_max_rank = int(
-                cuda_graph_params.slot_ranks_host.max().item())
-        except (RuntimeError, ValueError):
-            active_max_rank = 0
-        if active_max_rank <= 0:
+        # Pass the GLOBAL max LoRA rank (cuda_graph_params.max_rank), not the
+        # per-step active max. The device path uses this only to size the
+        # low-rank workspace row strides that get baked into the captured graph;
+        # using the global max keeps those strides valid for any per-slot rank
+        # up to the configured maximum across replays. The actual per-token rank
+        # is read on-device from the slot table, so a smaller rank simply runs a
+        # smaller GEMM. (Returning None here only matters at capture time; if no
+        # LoRA is configured at all, max_rank is 0 and we skip the path.)
+        max_rank = int(getattr(cuda_graph_params, "max_rank", 0))
+        if max_rank <= 0:
             return None
 
         return {
@@ -680,7 +686,7 @@ class CutlassFusedMoE(MoE):
             "token_to_slot":
             token_to_slot,
             "lora_max_low_rank":
-            active_max_rank,
+            max_rank,
         }
 
     def _check_configs(self):

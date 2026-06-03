@@ -15,11 +15,10 @@ the surface the eager-only tests in `test_moe_lora_op.py` cannot reach:
      verified against the eager result.
   3. Multi-adapter routing within a single capture (token_to_slot mixing two
      adapter slots).
-  4. Slot reassignment semantics: the per-token tables are materialized on the
-     host during the op body, which only executes at *capture* time. Changing
-     the slot tables in place after capture therefore does NOT affect replay;
-     a re-capture is required. This test pins that documented limitation and
-     verifies the re-capture workflow.
+  4. Slot reassignment under replay: the slot -> per-token expansion runs
+     on-device fed by captured H2D copies of the stable pinned slot tables, so
+     reassigning a slot's adapter in place is reflected on replay WITHOUT
+     re-capture (mirroring attention LoRA and the normal decode loop).
 
 They require a CUDA GPU and the built `trtllm::fused_moe` op.
 """
@@ -304,15 +303,27 @@ def test_device_path_cuda_graph_multi_adapter():
     torch.testing.assert_close(out_replay, out_ref, rtol=_RTOL, atol=_ATOL)
 
 
-@requires_cuda_and_op
-def test_device_path_slot_reassignment_requires_recapture():
-    """Document + verify the slot-table freezing semantics of the device path.
+def _set_slot_ptrs_inplace(slot_kwargs, adapters, slot_index=0):
+    """Overwrite one slot's (A, B) pointer rows for all three modules in place,
+    preserving the pinned-tensor storage (and thus the data_ptr the captured
+    H2D reads from)."""
+    for kernel, mod in (("fc1", "fc1"), ("fc2", "fc2"), ("gated", "gated")):
+        row = torch.tensor(
+            [adapters[mod]["A"].data_ptr(), adapters[mod]["B"].data_ptr(), 0],
+            dtype=torch.int64, device="cpu")
+        slot_kwargs[f"{kernel}_slot_lora_weight_ptrs"][slot_index].copy_(row)
 
-    The slot -> per-token expansion runs on the host inside the op body, which
-    executes only at *capture* time. Mutating the slot tables in place after
-    capture therefore must NOT change replay output; the graph must be
-    re-captured to pick up a new adapter. (This differs from attention LoRA,
-    whose device tensors are read on every replay.)
+
+@requires_cuda_and_op
+def test_device_path_slot_reassignment_reflected_on_replay():
+    """In-place slot reassignment must be reflected on replay WITHOUT recapture.
+
+    The slot -> per-token expansion runs on-device (launchMoeLoraSlotExpand)
+    fed by captured H2D copies of the stable pinned slot tables. Because both
+    the copies and the expansion kernel are recorded into the graph, mutating a
+    slot's adapter pointers in place (same pinned storage) and replaying picks
+    up the new adapter -- mirroring attention LoRA, and the normal decode loop
+    where requests/adapters change across steps under one captured graph.
     """
     device = torch.device("cuda")
     dtype = torch.bfloat16
@@ -347,32 +358,18 @@ def test_device_path_slot_reassignment_requires_recapture():
                                atol=_ATOL)
 
     # Reassign slot 0 to adapter_b *in place* (same pinned tensor storage), then
-    # replay WITHOUT re-capturing. The host materialization does not re-run on
-    # replay, so the output must remain adapter_a's.
-    new_ptrs = torch.tensor(
-        [[adapter_b["fc1"]["A"].data_ptr(), adapter_b["fc1"]["B"].data_ptr(),
-          0]], dtype=torch.int64, device="cpu")
-    slot_kwargs["fc1_slot_lora_weight_ptrs"].copy_(new_ptrs)
-    slot_kwargs["gated_slot_lora_weight_ptrs"].copy_(
-        torch.tensor([[
-            adapter_b["gated"]["A"].data_ptr(),
-            adapter_b["gated"]["B"].data_ptr(), 0
-        ]], dtype=torch.int64, device="cpu"))
-    slot_kwargs["fc2_slot_lora_weight_ptrs"].copy_(
-        torch.tensor([[
-            adapter_b["fc2"]["A"].data_ptr(), adapter_b["fc2"]["B"].data_ptr(),
-            0
-        ]], dtype=torch.int64, device="cpu"))
+    # replay WITHOUT re-capturing. The captured H2D + device slot-expand re-run
+    # on replay, so the output must now reflect adapter_b.
+    _set_slot_ptrs_inplace(slot_kwargs, adapter_b, slot_index=0)
 
     graph.replay()
     torch.cuda.synchronize()
-    # Stale on purpose: replay still reflects adapter_a (documented limitation).
-    torch.testing.assert_close(captured.clone(), out_ref_a, rtol=_RTOL,
+    torch.testing.assert_close(captured.clone(), out_ref_b, rtol=_RTOL,
                                atol=_ATOL)
 
-    # Re-capture to pick up adapter_b, then replay reflects the new adapter.
-    graph2, captured2 = _warmup_and_capture(call)
-    graph2.replay()
+    # And switching back is likewise reflected, confirming it is not a one-shot.
+    _set_slot_ptrs_inplace(slot_kwargs, adapter_a, slot_index=0)
+    graph.replay()
     torch.cuda.synchronize()
-    torch.testing.assert_close(captured2.clone(), out_ref_b, rtol=_RTOL,
+    torch.testing.assert_close(captured.clone(), out_ref_a, rtol=_RTOL,
                                atol=_ATOL)

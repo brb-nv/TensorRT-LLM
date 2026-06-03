@@ -24,6 +24,7 @@
 #include "tensorrt_llm/kernels/cutlass_kernels/include/moe_gemm_kernels.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/include/moe_lora_device_path.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/include/moe_lora_problem_builder.h"
+#include "tensorrt_llm/kernels/cutlass_kernels/include/moe_lora_slot_expand.h"
 
 #include "cutlass/gemm_coord.h"
 
@@ -1062,6 +1063,27 @@ private:
     // resizes do not reallocate and invalidate the captured copy addresses.
     int64_t mLoraHostBufCapacity = 0;
 
+    // ---- Slot-indexed (CUDA-graph) device-source buffers ----
+    // For the slot-indexed schema the per-source-token (rank, A_ptr, B_ptr)
+    // tables are produced on-device by launchMoeLoraSlotExpand, which reads the
+    // device-resident slot tables and token_to_slot below and writes into the
+    // mLoraExpand*Device mirrors above. The slot tables and token_to_slot are
+    // refreshed each step by a captured async H2D from the caller's stable
+    // pinned-host buffers (owned by CudaGraphLoraParams and updated in place),
+    // so replaying the captured graph picks up new adapter assignments without
+    // re-capture. All are persistent and address-stable across captures.
+    // token_to_slot is sized at max_num_tokens (with the expand buffers); the
+    // slot tables are sized at max_lora_size (the adapter-slot pool).
+    at::Tensor mLoraTokenToSlotDevice;     // [max_num_tokens]       int32
+    at::Tensor mLoraSlotFC1RanksDevice;    // [max_lora_size]        int32
+    at::Tensor mLoraSlotFC1PtrsDevice;     // [max_lora_size * 3]    int64
+    at::Tensor mLoraSlotFC2RanksDevice;    // [max_lora_size]        int32
+    at::Tensor mLoraSlotFC2PtrsDevice;     // [max_lora_size * 3]    int64
+    at::Tensor mLoraSlotGatedRanksDevice;  // [max_lora_size]        int32
+    at::Tensor mLoraSlotGatedPtrsDevice;   // [max_lora_size * 3]    int64
+    // Highest max_lora_size we have reserved slot-table storage for.
+    int64_t mLoraSlotTableCapacity = 0;
+
     // Persistent device-resident scratch backing the capture-safe MoE LoRA
     // path. One LoraDevicePathBuffers per module (fc1, fc2, gated). All
     // at::Tensor members are allocated by ensureLoraDeviceScratch and reused
@@ -1345,49 +1367,6 @@ private:
             " tokens but op input has ", num_tokens, " tokens.");
     }
 
-    // Slot-indexed materialization for the CUDA-graph decode path.
-    //
-    // Inputs (all CPU host tensors, pinned for graph-replay friendliness):
-    //   slot_ranks:        int32 [max_lora_size]
-    //   slot_weight_ptrs:  int64 [max_lora_size, 3]    (A, B, dora; dora ignored)
-    //   token_to_slot:     int32 [>=num_tokens]
-    //   num_tokens:        active token count for this call
-    //
-    // Writes per-token ranks/ptrs into the caller-owned pinned-host buffers
-    // expand_ranks_data ([num_tokens] int32) and expand_ptrs_data
-    // ([num_tokens * 2] int64). The buffers must already be sized to at
-    // least num_tokens / num_tokens * 2; callers reserve via
-    // reserveLoraHostBuffers so the storage addresses are stable across
-    // CUDA-graph captures and replays.
-    void materializeSlotIndexedLoraTo(torch::Tensor const& slot_ranks, torch::Tensor const& slot_weight_ptrs,
-        torch::Tensor const& token_to_slot, int64_t num_tokens, int32_t* expand_ranks_data, int64_t* expand_ptrs_data)
-    {
-        CHECK_CPU_INPUT(slot_ranks, at::ScalarType::Int)
-        CHECK_CPU_INPUT(slot_weight_ptrs, at::ScalarType::Long)
-        CHECK_CPU_INPUT(token_to_slot, at::ScalarType::Int)
-
-        auto const num_slots = static_cast<int64_t>(slot_ranks.size(0));
-        TORCH_CHECK(
-            slot_weight_ptrs.dim() == 2 && slot_weight_ptrs.size(0) == num_slots && slot_weight_ptrs.size(1) == 3,
-            "MoE LoRA slot_weight_ptrs must have shape [max_lora_size, 3]; got ", slot_weight_ptrs.sizes());
-        TORCH_CHECK(token_to_slot.size(0) >= num_tokens, "MoE LoRA token_to_slot length (", token_to_slot.size(0),
-            ") must be >= num_tokens (", num_tokens, ").");
-
-        auto const* slot_rank_data = static_cast<int32_t const*>(slot_ranks.data_ptr());
-        auto const* slot_ptr_data = static_cast<int64_t const*>(slot_weight_ptrs.data_ptr());
-        auto const* token2slot_data = static_cast<int32_t const*>(token_to_slot.data_ptr());
-
-        for (int64_t t = 0; t < num_tokens; ++t)
-        {
-            int32_t const slot = token2slot_data[t];
-            TORCH_CHECK(slot >= 0 && slot < num_slots, "MoE LoRA token_to_slot[", t, "]=", slot,
-                " is out of range [0, ", num_slots, ").");
-            expand_ranks_data[t] = slot_rank_data[slot];
-            expand_ptrs_data[2 * t + 0] = slot_ptr_data[slot * 3 + 0];
-            expand_ptrs_data[2 * t + 1] = slot_ptr_data[slot * 3 + 1];
-        }
-    }
-
     // Pre-allocate the pinned-host and persistent-device LoRA expansion
     // buffers at a fixed capacity. Required for CUDA-graph capture/replay
     // safety: the captured stream records cudaMemcpyAsync at the source
@@ -1412,22 +1391,32 @@ public:
     // this once with the engine's worst-case shape before any graph capture that
     // exercises routed-expert MoE LoRA. It is idempotent and grow-only, so
     // repeated or smaller calls are no-ops. experts_per_token is the routing
-    // top_k; max_lora_rank is the largest LoRA rank across adapters; has_gated
+    // top_k; max_lora_rank is the largest LoRA rank across adapters; max_lora_size
+    // is the adapter-slot pool size (for the slot-indexed device tables); has_gated
     // is true for gated activations (e.g. SwiGLU), which need a third module's
     // device scratch.
     void reserveLoraHostBuffers(
-        int64_t max_num_tokens, int64_t experts_per_token, int64_t max_lora_rank, bool has_gated)
+        int64_t max_num_tokens, int64_t experts_per_token, int64_t max_lora_rank, int64_t max_lora_size, bool has_gated)
     {
         std::lock_guard<std::mutex> lock(mMutex);
         TORCH_CHECK(max_num_tokens > 0, "max_num_tokens must be positive; got ", max_num_tokens);
         TORCH_CHECK(experts_per_token > 0, "experts_per_token must be positive; got ", experts_per_token);
+        TORCH_CHECK(max_lora_size > 0, "max_lora_size must be positive; got ", max_lora_size);
 
-        // Host pinned + device-mirror expansion buffers. Needed by both the
-        // legacy host path and the device path.
+        // Host pinned + device-mirror expansion buffers (and the device
+        // token_to_slot mirror). Needed by both the legacy host path and the
+        // device path.
         if (max_num_tokens > mLoraHostBufCapacity)
         {
             ensureLoraExpandBuffers(max_num_tokens);
             mLoraHostBufCapacity = max_num_tokens;
+        }
+
+        // Device-resident slot tables for the slot-indexed device-expand kernel.
+        if (max_lora_size > mLoraSlotTableCapacity)
+        {
+            ensureLoraSlotTableBuffers(max_lora_size);
+            mLoraSlotTableCapacity = max_lora_size;
         }
 
         // Device-path grouped-GEMM scratch. This method is the CUDA-graph
@@ -1491,6 +1480,28 @@ private:
         mLoraExpandFC1WeightPtrsDevice = at::empty({capacity * 2}, dev_long_opts);
         mLoraExpandFC2WeightPtrsDevice = at::empty({capacity * 2}, dev_long_opts);
         mLoraExpandGatedWeightPtrsDevice = at::empty({capacity * 2}, dev_long_opts);
+
+        // Device token_to_slot mirror for the slot-indexed device-expand kernel.
+        // Sized with the expand buffers (one entry per source token).
+        mLoraTokenToSlotDevice = at::empty({capacity}, dev_int_opts);
+    }
+
+    // (Re)allocate the device-resident slot tables consumed by
+    // launchMoeLoraSlotExpand. Sized at the adapter-slot pool (max_lora_size).
+    // Idempotent / grow-only; reallocation drops previous storage, so callers
+    // must not grow this while a graph referencing the old addresses can still
+    // replay (the in-capture guard enforces this).
+    void ensureLoraSlotTableBuffers(int64_t max_lora_size)
+    {
+        auto const dev_int_opts = at::TensorOptions().dtype(at::kInt).device(at::kCUDA);
+        auto const dev_long_opts = at::TensorOptions().dtype(at::kLong).device(at::kCUDA);
+
+        mLoraSlotFC1RanksDevice = at::empty({max_lora_size}, dev_int_opts);
+        mLoraSlotFC2RanksDevice = at::empty({max_lora_size}, dev_int_opts);
+        mLoraSlotGatedRanksDevice = at::empty({max_lora_size}, dev_int_opts);
+        mLoraSlotFC1PtrsDevice = at::empty({max_lora_size * 3}, dev_long_opts);
+        mLoraSlotFC2PtrsDevice = at::empty({max_lora_size * 3}, dev_long_opts);
+        mLoraSlotGatedPtrsDevice = at::empty({max_lora_size * 3}, dev_long_opts);
     }
 
     // Allocate the per-module device-path scratch for the capture-safe LoRA
@@ -1764,23 +1775,83 @@ private:
             num_seqs = num_tokens;
             has_gated = is_gated_activation && gated_slot_lora_ranks.has_value();
 
-            materializeSlotIndexedLoraTo(*fc1_slot_lora_ranks, *fc1_slot_lora_weight_ptrs, *token_to_slot, num_tokens,
-                mLoraExpandFC1RanksPinned.data_ptr<int32_t>(), mLoraExpandFC1WeightPtrsPinned.data_ptr<int64_t>());
-            materializeSlotIndexedLoraTo(*fc2_slot_lora_ranks, *fc2_slot_lora_weight_ptrs, *token_to_slot, num_tokens,
-                mLoraExpandFC2RanksPinned.data_ptr<int32_t>(), mLoraExpandFC2WeightPtrsPinned.data_ptr<int64_t>());
-            mLoraExpandFC1Size = num_tokens;
-            mLoraExpandFC2Size = num_tokens;
+            // Slot tables and token_to_slot must be int32/int64 host tensors so
+            // the H2D element sizes are correct and the device kernel reads the
+            // expected types.
+            CHECK_CPU_INPUT((*token_to_slot), at::ScalarType::Int)
+            CHECK_CPU_INPUT((*fc1_slot_lora_ranks), at::ScalarType::Int)
+            CHECK_CPU_INPUT((*fc1_slot_lora_weight_ptrs), at::ScalarType::Long)
+            CHECK_CPU_INPUT((*fc2_slot_lora_ranks), at::ScalarType::Int)
+            CHECK_CPU_INPUT((*fc2_slot_lora_weight_ptrs), at::ScalarType::Long)
+
+            int64_t const num_slots = fc1_slot_lora_ranks->size(0);
+            TORCH_CHECK(fc1_slot_lora_weight_ptrs->dim() == 2 && fc1_slot_lora_weight_ptrs->size(0) == num_slots
+                    && fc1_slot_lora_weight_ptrs->size(1) == 3,
+                "MoE LoRA fc1_slot_lora_weight_ptrs must have shape [max_lora_size, 3]; got ",
+                fc1_slot_lora_weight_ptrs->sizes());
+            TORCH_CHECK(fc2_slot_lora_ranks->size(0) == num_slots,
+                "MoE LoRA fc2_slot_lora_ranks must match fc1 max_lora_size (", num_slots, "); got ",
+                fc2_slot_lora_ranks->size(0));
+            TORCH_CHECK(token_to_slot->size(0) >= num_tokens, "MoE LoRA token_to_slot length (",
+                token_to_slot->size(0), ") must be >= num_tokens (", num_tokens, ").");
+
+            // Ensure the device slot tables can hold num_slots entries.
+            if (num_slots > mLoraSlotTableCapacity)
+            {
+                checkLoraReallocSafeDuringCapture(stream, num_slots, mLoraSlotTableCapacity);
+                ensureLoraSlotTableBuffers(num_slots);
+                mLoraSlotTableCapacity = num_slots;
+            }
+
+            // Capture-safe device slot->token expansion. Copy the caller's stable
+            // pinned slot tables and token_to_slot into persistent device buffers
+            // via captured async H2D, then run launchMoeLoraSlotExpand to produce
+            // the per-source-token (rank, A, B) mirrors on-device. Both the copies
+            // and the kernel are recorded into the graph, so replaying picks up
+            // in-place slot-table / token_to_slot updates without re-capture
+            // (mirroring the attention-LoRA device tables).
+            auto h2d_slot = [&](at::Tensor const& src, at::Tensor& dst, int64_t numel)
+            {
+                TLLM_CUDA_CHECK(cudaMemcpyAsync(dst.data_ptr(), src.data_ptr(),
+                    static_cast<size_t>(numel) * src.element_size(), cudaMemcpyHostToDevice, stream));
+            };
+            h2d_slot(*token_to_slot, mLoraTokenToSlotDevice, num_tokens);
+            h2d_slot(*fc1_slot_lora_ranks, mLoraSlotFC1RanksDevice, num_slots);
+            h2d_slot(*fc1_slot_lora_weight_ptrs, mLoraSlotFC1PtrsDevice, num_slots * 3);
+            h2d_slot(*fc2_slot_lora_ranks, mLoraSlotFC2RanksDevice, num_slots);
+            h2d_slot(*fc2_slot_lora_weight_ptrs, mLoraSlotFC2PtrsDevice, num_slots * 3);
             if (has_gated)
             {
-                materializeSlotIndexedLoraTo(*gated_slot_lora_ranks, *gated_slot_lora_weight_ptrs, *token_to_slot,
-                    num_tokens, mLoraExpandGatedRanksPinned.data_ptr<int32_t>(),
-                    mLoraExpandGatedWeightPtrsPinned.data_ptr<int64_t>());
-                mLoraExpandGatedSize = num_tokens;
+                CHECK_CPU_INPUT((*gated_slot_lora_ranks), at::ScalarType::Int)
+                CHECK_CPU_INPUT((*gated_slot_lora_weight_ptrs), at::ScalarType::Long)
+                h2d_slot(*gated_slot_lora_ranks, mLoraSlotGatedRanksDevice, num_slots);
+                h2d_slot(*gated_slot_lora_weight_ptrs, mLoraSlotGatedPtrsDevice, num_slots * 3);
             }
-            else
+
+            namespace ck = ::tensorrt_llm::kernels::cutlass_kernels;
+            ck::MoeLoraSlotExpandModule fc1_slot_mod{mLoraSlotFC1RanksDevice.data_ptr<int32_t>(),
+                mLoraSlotFC1PtrsDevice.data_ptr<int64_t>(), mLoraExpandFC1RanksDevice.data_ptr<int32_t>(),
+                mLoraExpandFC1WeightPtrsDevice.data_ptr<int64_t>()};
+            ck::MoeLoraSlotExpandModule fc2_slot_mod{mLoraSlotFC2RanksDevice.data_ptr<int32_t>(),
+                mLoraSlotFC2PtrsDevice.data_ptr<int64_t>(), mLoraExpandFC2RanksDevice.data_ptr<int32_t>(),
+                mLoraExpandFC2WeightPtrsDevice.data_ptr<int64_t>()};
+            ck::MoeLoraSlotExpandModule gated_slot_mod{};
+            if (has_gated)
             {
-                mLoraExpandGatedSize = 0;
+                gated_slot_mod = ck::MoeLoraSlotExpandModule{mLoraSlotGatedRanksDevice.data_ptr<int32_t>(),
+                    mLoraSlotGatedPtrsDevice.data_ptr<int64_t>(), mLoraExpandGatedRanksDevice.data_ptr<int32_t>(),
+                    mLoraExpandGatedWeightPtrsDevice.data_ptr<int64_t>()};
             }
+            ck::launchMoeLoraSlotExpand(mLoraTokenToSlotDevice.data_ptr<int32_t>(), num_tokens, num_slots, fc1_slot_mod,
+                fc2_slot_mod, has_gated ? &gated_slot_mod : nullptr, stream);
+
+            // The slot path fills the device mirrors directly via the kernel and
+            // always takes the device path, so the host per-token expand buffers
+            // are unused. Mark their live size 0 so the generic per-request H2D
+            // below is skipped and does not clobber the kernel output.
+            mLoraExpandFC1Size = 0;
+            mLoraExpandFC2Size = 0;
+            mLoraExpandGatedSize = 0;
         }
 
         // Queue an async H2D into the persistent device mirrors. The copy

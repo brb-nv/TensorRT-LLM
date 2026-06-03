@@ -102,13 +102,14 @@ class CudaGraphLoraManager:
                                  "reserve_moe_lora_cuda_graph_workspace", None)
             if reserve_fn is None:
                 continue
-            reserve_fn(max_num_tokens, self.max_lora_rank)
+            reserve_fn(max_num_tokens, self.max_lora_rank, self.max_lora_size)
             reserved += 1
         if reserved:
             logger.info(
                 f"Reserved routed-expert MoE-LoRA CUDA-graph workspace for "
                 f"{reserved} MoE layer(s) (max_num_tokens={max_num_tokens}, "
-                f"max_lora_rank={self.max_lora_rank}).")
+                f"max_lora_rank={self.max_lora_rank}, "
+                f"max_lora_size={self.max_lora_size}).")
 
     def _initialize_from_model(self, model: torch.nn.Module):
         """

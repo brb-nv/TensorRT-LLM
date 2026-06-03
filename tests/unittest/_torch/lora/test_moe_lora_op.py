@@ -206,11 +206,19 @@ def test_moe_per_expert_lora_changes_output():
 
 
 @requires_cuda_and_op
-def test_moe_lora_slot_indexed_matches_per_request():
+def test_moe_lora_slot_indexed_matches_per_request(monkeypatch):
     """The slot-indexed (CUDA-graph) input schema must produce bit-identical
     output to the per-request schema for the same adapter, since both expand to
     the same per-token (rank, A_ptr, B_ptr) arrays inside the op.
+
+    The slot-indexed schema always takes the capture-safe device path, so for an
+    apples-to-apples bit-exact comparison we force the per-request schema onto
+    the device path too (TLLM_MOE_LORA_USE_DEVICE_PATH=1). Both then share the
+    pointer-expand + grouped-GEMM kernels, so identical per-token tables yield
+    bit-identical output.
     """
+    from tensorrt_llm._torch.custom_ops.torch_custom_ops import MoERunner
+
     device = torch.device("cuda")
     dtype = torch.bfloat16
     num_tokens, hidden_size, inter_size = 16, 128, 256
@@ -245,12 +253,18 @@ def test_moe_lora_slot_indexed_matches_per_request():
         rank=rank,
     )
 
-    out_per_request = _call_fused_moe(
-        x, w3_w1, w2, topk_ids, topk_scores, output_dtype=dtype, lora_kwargs=per_request_kwargs
-    )[0]
-    out_slot = _call_fused_moe(
-        x, w3_w1, w2, topk_ids, topk_scores, output_dtype=dtype, lora_kwargs=slot_kwargs
-    )[0]
+    # Force both schemas onto the device path, via a fresh runner.
+    monkeypatch.setenv("TLLM_MOE_LORA_USE_DEVICE_PATH", "1")
+    MoERunner.runner_dict.clear()
+    try:
+        out_per_request = _call_fused_moe(
+            x, w3_w1, w2, topk_ids, topk_scores, output_dtype=dtype, lora_kwargs=per_request_kwargs
+        )[0]
+        out_slot = _call_fused_moe(
+            x, w3_w1, w2, topk_ids, topk_scores, output_dtype=dtype, lora_kwargs=slot_kwargs
+        )[0]
+    finally:
+        MoERunner.runner_dict.clear()
 
     assert torch.isfinite(out_slot).all()
     # Identical per-token kernel inputs => bit-identical output.
