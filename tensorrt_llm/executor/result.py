@@ -1,6 +1,7 @@
 import asyncio
 import dataclasses
 import json
+import os
 import time
 import weakref
 from dataclasses import dataclass, field
@@ -13,6 +14,7 @@ import torch
 import torch.nn.functional as F
 
 from tensorrt_llm.llmapi import tracing
+from tensorrt_llm.logger import logger
 
 try:
     pass
@@ -25,10 +27,31 @@ from ..disaggregated_params import DisaggregatedParams
 from ..llmapi.tracer import global_tracer
 from ..llmapi.utils import AsyncQueue, print_traceback_on_error
 from ..metrics import MetricNames, MetricsCollector, RequestEventTiming
+from ..metrics.perf_utils import (format_ttft_breakdown,
+                                  request_perf_metrics_to_dict)
 from ..metrics.perf_utils import \
     process_req_perf_metrics as _process_req_perf_metrics
 from ..sampling_params import LogprobParams, SamplingParams
 from .utils import ErrorResponse, has_event_loop, is_llm_response
+
+def _env_enabled(name: str, default: str = "1") -> bool:
+    """Return True unless the env var is explicitly set to a falsy value."""
+    return os.environ.get(name,
+                          default).strip().lower() not in ("0", "false", "no",
+                                                           "off")
+
+
+# Emit one host-side TTFT breakdown log line per request as it finishes.
+# Enabled by default; opt out with ``TLLM_LOG_TTFT_BREAKDOWN=0`` (also accepts
+# false/no/off). This is a no-op unless the engine is launched with
+# ``return_perf_metrics=True`` (otherwise the timing data is empty).
+_LOG_TTFT_BREAKDOWN = _env_enabled("TLLM_LOG_TTFT_BREAKDOWN")
+
+# Emit one ``/perf_metrics``-equivalent JSON record per request to stdout, for
+# deployments (e.g. Dynamo-native) that do not expose TRT-LLM's HTTP
+# ``/perf_metrics`` endpoint. Enabled by default; opt out with
+# ``TLLM_LOG_PERF_METRICS=0``. Also a no-op without ``return_perf_metrics``.
+_LOG_PERF_METRICS = _env_enabled("TLLM_LOG_PERF_METRICS")
 
 if TYPE_CHECKING:
     from .executor import GenerationExecutor
@@ -405,6 +428,62 @@ class GenerationResultBase:
         # Tracing is recorded once when the entire request is done.
         if self._done:
             self.do_tracing(output, req_perf_metrics_dict)
+            self._log_ttft_breakdown(req_perf_metrics_dict)
+            self._log_perf_metrics(output)
+
+    def _log_ttft_breakdown(
+        self,
+        req_perf_metrics_dict: Optional[dict[RequestEventTiming, float]],
+    ) -> None:
+        """Emit a single host-side TTFT breakdown log line for this request.
+
+        No-op unless ``TLLM_LOG_TTFT_BREAKDOWN=1`` and timing data is present
+        (the latter requires the engine to run with ``return_perf_metrics``).
+        Useful for locating per-request host bottlenecks (queue wait, KV-cache
+        transfer, prefill/compute) in disaggregated / Dynamo-native serving.
+        """
+        if not _LOG_TTFT_BREAKDOWN:
+            return
+        role = None
+        disagg_params = self.disaggregated_params
+        if disagg_params is not None and disagg_params.request_type:
+            # e.g. "context_only" -> "ctx", "generation_only" -> "gen"
+            role = disagg_params.request_type.split("_only")[0]
+            role = {"context": "ctx", "generation": "gen"}.get(role, role)
+        line = format_ttft_breakdown(req_perf_metrics_dict,
+                                     req_id=getattr(self, "id", None),
+                                     role=role)
+        if line is not None:
+            logger.info(line)
+
+    def _log_perf_metrics(self, output: CompletionOutput) -> None:
+        """Emit a ``/perf_metrics``-equivalent JSON record for this request.
+
+        Provides the per-request perf data (timing, KV-cache block stats,
+        speculative-decoding acceptance) to stdout for deployments that do not
+        expose TRT-LLM's HTTP ``/perf_metrics`` endpoint (e.g. Dynamo-native).
+        No-op unless ``TLLM_LOG_PERF_METRICS`` is enabled and the request
+        carries perf metrics (requires ``return_perf_metrics``).
+        """
+        if not _LOG_PERF_METRICS:
+            return
+        metrics = getattr(output, "request_perf_metrics", None)
+        if metrics is None:
+            return
+        try:
+            record = request_perf_metrics_to_dict(metrics)
+        except Exception as e:  # pragma: no cover - observability must not crash
+            # Never let perf logging break request handling; binding shape
+            # changes or partially-populated metrics are reported at debug.
+            logger.debug(f"Failed to serialize request perf metrics: {e}")
+            return
+        if record is None:
+            return
+        record["req_id"] = getattr(self, "id", None)
+        disagg_params = self.disaggregated_params
+        if disagg_params is not None and disagg_params.request_type:
+            record["request_type"] = disagg_params.request_type
+        logger.info("[PERF_METRICS] " + json.dumps(record))
 
     @print_traceback_on_error
     @nvtx_range_debug("handle_response",

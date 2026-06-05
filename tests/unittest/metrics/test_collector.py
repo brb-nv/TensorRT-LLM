@@ -14,12 +14,17 @@
 # limitations under the License.
 """Unit tests for MetricsCollector and process_req_perf_metrics."""
 
+from datetime import timedelta
+from types import SimpleNamespace
+
 import pytest
 from prometheus_client import REGISTRY
 
 from tensorrt_llm.metrics.collector import MetricsCollector
 from tensorrt_llm.metrics.enums import MetricNames, RequestEventTiming
-from tensorrt_llm.metrics.perf_utils import process_req_perf_metrics
+from tensorrt_llm.metrics.perf_utils import (format_ttft_breakdown,
+                                             process_req_perf_metrics,
+                                             request_perf_metrics_to_dict)
 
 
 @pytest.fixture(autouse=True)
@@ -613,6 +618,142 @@ class TestProcessReqPerfMetrics:
 
     def test_empty_stats_returns_empty(self):
         assert process_req_perf_metrics(None, output_length=10) == {}
+
+
+class TestFormatTtftBreakdown:
+    """Unit tests for the host-side TTFT breakdown log formatter."""
+
+    def test_full_breakdown_contains_all_stages(self):
+        timestamps = {
+            RequestEventTiming.ARRIVAL_TIME: 1000.0,
+            RequestEventTiming.FIRST_SCHEDULED_TIME: 1000.05,
+            RequestEventTiming.FIRST_TOKEN_TIME: 1000.4,
+            RequestEventTiming.KV_CACHE_TRANSFER_START: 1000.1,
+            RequestEventTiming.KV_CACHE_TRANSFER_END: 1000.3,
+            RequestEventTiming.KV_CACHE_SIZE: 4096,
+        }
+        line = format_ttft_breakdown(timestamps, req_id=7, role="gen")
+        assert line is not None
+        assert line.startswith("[TTFT] ")
+        assert "req_id=7" in line
+        assert "role=gen" in line
+        # ttft = 0.4s -> 400.00ms
+        assert "ttft=400.00ms" in line
+        # queue = 0.05s -> 50.00ms
+        assert "queue=50.00ms" in line
+        # kv_xfer = 0.2s -> 200.00ms
+        assert "kv_xfer=200.00ms" in line
+        # prefill_compute = 0.35s -> 350.00ms
+        assert "prefill_compute=350.00ms" in line
+        assert "kv_size=4096" in line
+
+    def test_none_or_empty_returns_none(self):
+        assert format_ttft_breakdown(None) is None
+        assert format_ttft_breakdown({}) is None
+
+    def test_no_usable_timestamps_returns_none(self):
+        # KV size alone does not produce any latency span.
+        assert format_ttft_breakdown(
+            {RequestEventTiming.KV_CACHE_SIZE: 1024}) is None
+
+    def test_ctx_only_without_kv_transfer(self):
+        """A context worker without KV-transfer timestamps still logs queue/ttft."""
+        timestamps = {
+            RequestEventTiming.ARRIVAL_TIME: 1000.0,
+            RequestEventTiming.FIRST_SCHEDULED_TIME: 1000.02,
+            RequestEventTiming.FIRST_TOKEN_TIME: 1000.2,
+        }
+        line = format_ttft_breakdown(timestamps, req_id=1, role="ctx")
+        assert line is not None
+        assert "role=ctx" in line
+        assert "ttft=200.00ms" in line
+        assert "queue=20.00ms" in line
+        assert "kv_xfer" not in line
+
+    def test_optional_tags_omitted(self):
+        timestamps = {
+            RequestEventTiming.ARRIVAL_TIME: 1000.0,
+            RequestEventTiming.FIRST_TOKEN_TIME: 1000.1,
+        }
+        line = format_ttft_breakdown(timestamps)
+        assert line is not None
+        assert "req_id=" not in line
+        assert "role=" not in line
+        assert "ttft=100.00ms" in line
+
+
+def _make_perf_metrics_stub(*, kv_transfer=False, spec=False):
+    """Build a RequestPerfMetrics-like stub for serializer tests."""
+    timing = SimpleNamespace(
+        arrival_time=timedelta(seconds=1000.0),
+        first_scheduled_time=timedelta(seconds=1000.05),
+        first_token_time=timedelta(seconds=1000.4),
+        last_token_time=timedelta(seconds=1002.5),
+        kv_cache_size=4096 if kv_transfer else 0,
+        kv_cache_transfer_start=timedelta(seconds=1000.1 if kv_transfer else 0),
+        kv_cache_transfer_end=timedelta(seconds=1000.3 if kv_transfer else 0),
+    )
+    kv = SimpleNamespace(
+        num_total_allocated_blocks=120,
+        num_new_allocated_blocks=20,
+        num_reused_blocks=100,
+        num_missed_blocks=20,
+    )
+    spec_dec = SimpleNamespace(
+        acceptance_rate=0.75 if spec else 0.0,
+        total_accepted_draft_tokens=30 if spec else 0,
+        total_draft_tokens=40 if spec else 0,
+    )
+    return SimpleNamespace(
+        first_iter=3,
+        last_iter=58,
+        timing_metrics=timing,
+        kv_cache_metrics=kv,
+        speculative_decoding=spec_dec,
+    )
+
+
+class TestRequestPerfMetricsToDict:
+    """Unit tests for the /perf_metrics-equivalent JSON serializer."""
+
+    def test_none_returns_none(self):
+        assert request_perf_metrics_to_dict(None) is None
+
+    def test_base_fields_always_present(self):
+        rec = request_perf_metrics_to_dict(_make_perf_metrics_stub())
+        assert rec["first_iter"] == 3
+        assert rec["last_iter"] == 58
+        tm = rec["timing_metrics"]
+        assert tm["arrival_time"] == pytest.approx(1000.0)
+        assert tm["first_scheduled_time"] == pytest.approx(1000.05)
+        assert tm["first_token_time"] == pytest.approx(1000.4)
+        assert tm["last_token_time"] == pytest.approx(1002.5)
+        kv = rec["kv_cache_metrics"]
+        assert kv["num_reused_blocks"] == 100
+        assert kv["num_missed_blocks"] == 20
+
+    def test_kv_transfer_fields_only_when_present(self):
+        without = request_perf_metrics_to_dict(_make_perf_metrics_stub())
+        assert "kv_cache_size" not in without["timing_metrics"]
+        assert "kv_cache_transfer_start" not in without["timing_metrics"]
+
+        with_xfer = request_perf_metrics_to_dict(
+            _make_perf_metrics_stub(kv_transfer=True))
+        tm = with_xfer["timing_metrics"]
+        assert tm["kv_cache_size"] == 4096
+        assert tm["kv_cache_transfer_start"] == pytest.approx(1000.1)
+        assert tm["kv_cache_transfer_end"] == pytest.approx(1000.3)
+
+    def test_speculative_decoding_only_when_draft_tokens(self):
+        without = request_perf_metrics_to_dict(_make_perf_metrics_stub())
+        assert "speculative_decoding" not in without
+
+        with_spec = request_perf_metrics_to_dict(
+            _make_perf_metrics_stub(spec=True))
+        sd = with_spec["speculative_decoding"]
+        assert sd["acceptance_rate"] == pytest.approx(0.75)
+        assert sd["total_accepted_draft_tokens"] == 30
+        assert sd["total_draft_tokens"] == 40
 
 
 class TestCustomHistogramBuckets:
