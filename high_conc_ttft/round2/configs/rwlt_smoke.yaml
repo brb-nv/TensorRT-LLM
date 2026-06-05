@@ -1,0 +1,38 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Smoke test: validate the disagg /perf_metrics plumbing end-to-end (proxy
+# perf_metrics_max_requests fix + worker return_perf_metrics) with the smallest
+# possible workload. conc=1, a single trajectory -> a handful of requests ->
+# perf_metrics_proxy.json should come back NON-empty.
+#
+# Tiny top-5 dataset from the old branch (5 worst-TTFT conversations, 318
+# turns) -- copied into round1/datasets so this stays self-contained.
+# base_url / model / results_dir overridden on the CLI by run_rwlt.sh.
+
+base_url: http://localhost:8000/v1
+model: openai/gpt-oss-120b
+api_key: not-required
+
+concurrencies: [1]
+phase_timeout_seconds: 600.0
+user_spawn_rate: 1.0
+settling_time_seconds: 0
+
+min_measurement_seconds: 0.0
+min_total_trajectories: 1
+min_trajectories_per_user: 1
+
+trajectory_path: /home/scratch.bbuddharaju_gpu/TensorRT-LLM_AA_RWLT/high_conc_ttft/round1/datasets/top5_signed.jsonl
+trajectories_per_user: 1
+max_starting_line_offset: 0
+seed: 42
+
+timeout_seconds: 300.0
+max_tokens: 16384
+reasoning_effort: high
+
+record_err_reasons: true
+record_err_reasons_include_input: false
+tool_calls_args_only: true
+send_conversation_routing_headers: true

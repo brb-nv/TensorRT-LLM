@@ -1,0 +1,44 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Round1 RWLT client config reproducing NVBug 6266370 at C=160.
+#
+# Faithful copy of the bug run's client config, captured at:
+#   high_conc_ttft/from_pei/run_benchx_3ctx2gen_tp2_dynamo_kvrouter_hcon_c160_.../rwlt_config.yaml
+#
+# Overridden on the CLI by scripts/run_rwlt.sh:
+#   base_url, model, api_key, results_dir, request_log_path (+ optional seed/conc).
+#
+# OPEN QUESTION (see README): the bug used trajectory dataset
+#   /lustre/.../data/agentic_coding_v2_full.jsonl  (NOT reachable from this node).
+# The closest local dataset is the coding-agent tuning set below. Confirm before
+# treating absolute TTFT numbers as 1:1 comparable to the bug run.
+
+base_url: http://localhost:8000/v1
+model: openai/gpt-oss-120b
+api_key: not-required
+
+concurrencies: [160]
+phase_timeout_seconds: 3600
+user_spawn_rate: 1.0
+settling_time_seconds: 240
+min_measurement_seconds: 900
+min_total_trajectories: 30
+min_trajectories_per_user: 1
+
+# Bug run used /lustre/.../data/agentic_coding_v2_full.jsonl (inaccessible here).
+# Local stand-in (500 trajectories, coding agent v2) chosen for trajectory
+# variety at C=160 (trajectories_per_user=30) to avoid artificial KV reuse:
+trajectory_path: /home/scratch.shobhitv_coreai/aa-rwlt-shared-datasets/aa-rwlt_coding-agent-scenario_tuning_v2_500traj.jsonl
+trajectories_per_user: 1
+max_starting_line_offset: 10
+seed: 42
+
+timeout_seconds: 300.0
+max_tokens: 16384
+reasoning_effort: high
+
+record_err_reasons: true
+record_err_reasons_include_input: false
+tool_calls_args_only: true
+send_conversation_routing_headers: true

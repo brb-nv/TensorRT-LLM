@@ -1,0 +1,35 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# ABLATION proxy config: identical topology to proxy_3ctx2gen.yaml but with
+# round_robin routing on both pools instead of kv_cache_aware.
+#
+# Purpose: isolate the proxy-side cost. The kv_cache_aware router TOKENIZES
+# every prompt on the proxy (router.py::_tokenize_and_compute_block_hashes) to
+# compute KV-block hashes; that tokenization is Python/GIL-bound and at C=160
+# with ~37k-token prompts serializes into ~2s of pre-dispatch latency
+# (e2e_ttft p50 ~2.1s vs ctx_total p50 ~0.15s). round_robin does NO per-request
+# tokenization/hashing on the proxy, so if proxy-side tokenization is the
+# bottleneck, e2e_ttft should collapse toward ctx_total (~150ms).
+#
+# Used by: CTX_CONFIG_BASE/GEN_CONFIG_BASE unchanged; pass
+#   PROXY_CONFIG_BASE=proxy_3ctx2gen_round_robin to launch_disagg_3ctx2gen.sh.
+hostname: localhost
+port: 8000
+backend: pytorch
+perf_metrics_max_requests: 20000
+context_servers:
+  num_instances: 3
+  router:
+    type: round_robin
+  urls:
+    - "localhost:8001"
+    - "localhost:8002"
+    - "localhost:8003"
+generation_servers:
+  num_instances: 2
+  router:
+    type: round_robin
+  urls:
+    - "localhost:8004"
+    - "localhost:8005"

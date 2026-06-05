@@ -1,0 +1,46 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Fast-iteration RWLT config: worst-TTFT 218-conversation subset (built by
+# scripts/build_worst_subset.py from the round1 C=160 run) + relaxed stop
+# conditions so a phase ends in a few minutes instead of ~25.
+#
+# Goal: reproduce the prefill TTFT tail quickly and capture /perf_metrics
+# (drain periodically via scripts/watch_perf_metrics.sh -- the C=160 prefill
+# workers crash ~8 min in, so don't rely on a single end-of-run drain).
+#
+# Overridden on the CLI by scripts/run_rwlt.sh: base_url, model, api_key,
+# results_dir, request_log_path (+ optional --seed / --concurrencies).
+# Lower concurrency for a crash-free run with: CONCS=64 scripts/run_rwlt.sh ...
+
+base_url: http://localhost:8000/v1
+model: openai/gpt-oss-120b
+api_key: not-required
+
+concurrencies: [120]
+phase_timeout_seconds: 900
+user_spawn_rate: 1.0
+settling_time_seconds: 30
+min_measurement_seconds: 60
+min_total_trajectories: 30
+min_trajectories_per_user: 1
+
+trajectory_path: /home/scratch.bbuddharaju_gpu/TensorRT-LLM_AA_RWLT/high_conc_ttft/round1/datasets/worst250.jsonl
+trajectories_per_user: 1
+max_starting_line_offset: 10
+seed: 42
+
+timeout_seconds: 300.0
+max_tokens: 16384
+reasoning_effort: high
+
+record_err_reasons: true
+record_err_reasons_include_input: false
+tool_calls_args_only: true
+send_conversation_routing_headers: true
+# PERF-only: client pre-tokenizes with tiktoken and sends prompt_token_ids so
+# the proxy + ctx worker skip their own tokenization -> removes the proxy
+# tokenization tax, mirroring Dynamo's tokenize-once frontend. tiktoken != the
+# model's harmony tokenizer, so prefill runs on WRONG tokens and outputs are
+# garbage even with real weights -- valid for TTFT/throughput, NOT correctness.
+send_prompt_token_ids: true

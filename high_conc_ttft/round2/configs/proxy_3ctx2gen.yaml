@@ -1,0 +1,34 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Round1 disagg orchestrator (proxy) for the 3ctx (TP1) + 2gen (TP2) topology
+# of NVBug 6266370. Schema: examples/disaggregated/README.md, parsed by
+# tensorrt_llm/llmapi/disagg_utils.py (extract_disagg_cfg).
+#
+# Router: kv_cache_aware on both pools -- this is the native trtllm-serve
+# equivalent of the bug's "dynamo_kvrouter" (KV-aware) routing.
+#
+# Used by: scripts/launch_disagg_3ctx2gen.sh -> "trtllm-serve disaggregated -c"
+hostname: localhost
+port: 8000
+backend: pytorch
+# REQUIRED for /perf_metrics on the proxy: DisaggServerConfig defaults this to
+# 0, which makes the proxy's joined metrics deque maxlen=0 -> /perf_metrics
+# always returns []. Must be > 0 (and the ctx/gen worker configs must also set
+# return_perf_metrics + perf_metrics_max_requests, which they do).
+perf_metrics_max_requests: 20000
+context_servers:
+  num_instances: 3
+  router:
+    type: kv_cache_aware
+  urls:
+    - "localhost:8001"
+    - "localhost:8002"
+    - "localhost:8003"
+generation_servers:
+  num_instances: 2
+  router:
+    type: kv_cache_aware
+  urls:
+    - "localhost:8004"
+    - "localhost:8005"
