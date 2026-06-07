@@ -347,6 +347,36 @@ class PyExecutor:
             "TLLM_LOG_HOST_STAGE_BREAKDOWN",
             "1").strip().lower() not in ("0", "false", "no", "off")
         self._host_stage_times: Dict[str, float] = {}
+        # Per-request state logging. On by default; disable with
+        # ``TLLM_LOG_REQ_STATES=0`` (also accepts false/no/off). Emits one
+        # ``[REQ_STATES]`` line only when the active set changes (membership /
+        # per-request stage / scheduled flag) so you can see what each
+        # in-flight request is doing (prefill progress, generation, queued)
+        # without per-iteration spam.
+        self._log_req_states = os.environ.get(
+            "TLLM_LOG_REQ_STATES",
+            "1").strip().lower() not in ("0", "false", "no", "off", "")
+        self._last_req_states_sig: Optional[tuple] = None
+        # Scheduler-funnel diagnostics surfaced in the per-iteration log to
+        # localize which stage caps context admission when active >> scheduled:
+        #   num_fitting_reqs  = capacity-scheduler output (KV-block bound)
+        #   num_inflight      = overlap-scheduler in-flight reqs (skipped by microbatch)
+        #   num_schedulable   = active reqs not stuck in disagg KV-transfer states
+        #   kv_{free,used}_blocks = KV-cache block accounting (egress backpressure)
+        self.num_fitting_reqs: int = 0
+        self.num_inflight: int = 0
+        self.num_schedulable: int = 0
+        self.kv_free_blocks: int = -1
+        self.kv_used_blocks: int = -1
+        # Logging point #4 — KV-transfer backlog on a context worker:
+        #   num_kv_transfer = post-prefill reqs holding KV mid-transfer (gauge),
+        #   kv_{fill,drain}_total = cumulative reqs entering / leaving transfer.
+        # Per-iteration rate = delta between consecutive iteration log lines.
+        # Attributes whether KV-egress backpressure (held blocks) starves the
+        # capacity scheduler; distinct from num_inflight (overlap set).
+        self.num_kv_transfer: int = 0
+        self.kv_fill_total: int = 0
+        self.kv_drain_total: int = 0
         self.attention_dp_enable_balance = (
             self.llm_args.attention_dp_config is not None
             and self.llm_args.attention_dp_config.enable_balance)
@@ -907,6 +937,81 @@ class PyExecutor:
             self._host_stage_times[name] = self._host_stage_times.get(
                 name, 0.0) + (time.perf_counter() - start)
 
+    def _update_sched_diag(self, num_fitting_reqs: int) -> None:
+        """Capture scheduler-funnel diagnostics for the per-iteration log.
+
+        Localizes the context-admission cap when ``active >> scheduled``:
+        capacity-scheduler output (``num_fitting_reqs``), overlap in-flight
+        count, schedulable active count, and KV-cache free/used blocks
+        (KV-egress backpressure on a context worker). Best-effort; never raises
+        into the executor loop.
+        """
+        try:
+            self.num_fitting_reqs = num_fitting_reqs
+            self.num_inflight = len(self.inflight_req_ids)
+            self.num_schedulable = self._count_schedulable_active_requests()
+            kvm = self.resource_manager.resource_managers.get(
+                ResourceManagerType.KV_CACHE_MANAGER)
+            if kvm is not None:
+                ks = kvm.get_kv_cache_stats()
+                self.kv_free_blocks = ks.free_num_blocks
+                self.kv_used_blocks = ks.used_num_blocks
+            # Logging point #4: post-prefill requests currently holding KV
+            # blocks while their cache drains to the gen worker.
+            self.num_kv_transfer = len(
+                self.async_transfer_manager.requests_in_transfer())
+        except Exception as e:  # pragma: no cover - observability must not crash
+            logger.debug(f"[sched_diag] skipped: {e}")
+
+    def _log_request_states(self, scheduled_batch) -> None:
+        """Emit a compact ``[REQ_STATES]`` line when the active set changes.
+
+        Gated by ``TLLM_LOG_REQ_STATES``. The line lists every active request
+        as ``id:STAGE[*]:ctx=<pos>/<prompt_len>:gen=<n>`` where ``*`` marks
+        requests scheduled into the current step. Deduplicated on a signature
+        of (id, stage, scheduled) so a line is emitted only on membership /
+        stage / scheduling transitions, not every iteration. Best-effort:
+        never raises into the executor loop.
+        """
+        if not self._log_req_states:
+            return
+        try:
+            scheduled_ids = set()
+            for r in scheduled_batch.context_requests:
+                scheduled_ids.add(r.request_id)
+            for r in scheduled_batch.generation_requests:
+                scheduled_ids.add(r.request_id)
+
+            sig = []
+            entries = []
+            for req in self.active_requests:
+                rid = req.request_id
+                stage = getattr(req.stage, "name", None) or str(req.stage)
+                # Raw state disambiguates the derived stage: e.g. kCONTEXT_INIT
+                # (schedulable) vs kDISAGG_CONTEXT_WAIT_SCHEDULER (not) both
+                # render as CONTEXT_IN_PROGRESS in the collapsed stage.
+                rawst = getattr(req, "state", None)
+                rawst = getattr(rawst, "name", None) or str(rawst)
+                sched = rid in scheduled_ids
+                sig.append((rid, stage, rawst, sched))
+                pos = getattr(req, "context_current_position", -1)
+                plen = getattr(req, "orig_prompt_len", -1)
+                gen = (getattr(req, "max_beam_num_tokens", 0) -
+                       plen) if plen and plen >= 0 else -1
+                entries.append(
+                    f"{rid}:{stage}/{rawst}{'*' if sched else ''}:ctx={pos}/{plen}:gen={gen}")
+
+            sig = tuple(sig)
+            if sig == self._last_req_states_sig:
+                return
+            self._last_req_states_sig = sig
+            logger.info(
+                f"[REQ_STATES] iter={self.iter_counter} "
+                f"n_active={len(self.active_requests)} "
+                f"n_sched={len(scheduled_ids)} " + " ".join(entries))
+        except Exception as e:  # pragma: no cover - observability must not crash
+            logger.debug(f"[REQ_STATES] skipped: {e}")
+
     @contextmanager
     def _profiler(self):
         it = -1
@@ -1013,7 +1118,15 @@ class PyExecutor:
                     f"timestamp = {formatted_timestamp}, "
                     f"num_waiting_requests: {self.num_waiting_requests}, "
                     f"num_active_requests: {self.num_active_requests}, "
-                    f"num_scheduled_requests: {self.num_scheduled_requests}"
+                    f"num_scheduled_requests: {self.num_scheduled_requests}, "
+                    f"num_fitting_requests: {self.num_fitting_reqs}, "
+                    f"num_inflight: {self.num_inflight}, "
+                    f"num_schedulable: {self.num_schedulable}, "
+                    f"kv_free_blocks: {self.kv_free_blocks}, "
+                    f"kv_used_blocks: {self.kv_used_blocks}, "
+                    f"num_kv_transfer: {self.num_kv_transfer}, "
+                    f"kv_fill_total: {self.kv_fill_total}, "
+                    f"kv_drain_total: {self.kv_drain_total}"
                     f"{host_stage_breakdown}, "
                     f"states = {self.model_engine.iter_states}")
             elif (start_time is not None and host_stage_breakdown
@@ -1536,6 +1649,8 @@ class PyExecutor:
                 self.num_scheduled_requests = scheduled_batch.batch_size
                 self.num_active_requests = len(self.active_requests)
                 self.num_waiting_requests = len(self.waiting_queue)
+                self._update_sched_diag(num_fitting_reqs)
+                self._log_request_states(scheduled_batch)
 
                 logger.debug(
                     f'iteration {self.iter_counter}, microbatch {microbatch_id}, '
@@ -2106,6 +2221,8 @@ class PyExecutor:
         self.num_scheduled_requests = scheduled_batch.batch_size
         self.num_active_requests = len(self.active_requests)
         self.num_waiting_requests = len(self.waiting_queue)
+        self._update_sched_diag(num_fitting_reqs)
+        self._log_request_states(scheduled_batch)
         logger.debug(
             f'has {len(self.active_requests)} active_requests, '
             f'scheduled {scheduled_batch.num_context_requests} context requests and '
@@ -3484,6 +3601,7 @@ class PyExecutor:
                     # Order is important here: we need to start the transfer before responding
                     # to make sure the blocks are stored for reuse before they are sent.
                     self.async_transfer_manager.start_transfer(req)
+                    self.kv_fill_total += 1  # [#4] req entered KV transfer
                     self.kv_cache_transceiver.respond_and_send_async(req)
 
                     if self.kv_cache_transceiver.kv_transfer_timeout_ms is not None:
@@ -3536,6 +3654,7 @@ class PyExecutor:
             request = requests_in_transfer[request_id]
 
             self._end_transfer_and_maybe_terminate(request)
+            self.kv_drain_total += 1  # [#4] req left KV transfer (blocks freed)
 
         # The set of requests in transfer may have changed since we terminated some requests.
         requests_in_transfer = self.async_transfer_manager.requests_in_transfer(

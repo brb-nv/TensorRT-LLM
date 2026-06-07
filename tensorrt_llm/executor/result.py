@@ -481,8 +481,17 @@ class GenerationResultBase:
             return
         record["req_id"] = getattr(self, "id", None)
         disagg_params = self.disaggregated_params
-        if disagg_params is not None and disagg_params.request_type:
-            record["request_type"] = disagg_params.request_type
+        if disagg_params is not None:
+            if disagg_params.request_type:
+                record["request_type"] = disagg_params.request_type
+            # Global/disagg request id used for the cross-worker KV-cache
+            # transfer. On the context server this matches the ``RequestID``
+            # column in the KV-cache send timing CSV
+            # (``TRTLLM_KVCACHE_TIME_OUTPUT_PATH``), so the in-engine timing
+            # here can be joined per-request to the KV egress span.
+            ctx_request_id = getattr(disagg_params, "ctx_request_id", None)
+            if ctx_request_id is not None:
+                record["ctx_request_id"] = ctx_request_id
         logger.info("[PERF_METRICS] " + json.dumps(record))
 
     @print_traceback_on_error
