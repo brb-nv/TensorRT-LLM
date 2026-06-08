@@ -451,18 +451,27 @@ std::tuple<RequestVector, RequestVector> MicroBatchScheduler::operator()(Request
         setCtxRequestsChunkSize(contextsToBeChunked, mCtxChunkConfig.value().chunkingPolicy, ctxTokensCapacity,
             mCtxChunkConfig.value().chunkUnitSize, mMaxContextLength);
     }
+    // [reuse-acct] INFO trace of the FINAL chunk-size distribution. If most candidates end with
+    // chunkSize==0 (deferred) while one eats the whole budget, that is the "1 ctx req/iter"
+    // symptom; cross-check the per-request reusable here against the [reuse-acct]
+    // getNeededBlocksOneStep estReusableTokens for the same req id.
     for (auto const& llmReq : contextsToBeChunked)
     {
+        SizeType32 const reusable = llmReq->isFirstContextChunk() ? llmReq->getEstimatedReusableTokens() : 0;
         if (llmReq->getContextChunkSize() > 0)
         {
             contextRequests.emplace_back(llmReq);
-            SizeType32 const reusable = llmReq->isFirstContextChunk() ? llmReq->getEstimatedReusableTokens() : 0;
             SizeType32 const computeTokens
                 = reuse_adjusted_compute(llmReq->getContextChunkSize(), reusable, llmReq->getContextRemainingLength());
             batchNumTokens += computeTokens;
             TLLM_LOG_DEBUG("context request scheduled: ID %lu, chunk size %d%s", llmReq->mRequestId,
                 llmReq->getContextChunkSize(), reusable > 0 ? (", reusable " + std::to_string(reusable)).c_str() : "");
         }
+        TLLM_LOG_INFO(
+            "[reuse-acct] microbatch-ctx req=%lu firstChunk=%d chunkSize=%d remaining=%d reusable=%d scheduled=%d",
+            static_cast<unsigned long>(llmReq->mRequestId), static_cast<int>(llmReq->isFirstContextChunk()),
+            llmReq->getContextChunkSize(), llmReq->getContextRemainingLength(), reusable,
+            static_cast<int>(llmReq->getContextChunkSize() > 0));
     }
 
     utils::sortRequests(contextRequests, generationRequests, !allContextRequestsFit);
@@ -475,6 +484,11 @@ std::tuple<RequestVector, RequestVector> MicroBatchScheduler::operator()(Request
         "[Summary] Micro Batch scheduler schedules %d context/encoder requests, %d generation requests. "
         "%d requests inflight with the model already",
         contextRequests.size(), generationRequests.size(), inflightReqIds.size());
+
+    TLLM_LOG_INFO("[reuse-acct] microbatch-iter ctxReqs=%zu genReqs=%zu ctxCandidates=%zu batchNumTokens=%d "
+                  "maxNumTokens=%d inflight=%zu",
+        contextRequests.size(), generationRequests.size(), contextsToBeChunked.size(), batchNumTokens,
+        maxNumTokensRuntime.value_or(0), inflightReqIds.size());
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
     return {std::move(contextRequests), std::move(generationRequests)};

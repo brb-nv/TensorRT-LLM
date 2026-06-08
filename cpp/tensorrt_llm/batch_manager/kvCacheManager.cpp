@@ -1353,6 +1353,15 @@ PrefixReuseSummary WindowBlockManager::analyzePrefixReuse(
 
     TLLM_LOG_DEBUG("%s::analyzePrefixReuse - reusableAllocated=%d, reusableAll=%d, hasNewBlock=%d", mLogPrefix.c_str(),
         summary.reusableBlocksAllocated, summary.reusableBlocksAll, summary.firstNewBlock.has_value());
+    // [reuse-acct] INFO-level trace to root-cause why the micro-scheduler sees ~0 reusable
+    // tokens at high concurrency. reusableBlocksAll counts every cached prefix block found in
+    // the radix tree; reusableBlocksAllocated counts only those still referenced (hasRefs).
+    // Freed-but-cached blocks (the common multi-turn reuse case after a prior request completes)
+    // bump *All but NOT *Allocated.
+    TLLM_LOG_INFO(
+        "[reuse-acct] analyzePrefixReuse req=%lu reusableAllocated=%d reusableAll=%d hasNewBlock=%d nBlockKeys=%zu",
+        static_cast<unsigned long>(llmRequest.mRequestId), summary.reusableBlocksAllocated, summary.reusableBlocksAll,
+        static_cast<int>(summary.firstNewBlock.has_value()), blockKeys.size());
     return summary;
 }
 
@@ -3282,6 +3291,17 @@ SizeType32 KVCacheManager::getNeededBlocksOneStep(LlmRequest const& req, bool tw
             numRequiredBlocks -= reusableSharedBlocks;
             // Store on request so the micro batch scheduler can use it for token budget
             req.setEstimatedReusableTokens(reusableSharedBlocks * getTokensPerBlock());
+            // [reuse-acct] Smoking-gun trace: the estimate is derived from reusableBlocksAllocated
+            // (refs only), NOT reusableBlocksAll. If *All >> *Allocated here in steady state, the
+            // micro-scheduler under-credits reuse -> FCFS charges full chunks -> 1 ctx req/iter.
+            TLLM_LOG_INFO(
+                "[reuse-acct] getNeededBlocksOneStep req=%lu firstChunk=%d reusableAllocated=%d reusableAll=%d "
+                "numSharedBlocks=%d maxRecoverable=%d reusableSharedBlocks=%d estReusableTokens=%d promptLen=%d "
+                "windowSize=%d numRequiredBlocks=%d",
+                static_cast<unsigned long>(req.mRequestId), static_cast<int>(req.isFirstContextChunk()),
+                summary.reusableBlocksAllocated, summary.reusableBlocksAll, numSharedBlocks, maxRecoverableSharedBlocks,
+                reusableSharedBlocks, reusableSharedBlocks * getTokensPerBlock(), req.mPromptLen, windowSize,
+                numRequiredBlocks);
         }
         return numRequiredBlocks;
     }
