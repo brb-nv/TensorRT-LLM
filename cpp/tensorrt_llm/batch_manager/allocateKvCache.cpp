@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -28,6 +28,15 @@ void tensorrt_llm::batch_manager::AllocateKvCache::operator()(BaseKVCacheManager
 
     kvCacheManager.syncTransferManagerWithBufferManager();
 
+    // NOTE: This (legacy TRT backend) path provisions context requests one at a time via the
+    // single-sequence addSequence, which claims reuse blocks and allocates fresh blocks together
+    // per request. Unlike the PyTorch backend (resource_manager.prepare_resources ->
+    // addSequenceBatch), it does NOT pin all reuse blocks batch-wide before any fresh allocation.
+    // Consequently, the token/compute budget that getNeededBlocksOneStep / getRemainingBlocksToCompletion
+    // derive from reusableBlocksAll (free-but-cached blocks included) is NOT eviction-protected here:
+    // an earlier request's fresh allocation can evict a free-cached block a later request intended to
+    // reuse, forcing recompute that the token budget under-counted. To make that budget safe on this
+    // path too, convert this loop to the two-phase addSequenceBatch (see kvCacheManager.cpp).
     for (auto const& llmReq : contextRequests)
     {
         if (llmReq->isFirstContextChunk())

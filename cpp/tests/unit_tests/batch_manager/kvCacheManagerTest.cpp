@@ -6440,13 +6440,15 @@ TEST(KVCacheManagerReuseAccountingTest, CountReusableBlocksPartialMatch)
     EXPECT_EQ(summaryShared.reusableBlocksAll, 2);
 
     // After removeSequence, reusable blocks are free (no active refs).
-    // getNeededBlocksOneStep must NOT subtract free reusable blocks to avoid double-counting.
+    // BLOCK budget must NOT subtract free reusable blocks (avoids the #11731 over-admission).
     auto const neededOneStep
         = kvCacheManager->getNeededBlocksOneStep(req1, /*twoStepsLookAhead=*/false, onlyWindowSize);
     EXPECT_EQ(neededOneStep, promptLength / tokensPerBlock); // All 4 context blocks
 
-    // Blocks are free (released via removeSequence), so onlyAllocated=true yields 0 reusable blocks.
-    EXPECT_EQ(req1.getEstimatedReusableTokens(), 0);
+    // TOKEN budget counts ALL reusable blocks (free or allocated): the cached prefix KV is
+    // recovered via prepopulatedPromptLen and is pinned at provisioning (addSequenceBatch), so it
+    // is not recomputed and must not count against max_num_tokens. 2 shared blocks match here.
+    EXPECT_EQ(req1.getEstimatedReusableTokens(), summaryShared.reusableBlocksAll * tokensPerBlock);
 }
 
 TEST(KVCacheManagerReuseAccountingTest, GetRemainingBlocksToCompletionWithPartialReuse)
@@ -6573,14 +6575,17 @@ TEST(KVCacheManagerReuseAccountingTest, GetNeededBlocksOneStepWithFullReuse)
     };
 
     // After removeSequence, reusable blocks are free (no active refs).
-    // getNeededBlocksOneStep must NOT subtract free reusable blocks.
+    // BLOCK budget must NOT subtract free reusable blocks (avoids the #11731 over-admission).
     auto const neededOneStep
         = kvCacheManager->getNeededBlocksOneStep(req1, /*twoStepsLookAhead=*/false, onlyWindowSize);
     auto const numSharedBlocks = promptLength / tokensPerBlock; // 3 blocks
     EXPECT_EQ(neededOneStep, numSharedBlocks);                  // All 3 context blocks
 
-    // Blocks are free (released via removeSequence), so onlyAllocated=true yields 0 reusable blocks.
-    EXPECT_EQ(req1.getEstimatedReusableTokens(), 0);
+    // TOKEN budget counts ALL reusable blocks (free or allocated). storeContextBlocks stores
+    // (promptLength - 1) / tokensPerBlock full blocks (the last token's block is not recoverable),
+    // so estimatedReusableTokens = min(numStoredBlocks, numSharedBlocks) * tokensPerBlock.
+    auto const numStoredBlocks = (promptLength - 1) / tokensPerBlock;
+    EXPECT_EQ(req1.getEstimatedReusableTokens(), std::min(numStoredBlocks, numSharedBlocks) * tokensPerBlock);
 }
 
 TEST(KVCacheManagerReuseAccountingTest, ReuseDisabledReturnsFullBlockCount)
@@ -6713,13 +6718,14 @@ TEST(KVCacheManagerReuseAccountingTest, MultipleRequestsWithSharedPrefix)
     EXPECT_EQ(summaryPrefix.reusableBlocksAll, sharedPrefixLength / tokensPerBlock);
 
     // After removeSequence, reusable blocks are free (no active refs).
-    // getNeededBlocksOneStep must NOT subtract free reusable blocks.
+    // BLOCK budget must NOT subtract free reusable blocks (avoids the #11731 over-admission).
     auto const neededOneStep
         = kvCacheManager->getNeededBlocksOneStep(req1, /*twoStepsLookAhead=*/false, onlyWindowSize);
     EXPECT_EQ(neededOneStep, promptLength / tokensPerBlock); // All 4 context blocks
 
-    // Blocks are free (released via removeSequence), so onlyAllocated=true yields 0 reusable blocks.
-    EXPECT_EQ(req1.getEstimatedReusableTokens(), 0);
+    // TOKEN budget counts ALL reusable blocks (free or allocated): the shared prefix KV is
+    // recovered via prepopulatedPromptLen and pinned at provisioning, so it is not recomputed.
+    EXPECT_EQ(req1.getEstimatedReusableTokens(), summaryPrefix.reusableBlocksAll * tokensPerBlock);
 
     // getRemainingBlocksToCompletion: 4 context + 1 gen = 5 blocks (no subtraction; blocks are free)
     auto const remaining = kvCacheManager->getRemainingBlocksToCompletion(req1, onlyWindowSize);

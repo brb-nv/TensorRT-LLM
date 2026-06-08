@@ -3278,29 +3278,44 @@ SizeType32 KVCacheManager::getNeededBlocksOneStep(LlmRequest const& req, bool tw
             // Use the cached summary if provided; otherwise perform a fresh tree walk.
             auto const summary
                 = cachedSummary.has_value() ? cachedSummary.value() : analyzePrefixReuse(req.getUniqueTokens(0), req);
-            auto const numReusableBlocks = summary.reusableBlocksAllocated;
             auto const promptInputLen = std::min(req.mPromptLen, windowSize + chunkSize);
             // `addSequence()` ignores the last prompt token because its KV cannot be recovered.
             // When the prompt lands exactly on a block boundary, counting reusable full blocks from
             // all unique tokens can over-credit one extra shared block.
             TLLM_CHECK_WITH_INFO(promptInputLen > 0, "Unexpected: promptInputLen == 0");
             auto const maxRecoverableSharedBlocks = (promptInputLen - 1) / getTokensPerBlock();
-            // Only subtract from shared blocks (reusable blocks are always shared)
+
+            // Block/capacity budget: only discount blocks that are already allocated (have active
+            // refs). Free-but-cached blocks must NOT be discounted here — they are already counted
+            // in the eviction policy's free pool, so discounting them would over-admit requests and
+            // exhaust the KV cache (see #11731). Reusable blocks are always shared.
             auto const reusableSharedBlocks
-                = std::min({numReusableBlocks, numSharedBlocks, maxRecoverableSharedBlocks});
+                = std::min({summary.reusableBlocksAllocated, numSharedBlocks, maxRecoverableSharedBlocks});
             numRequiredBlocks -= reusableSharedBlocks;
-            // Store on request so the micro batch scheduler can use it for token budget
-            req.setEstimatedReusableTokens(reusableSharedBlocks * getTokensPerBlock());
-            // [reuse-acct] Smoking-gun trace: the estimate is derived from reusableBlocksAllocated
-            // (refs only), NOT reusableBlocksAll. If *All >> *Allocated here in steady state, the
-            // micro-scheduler under-credits reuse -> FCFS charges full chunks -> 1 ctx req/iter.
+
+            // Token/compute budget: discount ALL reusable blocks (free or allocated). Cached KV is
+            // recovered via prepopulatedPromptLen regardless of ref state, so those prefix tokens are
+            // not recomputed and must not count against max_num_tokens. Using reusableBlocksAllocated
+            // here under-credits steady-state reuse (prefixes of completed requests are free-but-
+            // cached), making FCFS charge full context chunks so one request saturates the token
+            // budget and context requests serialize to ~1/iter — inflating TTFT at high concurrency.
+            //
+            // This is safe (unlike a naive token-budget change) because provisioning pins reuse:
+            // addSequenceBatch claims every matching reuse block batch-wide BEFORE any fresh
+            // allocation, so a block counted here cannot be evicted before the request launches.
+            // Mirrors the accounting getRemainingBlocksToCompletion already uses for GUARANTEED_NO_EVICT.
+            auto const reusableSharedBlocksForCompute
+                = std::min({summary.reusableBlocksAll, numSharedBlocks, maxRecoverableSharedBlocks});
+            req.setEstimatedReusableTokens(reusableSharedBlocksForCompute * getTokensPerBlock());
+            // [reuse-acct] Trace both budgets: block budget discounts reusableBlocksAllocated,
+            // token/compute budget discounts reusableBlocksAll.
             TLLM_LOG_INFO(
                 "[reuse-acct] getNeededBlocksOneStep req=%lu firstChunk=%d reusableAllocated=%d reusableAll=%d "
                 "numSharedBlocks=%d maxRecoverable=%d reusableSharedBlocks=%d estReusableTokens=%d promptLen=%d "
                 "windowSize=%d numRequiredBlocks=%d",
                 static_cast<unsigned long>(req.mRequestId), static_cast<int>(req.isFirstContextChunk()),
                 summary.reusableBlocksAllocated, summary.reusableBlocksAll, numSharedBlocks, maxRecoverableSharedBlocks,
-                reusableSharedBlocks, reusableSharedBlocks * getTokensPerBlock(), req.mPromptLen, windowSize,
+                reusableSharedBlocks, reusableSharedBlocksForCompute * getTokensPerBlock(), req.mPromptLen, windowSize,
                 numRequiredBlocks);
         }
         return numRequiredBlocks;
