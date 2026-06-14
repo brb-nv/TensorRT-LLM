@@ -2283,6 +2283,30 @@ def test_disaggregated_deepseek_v3_lite_bf16_tllm_gen_helix(
                            cwd=llm_venv.get_working_directory())
 
 
+@pytest.mark.skip_less_device(4)
+@pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-bf16'],
+                         indirect=True)
+def test_disaggregated_deepseek_v3_lite_bf16_tllm_gen_helix_short(
+        disaggregated_test_root, disaggregated_example_root, llm_venv,
+        deepseek_v3_model_root):
+    # Short prompts (each well under tokens_per_block=32) produce a single KV
+    # block, which is fewer than the generation CP size (cp=2). The highest CP
+    # rank therefore owns zero blocks for the sequence ("empty" rank). This
+    # exercises the Helix empty-rank path end-to-end: zero-block KV cache
+    # transmission (UCX) plus a no-op attention/all-to-all combine contribution
+    # from the empty rank. Reuses the ctxtp2/gentp1cp2 config but with the
+    # default short prompts so output correctness is verified.
+    setup_model_symlink(llm_venv, deepseek_v3_model_root,
+                        "DeepSeek-V3-Lite/bf16")
+
+    run_disaggregated_test(disaggregated_example_root,
+                           "deepseek_v3_lite_bf16_tllm_gen_helix",
+                           env=llm_venv._new_env,
+                           prompt_file="prompts.json",
+                           model_path=deepseek_v3_model_root,
+                           cwd=llm_venv.get_working_directory())
+
+
 @skip_pre_blackwell
 @pytest.mark.skip_less_device(4)
 @pytest.mark.parametrize("model_path", ['gpt_oss/gpt-oss-120b'])

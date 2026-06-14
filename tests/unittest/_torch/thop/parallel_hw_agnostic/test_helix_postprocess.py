@@ -289,6 +289,52 @@ class TestHelixPostProcess(unittest.TestCase):
             native_v2=native_v2,
         )
 
+    def test_helix_postprocess_empty_rank_noop(self):
+        """A CP rank that owns no KV blocks (num_total_blocks < cp_size) must be a
+        no-op in the combine: it contributes ``(-inf, 0)`` softmax stats and a
+        zeroed partial output. The result must match combining only the
+        non-empty ranks (and stay finite).
+
+        This mirrors the Python post-sanitization in ``_helix_post_process``,
+        which forces zero-local-KV rows to ``(-inf, 0)`` and zeros their
+        partial output before this op runs.
+        """
+        device = torch.device("cuda")
+        cp_size, num_tokens, num_heads, kv_lora_rank = 4, 8, 2, 64
+        dtype = torch.float16
+        scale = 1.0
+
+        gathered_o = torch.empty(
+            cp_size, num_tokens, num_heads, kv_lora_rank, dtype=dtype, device=device
+        ).uniform_(-1, 1)
+        gathered_stats = torch.empty(
+            cp_size, num_tokens, num_heads, 2, dtype=torch.float32, device=device
+        )
+        gathered_o_max = torch.max(gathered_o, dim=-1, keepdim=True)[0]
+        gathered_stats[..., 0] = gathered_o_max[..., 0]
+        gathered_stats[..., 1] = torch.sum(torch.exp(gathered_o - gathered_o_max), dim=-1)
+
+        # Mark the highest CP rank as "empty" (rank 0 always owns block 0, so it
+        # is never empty). Empty rank: (-inf, 0) stats and zeroed partial output.
+        empty = cp_size - 1
+        gathered_stats[empty, ..., 0] = float("-inf")
+        gathered_stats[empty, ..., 1] = 0.0
+        gathered_o[empty] = 0.0
+
+        gathered_o_v = gathered_o.view(cp_size, num_tokens, num_heads * kv_lora_rank)
+        output = torch.ops.trtllm.helix_post_process(gathered_o_v, gathered_stats, scale)
+
+        # Reference: combine only the non-empty ranks.
+        expected = baseline(
+            gathered_o_v[:empty].contiguous(),
+            gathered_stats[:empty].contiguous(),
+            kv_lora_rank,
+            scale,
+        )
+
+        assert torch.isfinite(output).all()
+        torch.testing.assert_close(output, expected, atol=1e-3, rtol=1e-2)
+
     def test_helix_postprocess_invalid_inputs(self):
         """Test error handling for invalid inputs (non-native)"""
         device = torch.device("cuda")
