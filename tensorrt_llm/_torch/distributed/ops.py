@@ -840,8 +840,6 @@ class AllReduce(nn.Module):
         input = input.contiguous()  # Underlying op requires contiguous input
 
         allreduce_strategy = self.strategy
-        if os.environ.get("TLLM_FORCE_NCCL_ALLREDUCE", "0") == "1":
-            allreduce_strategy = AllReduceStrategy.NCCL
 
         if all_reduce_params is None:
             all_reduce_params = AllReduceParams()

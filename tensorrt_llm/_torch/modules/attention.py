@@ -128,10 +128,12 @@ def attn_custom_op_inplace(
 
 def _helix_zero_kv_mask(attn_metadata: AttentionMetadata,
                         num_tokens: int) -> Optional[torch.Tensor]:
-    """Bool mask (shape ``[num_tokens]``) marking tokens whose local KV length
-    is zero on this CP rank, i.e. ranks that own no blocks for the sequence
-    (``num_total_blocks < cp_size``). Derived from the static ``kv_lens_cuda``
-    buffer so it stays CUDA-graph safe. Returns ``None`` when unavailable."""
+    """Return a bool mask marking tokens with zero local KV length on this CP rank.
+
+    These are ranks that own no blocks for the sequence. The mask is derived from
+    the static kv_lens_cuda buffer so it stays CUDA-graph safe. Returns None when
+    the buffer is unavailable.
+    """
     kv_lens = getattr(attn_metadata, "kv_lens_cuda", None)
     if kv_lens is None:
         return None
@@ -145,29 +147,25 @@ def _helix_sanitize_empty_kv(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Force zero-local-KV rows to a no-op contribution for the Helix combine.
 
-    A CP rank that owns no KV blocks for a sequence (``num_total_blocks <
-    cp_size``) attends to zero keys for that token. The attention kernel then
-    normalizes by a zero softmax sum, producing ``NaN`` in ``partial_o`` (and
-    undefined softmax stats). The Helix combine weights each rank by
-    ``sum * exp(max - global_max)``, so such a rank must contribute
-    ``softmax_stats = (-inf, 0)`` and a finite (zeroed) ``partial_o`` to act as
-    a no-op. We overwrite those rows using the externally-known
-    ``zero_kv_mask`` (derived from per-sequence KV length), which is robust
-    regardless of what the kernel wrote.
+    A CP rank that owns no KV blocks for a token attends to zero keys, so the
+    attention kernel normalizes by a zero softmax sum and yields NaN. The combine
+    weights each rank by sum * exp(max - global_max), so such rows must contribute
+    softmax_stats of (-inf, 0) and a zeroed partial_o to act as a no-op. The rows
+    are selected by zero_kv_mask, which is robust regardless of what the kernel
+    wrote. Passing None disables sanitization.
 
     Args:
-        partial_o: Partial attention output, shape ``[num_tokens, ...]``.
-        softmax_stats: Per-(token, head) ``(max, sum)``, shape
-            ``[num_tokens, num_heads, 2]``.
-        zero_kv_mask: Bool tensor, shape ``[num_tokens]``; ``True`` where this
-            rank has zero local KV. ``None`` disables sanitization.
+        partial_o: Partial attention output, shape [num_tokens, ...].
+        softmax_stats: Per (token, head) (max, sum), shape [num_tokens, num_heads, 2].
+        zero_kv_mask: Bool tensor of shape [num_tokens], True where this rank has
+            zero local KV.
     """
     if zero_kv_mask is None:
         return partial_o, softmax_stats
     num_tokens = partial_o.shape[0]
     mask = zero_kv_mask[:num_tokens].view(-1, 1)
-    # masked_fill overwrites by mask regardless of the current (possibly NaN)
-    # value, and is functional/CUDA-graph-safe (static shapes).
+    # masked_fill overwrites masked rows regardless of their current (possibly NaN)
+    # value and is CUDA-graph safe due to static shapes.
     partial_o = partial_o.masked_fill(mask, 0.0)
     sm_max = softmax_stats[..., 0].masked_fill(mask, float("-inf"))
     sm_sum = softmax_stats[..., 1].masked_fill(mask, 0.0)
@@ -192,9 +190,9 @@ def _helix_post_process(
     dimension that differs between the two callers is *value_dim*
     (``head_dim`` for MHA, ``kv_lora_rank`` for MLA).
 
-    *zero_kv_mask* (shape ``[num_tokens]``) marks tokens for which this CP rank
-    owns no KV blocks; those rows are forced to a no-op ``(-inf, 0)``
-    contribution before the exchange (see ``_helix_sanitize_empty_kv``).
+    zero_kv_mask marks tokens for which this CP rank owns no KV blocks; those rows
+    are forced to a no-op contribution before the exchange (see
+    _helix_sanitize_empty_kv).
 
     When *aux_stream* and *ln_events* are provided the two
     ``.contiguous()`` calls in the FIFO-v1 path are overlapped on

@@ -291,13 +291,13 @@ class TestHelixPostProcess(unittest.TestCase):
 
     def test_helix_postprocess_empty_rank_noop(self):
         """A CP rank that owns no KV blocks (num_total_blocks < cp_size) must be a
-        no-op in the combine: it contributes ``(-inf, 0)`` softmax stats and a
-        zeroed partial output. The result must match combining only the
-        non-empty ranks (and stay finite).
+        no-op in the combine: it contributes (-inf, 0) softmax stats and a zeroed
+        partial output. The result must match combining only the non-empty ranks
+        and stay finite.
 
-        This mirrors the Python post-sanitization in ``_helix_post_process``,
-        which forces zero-local-KV rows to ``(-inf, 0)`` and zeros their
-        partial output before this op runs.
+        This mirrors the Python post-sanitization in _helix_post_process, which
+        forces zero-local-KV rows to (-inf, 0) and zeros their partial output
+        before this op runs.
         """
         device = torch.device("cuda")
         cp_size, num_tokens, num_heads, kv_lora_rank = 4, 8, 2, 64

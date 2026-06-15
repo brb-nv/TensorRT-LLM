@@ -858,13 +858,10 @@ public:
                 /*recvSideHasCP=*/false, srcPpSize);
 
             int32_t requestedBlockSize = requestedBlockRange.getBlockIdsPerWindow().begin()->second.size();
-            // A Helix CP "empty" rank owns zero KV blocks for this sequence (the prompt has
-            // fewer blocks than cp_size). It still must send a RequestInfo so the context's
-            // per-request counterpart count is satisfied (otherwise the context would wait for
-            // it forever), but it requests zero blocks: the context transmits nothing to it
-            // (the formatter skips zero-block targets) and unformat skips the receive. The
-            // default RequestInfo (indexFromEnd=0, empty lastBlockKey) is used; the context
-            // ignores both when the receiver side has CP.
+            // A Helix CP "empty" rank owns zero KV blocks for this sequence (fewer blocks than
+            // cp_size). It still sends a RequestInfo so the context's per-request counterpart count
+            // is satisfied, but requests zero blocks: the default RequestInfo (indexFromEnd=0, empty
+            // lastBlockKey) is used and the context transmits nothing to it.
             if (requestedBlockSize > 0)
             {
                 auto const beam = 0;
@@ -877,7 +874,6 @@ public:
                 SizeType32 endTokenIdx = static_cast<SizeType32>(uniqueTokens.size());
                 auto extraKeys = kv_cache_manager::generateBlockHashExtraKeys(llmRequest, startTokenIdx, endTokenIdx);
                 lastBlockKey.extraKeys = std::move(extraKeys);
-                // Compute indexFromEnd from the number of requested blocks
                 int32_t indexFromEnd = requestedBlockSize - 1;
 
                 requestInfo = RequestInfo(requestId, mSelfState, indexFromEnd, lastBlockKey);

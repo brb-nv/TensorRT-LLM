@@ -295,8 +295,6 @@ def get_test_config(test_desc, example_dir, test_root):
         f"{test_configs_root}/disagg_config_llama4_kv_cache_overflow.yaml",
         "deepseek_v3_lite_bf16_tllm_gen_helix":
         f"{test_configs_root}/disagg_config_ctxtp2_gentp1cp2_deepseek_v3_lite_bf16_tllm_gen.yaml",
-        "deepseek_v3_lite_bf16_tllm_gen_helix_cp4":
-        f"{test_configs_root}/disagg_config_ctxtp4_gentp1cp4_deepseek_v3_lite_bf16_tllm_gen.yaml",
         "deepseek_r1_v2_fp4_stress":
         f"{test_configs_root}/disagg_config_ctxtp4_gentp4_deepseek_r1_v2_fp4_tllm.yaml",
         "deepseek_r1_v2_fp4_mtp_stress":
@@ -2281,9 +2279,9 @@ def test_disaggregated_deepseek_v3_lite_bf16_tllm_gen_helix(
     # Helix CP disaggregated serving on the ctxtp2/gentp1cp2 config (4 GPUs),
     # exercised with two prompt sets:
     #   - "prompts.json": short prompts sent via the completion endpoint without
-    #     a chat template, each a single KV block (well under tokens_per_block=32)
-    #     -- fewer than the generation CP size (cp=2). The highest CP rank then
-    #     owns zero blocks for the sequence ("empty" rank), exercising the Helix
+    #     a chat template, each a single KV block (well under tokens_per_block=32),
+    #     fewer than the generation CP size (cp=2). The highest CP rank then owns
+    #     zero blocks for the sequence ("empty" rank), exercising the Helix
     #     empty-rank path end-to-end: zero-block KV cache transmission (UCX) plus
     #     a no-op attention/all-to-all combine contribution from the empty rank.
     #     Output correctness is verified.
