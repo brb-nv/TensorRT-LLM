@@ -143,6 +143,10 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
     auto pickUpConnections
         = pickSendConnections(connections.size(), selfConfig, selfIdx, destConfig, session.getCounterPartRanks());
     auto targetNum = pickUpConnections.size();
+    TLLM_LOG_INFO(mpi::MpiComm::world().getRank(),
+        "[HELIX-DBG] mla format reqId %ld: ENTER, targetNum=%zu, selfCP=%d, destCP=%d", llmRequest.mRequestId,
+        targetNum, selfConfig.getParallelConfig().mContextParallelism,
+        destConfig.getParallelConfig().mContextParallelism);
     if (targetNum == 0)
     {
         TLLM_LOG_DEBUG("No targets to send KV cache to for request ID: %ld", llmRequest.mRequestId);
@@ -309,6 +313,10 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
             auto const& splitCache = outputSplitCaches.at(cacheIdx);
             if (splitCache == nullptr || splitCache->getSizeInBytes() == 0)
             {
+                TLLM_LOG_INFO(mpi::MpiComm::world().getRank(),
+                    "[HELIX-DBG] mla format reqId %ld: skipping send to processIdx %zu (cacheIdx %zu, 0-block CP "
+                    "target).",
+                    llmRequest.mRequestId, processIdx, cacheIdx);
                 return;
             }
             if (cacheIdx < bufferCoverTargetNum)
@@ -465,12 +473,19 @@ void MLACacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& s
             }
         }
 
+        TLLM_LOG_INFO(mpi::MpiComm::world().getRank(),
+            "[HELIX-DBG] mla unformat reqId %ld: blockNum=%d (transferIndexerKCache=%d, selfCP=%d)",
+            llmRequest.mRequestId, blockNum, static_cast<int>(transferIndexerKCache),
+            selfConfig.getParallelConfig().mContextParallelism);
+
         // Helix: an "empty" CP rank owns no KV blocks for this sequence (num_total_blocks < cp_size).
         // There is nothing to receive; the sender (context, CP=1) skips the matching 0-byte transfer.
         if (blockNum == 0)
         {
-            TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
-                "Skipping KV cache receive for request ID: %ld (empty CP rank, no blocks).", llmRequest.mRequestId);
+            TLLM_LOG_INFO(mpi::MpiComm::world().getRank(),
+                "[HELIX-DBG] mla unformat reqId %ld: blockNum==0 (empty CP rank), skipping receive "
+                "(transferIndexerKCache=%d).",
+                llmRequest.mRequestId, static_cast<int>(transferIndexerKCache));
             continue;
         }
 

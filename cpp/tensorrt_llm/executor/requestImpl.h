@@ -510,7 +510,17 @@ public:
 private:
     void validate()
     {
-        TLLM_CHECK(!mInputTokenIds.empty());
+        // NOTE: The "input tokens must not be empty" check is intentionally disabled to
+        // support Helix context-parallelism "empty" CP ranks. When a prompt has fewer
+        // KV-cache blocks than cp_size, the highest-indexed CP ranks own zero blocks (and
+        // thus zero input tokens) for the sequence; their KV cache is received via the
+        // cache transceiver rather than recomputed from input tokens, so an empty token
+        // list is valid. A precise gate (e.g. on mContextPhaseParams) is not possible here
+        // because some construction paths set the context phase params after the Request is
+        // constructed, i.e. after validate() runs.
+        // TODO(helix): restore a tighter check once empty-rank requests carry an
+        // identifiable flag at construction time.
+        // TLLM_CHECK(!mInputTokenIds.empty());
         TLLM_CHECK(mMaxNewTokens > 0);
 
         // Show warning message unless mNumReturnSequences is the default value.

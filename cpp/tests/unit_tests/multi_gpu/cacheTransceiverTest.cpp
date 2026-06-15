@@ -879,7 +879,11 @@ protected:
             cpMetaData.emplace(length, tokensPerBlock, mCpRank, mCpSize);
             seqLen = cpMetaData.value().mSeqLenOnThisCPRank;
         }
+        TLLM_LOG_INFO("[HELIX-DBG][rank %d cpRank %d/%d] makeLlmRequest len=%d -> seqLen=%d (creating texec::Request)",
+            mRank, mCpRank, mCpSize, length, seqLen);
         texec::Request request{VecTokens(seqLen, seqLen), maxNewTokens};
+        TLLM_LOG_INFO("[HELIX-DBG][rank %d cpRank %d] makeLlmRequest seqLen=%d: texec::Request created", mRank, mCpRank,
+            seqLen);
         auto state = std::make_unique<texec::DataTransceiverState>();
 
         TLLM_CHECK(mContextCommState);
@@ -889,6 +893,8 @@ protected:
         request.setContextPhaseParams(std::move(stats));
 
         auto llmRequestPtr = std::make_shared<LlmRequest>(mRequestId++, std::move(request));
+        TLLM_LOG_INFO("[HELIX-DBG][rank %d cpRank %d] makeLlmRequest seqLen=%d: LlmRequest created (reqId %ld)", mRank,
+            mCpRank, seqLen, llmRequestPtr->mRequestId);
         return std::make_unique<WrappedLlmRequest>(std::move(llmRequestPtr), cpMetaData);
     }
 
@@ -983,8 +989,24 @@ protected:
         auto constexpr beamIdx{0};
         auto constexpr beamWidth{1};
         auto& llmRequest = request->mLlmRequest;
+        auto const numTokens = llmRequest->getNumTokens(beamIdx);
+        TLLM_LOG_INFO("[HELIX-DBG][rank %d cpRank %d] addReqGen reqId %ld: numTokens=%d, cpMeta=%s, "
+                      "cpMeta.numBlocksThisRank=%d before addSequenceBatch",
+            mRank, mCpRank, llmRequest->mRequestId, numTokens, request->mCPMetaData.has_value() ? "yes" : "no",
+            request->mCPMetaData.has_value() ? request->mCPMetaData->mNumBlocksThisCPRank : -1);
         mManager->addSequenceBatch(
-            {{{llmRequest->mRequestId, llmRequest->getNumTokens(beamIdx), beamWidth}}}, {std::ref(*llmRequest)});
+            {{{llmRequest->mRequestId, numTokens, beamWidth}}}, {std::ref(*llmRequest)});
+        TLLM_LOG_INFO("[HELIX-DBG][rank %d cpRank %d] addReqGen reqId %ld: addSequenceBatch RETURNED", mRank, mCpRank,
+            llmRequest->mRequestId);
+        auto allocated = BlockRange::fromAllBlockIds(*mManager, llmRequest->mRequestId);
+        size_t allocatedBlocks = 0;
+        for (auto const& [ws, ids] : allocated.getBlockIdsPerWindow())
+        {
+            allocatedBlocks += ids.size();
+        }
+        TLLM_LOG_INFO("[HELIX-DBG][rank %d cpRank %d] addReqGen reqId %ld: BlockRange OK, allocatedBlocks=%zu; "
+                      "calling receiveAsync",
+            mRank, mCpRank, llmRequest->mRequestId, allocatedBlocks);
         return mRequester->receiveAsync(llmRequest);
     }
 
@@ -1001,6 +1023,15 @@ protected:
         auto initial = llmRequest->getPromptLen();
 
         auto const& windowSizes = blockRange.getWindowSizes();
+        {
+            size_t verifyBlocks = 0;
+            for (auto const& [ws, ids] : blockRange.getBlockIdsPerWindow())
+            {
+                verifyBlocks += ids.size();
+            }
+            TLLM_LOG_INFO("[HELIX-DBG][rank %d cpRank %d] verifyKV reqId %ld: blocks=%zu, windows=%zu", mRank, mCpRank,
+                llmRequest->mRequestId, verifyBlocks, windowSizes.size());
+        }
         for (auto const& windowSize : windowSizes)
         {
             auto blockRangeForWindow = blockRange.getBlockRangeForWindow(windowSize);
@@ -1365,34 +1396,80 @@ TEST_P(AsymmetricalCacheTest, TestCase)
             if (mIsContext)
             {
                 std::vector<std::future<void>> contextFutures;
+                TLLM_LOG_INFO("[HELIX-DBG][rank %d ctx] launching %zu context requests", mRank, requests.size());
                 for (auto&& request : requests)
                 {
                     contextFutures.push_back(addRequestAndTransportCacheForContext(request));
                     TLLM_LOG_DEBUG("setUpCacheTransceiver addRequestAndTransportCacheForContext");
                 }
                 mComm->barrier();
-                for (auto&& cfuture : contextFutures)
+                for (size_t ci = 0; ci < contextFutures.size(); ++ci)
                 {
-                    cfuture.get();
+                    try
+                    {
+                        contextFutures[ci].get();
+                        TLLM_LOG_INFO("[HELIX-DBG][rank %d ctx] context future idx %zu completed", mRank, ci);
+                    }
+                    catch (std::exception const& e)
+                    {
+                        TLLM_LOG_ERROR(
+                            "[HELIX-DBG][rank %d ctx] context future idx %zu THREW: %s", mRank, ci, e.what());
+                        throw;
+                    }
                 }
             }
             else
             {
                 std::vector<std::future<void>> generationFutures;
                 mComm->barrier();
-                for (auto&& request : requests)
+                TLLM_LOG_INFO("[HELIX-DBG][rank %d cpRank %d/%d] gen: launching %zu requests", mRank, mCpRank,
+                    mCpSize, requests.size());
+                for (size_t gi = 0; gi < requests.size(); ++gi)
                 {
-                    generationFutures.push_back(addRequestAndTransportCacheForGeneration(request));
-                    TLLM_LOG_DEBUG("setUpCacheTransceiver addRequestAndTransportCacheForGeneration");
+                    try
+                    {
+                        generationFutures.push_back(addRequestAndTransportCacheForGeneration(requests[gi]));
+                        TLLM_LOG_INFO("[HELIX-DBG][rank %d cpRank %d] gen: launched request idx %zu (reqId %ld)",
+                            mRank, mCpRank, gi, requests[gi]->mLlmRequest->mRequestId);
+                    }
+                    catch (std::exception const& e)
+                    {
+                        TLLM_LOG_ERROR("[HELIX-DBG][rank %d cpRank %d] gen: addRequestAndTransportCacheForGeneration "
+                                       "idx %zu THREW: %s",
+                            mRank, mCpRank, gi, e.what());
+                        throw;
+                    }
                 }
 
-                for (auto&& gfuture : generationFutures)
+                for (size_t gi = 0; gi < generationFutures.size(); ++gi)
                 {
-                    gfuture.get();
+                    try
+                    {
+                        generationFutures[gi].get();
+                        TLLM_LOG_INFO(
+                            "[HELIX-DBG][rank %d cpRank %d] gen: future idx %zu completed", mRank, mCpRank, gi);
+                    }
+                    catch (std::exception const& e)
+                    {
+                        TLLM_LOG_ERROR("[HELIX-DBG][rank %d cpRank %d] gen: future idx %zu THREW: %s", mRank, mCpRank,
+                            gi, e.what());
+                        throw;
+                    }
                 }
-                for (auto&& request : requests)
+                for (size_t gi = 0; gi < requests.size(); ++gi)
                 {
-                    generationVerifyKVCache(request);
+                    try
+                    {
+                        generationVerifyKVCache(requests[gi]);
+                        TLLM_LOG_INFO(
+                            "[HELIX-DBG][rank %d cpRank %d] gen: verified KV cache idx %zu", mRank, mCpRank, gi);
+                    }
+                    catch (std::exception const& e)
+                    {
+                        TLLM_LOG_ERROR("[HELIX-DBG][rank %d cpRank %d] gen: generationVerifyKVCache idx %zu THREW: %s",
+                            mRank, mCpRank, gi, e.what());
+                        throw;
+                    }
                 }
             }
             for (auto&& request : requests)
