@@ -942,7 +942,13 @@ class PyTorchModelEngine(ModelEngine):
             and self.guided_decoder is None
             and not isinstance(kv_cache_manager, MambaHybridCacheManager))
 
+        logger.info(
+            f"[HELIX-WARMUP-DBG][rank {self.mapping.rank}] >>> _run_attention_warmup start"
+        )
         self._run_attention_warmup(resource_manager, can_run_general_warmup)
+        logger.info(
+            f"[HELIX-WARMUP-DBG][rank {self.mapping.rank}] <<< _run_attention_warmup done"
+        )
 
         if can_run_general_warmup:
             # Specialize torch.compile graphs across the key input shapes before CUDA graph capture.
@@ -969,8 +975,14 @@ class PyTorchModelEngine(ModelEngine):
             # NVSHMEM).
             gc.collect()
             torch.cuda.empty_cache()
+        logger.info(
+            f"[HELIX-WARMUP-DBG][rank {self.mapping.rank}] >>> _run_cuda_graph_warmup start"
+        )
         with self.cuda_graph_runner.allow_capture():
             self._run_cuda_graph_warmup(resource_manager)
+        logger.info(
+            f"[HELIX-WARMUP-DBG][rank {self.mapping.rank}] <<< _run_cuda_graph_warmup done"
+        )
         if can_run_general_warmup:
             # Pre-populate the memory pool with max-shape allocations to reduce
             # fragmentation at runtime.
@@ -1089,11 +1101,20 @@ class PyTorchModelEngine(ModelEngine):
                 self._assert_all_tp_ranks_have_warmup_batch(batch, num_tokens)
                 if batch is None:
                     continue  # All ranks agree: not enough space
+                logger.info(
+                    f"[HELIX-WARMUP-DBG][rank {self.mapping.rank}] attn warmup forward start "
+                    f"(num_tokens={num_tokens}, num_gen_requests={num_gen_requests})")
                 with trtllm_gen_fmha_jit_warmup():
                     self.forward(batch,
                                  new_tensors_device=None,
                                  resource_manager=resource_manager)
+                logger.info(
+                    f"[HELIX-WARMUP-DBG][rank {self.mapping.rank}] attn warmup forward returned "
+                    f"(num_tokens={num_tokens}); syncing")
                 torch.cuda.synchronize()
+                logger.info(
+                    f"[HELIX-WARMUP-DBG][rank {self.mapping.rank}] attn warmup sync done "
+                    f"(num_tokens={num_tokens})")
 
     def _run_autotuner_warmup(self, resource_manager: ResourceManager):
         """Runs a forward pass to populate the autotuner cache."""

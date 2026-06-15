@@ -202,22 +202,43 @@ def _helix_post_process(
     """
     partial_o, softmax_stats = _helix_sanitize_empty_kv(partial_o, softmax_stats,
                                                         zero_kv_mask)
-    if mapping.cp_config.get("use_nccl_for_alltoall", True):
+    use_nccl_for_alltoall = mapping.cp_config.get("use_nccl_for_alltoall", False)
+    logger.info(
+        f"[HELIX-WARMUP-DBG][rank {mapping.rank} cpRank {mapping.cp_rank}] "
+        f"_helix_post_process enter: partial_o={tuple(partial_o.shape)}, "
+        f"softmax_stats={tuple(softmax_stats.shape)}, cp_size={mapping.cp_size}, "
+        f"use_nccl_for_alltoall={use_nccl_for_alltoall}")
+    if use_nccl_for_alltoall:
         # NCCL-based implementation using alltoall_helix.
         chunks = []
         for t in [partial_o, softmax_stats]:
             t = t.transpose(1, 0).contiguous()
             chunks.extend(torch.split(t, t.shape[0] // mapping.cp_size))
+        logger.info(
+            f"[HELIX-WARMUP-DBG][rank {mapping.rank} cpRank {mapping.cp_rank}] "
+            f"before alltoall_helix: {len(chunks)} chunks, chunk0={tuple(chunks[0].shape)}")
         gathered = alltoall_helix(chunks, mapping.cp_group)
+        logger.info(
+            f"[HELIX-WARMUP-DBG][rank {mapping.rank} cpRank {mapping.cp_rank}] "
+            f"after alltoall_helix")
         gathered = [t.transpose(1, 2).contiguous() for t in gathered]
-        return torch.ops.trtllm.helix_post_process(gathered[0], gathered[1],
-                                                   1.0)
+        out = torch.ops.trtllm.helix_post_process(gathered[0], gathered[1], 1.0)
+        logger.info(
+            f"[HELIX-WARMUP-DBG][rank {mapping.rank} cpRank {mapping.cp_rank}] "
+            f"after helix_post_process op")
+        return out
     else:
         # FIFO-based implementation using MNNVL workspace.
+        logger.info(
+            f"[HELIX-WARMUP-DBG][rank {mapping.rank} cpRank {mapping.cp_rank}] "
+            f"FIFO path: getting HelixAllToAllNative")
         helix = HelixAllToAllNative.get(mapping)
         num_tokens = partial_o.shape[0]
         cp_size = mapping.cp_size
         fifo_version = mapping.cp_config.get("fifo_version", 2)
+        logger.info(
+            f"[HELIX-WARMUP-DBG][rank {mapping.rank} cpRank {mapping.cp_rank}] "
+            f"FIFO path: helix obtained, fifo_version={fifo_version}, num_tokens={num_tokens}")
 
         if fifo_version == 1:
 
@@ -250,14 +271,24 @@ def _helix_post_process(
                                        num_heads_tp_cp * value_dim)
             softmax_stats = softmax_stats.view(num_tokens, cp_size,
                                                num_heads_tp_cp * 2)
+            logger.info(
+                f"[HELIX-WARMUP-DBG][rank {mapping.rank} cpRank {mapping.cp_rank}] "
+                f"FIFO v2: before alltoall_native (partial_o={tuple(partial_o.shape)})")
             partial_o_out, softmax_stats_out = helix.alltoall_native(
                 partial_o, softmax_stats)
+            logger.info(
+                f"[HELIX-WARMUP-DBG][rank {mapping.rank} cpRank {mapping.cp_rank}] "
+                f"FIFO v2: after alltoall_native")
             gathered_o = partial_o_out.view(num_tokens, cp_size,
                                             num_heads_tp_cp, value_dim)
             gathered_stats = softmax_stats_out.view(num_tokens, cp_size,
                                                     num_heads_tp_cp, 2)
-            return torch.ops.trtllm.helix_post_process_native(
+            out = torch.ops.trtllm.helix_post_process_native(
                 gathered_o, gathered_stats, 1.0, 1)
+            logger.info(
+                f"[HELIX-WARMUP-DBG][rank {mapping.rank} cpRank {mapping.cp_rank}] "
+                f"FIFO v2: after helix_post_process_native op")
+            return out
 
 
 def _helix_cp_pad(tensor: torch.Tensor, num_tokens: int,
