@@ -698,8 +698,6 @@ void CacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& sess
     // There is nothing to receive; the sender (context, CP=1) skips the matching 0-byte transfer.
     if (blockNum == 0)
     {
-        TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
-            "Skipping KV cache receive for request ID: %ld (empty CP rank, no blocks).", llmRequest.mRequestId);
         return;
     }
     if (outputBuffersPerWindow.size() > 1)

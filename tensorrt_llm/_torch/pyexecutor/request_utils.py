@@ -9,6 +9,7 @@ if TYPE_CHECKING:
 import torch
 
 from tensorrt_llm._utils import nvtx_range
+from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import CpType
 
 from ..distributed import Distributed
@@ -371,6 +372,16 @@ def merge_helix_requests(
         )
         req.total_input_len_cp = input_len
         req.seqlen_this_rank_cp = len(input_ids_this_rank)
+        # [HELIX-PROMPTLEN] Temporary diagnostic: report the tokenized prompt length that actually
+        # reaches the gen server and how it shards across CP ranks. num_total_blocks =
+        # ceil(input_len / tokens_per_block); this rank is "empty" (owns zero blocks) when
+        # num_total_blocks < cp_size and cp_rank is among the highest-indexed ranks.
+        num_total_blocks = (input_len + tokens_per_block - 1) // tokens_per_block
+        logger.info(
+            f"[HELIX-PROMPTLEN] req_id={req_item.id}: total_prompt_len={input_len}, "
+            f"tokens_per_block={tokens_per_block}, num_total_blocks={num_total_blocks}, "
+            f"cp_rank={cp_rank}/{cp_size}, seqlen_this_rank={len(input_ids_this_rank)}, "
+            f"empty_rank={len(input_ids_this_rank) == 0}")
         req_with_children.append(req)
         if req.child_requests:
             req_with_children.extend(req.child_requests)

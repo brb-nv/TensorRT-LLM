@@ -1967,30 +1967,18 @@ WindowBlockManager::ClaimResult WindowBlockManager::buildClaimResultMetadata(
         auto const& uniqueTokens
             = isSelfCache ? llmRequest.getUniqueTokens(beamIdx) : *(llmRequest.getEncoderUniqueTokens().value());
 
-        TLLM_LOG_INFO(mpi::MpiComm::world().getRank(),
-            "[HELIX-DBG] buildClaimResultMetadata reqId %lu: uniqueTokens.size=%zu, inputLength=%d, "
-            "inputLength-1=%d, before chopVectorIntoBlocks",
-            requestId, uniqueTokens.size(), inputLength, inputLength - 1);
         auto blockedUniqueTokens
             = chopVectorIntoBlocks<UniqueToken>(uniqueTokens, inputLength - 1, mTokensPerBlock, true);
-        TLLM_LOG_INFO(mpi::MpiComm::world().getRank(),
-            "[HELIX-DBG] buildClaimResultMetadata reqId %lu: chopVectorIntoBlocks OK (numBlocks=%zu)", requestId,
-            blockedUniqueTokens.size());
         if (inputLength % mTokensPerBlock == 1)
         {
             blockedUniqueTokens.emplace_back();
         }
         result.blockKeys = buildBlockKeys(blockedUniqueTokens, llmRequest);
-        TLLM_LOG_INFO(mpi::MpiComm::world().getRank(),
-            "[HELIX-DBG] buildClaimResultMetadata reqId %lu: buildBlockKeys OK", requestId);
     }
 
     auto config = llmRequest.getKvCacheRetentionConfig();
     result.perBlockRetentions = config.value_or(executor::KvCacheRetentionConfig())
                                     .getPerBlockRetentionPriorityDuration(mTokensPerBlock, inputLength);
-    TLLM_LOG_INFO(mpi::MpiComm::world().getRank(),
-        "[HELIX-DBG] buildClaimResultMetadata reqId %lu: getPerBlockRetentionPriorityDuration OK (size=%zu)",
-        requestId, result.perBlockRetentions.size());
     result.mode = config.value_or(executor::KvCacheRetentionConfig()).getTransferMode();
     result.directory = config.value_or(executor::KvCacheRetentionConfig()).getDirectory();
 
@@ -2045,10 +2033,6 @@ std::vector<WindowBlockManager::BatchSeqStats> WindowBlockManager::addSequenceBa
         {
             claimResults[i] = buildClaimResultMetadata(
                 *sequences[i], inputLengths[i], numContextBlocksVec[i], llmRequests[i].get());
-            TLLM_LOG_INFO(mpi::MpiComm::world().getRank(),
-                "[HELIX-DBG] WindowBlockManager::addSequenceBatch reqId %lu: buildClaimResultMetadata OK "
-                "(inputLength=%d, numContextBlocks=%d)",
-                sequences[i]->getRequestId(), inputLengths[i], numContextBlocksVec[i]);
         }
     }
 
@@ -2062,9 +2046,6 @@ std::vector<WindowBlockManager::BatchSeqStats> WindowBlockManager::addSequenceBa
 
         results[i].prepopulatedLen
             = onboardAndAllocateBlocks(*sequences[i], llmRequests[i].get(), claimResults[i], isEnableBlockReuse);
-        TLLM_LOG_INFO(mpi::MpiComm::world().getRank(),
-            "[HELIX-DBG] WindowBlockManager::addSequenceBatch reqId %lu: onboardAndAllocateBlocks OK",
-            sequences[i]->getRequestId());
 
         results[i].allocTotalDelta = mAllocTotalBlocks - preTotalBlocks;
         results[i].allocNewDelta = mAllocNewBlocks - preNewBlocks;
@@ -3787,25 +3768,16 @@ void KVCacheManager::addSequenceBatch(
             auto const inputLength = std::get<1>(requestInfos[i]);
             inputLengths[i] = std::min(inputLength, maxTokenNum);
             numContextBlocksVec[i] = tc::ceilDiv(inputLengths[i], getTokensPerBlock());
-            TLLM_LOG_INFO(mpi::MpiComm::world().getRank(),
-                "[HELIX-DBG] KVCacheManager::addSequenceBatch reqId %zu window %d: inputLength=%d, "
-                "numContextBlocks=%d, maxTokenNum=%d",
-                std::get<0>(requestInfos[i]), windowSize, inputLengths[i], numContextBlocksVec[i], maxTokenNum);
         }
 
         // Two-phase claim-then-onboard for this window
         auto const windowResults = mBlockManager.addSequenceBatch(
             sequences, inputLengths, numContextBlocksVec, llmRequests, windowSize, mEnableBlockReuse);
-        TLLM_LOG_INFO(mpi::MpiComm::world().getRank(),
-            "[HELIX-DBG] KVCacheManager::addSequenceBatch window %d: BlockManager::addSequenceBatch returned", windowSize);
 
         // Update offsets and accumulate stats
         for (size_t i = 0; i < n; ++i)
         {
             mBlockManager.updateSequenceCacheBlockOffsets(*sequences[i], windowSize);
-            TLLM_LOG_INFO(mpi::MpiComm::world().getRank(),
-                "[HELIX-DBG] KVCacheManager::addSequenceBatch reqId %zu window %d: updateSequenceCacheBlockOffsets OK",
-                std::get<0>(requestInfos[i]), windowSize);
 
             auto const& stats = windowResults[i];
             minPrepopulatedLen[i] = std::min(minPrepopulatedLen[i], stats.prepopulatedLen);

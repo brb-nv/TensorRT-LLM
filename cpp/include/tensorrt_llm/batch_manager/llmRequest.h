@@ -2205,8 +2205,6 @@ private:
     void initialize(
         VecTokens const& inputTokens, bool outputLogProbs, std::optional<TimePoint> arrivalTime = std::nullopt)
     {
-        TLLM_LOG_INFO("[HELIX-DBG] LlmRequest::initialize reqId %ld: promptLen=%d, numInputTokens=%zu, type=%d",
-            mRequestId, mPromptLen, inputTokens.size(), static_cast<int>(mLlmRequestType));
         if (mLlmRequestType == LlmRequestType::LLMREQUEST_TYPE_GENERATION_ONLY)
         {
             mState = LlmRequestState::kDISAGG_GENERATION_INIT;

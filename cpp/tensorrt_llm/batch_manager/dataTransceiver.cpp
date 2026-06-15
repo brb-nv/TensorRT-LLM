@@ -389,11 +389,6 @@ public:
         int peerIdx = std::distance(
             allCounterparts.begin(), std::find(allCounterparts.begin(), allCounterparts.end(), peerSelfIdx));
 
-        TLLM_LOG_INFO(mpi::MpiComm::world().getRank(),
-            "[HELIX-DBG] recvRequestInfo reqId %zu: peerSelfIdx=%d, peerIdx=%d, numCounterparts=%zu, "
-            "requestedIndexFromEnd=%d",
-            requestId, peerSelfIdx, peerIdx, allCounterparts.size(), info.getIndexFromEnd());
-
         TLLM_CHECK_WITH_INFO(peerIdx < static_cast<int>(allCounterparts.size()),
             "Peer rank %d not found in expected counterparts", peerSelfIdx);
         {
@@ -415,8 +410,6 @@ public:
 
     void sendSync(LlmRequest const& llmRequest)
     {
-        auto const worldRank = mpi::MpiComm::world().getRank();
-        TLLM_LOG_INFO(worldRank, "[HELIX-DBG] sendSync ENTER reqId %zu", llmRequest.mRequestId);
         TransferSession* session = nullptr;
         {
             std::unique_lock<std::mutex> lk(mMtxForMap);
@@ -427,7 +420,6 @@ public:
         session->setLlmRequest(llmRequest);
         mCacheTransferLayer.format(*session);
         llmRequest.setKvCacheTransferEnd(LlmRequest::getSteadyClockNow());
-        TLLM_LOG_INFO(worldRank, "[HELIX-DBG] sendSync EXIT reqId %zu", llmRequest.mRequestId);
     }
 
     bool cancelRequest(LlmRequest const& llmRequest)
@@ -563,8 +555,6 @@ private:
     {
         auto reqId = mCurrentRequest.value();
         auto count = --mRemainSendCount[reqId];
-        TLLM_LOG_INFO(mpi::MpiComm::world().getRank(),
-            "[HELIX-DBG] sendResponse reqId %zu: remaining counterpart count after decrement = %d", reqId, count);
         TLLM_CHECK(count >= 0);
         if (count == 0)
         {
@@ -664,9 +654,6 @@ private:
                     if (mRemainSendCount.find(reqId) == mRemainSendCount.end())
                     {
                         mRemainSendCount[reqId] = getCounterpartsCount(reqId);
-                        TLLM_LOG_INFO(mpi::MpiComm::world().getRank(),
-                            "[HELIX-DBG] responder reqId %zu: expecting %d counterpart requestInfos", reqId,
-                            mRemainSendCount[reqId]);
                     }
                 }
                 auto it = getCurrentResponse();
@@ -871,8 +858,6 @@ public:
                 /*recvSideHasCP=*/false, srcPpSize);
 
             int32_t requestedBlockSize = requestedBlockRange.getBlockIdsPerWindow().begin()->second.size();
-            TLLM_LOG_INFO(mpi::MpiComm::world().getRank(),
-                "[HELIX-DBG] sendRequestInfo reqId %zu: requestedBlockSize=%d", requestId, requestedBlockSize);
             // A Helix CP "empty" rank owns zero KV blocks for this sequence (the prompt has
             // fewer blocks than cp_size). It still must send a RequestInfo so the context's
             // per-request counterpart count is satisfied (otherwise the context would wait for
@@ -1120,17 +1105,14 @@ public:
 private:
     void requestSync(LlmRequest& llmRequest)
     {
-        auto const worldRank = mpi::MpiComm::world().getRank();
-        TLLM_LOG_INFO(worldRank, "[HELIX-DBG] requestSync ENTER reqId %zu (ctxReqId %zu)", llmRequest.mRequestId,
+        TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
+            "Start calling requestSync for request ID: %zu, context request ID: %zu.", llmRequest.mRequestId,
             llmRequest.getContextPhaseParams().value().getReqId());
         llmRequest.setKvCacheTransferStart(std::chrono::steady_clock::now());
         TLLM_CUDA_CHECK(cudaSetDevice(mDeviceId));
         auto session = sendRequestInfo(llmRequest);
-        TLLM_LOG_INFO(worldRank, "[HELIX-DBG] requestSync reqId %zu: sendRequestInfo done", llmRequest.mRequestId);
         session.setTime(TransferSession::kTimeRequestInfo);
         bool isReady = receiveReadySignal(session);
-        TLLM_LOG_INFO(
-            worldRank, "[HELIX-DBG] requestSync reqId %zu: receiveReadySignal=%d", llmRequest.mRequestId, isReady);
         if (!isReady)
         {
             // Reuse the error state for the cancelled request.
@@ -1141,7 +1123,9 @@ private:
         receiveSync(session);
         llmRequest.setKvCacheTransferEnd(std::chrono::steady_clock::now());
 
-        TLLM_LOG_INFO(worldRank, "[HELIX-DBG] requestSync EXIT reqId %zu: receiveSync done", llmRequest.mRequestId);
+        TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
+            "End calling requestSync for request ID: %zu, context request ID: %zu.", llmRequest.mRequestId,
+            llmRequest.getContextPhaseParams().value().getReqId());
     }
 
     struct RequestAndPromise

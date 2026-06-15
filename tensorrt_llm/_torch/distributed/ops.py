@@ -405,40 +405,23 @@ class HelixAllToAllNative:
         """
         if mapping not in HelixAllToAllNative._cache:
             logger.info(
-                f"[HELIX-WARMUP-DBG][rank {mapping.rank} cpRank {mapping.cp_rank}] "
-                f"HelixAllToAllNative.get: cache miss, initializing MNNVL (cp_size={mapping.cp_size})"
+                f"Rank {mapping.cp_rank} initializing HelixCpMnnvlMemory for Helix"
             )
             MnnvlMemory.initialize()
-            logger.info(
-                f"[HELIX-WARMUP-DBG][rank {mapping.rank} cpRank {mapping.cp_rank}] "
-                f"HelixAllToAllNative.get: MnnvlMemory.initialize() done")
 
             # Get workspace size (in bytes)
             workspace_size_per_rank = _tllm_internal.thop.get_helix_workspace_size_per_rank(
                 mapping.cp_size)
-            logger.info(
-                f"[HELIX-WARMUP-DBG][rank {mapping.rank} cpRank {mapping.cp_rank}] "
-                f"HelixAllToAllNative.get: workspace_size_per_rank={workspace_size_per_rank}; allocating"
-            )
 
             # Allocate MNNVL memory using CP communicator for Helix
             workspace = HelixCpMnnvlMemory(mapping, workspace_size_per_rank)
             workspace_tensor = workspace.as_torch_strided_tensor(torch.uint64)
-            logger.info(
-                f"[HELIX-WARMUP-DBG][rank {mapping.rank} cpRank {mapping.cp_rank}] "
-                f"HelixAllToAllNative.get: workspace allocated; initialize_helix_workspace")
 
             torch.ops.trtllm.initialize_helix_workspace(workspace_tensor,
                                                         mapping.cp_rank,
                                                         mapping.cp_size)
             torch.cuda.synchronize()
-            logger.info(
-                f"[HELIX-WARMUP-DBG][rank {mapping.rank} cpRank {mapping.cp_rank}] "
-                f"HelixAllToAllNative.get: workspace initialized + synced; entering barrier()")
             HelixCpMnnvlMemory.get_comm(mapping).barrier()
-            logger.info(
-                f"[HELIX-WARMUP-DBG][rank {mapping.rank} cpRank {mapping.cp_rank}] "
-                f"HelixAllToAllNative.get: barrier() passed; cached")
 
             HelixAllToAllNative._cache[mapping] = HelixAllToAllNative(
                 mapping, workspace, workspace_tensor)
@@ -457,9 +440,6 @@ class HelixAllToAllNative:
         Returns:
             Tuple of (partial_o_out, softmax_stats_out) with same shapes as inputs.
         """
-        logger.info(
-            f"[HELIX-WARMUP-DBG][rank {self.mapping.rank} cpRank {self.mapping.cp_rank}] "
-            f"alltoall_native: before op (partial_o={tuple(partial_o.shape)})")
         partial_o_out, softmax_stats_out = torch.ops.trtllm.alltoall_helix_native(
             partial_o,
             softmax_stats,
@@ -467,9 +447,6 @@ class HelixAllToAllNative:
             self.mapping.cp_rank,
             self.mapping.cp_size,
         )
-        logger.info(
-            f"[HELIX-WARMUP-DBG][rank {self.mapping.rank} cpRank {self.mapping.cp_rank}] "
-            f"alltoall_native: after op")
 
         return partial_o_out, softmax_stats_out
 
@@ -914,11 +891,6 @@ class AllReduce(nn.Module):
         disable_allreduce_autotune = os.environ.get(
             "TLLM_DISABLE_ALLREDUCE_AUTOTUNE", "0") == "1"
 
-        logger.info(
-            f"[HELIX-WARMUP-DBG][rank {self.mapping.rank}] AllReduce.forward: "
-            f"input={tuple(input.shape)}, strategy={allreduce_strategy}, "
-            f"disable_autotune={disable_allreduce_autotune}, fusion_op={all_reduce_params.fusion_op}, "
-            f"tp_group={self.mapping.tp_group}")
         if allreduce_strategy == AllReduceStrategy.AUTO and not disable_allreduce_autotune and not self._disable_mpi:
             output = torch.ops.trtllm.tunable_allreduce(
                 input=input,
@@ -951,9 +923,6 @@ class AllReduce(nn.Module):
                 **additional_args,
             )
 
-        logger.info(
-            f"[HELIX-WARMUP-DBG][rank {self.mapping.rank}] AllReduce.forward: done "
-            f"(input={tuple(input.shape)})")
         return output if len(output) > 1 else output[0]
 
 
