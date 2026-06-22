@@ -131,7 +131,9 @@ def _build_lora_slot_buffers(
     )
 
 
-def _call_fused_moe(x, w3_w1, w2, topk_ids, topk_scores, output_dtype, lora_kwargs=None, quant_scales=None):
+def _call_fused_moe(
+    x, w3_w1, w2, topk_ids, topk_scores, output_dtype, lora_kwargs=None, quant_scales=None
+):
     common = dict(
         input=x,
         token_selected_experts=topk_ids,
@@ -1262,8 +1264,7 @@ def _quant_per_tensor_fp8(t):
     """
     amax = t.detach().abs().max().float().clamp(min=1e-6)
     dequant = amax / _FP8_E4M3_MAX
-    t_fp8 = (t.float() / dequant).clamp(-_FP8_E4M3_MAX,
-                                        _FP8_E4M3_MAX).to(torch.float8_e4m3fn)
+    t_fp8 = (t.float() / dequant).clamp(-_FP8_E4M3_MAX, _FP8_E4M3_MAX).to(torch.float8_e4m3fn)
     return t_fp8, dequant
 
 
@@ -1302,8 +1303,7 @@ def _build_fp8_moe_inputs(x_bf16, w3_w1_bf16, w2_bf16):
 
     w3_w1_fp8, w31_scale = _quant_per_expert_fp8(w3_w1_bf16)
     w2_fp8, w2_scale = _quant_per_expert_fp8(w2_bf16)
-    w3_w1_deq = (w3_w1_fp8.float() *
-                 w31_scale.view(-1, 1, 1)).to(w3_w1_bf16.dtype)
+    w3_w1_deq = (w3_w1_fp8.float() * w31_scale.view(-1, 1, 1)).to(w3_w1_bf16.dtype)
     w2_deq = (w2_fp8.float() * w2_scale.view(-1, 1, 1)).to(w2_bf16.dtype)
 
     device = x_bf16.device
@@ -1346,8 +1346,13 @@ def test_moe_fp8_lora_changes_output(schema, monkeypatch):
         x_fp8, w3_w1_fp8, w2_fp8, quant_scales, *_ = _build_fp8_moe_inputs(x, w3_w1, w2)
 
         out_baseline = _call_fused_moe(
-            x_fp8, w3_w1_fp8, w2_fp8, topk_ids, topk_scores,
-            output_dtype=dtype, quant_scales=quant_scales,
+            x_fp8,
+            w3_w1_fp8,
+            w2_fp8,
+            topk_ids,
+            topk_scores,
+            output_dtype=dtype,
+            quant_scales=quant_scales,
         )[0]
 
         fc1_adapter = _make_per_expert_lora_scaled(
@@ -1359,26 +1364,40 @@ def test_moe_fp8_lora_changes_output(schema, monkeypatch):
 
         if schema == "per_request":
             lora_kwargs = _build_lora_request_buffers(
-                num_tokens, fc1_adapter["A"], fc1_adapter["B"],
-                fc2_adapter["A"], fc2_adapter["B"], rank=rank,
+                num_tokens,
+                fc1_adapter["A"],
+                fc1_adapter["B"],
+                fc2_adapter["A"],
+                fc2_adapter["B"],
+                rank=rank,
             )
         else:
             lora_kwargs = _build_lora_slot_buffers(
-                num_tokens, fc1_adapter["A"], fc1_adapter["B"],
-                fc2_adapter["A"], fc2_adapter["B"], rank=rank,
+                num_tokens,
+                fc1_adapter["A"],
+                fc1_adapter["B"],
+                fc2_adapter["A"],
+                fc2_adapter["B"],
+                rank=rank,
             )
 
         out_lora = _call_fused_moe(
-            x_fp8, w3_w1_fp8, w2_fp8, topk_ids, topk_scores,
-            output_dtype=dtype, lora_kwargs=lora_kwargs, quant_scales=quant_scales,
+            x_fp8,
+            w3_w1_fp8,
+            w2_fp8,
+            topk_ids,
+            topk_scores,
+            output_dtype=dtype,
+            lora_kwargs=lora_kwargs,
+            quant_scales=quant_scales,
         )[0]
 
         assert out_lora.shape == out_baseline.shape
-        assert torch.isfinite(out_lora).all(), (
-            f"FP8 fused_moe + LoRA ({schema}) produced NaN / Inf")
+        assert torch.isfinite(out_lora).all(), f"FP8 fused_moe + LoRA ({schema}) produced NaN / Inf"
         diff = (out_lora.float() - out_baseline.float()).abs().mean().item()
         assert diff > 1e-3, (
-            f"FP8 MoE LoRA ({schema}) had no observable effect (mean abs diff={diff})")
+            f"FP8 MoE LoRA ({schema}) had no observable effect (mean abs diff={diff})"
+        )
     finally:
         MoERunner.runner_dict.clear()
 
@@ -1402,8 +1421,9 @@ def _run_fp8_eager_vs_dequant_reference_check():
     x, w3_w1, w2, topk_ids, topk_scores = _build_base_inputs(
         num_tokens, hidden_size, inter_size, num_experts, top_k, dtype, device
     )
-    (x_fp8, w3_w1_fp8, w2_fp8, quant_scales,
-     x_deq, w3_w1_deq, w2_deq) = _build_fp8_moe_inputs(x, w3_w1, w2)
+    (x_fp8, w3_w1_fp8, w2_fp8, quant_scales, x_deq, w3_w1_deq, w2_deq) = _build_fp8_moe_inputs(
+        x, w3_w1, w2
+    )
 
     fc1_adapter = _make_per_expert_lora_scaled(
         num_experts, rank, hidden_size, inter_size, dtype=dtype, device=device, seed=420
@@ -1416,14 +1436,25 @@ def _run_fp8_eager_vs_dequant_reference_check():
     )
 
     lora_kwargs = _build_lora_request_buffers(
-        num_tokens, fc1_adapter["A"], fc1_adapter["B"],
-        fc2_adapter["A"], fc2_adapter["B"], rank=rank,
-        gated_a=gated_adapter["A"], gated_b=gated_adapter["B"],
+        num_tokens,
+        fc1_adapter["A"],
+        fc1_adapter["B"],
+        fc2_adapter["A"],
+        fc2_adapter["B"],
+        rank=rank,
+        gated_a=gated_adapter["A"],
+        gated_b=gated_adapter["B"],
     )
 
     out_op = _call_fused_moe(
-        x_fp8, w3_w1_fp8, w2_fp8, topk_ids, topk_scores,
-        output_dtype=dtype, lora_kwargs=lora_kwargs, quant_scales=quant_scales,
+        x_fp8,
+        w3_w1_fp8,
+        w2_fp8,
+        topk_ids,
+        topk_scores,
+        output_dtype=dtype,
+        lora_kwargs=lora_kwargs,
+        quant_scales=quant_scales,
     )[0]
 
     out_ref = reference_swiglu_moe_lora(
