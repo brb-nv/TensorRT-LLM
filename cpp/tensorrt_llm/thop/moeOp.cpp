@@ -593,15 +593,26 @@ public:
             TORCH_CHECK(!(lora_per_request && lora_slot_indexed),
                 "MoE LoRA: the per-request (fc1_lora_ranks, ...) and slot-indexed (fc1_slot_lora_ranks, ..., "
                 "token_to_slot) input schemas are mutually exclusive. Provide exactly one, not both.");
-            // Conservative rejections (min-latency, alltoall, quant, graph capture).
+            // Conservative rejections (min-latency, alltoall, unsupported quant, graph capture).
             TORCH_CHECK(!min_latency_mode, "MoE LoRA is not supported in min-latency mode.");
             TORCH_CHECK(!enable_alltoall,
                 "MoE LoRA is not supported with alltoall: the per-token adapter pointer arrays do not survive "
                 "cross-rank token reshuffling.");
-            TORCH_CHECK(mActivationDtype == c10::ScalarType::Half || mActivationDtype == c10::ScalarType::BFloat16,
-                "MoE LoRA only supports fp16 and bf16 activation dtypes.");
-            TORCH_CHECK(mWeightDtype == c10::ScalarType::Half || mWeightDtype == c10::ScalarType::BFloat16,
-                "MoE LoRA only supports unquantized fp16/bf16 expert weights.");
+            // Per-tensor FP8 (qdq) base weights are supported: for the fp8 runner
+            // the kernel dequantizes the FP8 activations to the bf16/fp16 LoRA
+            // compute type (loraFC1/loraFC2 in moe_kernels.cu) before the LoRA
+            // GEMM, so both the activation and weight dtype may be FP8. FP4 is
+            // still rejected inside the kernel. Block-scale FP8 (DeepSeek) and
+            // integer quant have no LoRA dequant path and are rejected below.
+            TORCH_CHECK(mActivationDtype == c10::ScalarType::Half || mActivationDtype == c10::ScalarType::BFloat16
+                    || mActivationDtype == c10::ScalarType::Float8_e4m3fn,
+                "MoE LoRA only supports fp16, bf16, or per-tensor FP8 activation dtypes.");
+            TORCH_CHECK(mWeightDtype == c10::ScalarType::Half || mWeightDtype == c10::ScalarType::BFloat16
+                    || mWeightDtype == c10::ScalarType::Float8_e4m3fn,
+                "MoE LoRA supports unquantized fp16/bf16 or per-tensor FP8 expert weights only.");
+            TORCH_CHECK(!mUseDeepSeekFP8BlockScaling,
+                "MoE LoRA does not support DeepSeek FP8 block-scale weights; only unquantized fp16/bf16 or "
+                "per-tensor FP8 (qdq) base weights are supported.");
             // CUDA-graph capture is only safe on the device LoRA path. The
             // legacy host path performs a host-side cudaEventSynchronize and
             // per-token pointer expansion in setupLoraWorkspace, plus host-side

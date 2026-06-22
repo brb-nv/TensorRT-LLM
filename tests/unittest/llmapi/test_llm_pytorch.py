@@ -43,6 +43,7 @@ from utils.util import (force_ampere, similar, similarity_score,
 from utils.llm_data import llm_models_root
 from tensorrt_llm.lora_helper import LoraConfig
 from tensorrt_llm.llmapi.llm_args import MoeConfig
+from tensorrt_llm.quantization import QuantAlgo
 from tensorrt_llm.executor.request import LoRARequest
 import tempfile
 
@@ -1280,6 +1281,134 @@ def test_qwen_moe_routed_expert_multi_lora_varying_ranks(
             for i in range(len(lora_requests)):
                 assert out_tokens[i + 1] != base_tokens, (
                     f"Routed-expert MoE LoRA adapter {i} produced output "
+                    "identical to the base model; it was not applied.")
+        finally:
+            llm.shutdown()
+
+
+# Candidate locations for a pre-quantized per-tensor FP8 (qdq) Qwen1.5-MoE
+# checkpoint. The PyTorch backend does not quantize bf16 weights to FP8 on the
+# fly (the LLM-API quant_config is ignored), so this test needs a pre-quantized
+# checkpoint and skips when none is present.
+_FP8_QWEN_MOE_CANDIDATES = (
+    "Qwen1.5-MoE-A2.7B-Chat-fp8",
+    "modelopt-hf-model-hub/Qwen1.5-MoE-A2.7B-Chat-fp8",
+)
+
+
+def _find_fp8_qwen_moe_dir() -> Optional[str]:
+    root = llm_models_root()
+    if root is None:
+        return None
+    for rel in _FP8_QWEN_MOE_CANDIDATES:
+        cand = os.path.join(root, rel)
+        if os.path.isdir(cand):
+            return cand
+    return None
+
+
+@skip_fp8_pre_ada
+@skip_gpu_memory_less_than_80gb
+def test_qwen_moe_routed_expert_fp8_multi_lora_varying_ranks(monkeypatch) -> None:
+    """Routed-expert MoE LoRA on a per-tensor FP8 (qdq) Qwen1.5-MoE checkpoint.
+
+    Exercises the FP8 base-weight + routed-expert LoRA path end to end: the
+    CUTLASS MoE kernel dequantizes the FP8 activations to the bf16 LoRA compute
+    type before the LoRA GEMM, so the FP8 base and the bf16 adapters compose.
+    Forces the capture-safe device LoRA path (TLLM_MOE_LORA_USE_DEVICE_PATH=1),
+    which performs the FP8 dequant.
+
+    Skipped unless a pre-quantized FP8 Qwen1.5-MoE checkpoint is available, since
+    the PyTorch backend cannot quantize bf16 weights to FP8 on the fly.
+    """
+    model_dir = _find_fp8_qwen_moe_dir()
+    if model_dir is None:
+        pytest.skip(
+            "No pre-quantized FP8 Qwen1.5-MoE checkpoint found under "
+            f"LLM_MODELS_ROOT (looked for {list(_FP8_QWEN_MOE_CANDIDATES)}).")
+
+    # Force the eager device LoRA path, which runs the FP8 dequant before the
+    # grouped-GEMM LoRA core (loraFC1/loraFC2 in moe_kernels.cu).
+    monkeypatch.setenv("TLLM_MOE_LORA_USE_DEVICE_PATH", "1")
+
+    ranks = [8, 16, 32, 16, 64]
+    max_rank = max(ranks)
+
+    target_modules = ["moe_h_to_4h", "moe_gate", "moe_4h_to_h"]
+    trtllm_modules_to_hf_modules = {
+        "moe_h_to_4h": "gate_proj",
+        "moe_gate": "up_proj",
+        "moe_4h_to_h": "down_proj",
+    }
+
+    with open(f"{model_dir}/config.json") as f:
+        cfg = json.load(f)
+    num_experts = cfg["num_experts"]
+    hidden_size = cfg["hidden_size"]
+    moe_intermediate_size = cfg["moe_intermediate_size"]
+    num_hidden_layers = cfg["num_hidden_layers"]
+    decoder_sparse_step = cfg.get("decoder_sparse_step", 1)
+    mlp_only_layers = cfg.get("mlp_only_layers") or []
+    moe_layers = [
+        layer_idx for layer_idx in range(num_hidden_layers)
+        if layer_idx not in mlp_only_layers and num_experts > 0 and
+        (layer_idx + 1) % decoder_sparse_step == 0
+    ]
+
+    with tempfile.TemporaryDirectory() as lora_dir:
+        lora_paths = []
+        for i, r in enumerate(ranks):
+            lora_path = f"{lora_dir}/lora_{i}"
+            _write_routed_expert_lora_adapter(
+                lora_path,
+                moe_layers=moe_layers,
+                num_experts=num_experts,
+                hidden_size=hidden_size,
+                moe_intermediate_size=moe_intermediate_size,
+                rank=r,
+                lora_alpha=2 * r,
+                seed=2000 + i,
+            )
+            lora_paths.append(lora_path)
+
+        lora_config = LoraConfig(
+            lora_dir=lora_paths,
+            lora_target_modules=target_modules,
+            trtllm_modules_to_hf_modules=trtllm_modules_to_hf_modules,
+            max_lora_rank=max_rank,
+            max_loras=len(ranks),
+            max_cpu_loras=len(ranks),
+        )
+        llm = LLM(model=model_dir,
+                  lora_config=lora_config,
+                  moe_config=MoeConfig(backend="CUTLASS"),
+                  kv_cache_config=global_kvcache_config)
+        try:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.FP8, (
+                "Expected a per-tensor FP8 (qdq) checkpoint; got "
+                f"quant_algo={llm.args.quant_config.quant_algo}.")
+            sampling_params = SamplingParams(max_tokens=20, temperature=0.0)
+            prompt = "What is your name?"
+
+            base_tokens = list(
+                llm.generate([prompt], sampling_params,
+                             lora_request=None)[0].outputs[0].token_ids)
+
+            lora_requests = [
+                LoRARequest(f"moe-lora-{i}", i, path)
+                for i, path in enumerate(lora_paths)
+            ]
+            requests = [None] + lora_requests
+            outputs = llm.generate([prompt] * len(requests),
+                                   sampling_params,
+                                   lora_request=requests)
+            out_tokens = [list(o.outputs[0].token_ids) for o in outputs]
+
+            assert out_tokens[0], (
+                "No-LoRA row in the mixed batch produced no tokens.")
+            for i in range(len(lora_requests)):
+                assert out_tokens[i + 1] != base_tokens, (
+                    f"FP8 routed-expert MoE LoRA adapter {i} produced output "
                     "identical to the base model; it was not applied.")
         finally:
             llm.shutdown()

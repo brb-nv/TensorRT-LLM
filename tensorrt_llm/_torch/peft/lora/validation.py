@@ -2,11 +2,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """Validation helpers for routed-expert (MoE) LoRA.
 
-MoE LoRA is supported only on the Cutlass backend with unquantized fp16/bf16
-base weights. This module provides a single helper, `check_moe_lora_supported`,
-that callers (typically the MoE factory in `create_moe.py`) can invoke at
-construction time so that unsupported combinations fail loudly instead of
-silently dropping the LoRA contribution at runtime.
+MoE LoRA is supported only on the Cutlass backend with either unquantized
+fp16/bf16 base weights or per-tensor FP8 (qdq) base weights. This module
+provides a single helper, `check_moe_lora_supported`, that callers (typically
+the MoE factory in `create_moe.py`) can invoke at construction time so that
+unsupported combinations fail loudly instead of silently dropping the LoRA
+contribution at runtime.
 
 Runtime-only rejections (min-latency mode, alltoall, FP4 base, CUDA-graph
 without slot pointers) are enforced in the C++ thop / runtime call paths and
@@ -16,6 +17,17 @@ are NOT re-checked here.
 from typing import Iterable, Optional, Set
 
 from tensorrt_llm.lora_helper import LoraConfig
+from tensorrt_llm.quantization.mode import QuantMode
+
+# Base-weight quantization bits other than per-tensor FP8 (qdq). The CUTLASS MoE
+# LoRA kernel only has a dequant path for per-tensor FP8 activations, so the
+# presence of any of these bits means the LoRA combination is unsupported.
+_NON_FP8_QDQ_QUANT = (QuantMode.INT4_WEIGHTS | QuantMode.INT8_WEIGHTS
+                      | QuantMode.ACTIVATIONS | QuantMode.FP8_ROWWISE
+                      | QuantMode.W4A8_QSERVE | QuantMode.FP8_1x128_128x128
+                      | QuantMode.NVFP4 | QuantMode.W4A8_NVFP4_FP8
+                      | QuantMode.W4A8_MXFP4_FP8 | QuantMode.W4A16_MXFP4
+                      | QuantMode.W4A8_MXFP4_MXFP8)
 
 # TRTLLM module names that map to routed-expert MoE projections.
 MOE_LORA_MODULE_NAMES: Set[str] = {"moe_h_to_4h", "moe_4h_to_h", "moe_gate"}
@@ -33,6 +45,19 @@ def has_moe_lora_targets(lora_config: Optional[LoraConfig]) -> bool:
         MOE_LORA_MODULE_NAMES
         & _normalize_targets(getattr(lora_config, "lora_target_modules", []) or [])
     )
+
+
+def _is_fp8_qdq_only(quant_mode) -> bool:
+    """Return True iff the only base-weight quantization is per-tensor FP8 (qdq).
+
+    The CUTLASS MoE LoRA kernel dequantizes per-tensor FP8 activations to the
+    bf16/fp16 LoRA compute type before the LoRA GEMM, so FP8-qdq base weights
+    are supported. Any other quantization (FP4, FP8 block-scale, INT4/INT8,
+    W4A8, ...) has no LoRA dequant path and stays rejected.
+    """
+    if quant_mode is None or not quant_mode.has_fp8_qdq():
+        return False
+    return not bool(quant_mode & _NON_FP8_QDQ_QUANT)
 
 
 def check_moe_lora_supported(
@@ -55,7 +80,8 @@ def check_moe_lora_supported(
 
     Constraints:
         - MoE backend MUST be CUTLASS.
-        - Base weight quantization MUST be off (no FP8 / FP4 / INT8 / INT4 / W4A8 ...).
+        - Base weight quantization MUST be off (fp16/bf16) or per-tensor FP8
+          (qdq). FP4 / FP8-block-scale / INT8 / INT4 / W4A8 ... are rejected.
 
     Other constraints (alltoall, min-latency, FP4, CUDA-graph) are enforced at
     runtime; we do not pre-check them here because they depend on per-call
@@ -83,10 +109,10 @@ def check_moe_lora_supported(
             except TypeError:
                 # Older signatures may not accept the kwarg; fall back.
                 is_quantized = bool(quant_mode.has_any_quant())
-        if is_quantized:
+        if is_quantized and not _is_fp8_qdq_only(quant_mode):
             raise ValueError(
                 f"{prefix}Routed-expert MoE LoRA only supports unquantized "
-                f"fp16/bf16 base weights; got quant_mode={quant_mode}. "
-                "FP8/FP4/INT4/INT8 base weights combined with MoE LoRA are not "
-                "supported."
+                f"fp16/bf16 or per-tensor FP8 (qdq) base weights; got "
+                f"quant_mode={quant_mode}. FP4/FP8-block-scale/INT4/INT8/W4A8 "
+                "base weights combined with MoE LoRA are not supported."
             )
