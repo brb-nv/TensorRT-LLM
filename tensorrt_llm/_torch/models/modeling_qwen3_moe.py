@@ -134,6 +134,7 @@ class Qwen3MoE(nn.Module):
         attn_metadata: AttentionMetadata,
         all_reduce_params: Optional[AllReduceParams] = None,
         do_finalize: Optional[bool] = True,
+        lora_params: Optional[dict] = None,
     ) -> torch.Tensor:
         assert hidden_states.shape[-1] == self.hidden_dim
         orig_shape = hidden_states.shape
@@ -144,6 +145,22 @@ class Qwen3MoE(nn.Module):
         if not do_finalize:
             assert not self.enable_attention_dp
 
+        # DEBUG(moe-lora): confirm routed-expert LoRA params reach the Qwen3 MoE
+        # module. Report the actual per-layer module ids present in lora_params
+        # (ground truth) rather than _moe_lora_active, which keys on the backend
+        # instance's layer_idx and can be misleading through the ConfigurableMoE
+        # wrapper. The routed-expert ids are moe_h_to_4h=13, moe_4h_to_h=14,
+        # moe_gate=15.
+        _layer_idx = getattr(self.experts, "layer_idx", None)
+        _layer_module_ids = (sorted(lora_params.get(_layer_idx, {}).keys()) if
+                             (lora_params and _layer_idx is not None) else None)
+        print(
+            f"[qwen3-moe] layer={_layer_idx} "
+            f"experts_type={type(self.experts).__name__} "
+            f"lora_params_present={lora_params is not None} "
+            f"layer_module_ids={_layer_module_ids}",
+            flush=True)
+
         router_logits = self.gate(hidden_states)
         final_hidden_states = self.experts(
             hidden_states,
@@ -151,6 +168,7 @@ class Qwen3MoE(nn.Module):
             all_rank_num_tokens=all_rank_num_tokens,
             use_dp_padding=use_dp_padding,
             do_finalize=do_finalize,
+            lora_params=lora_params,
         )
 
         if not do_finalize:
@@ -225,6 +243,7 @@ class Qwen3MoEDecoderLayer(DecoderLayer):
         spec_metadata: Optional[SpecMetadata] = None,
         mrope_config: Optional[Dict[str, torch.Tensor]] = None,
         deepstack_embeds: Optional[List[torch.Tensor]] = None,
+        lora_params: Optional[dict] = None,
         **kwargs,
     ) -> torch.Tensor:
         if residual is None:
@@ -241,6 +260,7 @@ class Qwen3MoEDecoderLayer(DecoderLayer):
             all_reduce_params=AllReduceParams(
                 enable_allreduce=not self.disable_attn_allreduce),
             mrope_config=mrope_config,
+            lora_params=lora_params,
             **kwargs,
         )
 
@@ -272,6 +292,7 @@ class Qwen3MoEDecoderLayer(DecoderLayer):
                 enable_allreduce=not (self.fusion_config.POST_MOE_FUSION
                                       or self.mapping.tp_size == 1)),
             do_finalize=do_finalize,
+            lora_params=lora_params,
         )
 
         if deepstack_embeds is not None and self.layer_idx in range(

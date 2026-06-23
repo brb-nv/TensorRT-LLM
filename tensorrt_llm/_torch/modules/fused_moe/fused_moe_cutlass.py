@@ -1009,6 +1009,20 @@ class CutlassFusedMoE(MoE):
         if lora_kwargs is None:
             lora_kwargs = {}
 
+        # DEBUG(moe-lora): report what the CUTLASS MoE op actually receives for
+        # this layer -- which quant method, the input tensor type/dtype (this is
+        # the activation precision reaching the op), and whether a routed-expert
+        # LoRA delta is being fused. Lets us see how NVFP4 surfaces at runtime.
+        if self._moe_lora_active(lora_params):
+            _x_dtype = getattr(x, "dtype", None)
+            print(
+                f"[moe-lora-diag][py] layer={self.layer_idx} "
+                f"quant_method={type(self.quant_method).__name__} "
+                f"x_type={type(x).__name__} x_dtype={_x_dtype} "
+                f"x_sf_present={x_sf is not None} has_nvfp4={self.has_nvfp4} "
+                f"weight_dtype={weight_dtype} lora_active={bool(lora_kwargs)}",
+                flush=True)
+
         result = torch.ops.trtllm.fused_moe(
             x,
             token_selected_experts,

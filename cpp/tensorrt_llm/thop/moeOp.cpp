@@ -604,14 +604,34 @@ public:
             // the per-tensor (qdq) and block-scale forms: the LoRA GEMM runs on
             // fp16/bf16 activations (loraFC1/loraFC2 in moe_kernels.cu), either
             // dequantizing the per-tensor FP8 activations or reading the
-            // block-scale path's bf16 activations directly. FP4 is still rejected
-            // inside the kernel; integer quant has no LoRA path.
-            TORCH_CHECK(mActivationDtype == c10::ScalarType::Half || mActivationDtype == c10::ScalarType::BFloat16
+            // block-scale path's bf16 activations directly. NVFP4 base weights
+            // are presented as packed FP4 (c10::Long) with FP4 activations, so
+            // the dtype checks below are skipped for NVFP4 and the runtime
+            // FP4-activation handling is enforced in the kernel (moe_kernels.cu).
+            // Integer quant has no LoRA path.
+            bool const is_nvfp4 = isNvfp4Quant();
+            // DEBUG(moe-lora): report the dtypes/quant flags the op actually
+            // received so we can see what precision NVFP4 surfaces as here.
+            {
+                static int _thop_diag = 0;
+                if (_thop_diag++ < 64)
+                {
+                    printf("[moe-lora-diag][thop] act_dtype=%s weight_dtype=%s output_dtype=%s isNvfp4=%d isFp8=%d "
+                           "deepseekBlockScale=%d useW4Group=%d useMxfp8Act=%d\n",
+                        torch::toString(mActivationDtype), torch::toString(mWeightDtype),
+                        torch::toString(mOutputDtype), (int) is_nvfp4, (int) isFp8Quant(),
+                        (int) mUseDeepSeekFP8BlockScaling, (int) mUseW4GroupScaling, (int) mUseMxfp8ActScaling);
+                    fflush(stdout);
+                }
+            }
+            TORCH_CHECK(is_nvfp4 || mActivationDtype == c10::ScalarType::Half
+                    || mActivationDtype == c10::ScalarType::BFloat16
                     || mActivationDtype == c10::ScalarType::Float8_e4m3fn,
-                "MoE LoRA only supports fp16, bf16, or per-tensor FP8 activation dtypes.");
-            TORCH_CHECK(mWeightDtype == c10::ScalarType::Half || mWeightDtype == c10::ScalarType::BFloat16
+                "MoE LoRA only supports fp16, bf16, per-tensor FP8, or NVFP4 activation dtypes.");
+            TORCH_CHECK(is_nvfp4 || mWeightDtype == c10::ScalarType::Half
+                    || mWeightDtype == c10::ScalarType::BFloat16
                     || mWeightDtype == c10::ScalarType::Float8_e4m3fn,
-                "MoE LoRA supports unquantized fp16/bf16 or FP8 base expert weights only "
+                "MoE LoRA supports unquantized fp16/bf16, FP8, or NVFP4 base expert weights only "
                 "(LoRA adapters are always fp16/bf16).");
             // CUDA-graph capture is only safe on the device LoRA path. The
             // legacy host path performs a host-side cudaEventSynchronize and
@@ -1287,6 +1307,15 @@ private:
         case c10::ScalarType::Float8_e4m3fn:
             TORCH_CHECK(mOutputDtype != c10::ScalarType::Float8_e4m3fn,
                 "MoE LoRA with FP8 base activations requires an fp16/bf16 output (LoRA compute) dtype.");
+            return loraTypeFromActDtype(mOutputDtype);
+#endif
+#ifdef ENABLE_FP4
+        // NVFP4 base activations are presented as packed FP4 (uint8/Byte) with
+        // separate per-block scales; the LoRA GEMM runs in the fp16/bf16 output
+        // (backbone) dtype after the kernel dequantizes the FP4 activations.
+        case c10::ScalarType::Byte:
+            TORCH_CHECK(mOutputDtype != c10::ScalarType::Float8_e4m3fn,
+                "MoE LoRA with NVFP4 base activations requires an fp16/bf16 output (LoRA compute) dtype.");
             return loraTypeFromActDtype(mOutputDtype);
 #endif
         default: C10_THROW_ERROR_FORMATTED(Error, "MoE LoRA only supports fp16/bf16/fp32 activation dtype.");

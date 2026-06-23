@@ -4105,6 +4105,22 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
     TLLM_CHECK_WITH_INFO(gemm1_config_, "MOE GEMM1 Config is not set");
     TLLM_CHECK_WITH_INFO(gemm2_config_, "MOE GEMM2 Config is not set");
 
+    // DEBUG(moe-lora): dump the compile-time precision flags of the runner that
+    // actually ran, so we can see whether NVFP4 reached this runMoe with FP4
+    // activations (act_fp4) or via some bf16/fp8 path. Capped to avoid flooding.
+    {
+        static int _krn_diag = 0;
+        if (use_lora && _krn_diag++ < 64)
+        {
+            printf("[moe-lora-diag][kernel] use_lora=%d act_fp4=%d weight_fp4=%d use_fp4=%d use_fp8=%d "
+                   "use_w4afp8=%d use_wfp4afp8=%d use_wfp4a16=%d use_block_scaling=%d "
+                   "use_deepseek_fp8_block_scale=%d\n",
+                (int) use_lora, (int) act_fp4, (int) weight_fp4, (int) use_fp4, (int) use_fp8, (int) use_w4afp8,
+                (int) use_wfp4afp8, (int) use_wfp4a16, (int) use_block_scaling, (int) use_deepseek_fp8_block_scale);
+            fflush(stdout);
+        }
+    }
+
     TLLM_CHECK_WITH_INFO(!use_lora || !act_fp4, "MOE does not support LoRA with FP4 model");
 
     if (int_scales_required)

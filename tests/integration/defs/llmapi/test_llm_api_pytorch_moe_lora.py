@@ -50,6 +50,14 @@ skip_if_no_fp8_block_scale = pytest.mark.skipif(
     reason="FP8 block-scale GEMM is only implemented for SM90 (Hopper) and SM120.",
 )
 
+# The CUTLASS NVFP4 MoE GEMM (nvfp4_nvfp4_gemm_template_sm{100,120}.h) is only
+# built for Blackwell-class architectures, so NVFP4 MoE LoRA can only run there.
+_NVFP4_SUPPORTED_SM = (100, 103, 120)
+skip_if_no_nvfp4 = pytest.mark.skipif(
+    get_sm_version() not in _NVFP4_SUPPORTED_SM,
+    reason="NVFP4 MoE GEMM is only implemented for SM100/SM103/SM120 (Blackwell).",
+)
+
 # These tests spin up the PyTorch engine (and, in CUDA-graph mode, torch.compile
 # / inductor subprocesses) whose helper threads outlive the test, so the
 # thread-leak check is disabled as for the other LLM-API integration tests.
@@ -166,15 +174,17 @@ def _write_mixtral_expert_lora_adapter(save_dir: str, *, moe_layers: list[int],
         json.dump(adapter_config, f)
 
 
-def _run_fp8_routed_expert_multi_lora(model_dir: str, lora_paths: list, *,
-                                      max_rank: int, target_modules: list,
-                                      trtllm_modules_to_hf_modules: dict,
-                                      expected_quant_algo) -> None:
-    """Serve an FP8 MoE checkpoint with routed-expert LoRA and assert it applies.
+def _run_quantized_routed_expert_multi_lora(model_dir: str, lora_paths: list, *,
+                                            max_rank: int, target_modules: list,
+                                            trtllm_modules_to_hf_modules: dict,
+                                            expected_quant_algo) -> None:
+    """Serve a quantized MoE checkpoint with routed-expert LoRA and assert it
+    applies.
 
     The batch mixes a no-LoRA (rank-0) request with every adapter, asserting the
     no-LoRA row produces output and each adapter changes the output versus the
-    base model. Caller must force the device LoRA path.
+    base model. Works for any supported quantized base (per-tensor FP8,
+    FP8 block-scale, NVFP4). Caller must force the device LoRA path.
     """
     lora_config = LoraConfig(
         lora_dir=lora_paths,
@@ -213,7 +223,7 @@ def _run_fp8_routed_expert_multi_lora(model_dir: str, lora_paths: list, *,
             "No-LoRA row in the mixed batch produced no tokens.")
         for i in range(len(lora_requests)):
             assert out_tokens[i + 1] != base_tokens, (
-                f"FP8 routed-expert MoE LoRA adapter {i} produced output "
+                f"Quantized routed-expert MoE LoRA adapter {i} produced output "
                 "identical to the base model; it was not applied.")
     finally:
         llm.shutdown()
@@ -407,7 +417,7 @@ def test_mixtral_moe_routed_expert_fp8_multi_lora_varying_ranks(
             )
             lora_paths.append(lora_path)
 
-        _run_fp8_routed_expert_multi_lora(
+        _run_quantized_routed_expert_multi_lora(
             model_dir,
             lora_paths,
             max_rank=max_rank,
@@ -417,7 +427,6 @@ def test_mixtral_moe_routed_expert_fp8_multi_lora_varying_ranks(
         )
 
 
-@skip_if_no_fp8_block_scale
 @pytest.mark.skip_less_device_memory(80000)
 def test_deepseek_moe_routed_expert_fp8_block_scale_multi_lora_varying_ranks(
         monkeypatch) -> None:
@@ -477,11 +486,89 @@ def test_deepseek_moe_routed_expert_fp8_block_scale_multi_lora_varying_ranks(
             )
             lora_paths.append(lora_path)
 
-        _run_fp8_routed_expert_multi_lora(
+        _run_quantized_routed_expert_multi_lora(
             model_dir,
             lora_paths,
             max_rank=max_rank,
             target_modules=target_modules,
             trtllm_modules_to_hf_modules=trtllm_modules_to_hf_modules,
             expected_quant_algo=QuantAlgo.FP8_BLOCK_SCALES,
+        )
+
+
+@skip_if_no_nvfp4
+@pytest.mark.skip_less_device_memory(80000)
+def test_qwen3_moe_routed_expert_nvfp4_multi_lora_varying_ranks(
+        monkeypatch) -> None:
+    """Routed-expert MoE LoRA on an NVFP4 Qwen3-30B-A3B checkpoint.
+
+    Exercises the NVFP4 base-weight + routed-expert LoRA path. NVFP4 presents
+    both the routed-expert weights and the MoE activations as packed FP4
+    (``act_fp4``); the CUTLASS LoRA path must dequantize the FP4 activations to
+    the bf16 LoRA compute type before the LoRA GEMM. Forces the capture-safe
+    device LoRA path (TLLM_MOE_LORA_USE_DEVICE_PATH=1).
+
+    Qwen3-30B-A3B has 128 experts across 48 MoE layers, so a full per-expert,
+    all-layer adapter would be tens of GiB on disk; the fabricated adapter is
+    capped to the first few MoE layers, which still perturbs the output enough
+    to assert the LoRA is applied while keeping the LoRA cache small.
+    """
+    monkeypatch.setenv("TLLM_MOE_LORA_USE_DEVICE_PATH", "1")
+
+    model_dir = f"{llm_models_root()}/Qwen3/nvidia-Qwen3-30B-A3B-NVFP4"
+
+    ranks = _RANKS
+    max_rank = max(ranks)
+
+    # Qwen3-MoE routed experts expose gate_proj/up_proj/down_proj, matching the
+    # default Qwen-style adapter writer and module mapping.
+    target_modules = ["moe_h_to_4h", "moe_gate", "moe_4h_to_h"]
+    trtllm_modules_to_hf_modules = {
+        "moe_h_to_4h": "gate_proj",
+        "moe_gate": "up_proj",
+        "moe_4h_to_h": "down_proj",
+    }
+
+    with open(f"{model_dir}/config.json") as f:
+        cfg = json.load(f)
+    num_experts = cfg["num_experts"]
+    hidden_size = cfg["hidden_size"]
+    moe_intermediate_size = cfg["moe_intermediate_size"]
+    num_hidden_layers = cfg["num_hidden_layers"]
+    decoder_sparse_step = cfg.get("decoder_sparse_step", 1)
+    mlp_only_layers = cfg.get("mlp_only_layers") or []
+    moe_layers = [
+        layer_idx for layer_idx in range(num_hidden_layers)
+        if layer_idx not in mlp_only_layers and num_experts > 0 and
+        (layer_idx + 1) % decoder_sparse_step == 0
+    ]
+    # Cap the fabricated adapter to a handful of MoE layers: with 128 experts a
+    # full all-layer adapter is tens of GiB, and the LoRA delta on the early
+    # layers is sufficient to change the greedy-decoded tokens.
+    _MAX_ADAPTER_LAYERS = 4
+    moe_layers = moe_layers[:_MAX_ADAPTER_LAYERS]
+
+    with tempfile.TemporaryDirectory() as lora_dir:
+        lora_paths = []
+        for i, r in enumerate(ranks):
+            lora_path = f"{lora_dir}/lora_{i}"
+            _write_routed_expert_lora_adapter(
+                lora_path,
+                moe_layers=moe_layers,
+                num_experts=num_experts,
+                hidden_size=hidden_size,
+                moe_intermediate_size=moe_intermediate_size,
+                rank=r,
+                lora_alpha=2 * r,
+                seed=4000 + i,
+            )
+            lora_paths.append(lora_path)
+
+        _run_quantized_routed_expert_multi_lora(
+            model_dir,
+            lora_paths,
+            max_rank=max_rank,
+            target_modules=target_modules,
+            trtllm_modules_to_hf_modules=trtllm_modules_to_hf_modules,
+            expected_quant_algo=QuantAlgo.NVFP4,
         )
