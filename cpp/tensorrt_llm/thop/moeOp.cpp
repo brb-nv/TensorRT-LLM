@@ -1270,8 +1270,11 @@ private:
         }
     }
 
-    // Map a torch dtype to the TRT-LLM nvinfer1::DataType expected by LoraImpl.
-    static nvinfer1::DataType loraTypeFromActDtype(c10::ScalarType dtype)
+    // Map a torch dtype to the TRT-LLM nvinfer1::DataType used for the LoRA
+    // computation. LoRA runs in the fp16/bf16 backbone (output) dtype. For FP8
+    // base activations that is the output dtype, since the kernel dequantizes
+    // the FP8 activations to the backbone type before the LoRA GEMM.
+    nvinfer1::DataType loraTypeFromActDtype(c10::ScalarType dtype) const
     {
         switch (dtype)
         {
@@ -1279,6 +1282,12 @@ private:
         case c10::ScalarType::Float: return nvinfer1::DataType::kFLOAT;
 #ifdef ENABLE_BF16
         case c10::ScalarType::BFloat16: return nvinfer1::DataType::kBF16;
+#endif
+#ifdef ENABLE_FP8
+        case c10::ScalarType::Float8_e4m3fn:
+            TORCH_CHECK(mOutputDtype != c10::ScalarType::Float8_e4m3fn,
+                "MoE LoRA with FP8 base activations requires an fp16/bf16 output (LoRA compute) dtype.");
+            return loraTypeFromActDtype(mOutputDtype);
 #endif
         default: C10_THROW_ERROR_FORMATTED(Error, "MoE LoRA only supports fp16/bf16/fp32 activation dtype.");
         }

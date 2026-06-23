@@ -4404,6 +4404,24 @@ class PyTorchModelEngine(ModelEngine):
                 current_lora_params['weight_pointers'] = torch.LongTensor(
                     current_lora_params['weight_pointers'])
 
+        # DEBUG(moe-lora): log the assembled per-request ranks/pointers for the
+        # routed-expert MoE modules on the first MoE layer, to verify the
+        # per-request arrays are correct before they reach the kernel.
+        _MOE_LORA_MODULE_IDS = (13, 14, 15)  # moe_h_to_4h, moe_4h_to_h, moe_gate
+        _moe_dbg_layers = sorted(
+            lid for lid in lora_params
+            if any(mid in lora_params[lid] for mid in _MOE_LORA_MODULE_IDS))
+        if _moe_dbg_layers:
+            _dbg_layer = _moe_dbg_layers[0]
+            for _mid in _MOE_LORA_MODULE_IDS:
+                if _mid in lora_params[_dbg_layer]:
+                    _cp = lora_params[_dbg_layer][_mid]
+                    print(
+                        f"[lora-asm] layer={_dbg_layer} module={_mid} "
+                        f"ranks={_cp['adapter_size'].tolist()} "
+                        f"ptrs={_cp['weight_pointers'].view(-1, 3).tolist()}",
+                        flush=True)
+
         if lora_params:
             host_request_types = attn_metadata.host_request_types
             prompt_lens_cpu = attn_metadata.prompt_lens_cpu

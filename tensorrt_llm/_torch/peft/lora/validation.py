@@ -67,9 +67,18 @@ def _is_supported_fp8(quant_mode) -> bool:
     """
     if quant_mode is None:
         return False
-    if not (quant_mode.has_fp8_qdq() or quant_mode.has_fp8_block_scales()):
-        return False
-    return not bool(quant_mode & _UNSUPPORTED_QUANT)
+    # quant_mode may be a QuantMode, or a QuantModeWrapper that holds a per-layer
+    # list of QuantModes and forwards has_* queries. Normalize to the underlying
+    # QuantMode(s) so the bitwise check works in either case.
+    objs = getattr(quant_mode, "objs", None)
+    modes = objs if objs is not None else [quant_mode]
+    has_fp8 = False
+    for mode in modes:
+        if mode.has_fp8_qdq() or mode.has_fp8_block_scales():
+            has_fp8 = True
+        if bool(mode & _UNSUPPORTED_QUANT):
+            return False
+    return has_fp8
 
 
 def check_moe_lora_supported(
