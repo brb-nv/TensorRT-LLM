@@ -61,14 +61,32 @@ class MixtralMoE(nn.Module):
         self,
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
+        lora_params: Optional[dict] = None,
     ) -> torch.Tensor:
+        # DEBUG(moe-lora): confirm routed-expert LoRA params reach the Mixtral
+        # MoE module. Without this plumbing the experts run without LoRA and the
+        # adapter output is identical to the base model. `self.experts` may be a
+        # ConfigurableMoE wrapper whose CUTLASS impl (with _moe_lora_active)
+        # lives on `.backend`, so resolve through it before giving up.
+        _impl = self.experts
+        if not hasattr(_impl, "_moe_lora_active"):
+            _impl = getattr(self.experts, "backend", None)
+        _active = _impl._moe_lora_active(lora_params) if hasattr(
+            _impl, "_moe_lora_active") else None
+        print(
+            f"[mixtral-moe] layer={getattr(self.experts, 'layer_idx', None)} "
+            f"experts_type={type(self.experts).__name__} "
+            f"lora_params_present={lora_params is not None} "
+            f"moe_lora_active={_active}",
+            flush=True)
         all_rank_num_tokens = attn_metadata.all_rank_num_tokens
         router_logits = self.gate(hidden_states)
         final_hidden_states = self.experts(
             hidden_states,
             router_logits,
             all_rank_num_tokens=all_rank_num_tokens,
-            use_dp_padding=False)
+            use_dp_padding=False,
+            lora_params=lora_params)
         return final_hidden_states
 
 
@@ -141,6 +159,7 @@ class MixtralDecoderLayer(DecoderLayer):
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
         residual: Optional[torch.Tensor],
+        lora_params: Optional[dict] = None,
         **kwargs,
     ) -> torch.Tensor:
         if residual is None:
@@ -155,13 +174,16 @@ class MixtralDecoderLayer(DecoderLayer):
             position_ids=position_ids,
             hidden_states=hidden_states,
             attn_metadata=attn_metadata,
+            lora_params=lora_params,
             **kwargs,
         )
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(
             hidden_states, residual)
-        hidden_states = self.block_sparse_moe(hidden_states, attn_metadata)
+        hidden_states = self.block_sparse_moe(hidden_states,
+                                              attn_metadata,
+                                              lora_params=lora_params)
         return hidden_states, residual
 
 
@@ -195,6 +217,7 @@ class MixtralModel(DecoderModel):
         input_ids: Optional[torch.IntTensor] = None,
         position_ids: Optional[torch.IntTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
+        lora_params: Optional[dict] = None,
         **kwargs,
     ) -> torch.Tensor:
         if (input_ids is None) ^ (inputs_embeds is not None):
@@ -212,7 +235,8 @@ class MixtralModel(DecoderModel):
             hidden_states, residual = decoder_layer(position_ids=position_ids,
                                                     hidden_states=hidden_states,
                                                     attn_metadata=attn_metadata,
-                                                    residual=residual)
+                                                    residual=residual,
+                                                    lora_params=lora_params)
 
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
