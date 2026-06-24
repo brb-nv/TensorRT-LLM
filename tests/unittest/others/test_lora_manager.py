@@ -212,6 +212,119 @@ class TestLoraManagerRetainDeviceTensors(unittest.TestCase):
         self.assertEqual(_cpu_cache_bytes(manager),
                          bytes_after_first * num_adapters)
 
+    def test_cpp_cache_sizes_and_cpu_growth(self):
+        """Report C++ host/device cache sizes AND Python CPU-store growth together.
+
+        Builds a *real* C++ PeftCacheManager (not a mock) so we can read the actual
+        bounded host/device cache page counts, and uses its wired LoraManager to show
+        the (unbounded) Python CPU weight store growing per distinct adapter.
+        """
+        from tensorrt_llm._torch.pyexecutor.resource_manager import \
+            PeftCacheManager as PyPeftCacheManager
+        from tensorrt_llm.bindings import DataType
+        from tensorrt_llm.bindings import LoraModule
+        from tensorrt_llm.bindings import ModelConfig as ModelConfigCpp
+        from tensorrt_llm.llmapi.llm_args import PeftCacheConfig as \
+            LlmApiPeftCacheConfig
+        from tensorrt_llm.lora_helper import LoraConfig
+
+        hidden_size = 64
+        num_heads = 4
+        head_size = hidden_size // num_heads
+        num_layers = 2
+        mlp_hidden_size = 4 * hidden_size
+        target_modules = ["attn_q", "attn_k", "attn_v"]
+
+        # A real C++ ModelConfig with LoRA modules so the cache can be sized.
+        model_config_cpp = ModelConfigCpp(
+            vocab_size=128,
+            num_layers=num_layers,
+            num_attention_layers=num_layers,
+            num_rnn_layers=0,
+            num_heads=num_heads,
+            hidden_size=hidden_size,
+            data_type=DataType.HALF,
+        )
+        model_config_cpp.set_num_kv_heads(num_heads)
+        model_config_cpp.mlp_hidden_size = mlp_hidden_size
+        model_config_cpp.use_lora_plugin = True
+        model_config_cpp.max_lora_rank = 8
+        model_config_cpp.lora_modules = LoraModule.create_lora_modules(
+            lora_module_names=target_modules,
+            hidden_size=hidden_size,
+            mlp_hidden_size=mlp_hidden_size,
+            num_attention_heads=num_heads,
+            num_kv_attention_heads=num_heads,
+            attention_head_size=head_size,
+            tp_size=1,
+        )
+
+        # host (max_cpu_loras-like) configured larger than device (max_loras-like).
+        peft_cache_config = LlmApiPeftCacheConfig(
+            num_host_module_layer=192,
+            num_device_module_layer=96,
+            optimal_adapter_size=8,
+            max_adapter_size=8,
+        )
+        lora_config = LoraConfig(
+            lora_target_modules=target_modules,
+            max_lora_rank=8,
+            max_loras=2,
+            max_cpu_loras=4,
+        )
+
+        pcm = PyPeftCacheManager(
+            peft_cache_config=peft_cache_config,
+            lora_config=lora_config,
+            model_config=model_config_cpp,
+        )
+
+        max_host_pages = pcm.impl.max_host_pages
+        max_device_pages = pcm.impl.max_device_pages
+        print(f"[cpp_cache] max_host_pages={max_host_pages}  "
+              f"max_device_pages={max_device_pages}")
+
+        # Both C++ caches are bounded and non-empty, and the host cache is
+        # configured larger than the device cache.
+        self.assertGreater(max_host_pages, 0)
+        self.assertGreater(max_device_pages, 0)
+        self.assertGreater(max_host_pages, max_device_pages)
+
+        # The LoraManager wired to the real C++ cache must be on the PyTorch path.
+        manager = pcm.get_lora_manager()
+        self.assertFalse(manager._retain_device_tensors)
+
+        model_config = MockModelConfig()
+        num_adapters = 20
+        bytes_after_first = None
+        with tempfile.TemporaryDirectory() as tmpdir:
+            for i in range(num_adapters):
+                adapter_dir = Path(tmpdir) / f"adapter_{i}"
+                adapter_dir.mkdir()
+                _create_dummy_hf_lora_adapter(adapter_dir)
+
+                manager.load_from_hf(
+                    model_dirs=[str(adapter_dir)],
+                    model_config=model_config,
+                    uids=[f"uid-{i}"],
+                )
+                total_bytes = _cpu_cache_bytes(manager)
+                if i == 0:
+                    bytes_after_first = total_bytes
+                print(f"[lora_caches] adapters={i + 1:>2}  "
+                      f"cpp_host_pages={max_host_pages}  "
+                      f"cpp_device_pages={max_device_pages}  "
+                      f"cpu_store_total={total_bytes / 1024:.1f} KiB  "
+                      f"cpu_store_per_adapter={total_bytes / (i + 1) / 1024:.1f} KiB")
+
+        # C++ caches are page-bounded, but the Python CPU store grows one tensor
+        # per distinct adapter, unbounded by max_host_pages.
+        self.assertEqual(len(manager._lora_weights), 0)
+        self.assertEqual(len(manager._cpp_lora_weights), num_adapters)
+        self.assertGreater(bytes_after_first, 0)
+        self.assertEqual(_cpu_cache_bytes(manager),
+                         bytes_after_first * num_adapters)
+
 
 if __name__ == "__main__":
     unittest.main()

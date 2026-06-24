@@ -1102,7 +1102,8 @@ class Deepseekv3MoE(nn.Module):
         return quant_config
 
     def compute_routed_output(self, hidden_states, hidden_states_fp4,
-                              all_rank_num_tokens, do_finalize):
+                              all_rank_num_tokens, do_finalize,
+                              lora_params=None):
         # max-throughput
         use_dp_padding = False
         # Add DP padding on SM120 for context comm performance
@@ -1123,6 +1124,7 @@ class Deepseekv3MoE(nn.Module):
             output_dtype=hidden_states.dtype,
             all_rank_num_tokens=all_rank_num_tokens,
             use_dp_padding=use_dp_padding,
+            lora_params=lora_params,
             **({
                 "alltoall_result_do_sum": False
             } if isinstance(self.experts, WideEPMoE) else {}),
@@ -1137,9 +1139,23 @@ class Deepseekv3MoE(nn.Module):
         all_rank_num_tokens: Optional[list[int]] = None,
         final_all_reduce_params: Optional[AllReduceParams] = None,
         do_finalize: Optional[bool] = True,
+        lora_params: Optional[dict] = None,
     ) -> torch.Tensor:
         if not do_finalize:
             assert not self.use_dp
+
+        # DEBUG(moe-lora): confirm routed-expert LoRA params reach the DeepSeek
+        # MoE module. Report the per-layer module ids present in lora_params
+        # (routed-expert ids: moe_h_to_4h=13, moe_4h_to_h=14, moe_gate=15).
+        _layer_idx = getattr(self.experts, "layer_idx", None)
+        _layer_module_ids = (sorted(lora_params.get(_layer_idx, {}).keys()) if
+                             (lora_params and _layer_idx is not None) else None)
+        print(
+            f"[deepseek-moe] layer={_layer_idx} "
+            f"experts_type={type(self.experts).__name__} "
+            f"lora_params_present={lora_params is not None} "
+            f"layer_module_ids={_layer_module_ids}",
+            flush=True)
 
         def _compute_shared_output():
             shared_input = (hidden_states_fp4 if
@@ -1155,7 +1171,8 @@ class Deepseekv3MoE(nn.Module):
             routed_output = self.compute_routed_output(hidden_states,
                                                        hidden_states_fp4,
                                                        all_rank_num_tokens,
-                                                       do_finalize)
+                                                       do_finalize,
+                                                       lora_params=lora_params)
             return routed_output
 
         # NOTE: define compiled helpers at module scope to avoid defining decorators inside compiled frames
@@ -1407,12 +1424,15 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         attn_metadata: AttentionMetadata,
         residual: torch.Tensor,
         spec_metadata: Optional[SpecMetadata] = None,
+        lora_params: Optional[dict] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
-        # Self Attention
+        # Self Attention. DeepSeek attention is MLA, whose forward does not
+        # accept lora_params, so it is intentionally not threaded here; routed-
+        # expert MoE LoRA is applied in the MoE path below.
         hidden_states = self.self_attn(
             position_ids=position_ids,
             hidden_states=hidden_states,
@@ -1433,6 +1453,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                 attn_metadata=attn_metadata,
                 residual=residual,
                 spec_metadata=spec_metadata,
+                lora_params=lora_params,
             )
         else:
             if spec_metadata is not None and spec_metadata.is_layer_capture(
@@ -1451,6 +1472,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         attn_metadata: AttentionMetadata,
         residual: torch.Tensor,
         spec_metadata: Optional[SpecMetadata] = None,
+        lora_params: Optional[dict] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
 
         def _run_MoE(hidden_states, hidden_states_fp4, do_finalize):
@@ -1462,6 +1484,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                     enable_allreduce=not (self.fusion_config.POST_MOE_FUSION
                                           or self.mapping.tp_size == 1)),
                 do_finalize=do_finalize,
+                lora_params=lora_params,
             )
 
         if self.fusion_config.PRE_MOE_FUSION:
@@ -1780,6 +1803,7 @@ class DeepseekV3Model(DecoderModel):
         position_ids: Optional[torch.IntTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         spec_metadata: Optional[SpecMetadata] = None,
+        lora_params: Optional[dict] = None,
         **kwargs,
     ) -> torch.Tensor:
         if (input_ids is None) ^ (inputs_embeds is not None):
@@ -1801,6 +1825,7 @@ class DeepseekV3Model(DecoderModel):
                 attn_metadata=attn_metadata,
                 residual=residual,
                 spec_metadata=spec_metadata,
+                lora_params=lora_params,
             )
 
         hidden_states = maybe_allgather_for_helix_cp(hidden_states,
