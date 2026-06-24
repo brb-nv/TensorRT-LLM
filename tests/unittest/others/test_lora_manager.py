@@ -75,6 +75,12 @@ def _create_dummy_hf_lora_adapter(
     save_file(weights, str(adapter_dir / "adapter_model.safetensors"))
 
 
+def _cpu_cache_bytes(manager) -> int:
+    """Total bytes retained in the Python LoraManager's CPU weight store."""
+    return sum(t.element_size() * t.nelement()
+               for t in manager._cpp_lora_weights.values())
+
+
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
 class TestLoraManagerRetainDeviceTensors(unittest.TestCase):
     """Tests for the _retain_device_tensors flag that prevents GPU memory leaks."""
@@ -160,6 +166,51 @@ class TestLoraManagerRetainDeviceTensors(unittest.TestCase):
 
         self.assertEqual(len(manager._lora_weights), 0)
         self.assertEqual(len(manager._cpp_lora_weights), num_adapters)
+
+    def test_cpu_lora_weights_grows_with_distinct_adapters(self):
+        """_cpp_lora_weights retains one CPU tensor per distinct adapter, unbounded.
+
+        Even though the C++ PeftCacheManager bounds GPU/host *cache* residency via
+        max_cpu_loras, the Python LoraManager keeps a CPU copy of every adapter it
+        has ever loaded and never evicts. This test documents that host-side growth
+        is linear in the number of distinct adapters.
+        """
+        mock_cache = MagicMock()
+        manager = self._create_manager(cpp_peft_cache_manager=mock_cache)
+        model_config = MockModelConfig()
+
+        # This test must exercise the PyTorch workflow (C++ PeftCacheManager
+        # present), not the legacy TRT path.
+        self.assertFalse(manager._retain_device_tensors)
+
+        num_adapters = 20
+        bytes_after_first = None
+        with tempfile.TemporaryDirectory() as tmpdir:
+            for i in range(num_adapters):
+                adapter_dir = Path(tmpdir) / f"adapter_{i}"
+                adapter_dir.mkdir()
+                _create_dummy_hf_lora_adapter(adapter_dir)
+
+                manager.load_from_hf(
+                    model_dirs=[str(adapter_dir)],
+                    model_config=model_config,
+                    uids=[f"uid-{i}"],
+                )
+                total_bytes = _cpu_cache_bytes(manager)
+                if i == 0:
+                    bytes_after_first = total_bytes
+                print(f"[cpu_lora_weights] adapters={i + 1:>2}  "
+                      f"total={total_bytes / 1024:.1f} KiB  "
+                      f"per_adapter={total_bytes / (i + 1) / 1024:.1f} KiB")
+
+        # PyTorch workflow: no GPU tensors retained in the Python manager ...
+        self.assertEqual(len(manager._lora_weights), 0)
+        # ... but one CPU tensor retained per distinct adapter ...
+        self.assertEqual(len(manager._cpp_lora_weights), num_adapters)
+        # ... and total CPU bytes scale linearly (dummy adapters are identical in size).
+        self.assertGreater(bytes_after_first, 0)
+        self.assertEqual(_cpu_cache_bytes(manager),
+                         bytes_after_first * num_adapters)
 
 
 if __name__ == "__main__":
