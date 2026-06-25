@@ -362,6 +362,9 @@ class PyExecutor:
         self.peft_cache_config = peft_cache_config
 
         self.iter_counter = 0
+        # Env-gated executor-loop tracing (TLLM_DEBUG_EXECLOOP=1). See
+        # _execloop_dbg_log; used to localize hangs in the decode loop.
+        self._execloop_dbg = os.environ.get("TLLM_DEBUG_EXECLOOP", "0") != "0"
         # profile config
         self.profile_start_iters, self.profile_stop_iters = _load_iteration_indexes(
             PROFILE_START_STOP_ENV_VAR_NAME)
@@ -2881,6 +2884,38 @@ class PyExecutor:
                 return can_forward, True
         return can_forward, False
 
+    def _execloop_dbg_log(self, tag, scheduled_batch=None):
+        """Env-gated executor-loop tracing (set TLLM_DEBUG_EXECLOOP=1).
+
+        Emits one concise [EXECLOOP] line per milestone so a hang can be
+        localized (which milestone is the last logged) and a "generates
+        forever" request can be spotted (decoding_iter keeps climbing while the
+        request never leaves the active set).
+        """
+        if not getattr(self, '_execloop_dbg', False):
+            return
+        try:
+            n_active = len(self.active_requests)
+            n_wait = len(self.waiting_queue)
+            sched_ctx = sched_gen = -1
+            if scheduled_batch is not None:
+                sched_ctx = len(scheduled_batch.context_requests)
+                sched_gen = len(scheduled_batch.generation_requests)
+            reqs = []
+            for r in self.active_requests[:16]:
+                reqs.append("(id={},st={},it={},ntok={},plen={},draft={})".format(
+                    r.py_request_id, r.state,
+                    getattr(r, 'py_decoding_iter', -1),
+                    getattr(r, 'max_beam_num_tokens', -1),
+                    getattr(r, 'py_prompt_len', -1),
+                    len(getattr(r, 'py_draft_tokens', []) or [])))
+            logger.info(
+                "[EXECLOOP] it={} {} active={} wait={} sched_ctx={} sched_gen={} reqs={}"
+                .format(self.iter_counter, tag, n_active, n_wait, sched_ctx,
+                        sched_gen, ' '.join(reqs)))
+        except Exception as e:
+            logger.info("[EXECLOOP] log error in tag={}: {}".format(tag, e))
+
     def _executor_loop(self):
         torch.cuda.set_device(self.device_id)
         # ensure the context is created, otherwise, some MPI calls will fail.
@@ -2906,11 +2941,14 @@ class PyExecutor:
                 self._handle_control_request()
 
                 if scheduled_batch is None:
+                    self._execloop_dbg_log("scheduled=None -> break")
                     break
+                self._execloop_dbg_log("scheduled", scheduled_batch)
 
                 can_forward, should_retry = self._check_benchmark_disagg_gate(
                     scheduled_batch, can_forward)
                 if should_retry:
+                    self._execloop_dbg_log("benchmark-gate retry", scheduled_batch)
                     continue
 
                 if not self._is_kv_manager_v2:
@@ -2934,6 +2972,8 @@ class PyExecutor:
                     self._run_encoder_step(scheduled_batch.encoder_requests)
 
                 can_queue, _ = self._can_queue(scheduled_batch)
+                self._execloop_dbg_log("can_queue={}".format(can_queue),
+                                       scheduled_batch)
 
                 if can_queue:
                     if self.kv_cache_transceiver:
@@ -3005,11 +3045,13 @@ class PyExecutor:
                         )
                         gpu_forward_events_from_perf_pool = True
 
+                    self._execloop_dbg_log("forward-start", scheduled_batch)
                     with self.perf_manager.record_perf_events(
                             gpu_forward_start, gpu_forward_end) as fwd_timing:
                         if self.dwdp_manager is not None:
                             self.dwdp_manager.prefetch_first_layers()
                         batch_outputs = self._forward_step(scheduled_batch)
+                    self._execloop_dbg_log("forward-done", scheduled_batch)
 
                     self._maybe_prefetch_next_iter_mm_encoders(scheduled_batch)
 
@@ -3049,12 +3091,16 @@ class PyExecutor:
 
                     self._update_request_states(scheduled_batch)
                     self._update_requests(sample_state, self.resource_manager)
+                    self._execloop_dbg_log("update-requests-done", scheduled_batch)
 
                     self._send_kv_async(scheduled_batch.all_requests())
                     self._flush_pending_transfer_responses()
 
                     self._handle_canceled_requests()
                     finished_requests = self._handle_responses()
+                    self._execloop_dbg_log(
+                        "responses-done finished={}".format(len(finished_requests)),
+                        scheduled_batch)
                     # Complete ctx send sessions AFTER responses are created so
                     # _handle_responses sees the request before it is terminated.
                     if self.kv_cache_transceiver:
@@ -3303,11 +3349,14 @@ class PyExecutor:
                 self._handle_control_request()
 
                 if scheduled_batch is None:
+                    self._execloop_dbg_log("scheduled=None -> break")
                     break
+                self._execloop_dbg_log("scheduled", scheduled_batch)
 
                 can_forward, should_retry = self._check_benchmark_disagg_gate(
                     scheduled_batch, can_forward)
                 if should_retry:
+                    self._execloop_dbg_log("benchmark-gate retry", scheduled_batch)
                     continue
 
                 if not self._is_kv_manager_v2:

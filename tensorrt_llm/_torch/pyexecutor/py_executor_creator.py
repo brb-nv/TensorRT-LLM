@@ -23,7 +23,7 @@ from tensorrt_llm.llmapi.tokenizer import (TokenizerBase,
                                            _llguidance_tokenizer_info,
                                            _xgrammar_tokenizer_info)
 from tensorrt_llm.logger import logger
-from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.mapping import CpType, Mapping
 from tensorrt_llm.quantization import QuantAlgo
 from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
 
@@ -414,6 +414,28 @@ def create_py_executor(
                 f"decode path expects exactly 1 token per sequence, but one-engine speculative "
                 f"decoding requires multiple tokens per sequence. Please use 'TRTLLM' attention "
                 f"backend instead by setting attn_backend='TRTLLM'.")
+
+        # Helix CP + speculative decoding does not support the overlap scheduler
+        # yet. Under the overlap scheduler the number of accepted tokens per step
+        # is only known on-device, so the host-computed Helix verify metadata
+        # (global RoPE positions, round-robin per-block KV ownership, and the
+        # per-rank kv-lens / cached-length accounting) would be stale and the
+        # generic overlap correction does not understand Helix ownership. Plain
+        # (non-spec) Helix decode is unaffected because it advances exactly one
+        # token per step. Force-disable overlap with a loud warning until
+        # helix+spec+overlap is implemented (tracked as a follow-up).
+        if (not llm_args.disable_overlap_scheduler
+                and llm_args.context_parallel_size > 1
+                and llm_args.cp_config is not None
+                and llm_args.cp_config.cp_type == CpType.HELIX):
+            logger.warning(
+                "Disabling overlap scheduler: Helix context parallelism combined "
+                "with speculative decoding does not support the overlap scheduler "
+                "yet. The per-step accepted-token count is only known on-device, "
+                "so the host-side Helix verify metadata would be stale. Running "
+                "with disable_overlap_scheduler=True; enabling "
+                "helix+speculative-decoding+overlap is a planned follow-up.")
+            llm_args.disable_overlap_scheduler = True
 
     if mm_encoder_only:
         llm_args.mm_encoder_only = True

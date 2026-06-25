@@ -627,12 +627,20 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         # target verify metadata can be restored (needed for CUDA graph capture).
         self._saved_helix_position_offsets = None
         self._saved_helix_is_inactive_rank = None
+        self._saved_kv_lens_cuda = None
         if getattr(attn_metadata, 'helix_position_offsets', None) is not None:
             self._saved_helix_position_offsets = attn_metadata.helix_position_offsets.clone(
             )
         if getattr(attn_metadata, 'helix_is_inactive_rank', None) is not None:
             self._saved_helix_is_inactive_rank = attn_metadata.helix_is_inactive_rank.clone(
             )
+            # Under Helix the draft loop grows kv_lens_cuda per-step by each
+            # draft token's owner rank; save it so the target verify state can
+            # be restored after the loop (and across CUDA graph capture).
+            if getattr(attn_metadata, 'kv_lens_cuda', None) is not None:
+                self._saved_kv_lens_cuda = attn_metadata.kv_lens_cuda[:
+                                                                      batch_size].clone(
+                                                                      )
 
     def _restore_attn_metadata_from_spec_dec(self, attn_metadata):
         super()._restore_attn_metadata_from_spec_dec(attn_metadata)
@@ -681,7 +689,7 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         Returns the boolean owner mask of shape [batch_size], or None when Helix is
         not active.
         """
-        if not self.mapping.has_cp_helix():
+        if self.mapping is None or not self.mapping.has_cp_helix():
             return None
         tpb = attn_metadata.tokens_per_block
         cp_size = self.mapping.cp_size
@@ -1384,10 +1392,11 @@ class MTPEagleWorker(Eagle3OneModelWorker):
     def __init__(self,
                  spec_config,
                  model_config: Optional[ModelConfig] = None,
+                 mapping: Optional[Mapping] = None,
                  use_separate_draft_kv_cache: bool = False):
         super().__init__(
             spec_config,
-            mapping=None,
+            mapping=mapping,
             model_config=model_config,
             use_separate_draft_kv_cache=use_separate_draft_kv_cache)
         # Preserved for callers/tests that still expect this attribute.

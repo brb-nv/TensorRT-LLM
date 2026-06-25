@@ -421,6 +421,9 @@ public:
         session->setLlmRequest(llmRequest);
         mCacheTransferLayer.format(*session);
         llmRequest.setKvCacheTransferEnd(LlmRequest::getSteadyClockNow());
+        // [KVXFER] Send-side data push finished for this request.
+        TLLM_LOG_INFO("[KVXFER][send] sendSync/format DONE reqId=%llu",
+            static_cast<unsigned long long>(llmRequest.mRequestId));
     }
 
     bool cancelRequest(LlmRequest const& llmRequest)
@@ -571,6 +574,12 @@ private:
                 }
             }
             sendReadySignal(reqId, isReady);
+            // [KVXFER] Ready signal sent: the gen side's receiveReadySignal can now
+            // unblock. If a [recv] WAITING-ready line has no matching [send] ready
+            // line for the same ctxReqId, the context server never got all
+            // counterparts (see recvRequestInfo counterparts/remain above).
+            TLLM_LOG_INFO("[KVXFER][send] sent ready signal reqId=%llu isReady=%d",
+                static_cast<unsigned long long>(reqId), static_cast<int>(isReady));
 
             if (isReady)
             {
@@ -656,6 +665,15 @@ private:
                     {
                         mRemainSendCount[reqId] = getCounterpartsCount(reqId);
                     }
+                    // [KVXFER] The context server only sends the ready signal once
+                    // it has received RequestInfo from ALL `counterparts` gen ranks
+                    // (remain decremented to 0). If `counterparts` is larger than the
+                    // number of gen CP ranks that actually request this context
+                    // request, `remain` never reaches 0 and the gen side blocks
+                    // forever in receiveReadySignal.
+                    TLLM_LOG_INFO("[KVXFER][send] recvRequestInfo reqId=%llu counterparts=%llu remain=%d",
+                        static_cast<unsigned long long>(reqId),
+                        static_cast<unsigned long long>(getCounterpartsCount(reqId)), mRemainSendCount[reqId]);
                 }
                 auto it = getCurrentResponse();
                 if (it != mReadyResponses.end())
@@ -817,6 +835,12 @@ public:
             {
                 std::unique_lock<std::mutex> lck(asyncResource->mMtxForQueue);
                 asyncResource->mRequestsQueue.emplace_back(llmRequest, std::move(promise));
+                // [KVXFER] queueDepth > 1 means transfers are backing up behind a
+                // stuck worker: the request reported in the observe-only timeout
+                // WARN likely never started (explains the bogus ~uptime elapsed).
+                TLLM_LOG_INFO("[KVXFER][recv] enqueued reqId=%llu queueDepth=%llu",
+                    static_cast<unsigned long long>(llmRequest->mRequestId),
+                    static_cast<unsigned long long>(asyncResource->mRequestsQueue.size()));
             }
             asyncResource->mCVforQueue.notify_all();
             return future;
@@ -1100,14 +1124,31 @@ public:
 private:
     void requestSync(LlmRequest& llmRequest)
     {
+        auto const kvxferCtxReqId = llmRequest.getContextPhaseParams().value().getReqId();
         TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
             "Start calling requestSync for request ID: %zu, context request ID: %zu.", llmRequest.mRequestId,
-            llmRequest.getContextPhaseParams().value().getReqId());
+            kvxferCtxReqId);
+        // [KVXFER] One-shot stage trace (recv side). A bogus ~uptime "elapsed" in
+        // the observe-only timeout WARN means requestSync never reached here for a
+        // request (it sat queued behind an earlier stuck transfer). The stage logs
+        // below pinpoint which stage hangs: WAITING-ready means the context server
+        // never sent the ready signal (counterpart-count or matching mismatch);
+        // a missing DONE after RECV-START means the data transfer itself stalls.
+        TLLM_LOG_INFO("[KVXFER][recv] requestSync ENTER reqId=%llu ctxReqId=%llu",
+            static_cast<unsigned long long>(llmRequest.mRequestId),
+            static_cast<unsigned long long>(kvxferCtxReqId));
         llmRequest.setKvCacheTransferStart(std::chrono::steady_clock::now());
         TLLM_CUDA_CHECK(cudaSetDevice(mDeviceId));
         auto session = sendRequestInfo(llmRequest);
         session.setTime(TransferSession::kTimeRequestInfo);
+        TLLM_LOG_INFO("[KVXFER][recv] sent RequestInfo, WAITING-ready reqId=%llu ctxReqId=%llu connections=%llu",
+            static_cast<unsigned long long>(llmRequest.mRequestId),
+            static_cast<unsigned long long>(kvxferCtxReqId),
+            static_cast<unsigned long long>(session.getConnections().size()));
         bool isReady = receiveReadySignal(session);
+        TLLM_LOG_INFO("[KVXFER][recv] got ready=%d reqId=%llu ctxReqId=%llu", static_cast<int>(isReady),
+            static_cast<unsigned long long>(llmRequest.mRequestId),
+            static_cast<unsigned long long>(kvxferCtxReqId));
         if (!isReady)
         {
             // Reuse the error state for the cancelled request.
@@ -1115,12 +1156,18 @@ private:
             llmRequest.setKvCacheTransferEnd(std::chrono::steady_clock::now());
             return;
         }
+        TLLM_LOG_INFO("[KVXFER][recv] RECV-START reqId=%llu ctxReqId=%llu",
+            static_cast<unsigned long long>(llmRequest.mRequestId),
+            static_cast<unsigned long long>(kvxferCtxReqId));
         receiveSync(session);
         llmRequest.setKvCacheTransferEnd(std::chrono::steady_clock::now());
+        TLLM_LOG_INFO("[KVXFER][recv] transfer DONE reqId=%llu ctxReqId=%llu",
+            static_cast<unsigned long long>(llmRequest.mRequestId),
+            static_cast<unsigned long long>(kvxferCtxReqId));
 
         TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
             "End calling requestSync for request ID: %zu, context request ID: %zu.", llmRequest.mRequestId,
-            llmRequest.getContextPhaseParams().value().getReqId());
+            kvxferCtxReqId);
     }
 
     struct RequestAndPromise
