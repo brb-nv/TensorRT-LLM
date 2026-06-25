@@ -44,6 +44,7 @@ from tensorrt_llm._torch.models.checkpoints.base_weight_loader import \
 from tensorrt_llm._utils import get_sm_version, is_sm_100f
 from tensorrt_llm.bindings.internal.thop import BufferKind
 from tensorrt_llm.functional import PositionEmbeddingType
+from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
@@ -51,7 +52,8 @@ from tensorrt_llm.quantization.mode import QuantAlgo
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
 from ..distributed import (AllReduce, AllReduceFusionOp, AllReduceParams,
-                           MoEAllReduce, MoEAllReduceParams, allgather)
+                          MoEAllReduce, MoEAllReduceParams, allgather,
+                          cp_allgather)
 from ..model_config import ModelConfig
 from ..modules.attention import (MLA, maybe_allgather_for_helix_cp,
                                  maybe_slice_for_helix_cp)
@@ -658,6 +660,25 @@ class DeepseekV3MTPHead(nn.Module):
         enable_attention_dp = self.model_config.mapping.enable_attention_dp
         enable_lm_head_tp_in_adp = enable_attention_dp and self.model_config.mapping.enable_lm_head_tp_in_adp
 
+        # DEBUG (Helix): the input to the draft LM head must be identical across
+        # decode ranks. If it is, but the resulting draft tokens differ, the
+        # divergence is in the (vocab-sharded) OUTPUT logits not being gathered
+        # back on the Helix path. See _helix_debug_compare.
+        _helix_debug_compare("mtphead_in_hidden", hidden_states,
+                             self.model_config.mapping, -1)
+
+        # Under Helix CP the CP ranks are repurposed to TP, so the draft lm_head
+        # (built with the repurposed mapping) shards the vocab across the decode
+        # ranks. Unlike the real-TP path, the draft sampler runs with the
+        # restored (un-repurposed) mapping (tp_size == 1) and therefore takes the
+        # plain-argmax path, which never gathers these vocab shards. Each rank
+        # would then argmax over a different half of the vocab and pick a
+        # different draft token, desyncing acceptance across ranks and
+        # deadlocking the next Helix collective. Force a full-vocab all-gather
+        # here (exactly as the target lm_head does) so every decode rank sees
+        # identical logits before sampling.
+        is_helix_cp = self.model_config.mapping.has_cp_helix()
+
         # Add pre-lm gather logic
         if enable_lm_head_tp_in_adp:
             # ADP + LM TP mode: perform All-Gather before LM_head
@@ -667,14 +688,51 @@ class DeepseekV3MTPHead(nn.Module):
                                       self.mapping_lm_head_tp,
                                       dim=0)
 
-        # Temporarily disable gather_output when not in ADP mode or (in ADP mode and LM TP is enabled)
-        if not enable_attention_dp or enable_lm_head_tp_in_adp:
-            lm_head.gather_output = False
-        logits = lm_head(hidden_states,
-                         mapping_lm_head_tp=self.mapping_lm_head_tp,
-                         is_spec_decoding_head=True)
-        if not enable_attention_dp or enable_lm_head_tp_in_adp:
+        if is_helix_cp:
+            # Gather the full vocab over the repurposed CP->TP group.
+            prev_gather_output = lm_head.gather_output
             lm_head.gather_output = True
+            logits = lm_head(hidden_states,
+                             mapping_lm_head_tp=self.mapping_lm_head_tp,
+                             is_spec_decoding_head=True)
+            lm_head.gather_output = prev_gather_output
+        else:
+            # Temporarily disable gather_output when not in ADP mode or (in ADP mode and LM TP is enabled)
+            if not enable_attention_dp or enable_lm_head_tp_in_adp:
+                lm_head.gather_output = False
+            logits = lm_head(hidden_states,
+                             mapping_lm_head_tp=self.mapping_lm_head_tp,
+                             is_spec_decoding_head=True)
+            if not enable_attention_dp or enable_lm_head_tp_in_adp:
+                lm_head.gather_output = True
+
+        if _helix_debug_enabled():
+            mapping = self.model_config.mapping
+            full_vocab = self.model_config.pretrained_config.vocab_size
+            local_max_val, local_argmax = torch.max(logits, dim=-1)
+            # Global token id this rank would pick: local argmax + vocab offset.
+            # If the logits are vocab-sharded over the repurposed CP->TP group,
+            # each rank scans a different vocab range, so a plain (un-gathered)
+            # argmax diverges across ranks -- the deadlock root cause.
+            tp_size_repurposed = (full_vocab // logits.shape[-1]
+                                  if logits.shape[-1] > 0 else 1)
+            # FIX VERIFICATION: on the Helix path we expect the LM head to have
+            # gathered the full vocab, so logits should NOT be sharded and the
+            # per-rank argmax should agree across ranks.
+            logger.info(
+                f"[HELIX-MTPHEAD] helix_gather_applied={is_helix_cp} "
+                f"gather_output(restored)={lm_head.gather_output} "
+                f"orig_tp_size={mapping.tp_size} cp_size={mapping.cp_size} "
+                f"logits_shape={tuple(logits.shape)} full_vocab={full_vocab} "
+                f"sharded={logits.shape[-1] != full_vocab} "
+                f"implied_shards={tp_size_repurposed} "
+                f"local_argmax={local_argmax.flatten().tolist()} "
+                f"local_max={local_max_val.flatten().tolist()}")
+            # Authoritative check: after the fix the full-vocab logits must be
+            # bitwise-identical on every decode rank (exact=True). Before the
+            # fix this compared sharded halves and reported exact=False.
+            _helix_debug_compare("mtphead_out_logits", logits,
+                                 self.model_config.mapping, -1)
         return logits
 
 
@@ -1587,6 +1645,59 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         return hidden_states, residual
 
 
+def _helix_debug_enabled() -> bool:
+    """Whether the Helix MTP debug logs are enabled.
+
+    Reuses the ``TLLM_DEBUG_HELIX_LOGITS`` flag so these logs toggle together
+    with the cross-rank logits/draft-token comparison in modeling_speculative
+    and the draft sampler logs in eagle3.
+    """
+    return os.environ.get("TLLM_DEBUG_HELIX_LOGITS", "0") == "1"
+
+
+@torch.no_grad()
+def _helix_debug_compare(name: str, tensor: torch.Tensor,
+                         mapping_with_cp: Optional[Mapping],
+                         layer_idx: int) -> None:
+    """DEBUG: all-gather ``tensor`` across the Helix CP group and report diffs.
+
+    Under Helix CP the CP ranks are repurposed to TP right after attention, so
+    (with attention DP disabled) every TP all-reduce should leave identical
+    activations on every decode rank. By comparing the same activation across
+    ranks at each MTP stage we can localize the exact step where rank
+    consistency breaks -- which is what desyncs draft-token sampling and
+    deadlocks the next Helix collective. Enable with
+    ``TLLM_DEBUG_HELIX_LOGITS=1``.
+
+    ``tensor`` is gathered along dim 0, so only pass activations that are
+    expected to be replicated (i.e. NOT column-sharded across TP ranks).
+    """
+    if not _helix_debug_enabled():
+        return
+    if (mapping_with_cp is None or not mapping_with_cp.has_cp_helix()
+            or mapping_with_cp.cp_size <= 1):
+        return
+    local = tensor.detach().to(torch.float32).contiguous()
+    gathered = cp_allgather(local, mapping_with_cp, dim=0)
+    chunks = list(torch.chunk(gathered, mapping_with_cp.cp_size, dim=0))
+    # The gathered view is identical on every rank, so let cp_rank 0 report.
+    if mapping_with_cp.cp_rank != 0:
+        return
+    ref = chunks[0]
+    for r, chunk in enumerate(chunks[1:], start=1):
+        if chunk.shape != ref.shape:
+            logger.error(f"[HELIX-MTP] {name} layer={layer_idx} "
+                         f"rank {r} vs 0 shape mismatch "
+                         f"{tuple(chunk.shape)} vs {tuple(ref.shape)}")
+            continue
+        exact = torch.equal(chunk, ref)
+        max_abs = (chunk - ref).abs().max().item()
+        report = logger.info if exact else logger.error
+        report(f"[HELIX-MTP] {name} layer={layer_idx} rank {r} vs 0: "
+               f"exact={exact} max_abs_diff={max_abs:.3e} "
+               f"shape={tuple(ref.shape)}")
+
+
 class DeepseekV3MTP(DeepseekV3DecoderLayer):
 
     def __init__(self,
@@ -1665,6 +1776,13 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
         spec_metadata: Optional[SpecMetadata] = None,
         **kwargs,
     ) -> torch.Tensor:
+        # DEBUG (Helix): localize where the MTP draft activations diverge across
+        # decode ranks. The inputs must already match; if they don't, the
+        # divergence is upstream (target hidden-state capture / accepted tokens).
+        _helix_debug_compare("mtp_in_input_ids", input_ids.unsqueeze(-1),
+                             self.mapping_with_cp, self.layer_idx)
+        _helix_debug_compare("mtp_in_hidden", hidden_states,
+                             self.mapping_with_cp, self.layer_idx)
 
         def norm_embeds():
             return self.enorm(embed_tokens(input_ids))  #emdedding
@@ -1681,6 +1799,10 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
             disable_on_compile=True,
         )
         hidden_states = torch.concat([inputs_embeds, hidden_states], dim=-1)
+        # Pre-chunk: replicated across ranks (inputs are replicated under
+        # Helix without attention DP).
+        _helix_debug_compare("mtp_concat", hidden_states, self.mapping_with_cp,
+                             self.layer_idx)
         # Split hidden_states columnwise based on TP. Use self.mapping (captured
         # at construction) rather than self.model_config.mapping: under Helix CP
         # the latter is restored to the original (un-repurposed) mapping after
@@ -1693,6 +1815,10 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
         if tp_size > 1 and not (self.mapping.enable_attention_dp):
             hidden_states = torch.chunk(hidden_states, tp_size, dim=-1)[tp_rank]
         hidden_states = self.eh_proj(hidden_states)
+        # eh_proj is ROW-parallel with reduce_output=True, so its output is
+        # all-reduced and should be replicated across ranks again.
+        _helix_debug_compare("mtp_post_eh_proj", hidden_states,
+                             self.mapping_with_cp, self.layer_idx)
 
         # Input layer norm
         residual = hidden_states
@@ -1707,6 +1833,12 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
                 enable_allreduce=not (self.disable_attn_allreduce)),
             **kwargs,
         )
+        # Raw attention output. When the attn all-reduce is fused into the
+        # post-attention norm below (PRE_MOE_FUSION / disable_attn_allreduce),
+        # this is still the pre-all-reduce partial and may legitimately differ;
+        # the post-norm compare is the authoritative "should be identical" point.
+        _helix_debug_compare("mtp_post_attn", hidden_states,
+                             self.mapping_with_cp, self.layer_idx)
 
         # MTP Layer Must have sparse MOE
         if self.fusion_config.PRE_MOE_FUSION:
@@ -1722,6 +1854,9 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
         else:
             hidden_states, residual = self.post_attention_layernorm(
                 hidden_states, residual)
+        # Post attention (+ all-reduce): should be identical across ranks.
+        _helix_debug_compare("mtp_post_attn_ln", hidden_states,
+                             self.mapping_with_cp, self.layer_idx)
 
         # MoE
         hidden_states = self.mlp(
@@ -1731,6 +1866,9 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
                 enable_allreduce=not (self.fusion_config.POST_MOE_FUSION
                                       or self.mapping.tp_size == 1)),
         )
+        # MoE output before any POST_MOE_FUSION all-reduce.
+        _helix_debug_compare("mtp_post_moe", hidden_states,
+                             self.mapping_with_cp, self.layer_idx)
 
         if self.fusion_config.POST_MOE_FUSION:
             hidden_states, residual = self.allreduce(
@@ -1744,6 +1882,12 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
             )
         else:
             hidden_states, _ = self.shared_head.norm(hidden_states, residual)
+        # Final hidden states feeding shared_head.lm_head. This must be
+        # identical across decode ranks for the draft logits (and thus the
+        # greedy draft token) to match; a divergence here is the direct cause
+        # of the cross-rank draft-token mismatch seen in eagle3.draft_decoder.
+        _helix_debug_compare("mtp_pre_lm_head", hidden_states,
+                             self.mapping_with_cp, self.layer_idx)
 
         # It's for 2-model path, capture the hidden states
         if spec_metadata is not None:
