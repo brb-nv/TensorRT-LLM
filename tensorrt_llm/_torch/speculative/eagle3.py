@@ -1099,7 +1099,7 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         local_max_values, local_argmax = torch.max(logits, dim=-1, keepdim=True)
         vocab_per_rank = logits.shape[-1]
         mapping_lm_tp = mapping_lm_tp if mapping_lm_tp is not None else \
-            self.model_config.mapping
+            self.sampler_mapping
         max_index_per_rank = local_argmax.type(
             torch.int32) + (mapping_lm_tp.tp_rank * vocab_per_rank)
         max_index_per_rank_float = max_index_per_rank.float()
@@ -1127,18 +1127,19 @@ class Eagle3OneModelWorker(SpecWorkerBase):
 
         Falls back to simple argmax when no tensor parallelism is active or
         when only attention DP is enabled without LM-head TP.
+
+        Under Helix CP the vocab is sharded over the repurposed CP->TP group,
+        so ``sampler_mapping`` (not ``model_config.mapping``) is the group to
+        reduce over -- exactly as plain TP would.
         """
-        if (self.model_config is not None
-                and hasattr(self.model_config, 'mapping')
-                and self.model_config.mapping.tp_size > 1
-                and not self.model_config.mapping.enable_attention_dp):
+        mapping = self.sampler_mapping
+        if (mapping is not None and mapping.tp_size > 1
+                and not mapping.enable_attention_dp):
             combined = self._get_local_max_and_combined(logits)
-            gathered = allgather(combined, self.model_config.mapping, dim=-1)
+            gathered = allgather(combined, mapping, dim=-1)
             return self._get_draft_tokens_from_gathered(gathered)
-        elif (self.model_config is not None
-              and hasattr(self.model_config, 'mapping')
-              and self.model_config.mapping.tp_size > 1
-              and self.model_config.mapping.enable_lm_head_tp_in_adp):
+        elif (mapping is not None and mapping.tp_size > 1
+              and mapping.enable_lm_head_tp_in_adp):
             combined = self._get_local_max_and_combined(logits,
                                                         mapping_lm_head_tp)
             gathered = allgather(combined, mapping_lm_head_tp, dim=-1)
@@ -1303,10 +1304,12 @@ class Eagle3OneModelWorker(SpecWorkerBase):
             # d2t-aware argmax. (Routing ADP/LM-head-TP through draft_sampler
             # without its mapping_lm_head_tp arg hits the None-mapping branch
             # and crashes with 'NoneType has no attribute tp_group'.)
-            if (self.is_mtp_eagle and self.model_config is not None
-                    and hasattr(self.model_config, 'mapping')
-                    and self.model_config.mapping.tp_size > 1
-                    and not self.model_config.mapping.enable_attention_dp):
+            # ``sampler_mapping`` folds the Helix CP ranks into TP, so this is
+            # the plain-TP vocab-shard check post-attention.
+            mapping = self.sampler_mapping
+            if (self.is_mtp_eagle and mapping is not None
+                    and mapping.tp_size > 1
+                    and not mapping.enable_attention_dp):
                 return self.draft_sampler(logits)
             return self._draft_sampler_greedy(logits, d2t)
         # Non-greedy (advanced) draft sampling has the same TP hazard as the
@@ -1319,11 +1322,10 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         # shared seed. (Greedy uses draft_sampler()'s lighter max+index gather;
         # random sampling needs the full distribution. The LM-head-TP-in-ADP
         # case is handled upstream and must not be gathered again here.)
-        if (self.is_mtp_eagle and self.model_config is not None
-                and hasattr(self.model_config, 'mapping')
-                and self.model_config.mapping.tp_size > 1
-                and not self.model_config.mapping.enable_attention_dp):
-            logits = allgather(logits, self.model_config.mapping, dim=-1)
+        mapping = self.sampler_mapping
+        if (self.is_mtp_eagle and mapping is not None and mapping.tp_size > 1
+                and not mapping.enable_attention_dp):
+            logits = allgather(logits, mapping, dim=-1)
         if spec_metadata.use_rejection_sampling and draft_step is not None:
             return self._draft_sampler_advanced_for_rejection(
                 logits, spec_metadata, batch_size, d2t, draft_step)

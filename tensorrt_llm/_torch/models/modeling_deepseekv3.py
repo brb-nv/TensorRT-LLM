@@ -658,18 +658,6 @@ class DeepseekV3MTPHead(nn.Module):
         enable_attention_dp = self.model_config.mapping.enable_attention_dp
         enable_lm_head_tp_in_adp = enable_attention_dp and self.model_config.mapping.enable_lm_head_tp_in_adp
 
-        # Under Helix CP the CP ranks are repurposed to TP, so the draft lm_head
-        # (built with the repurposed mapping) shards the vocab across the decode
-        # ranks. Unlike the real-TP path, the draft sampler runs with the
-        # restored (un-repurposed) mapping (tp_size == 1) and therefore takes the
-        # plain-argmax path, which never gathers these vocab shards. Each rank
-        # would then argmax over a different half of the vocab and pick a
-        # different draft token, desyncing acceptance across ranks and
-        # deadlocking the next Helix collective. Force a full-vocab all-gather
-        # here (exactly as the target lm_head does) so every decode rank sees
-        # identical logits before sampling.
-        is_helix_cp = self.model_config.mapping.has_cp_helix()
-
         # Add pre-lm gather logic
         if enable_lm_head_tp_in_adp:
             # ADP + LM TP mode: perform All-Gather before LM_head
@@ -679,23 +667,14 @@ class DeepseekV3MTPHead(nn.Module):
                                       self.mapping_lm_head_tp,
                                       dim=0)
 
-        if is_helix_cp:
-            # Gather the full vocab over the repurposed CP->TP group.
-            prev_gather_output = lm_head.gather_output
+        # Temporarily disable gather_output when not in ADP mode or (in ADP mode and LM TP is enabled)
+        if not enable_attention_dp or enable_lm_head_tp_in_adp:
+            lm_head.gather_output = False
+        logits = lm_head(hidden_states,
+                         mapping_lm_head_tp=self.mapping_lm_head_tp,
+                         is_spec_decoding_head=True)
+        if not enable_attention_dp or enable_lm_head_tp_in_adp:
             lm_head.gather_output = True
-            logits = lm_head(hidden_states,
-                             mapping_lm_head_tp=self.mapping_lm_head_tp,
-                             is_spec_decoding_head=True)
-            lm_head.gather_output = prev_gather_output
-        else:
-            # Temporarily disable gather_output when not in ADP mode or (in ADP mode and LM TP is enabled)
-            if not enable_attention_dp or enable_lm_head_tp_in_adp:
-                lm_head.gather_output = False
-            logits = lm_head(hidden_states,
-                             mapping_lm_head_tp=self.mapping_lm_head_tp,
-                             is_spec_decoding_head=True)
-            if not enable_attention_dp or enable_lm_head_tp_in_adp:
-                lm_head.gather_output = True
         return logits
 
 
