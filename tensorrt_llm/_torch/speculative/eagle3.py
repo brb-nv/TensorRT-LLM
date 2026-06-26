@@ -1,4 +1,3 @@
-import os
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Dict, List, Optional, Set
 
@@ -8,7 +7,6 @@ from torch import nn
 
 from tensorrt_llm._torch.custom_ops import inplace_slice_copy
 from tensorrt_llm._utils import prefer_pinned
-from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
 from ..attention_backend import AttentionMetadata
@@ -26,15 +24,6 @@ from .spec_tree_manager import SpecTreeManager
 
 if TYPE_CHECKING:
     from ...llmapi.llm_args import EagleDecodingConfig
-
-
-def _helix_debug_enabled() -> bool:
-    """Whether the Helix sampling debug logs are enabled.
-
-    Reuses the ``TLLM_DEBUG_HELIX_LOGITS`` flag so these logs toggle together
-    with the cross-rank logits/draft-token comparison in modeling_speculative.
-    """
-    return os.environ.get("TLLM_DEBUG_HELIX_LOGITS", "0") == "1"
 
 
 class Eagle3ResourceManager(BaseResourceManager):
@@ -748,19 +737,6 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         accepted_tokens, num_accepted_tokens = self.sample_and_accept_draft_tokens(
             input_ids, logits, attn_metadata, spec_metadata)
 
-        if _helix_debug_enabled():
-            # Per-rank view of acceptance. Under Helix CP every gen rank must
-            # accept the same tokens / counts; a divergence here (with matching
-            # target logits) localizes the deadlock to draft-token sampling.
-            prev_draft_tokens = getattr(spec_metadata, "draft_tokens", None)
-            logger.info(
-                f"[HELIX-SAMPLE] accept num_contexts={num_contexts} "
-                f"num_gens={num_gens} "
-                f"prev_draft_tokens="
-                f"{prev_draft_tokens.flatten().tolist() if prev_draft_tokens is not None else None} "
-                f"num_accepted_tokens={num_accepted_tokens.flatten().tolist()} "
-                f"accepted_tokens={accepted_tokens.flatten().tolist()}")
-
         # Mamba hybrid models need state updates after token acceptance because
         # the accepted token count affects which Mamba states are valid. The
         # isinstance check below naturally no-ops on non-Mamba kv_cache_managers,
@@ -1152,18 +1128,13 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         Falls back to simple argmax when no tensor parallelism is active or
         when only attention DP is enabled without LM-head TP.
         """
-        debug = _helix_debug_enabled()
         if (self.model_config is not None
                 and hasattr(self.model_config, 'mapping')
                 and self.model_config.mapping.tp_size > 1
                 and not self.model_config.mapping.enable_attention_dp):
             combined = self._get_local_max_and_combined(logits)
             gathered = allgather(combined, self.model_config.mapping, dim=-1)
-            draft_tokens = self._get_draft_tokens_from_gathered(gathered)
-            if debug:
-                self._log_draft_sampler_path("tp_allgather", logits,
-                                             draft_tokens)
-            return draft_tokens
+            return self._get_draft_tokens_from_gathered(gathered)
         elif (self.model_config is not None
               and hasattr(self.model_config, 'mapping')
               and self.model_config.mapping.tp_size > 1
@@ -1176,42 +1147,9 @@ class Eagle3OneModelWorker(SpecWorkerBase):
             gathered = gathered.view(mapping_lm_head_tp.tp_size,
                                      local_batch_size, -1)
             sliced_gathered = gathered[mapping_lm_head_tp.tp_rank]
-            draft_tokens = self._get_draft_tokens_from_gathered(sliced_gathered)
-            if debug:
-                self._log_draft_sampler_path("lm_head_tp_in_adp", logits,
-                                             draft_tokens)
-            return draft_tokens
+            return self._get_draft_tokens_from_gathered(sliced_gathered)
         else:
-            draft_tokens = self._draft_sampler_greedy(logits)
-            if debug:
-                self._log_draft_sampler_path("plain_argmax", logits,
-                                             draft_tokens)
-            return draft_tokens
-
-    @torch.no_grad()
-    def _log_draft_sampler_path(self, path: str, logits: torch.Tensor,
-                                draft_tokens: torch.Tensor) -> None:
-        """DEBUG: report which draft_sampler branch ran and what it produced.
-
-        Under Helix CP the gen ranks run with ``tp_size == 1`` so the
-        ``plain_argmax`` branch is taken. If the per-rank draft logits are not
-        bitwise-identical across ranks, this argmax diverges, the accepted
-        token counts drift apart, and the next Helix collective deadlocks.
-        Enable with ``TLLM_DEBUG_HELIX_LOGITS=1``.
-        """
-        mapping = getattr(self.model_config, 'mapping', None)
-        tp_size = getattr(mapping, 'tp_size', None)
-        cp_size = getattr(mapping, 'cp_size', None)
-        enable_attention_dp = getattr(mapping, 'enable_attention_dp', None)
-        enable_lm_head_tp_in_adp = getattr(mapping, 'enable_lm_head_tp_in_adp',
-                                           None)
-        logger.info(
-            f"[HELIX-SAMPLE] draft_sampler path={path} "
-            f"tp_size={tp_size} cp_size={cp_size} "
-            f"enable_attention_dp={enable_attention_dp} "
-            f"enable_lm_head_tp_in_adp={enable_lm_head_tp_in_adp} "
-            f"logits_shape={tuple(logits.shape)} "
-            f"draft_tokens={draft_tokens.flatten().tolist()}")
+            return self._draft_sampler_greedy(logits)
 
     @torch.compile(options={"max-autotune": True})
     def _topk_kernel(self, gen_logprobs, num_gens, mtp_num_modules,
@@ -1356,7 +1294,6 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         # MTP-Eagle + TP). draft_sampler() all-gathers the sharded logits
         # before argmax (and falls back to a plain argmax when no TP gather is
         # needed). Eagle3 (non-MTP) keeps its d2t-aware argmax.
-        debug = _helix_debug_enabled()
         if spec_metadata.is_all_greedy_sample:
             # Only plain tensor parallelism (tp_size>1 without attention DP)
             # shards the draft logits over the vocab dim and thus needs
@@ -1370,17 +1307,8 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                     and hasattr(self.model_config, 'mapping')
                     and self.model_config.mapping.tp_size > 1
                     and not self.model_config.mapping.enable_attention_dp):
-                draft_tokens = self.draft_sampler(logits)
-                if debug:
-                    self._log_draft_decoder_path(
-                        "greedy->draft_sampler", logits, draft_tokens,
-                        draft_step)
-                return draft_tokens
-            draft_tokens = self._draft_sampler_greedy(logits, d2t)
-            if debug:
-                self._log_draft_decoder_path("greedy->plain_argmax", logits,
-                                             draft_tokens, draft_step)
-            return draft_tokens
+                return self.draft_sampler(logits)
+            return self._draft_sampler_greedy(logits, d2t)
         # Non-greedy (advanced) draft sampling has the same TP hazard as the
         # greedy path: when the draft LM head is plain tensor-parallel
         # (tp_size>1 without attention DP), each rank only holds a vocab shard
@@ -1391,49 +1319,16 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         # shared seed. (Greedy uses draft_sampler()'s lighter max+index gather;
         # random sampling needs the full distribution. The LM-head-TP-in-ADP
         # case is handled upstream and must not be gathered again here.)
-        gathered_for_tp = False
         if (self.is_mtp_eagle and self.model_config is not None
                 and hasattr(self.model_config, 'mapping')
                 and self.model_config.mapping.tp_size > 1
                 and not self.model_config.mapping.enable_attention_dp):
             logits = allgather(logits, self.model_config.mapping, dim=-1)
-            gathered_for_tp = True
         if spec_metadata.use_rejection_sampling and draft_step is not None:
-            draft_tokens = self._draft_sampler_advanced_for_rejection(
+            return self._draft_sampler_advanced_for_rejection(
                 logits, spec_metadata, batch_size, d2t, draft_step)
-            if debug:
-                self._log_draft_decoder_path(
-                    f"advanced_rejection(gathered={gathered_for_tp})", logits,
-                    draft_tokens, draft_step)
-            return draft_tokens
-        draft_tokens = self._draft_sampler_advanced(logits, spec_metadata,
-                                                    batch_size, d2t)
-        if debug:
-            self._log_draft_decoder_path(
-                f"advanced(gathered={gathered_for_tp})", logits, draft_tokens,
-                draft_step)
-        return draft_tokens
-
-    @torch.no_grad()
-    def _log_draft_decoder_path(self, path: str, logits: torch.Tensor,
-                                draft_tokens: torch.Tensor,
-                                draft_step: Optional[int]) -> None:
-        """DEBUG: report the draft_decoder branch and the sampled draft tokens.
-
-        This is the source of the per-step draft tokens that are verified on
-        the next iteration. Under Helix CP (gen ranks run with tp_size == 1)
-        the ``greedy->plain_argmax`` / ``advanced`` branches are taken without
-        a cross-rank gather, so any per-rank difference in the draft logits
-        surfaces here as divergent draft tokens and later deadlocks the next
-        Helix collective. Enable with ``TLLM_DEBUG_HELIX_LOGITS=1``.
-        """
-        mapping = getattr(self.model_config, 'mapping', None)
-        logger.info(
-            f"[HELIX-SAMPLE] draft_decoder step={draft_step} path={path} "
-            f"tp_size={getattr(mapping, 'tp_size', None)} "
-            f"cp_size={getattr(mapping, 'cp_size', None)} "
-            f"logits_shape={tuple(logits.shape)} "
-            f"draft_tokens={draft_tokens.flatten().tolist()}")
+        return self._draft_sampler_advanced(logits, spec_metadata, batch_size,
+                                            d2t)
 
     def prepare_1st_drafter_inputs(
         self,

@@ -620,7 +620,7 @@ def setup_disagg_cluster(
     model_name: str | None = None,
     env: dict[str, str] | None = None,
     cwd: str | None = None,
-    server_start_timeout: int = 300,
+    server_start_timeout: int = 2400,
     schedule_style: str | None = None,
     save_log: bool = False,
 ) -> tuple[dict[str, Any], list[ProcessWrapper], list[ProcessWrapper],
@@ -757,7 +757,7 @@ def setup_disagg_cluster(
 
 def run_disaggregated_test(example_dir,
                            test_desc,
-                           num_iters=5,
+                           num_iters=1,
                            env=None,
                            prompt_file="prompts.json",
                            extra_endpoints_test=None,

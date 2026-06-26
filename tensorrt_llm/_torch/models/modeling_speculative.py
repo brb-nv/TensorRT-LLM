@@ -1,5 +1,4 @@
 import inspect
-import os
 from dataclasses import replace
 from typing import Dict, Generic, List, Optional, Tuple
 
@@ -13,7 +12,6 @@ from tensorrt_llm.logger import logger
 from ...functional import PositionEmbeddingType, RotaryScalingType
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
-from ..distributed import cp_allgather
 from ..model_config import ModelConfig, TConfig
 from ..modules.attention import MLA, Attention
 from ..modules.decoder_layer import DecoderLayer
@@ -1744,96 +1742,6 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                 self.epilogue.append(self.spec_worker)
         self.layer_idx = -1
 
-    @torch.no_grad()
-    def _debug_compare_decode_ranks(self, logits: torch.Tensor,
-                                    spec_metadata) -> None:
-        """DEBUG: verify the inputs to MTP acceptance match across Helix ranks.
-
-        Under Helix CP, after attention the CP ranks are repurposed to TP, so
-        the LM-head logits feeding sampling / MTP draft acceptance are expected
-        to be bitwise-identical on every decode rank (exactly as in the pure-TP
-        case). Acceptance is ``argmax(target_logits) == draft_token`` (greedy),
-        so the *draft tokens* must also be identical across ranks. If either
-        differs, acceptance / committed length drift apart across ranks and the
-        next Helix collective deadlocks. Enable with ``TLLM_DEBUG_HELIX_LOGITS=1``.
-        """
-        mapping_with_cp = getattr(self.model, "mapping_with_cp", None)
-        if (mapping_with_cp is None or not mapping_with_cp.has_cp_helix()
-                or mapping_with_cp.cp_size <= 1):
-            return
-
-        # Print which ranks participate in this all-gather so we can confirm we
-        # are comparing the intended decode (CP) group. Every rank logs its own
-        # view (global rank, cp_rank) and the full cp_group it gathers over.
-        logger.info(
-            f"[HELIX-LOGITS] global_rank={mapping_with_cp.rank} "
-            f"cp_rank={mapping_with_cp.cp_rank}/{mapping_with_cp.cp_size} "
-            f"tp_rank={mapping_with_cp.tp_rank}/{mapping_with_cp.tp_size} "
-            f"pp_rank={mapping_with_cp.pp_rank} "
-            f"allgather_cp_group={mapping_with_cp.cp_group}")
-
-        self._compare_tensor_across_cp("logits",
-                                       logits.to(torch.float32),
-                                       mapping_with_cp,
-                                       is_logits=True)
-
-        draft_tokens = getattr(spec_metadata, "draft_tokens", None)
-        if draft_tokens is not None:
-            self._compare_tensor_across_cp("draft_tokens",
-                                           draft_tokens.to(torch.int64),
-                                           mapping_with_cp,
-                                           is_logits=False)
-
-    @torch.no_grad()
-    def _compare_tensor_across_cp(self, name: str, local: torch.Tensor,
-                                  mapping_with_cp, is_logits: bool) -> None:
-        """All-gather ``local`` across the CP group and report cross-rank diffs."""
-        local = local.detach().contiguous()
-
-        # Confirm every decode rank produced the same row count first; if not,
-        # the big all-gather below would mismatch/hang. A count divergence is
-        # itself a meaningful signal worth reporting.
-        num_rows = torch.tensor([local.shape[0]],
-                                device=local.device,
-                                dtype=torch.int64)
-        all_rows = cp_allgather(num_rows, mapping_with_cp, dim=0)
-        if int(all_rows.min()) != int(all_rows.max()):
-            if mapping_with_cp.cp_rank == 0:
-                logger.error(
-                    f"[HELIX-LOGITS] decode ranks disagree on {name} row count: "
-                    f"{all_rows.tolist()}")
-            return
-
-        gathered = cp_allgather(local, mapping_with_cp, dim=0)
-        chunks = list(torch.chunk(gathered, mapping_with_cp.cp_size, dim=0))
-
-        # The gathered view is identical on every rank, so let cp_rank 0 report.
-        if mapping_with_cp.cp_rank != 0:
-            return
-
-        ref = chunks[0]
-        for r, chunk in enumerate(chunks[1:], start=1):
-            exact = torch.equal(chunk, ref)
-            if is_logits:
-                max_abs = (chunk - ref).abs().max().item()
-                row_mismatch = int((~(chunk == ref).all(dim=-1)).sum().item())
-                argmax_flips = int(
-                    (chunk.argmax(dim=-1) != ref.argmax(dim=-1)).sum().item())
-                report = logger.info if exact else logger.error
-                report(
-                    f"[HELIX-LOGITS] {name} decode rank {r} vs 0: exact={exact} "
-                    f"max_abs_diff={max_abs:.3e} "
-                    f"mismatched_rows={row_mismatch}/{ref.shape[0]} "
-                    f"argmax_flips={argmax_flips}")
-            else:
-                mismatch = int((chunk != ref).sum().item())
-                report = logger.info if exact else logger.error
-                report(
-                    f"[HELIX-LOGITS] {name} decode rank {r} vs 0: exact={exact} "
-                    f"mismatched={mismatch}/{ref.numel()} "
-                    f"rank0={ref.flatten().tolist()} "
-                    f"rank{r}={chunk.flatten().tolist()}")
-
     def forward(
         self,
         attn_metadata: AttentionMetadata,
@@ -1868,9 +1776,6 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                 attn_metadata,
                 True,
             )
-
-            if os.environ.get("TLLM_DEBUG_HELIX_LOGITS", "0") == "1":
-                self._debug_compare_decode_ranks(logits, spec_metadata)
 
             spec_input_ids = input_ids
             spec_position_ids = position_ids

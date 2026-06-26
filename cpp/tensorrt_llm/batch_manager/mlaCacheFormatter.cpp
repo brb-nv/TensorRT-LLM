@@ -253,28 +253,6 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
             return bufferSizeForTarget;
         };
         auto bufferEleSizes = getBufferSizeForTarget();
-        {
-            // [KVXFER] One-shot transfer-geometry diagnostics (send side). Compare
-            // blockNum / per-target buffer sizes against the matching [recv] line
-            // for the same ctxReqId to spot Helix/MTP layout mismatches.
-            std::string sizesStr;
-            for (auto s : bufferEleSizes)
-            {
-                sizesStr += std::to_string(static_cast<unsigned long long>(s)) + ",";
-            }
-            std::string winStr;
-            for (auto w : windowSizes)
-            {
-                winStr += std::to_string(static_cast<long long>(w)) + ",";
-            }
-            TLLM_LOG_INFO(
-                "[KVXFER][send] reqId=%llu selfIdx=%d blockNum=%llu numPools=%d windowSizes=[%s] "
-                "ppDomain=%llu cpDomain=%llu indexerKCache=%d bufferEleSizes=[%s]",
-                static_cast<unsigned long long>(llmRequest.mRequestId), static_cast<int>(selfIdx),
-                static_cast<unsigned long long>(blockNum), static_cast<int>(numPools), winStr.c_str(),
-                static_cast<unsigned long long>(pPDomainSize), static_cast<unsigned long long>(cPDomainSize),
-                static_cast<int>(transferIndexerKCache), sizesStr.c_str());
-        }
         auto cacheBufferId = mCacheTransBufferManagers[transferIndexerKCache]->assignBufferIndexForSend();
         BufferIndexHolder sendHolder(
             *mCacheTransBufferManagers[transferIndexerKCache], cacheBufferId, /*isRecv=*/false);
@@ -545,31 +523,6 @@ void MLACacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& s
                 return bufferEleSizes;
             };
             auto bufferEleSizes = getBufferSizeForTarget();
-            {
-                // [KVXFER] One-shot transfer-geometry diagnostics (recv side).
-                // Compare blockNum / per-target buffer sizes against the matching
-                // [send] line for the same ctxReqId. A mismatch means the context
-                // server is sending a different KV layout/size than this Helix CP
-                // rank expects, which deadlocks the recv.
-                std::string sizesStr;
-                for (auto s : bufferEleSizes)
-                {
-                    sizesStr += std::to_string(static_cast<unsigned long long>(s)) + ",";
-                }
-                std::string winStr;
-                for (auto w : windowSizes)
-                {
-                    winStr += std::to_string(static_cast<long long>(w)) + ",";
-                }
-                TLLM_LOG_INFO(
-                    "[KVXFER][recv] reqId=%llu ctxReqId=%llu selfIdx=%d blockNum=%llu numPools=%d windowSizes=[%s] "
-                    "cpSize=%d targetNum=%llu indexerKCache=%d bufferEleSizes=[%s]",
-                    static_cast<unsigned long long>(llmRequest.mRequestId), static_cast<unsigned long long>(ctxReqId),
-                    static_cast<int>(selfIdx), static_cast<unsigned long long>(blockNum), static_cast<int>(numPools),
-                    winStr.c_str(), static_cast<int>(selfConfig.getParallelConfig().mContextParallelism),
-                    static_cast<unsigned long long>(targetNum), static_cast<int>(transferIndexerKCache),
-                    sizesStr.c_str());
-            }
 
             auto result = mCacheTransBufferManagers[transferIndexerKCache]->getOrAllocateRecvBuffers(
                 cacheBufferId, static_cast<int>(targetNum), bufferEleSizes, bufferManager);
