@@ -957,6 +957,7 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                     hidden_states = hidden_states[gather_ids]
                 else:
                     hidden_states = hidden_states_to_save[gather_ids]
+                # @B: Verify where this is built and that it is helix aware.
                 position_ids = (_select_mtp_position_ids(
                     inputs["position_ids"], gather_ids) + 1)
 
@@ -1067,11 +1068,14 @@ class Eagle3OneModelWorker(SpecWorkerBase):
             spec_metadata, step_idx)
 
         if self.is_mtp_eagle:
+            assert len(draft_model.mtp_layers) == 1, f"expect only one MTP layer, found {len(draft_model.mtp_layers)} instead."
             hidden_states = draft_model.mtp_layers[0](
                 embed_tokens=draft_model.embed_tokens,
                 all_rank_num_tokens=all_rank_num_tokens,
                 **inputs)
             return hidden_states, None
+        else:
+            assert False, "expect MTP Eagle to be active."
 
         inputs["all_rank_num_tokens"] = all_rank_num_tokens
         hidden_states, hidden_states_to_save = draft_model.model(**inputs)

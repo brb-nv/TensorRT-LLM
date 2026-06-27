@@ -4447,6 +4447,7 @@ class PyExecutor:
                         req, beam_width, first_gen_tokens):
                     continue
                 for beam in range(0, beam_width):
+                    print(f"[py_executor::_prepare_disagg_gen_transmission_complete][rank={self.model_engine.mapping.rank}] Appending token {first_gen_tokens[beam]} to request {req.py_request_id}. draft tokens: {req.py_draft_tokens}.")
                     req.add_new_token(first_gen_tokens[beam], beam)
 
                 self._maybe_prepend_logprobs_and_logits(req, beam_width)

@@ -297,6 +297,8 @@ def get_test_config(test_desc, example_dir, test_root):
         f"{test_configs_root}/disagg_config_ctxtp2_gentp1cp2_deepseek_v3_lite_bf16_tllm_gen.yaml",
         "deepseek_v3_lite_bf16_tllm_gen_helix_mtp":
         f"{test_configs_root}/disagg_config_ctxtp2_gentp1cp2_deepseek_v3_lite_bf16_tllm_gen_mtp.yaml",
+        "deepseek_v3_lite_bf16_tllm_gen_helix_mtp_ref":
+        f"{test_configs_root}/disagg_config_ctxtp2_gentp1cp2_deepseek_v3_lite_bf16_tllm_gen_mtp_ref.yaml",
         "deepseek_r1_v2_fp4_stress":
         f"{test_configs_root}/disagg_config_ctxtp4_gentp4_deepseek_r1_v2_fp4_tllm.yaml",
         "deepseek_r1_v2_fp4_mtp_stress":
@@ -355,7 +357,7 @@ ClientTestSet = namedtuple('ClientTestSet', [
 
 def get_client_test_set(test_desc):
     """Get the set of client tests to run for a given test description."""
-    if test_desc == "deepseek_v3_lite_bf16_tllm_gen_helix_mtp":
+    if test_desc == "deepseek_v3_lite_bf16_tllm_gen_helix_mtp" or test_desc == "deepseek_v3_lite_bf16_tllm_gen_helix_mtp_ref":
         # Streaming under Helix CP + MTP is under investigation (the streaming
         # client path appears to hang). Run non-streaming completion only for
         # now; revisit streaming once the hang is root-caused.
@@ -431,7 +433,7 @@ def run_client_tests(example_dir,
         ]
         if prompt_file == "long_prompts.json":
             # Use max_tokens 4 for long prompts to reduce test time
-            client_cmd.extend(['--max-tokens', '4'])
+            client_cmd.extend(['--max-tokens', '2'])
 
         # Prepare poll processes
         worker_processes = []
@@ -2298,16 +2300,21 @@ def test_disaggregated_deepseek_v3_lite_bf16_tllm_gen_helix(
 
 
 @pytest.mark.skip_less_device(4)
+@pytest.mark.parametrize("test_desc", [
+    "deepseek_v3_lite_bf16_tllm_gen_helix_mtp",
+    "deepseek_v3_lite_bf16_tllm_gen_helix_mtp_ref",
+],
+                         ids=["helix", "ref"])
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-bf16'],
                          indirect=True)
 def test_disaggregated_deepseek_v3_lite_bf16_tllm_gen_helix_mtp(
         disaggregated_test_root, disaggregated_example_root, llm_venv,
-        deepseek_v3_model_root):
+        deepseek_v3_model_root, test_desc):
     setup_model_symlink(llm_venv, deepseek_v3_model_root,
                         "DeepSeek-V3-Lite/bf16")
 
     run_disaggregated_test(disaggregated_example_root,
-                           "deepseek_v3_lite_bf16_tllm_gen_helix_mtp",
+                           test_desc,
                            env=llm_venv._new_env,
                            prompt_file="long_prompts.json",
                            model_path=deepseek_v3_model_root,

@@ -1779,6 +1779,11 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
 
             spec_input_ids = input_ids
             spec_position_ids = position_ids
+            is_gen_side = attn_metadata.num_contexts == 0
+            if is_gen_side:
+                print(f"[SpecDecOneEngineForCausalLM::forward][rank={self.model_config.mapping.rank}] spec_input_ids: {spec_input_ids}")
+                print(f"[SpecDecOneEngineForCausalLM::forward][rank={self.model_config.mapping.rank}] spec_position_ids: {spec_position_ids}")
+                print(f"[SpecDecOneEngineForCausalLM::forward][rank={self.model_config.mapping.rank}] logits.shape: {logits.shape}, logits: {logits}")
             if attn_metadata.padded_num_tokens is not None:
                 if input_ids is not None:
                     # Slice along the first dimension
@@ -1797,12 +1802,16 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                                     draft_model=self.draft_model,
                                     resource_manager=resource_manager)
         else:
+            # assert False, "expect spec-decoding to be active."
             logits = self.logits_processor.forward(
                 hidden_states,
                 self.lm_head,
                 attn_metadata,
                 return_context_logits,
             )
+            is_gen_side = attn_metadata.num_contexts == 0
+            if is_gen_side:
+                print(f"[SpecDecOneEngineForCausalLM::forward][rank={self.model_config.mapping.rank}] logits.shape: {logits.shape}, logits: {logits}")
 
         return logits
 

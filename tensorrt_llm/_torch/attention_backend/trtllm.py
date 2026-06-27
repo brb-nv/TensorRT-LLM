@@ -593,6 +593,21 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         self.kv_lens_cuda[:self.num_seqs].copy_(maybe_pin_memory(
             kv_lens[:self.num_seqs]),
                                                 non_blocking=True)
+
+        if self.enable_helix and self.num_contexts == 0:
+            rank = self.mapping.rank if self.mapping is not None else -1
+            total_q = int(self.seq_lens_kv[:self.num_seqs].sum().item())
+            owned_counts = (self._helix_owned_token_counts() if
+                            (self.is_spec_decoding_enabled
+                             and self.helix_is_inactive_rank_cpu is not None)
+                            else None)
+            print(f"[TrtllmAttentionMetadata::prepare][rank={rank}] is_spec_decoding_enabled: {self.is_spec_decoding_enabled}, use_spec_decoding: {self.use_spec_decoding}")
+            print(f"[TrtllmAttentionMetadata::prepare][rank={rank}] num_seqs: {self.num_seqs}, num_contexts: {self.num_contexts}, num_extra_kv_tokens: {self.kv_cache_params.num_extra_kv_tokens}")
+            print(f"[TrtllmAttentionMetadata::prepare][rank={rank}] seq_lens_kv: {self.seq_lens_kv[:self.num_seqs]}")
+            print(f"[TrtllmAttentionMetadata::prepare][rank={rank}] cached_token_lens: {cached_token_lens}")
+            print(f"[TrtllmAttentionMetadata::prepare][rank={rank}] helix_owned_token_counts: {owned_counts}")
+            print(f"[TrtllmAttentionMetadata::prepare][rank={rank}] helix_is_inactive_rank_cpu: {self.helix_is_inactive_rank_cpu[:total_q] if self.helix_is_inactive_rank_cpu is not None else None}")
+            print(f"[TrtllmAttentionMetadata::prepare][rank={rank}] final kv_lens: {kv_lens[:self.num_seqs]}, kv_lens (with extra): {self.kv_lens[:self.num_seqs]}")
         # total kv lens for context requests and generation requests, without extra tokens
         self.host_total_kv_lens[0] = kv_lens[:self.num_contexts].sum().item()
         self.host_total_kv_lens[1] = kv_lens[self.num_contexts:self.

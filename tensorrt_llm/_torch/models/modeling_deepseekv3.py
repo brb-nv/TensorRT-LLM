@@ -1265,8 +1265,10 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                 reduce_output=needs_tp_reduce or needs_cp_reduce)
 
         self.fusion_config = EagerFusionConfig()
-        self.enable_fusion = os.environ.get(
-            "TRTLLM_DEEPSEEK_EAGER_FUSION_DISABLED", "0") == "0"
+        # NOTE: DEBUGGING: FORCE DISABLE FUSION.
+        ## self.enable_fusion = os.environ.get(
+        ##     "TRTLLM_DEEPSEEK_EAGER_FUSION_DISABLED", "0") == "0"
+        self.enable_fusion = False
         self.enable_fusion &= not self.enable_attention_dp
 
         # FIXME: incompatible with mixed quantization mode
@@ -1412,6 +1414,11 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
+
+        is_gen_side = attn_metadata.num_contexts == 0
+        if is_gen_side:
+            print(f"[DeepseekV3DecoderLayer::forward][rank={self.mapping.rank}][layer={self.layer_idx}] BEFORE ATTENTION: hidden_states.shape: {hidden_states.shape}, hidden_states: {hidden_states}")
+
         # Self Attention
         hidden_states = self.self_attn(
             position_ids=position_ids,
@@ -1421,6 +1428,10 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                 enable_allreduce=not (self.disable_attn_allreduce)),
             **kwargs,
         )
+
+        if is_gen_side:
+            print(f"[DeepseekV3DecoderLayer::forward][rank={self.mapping.rank}][layer={self.layer_idx}] AFTER ATTENTION: hidden_states.shape: {hidden_states.shape}, hidden_states: {hidden_states}")
+
         residual = maybe_slice_for_helix_cp(residual, attn_metadata,
                                             self.mapping_with_cp,
                                             self.layer_idx)
@@ -1428,7 +1439,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
             if spec_metadata is not None and spec_metadata.is_layer_capture(
                     self.layer_idx):
                 self.fusion_config.POST_MOE_FUSION = False
-            return self.forward_MoE(
+            hidden_states, residual = self.forward_MoE(
                 hidden_states=hidden_states,
                 attn_metadata=attn_metadata,
                 residual=residual,
@@ -1439,11 +1450,16 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                     self.layer_idx):
                 self.fusion_config.POST_MLP_FUSION = False
             assert isinstance(self.mlp, GatedMLP)
-            return self.forward_mlp(
+            hidden_states, residual = self.forward_mlp(
                 hidden_states=hidden_states,
                 residual=residual,
                 spec_metadata=spec_metadata,
             )
+
+        if is_gen_side:
+            print(f"[DeepseekV3DecoderLayer::forward][rank={self.mapping.rank}][layer={self.layer_idx}] AFTER MLP: hidden_states.shape: {hidden_states.shape}, hidden_states: {hidden_states}")
+
+        return hidden_states, residual
 
     def forward_MoE(
         self,
@@ -1480,6 +1496,8 @@ class DeepseekV3DecoderLayer(DecoderLayer):
             # No fusion
             hidden_states, residual = self.post_attention_layernorm(
                 hidden_states, residual)
+            if attn_metadata.num_contexts == 0:
+                print(f"[DeepseekV3DecoderLayer::forward_MoE][rank={self.mapping.rank}][layer={self.layer_idx}] BEFORE MLP: hidden_states.shape: {hidden_states.shape}, hidden_states: {hidden_states}")
 
         # Note: this fusion pattern is only supported for single-node TRTLLM-nvfp4 backend now
         do_finalize = self.mapping.is_multi_node() or (
@@ -1558,6 +1576,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
             # We need to add twoshot allreduce here to avoid modifying MLA logic
             hidden_states, residual = self.post_attention_layernorm(
                 hidden_states, residual)
+            print(f"[DeepseekV3DecoderLayer::forward_mlp][rank={self.mapping.rank}][layer={self.layer_idx}] BEFORE MLP: hidden_states.shape: {hidden_states.shape}, hidden_states: {hidden_states}")
 
         hidden_states = self.mlp(
             hidden_states,
@@ -1698,6 +1717,10 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
 
+        is_gen_side = attn_metadata.num_contexts == 0
+        if is_gen_side:
+            print(f"[DeepseekV3MTP::forward][rank={self.mapping.rank}] BEFORE ATTENTION: hidden_states.shape: {hidden_states.shape}, hidden_states: {hidden_states}")
+
         # Self Attention
         hidden_states = self.self_attn(
             position_ids=position_ids,
@@ -1707,6 +1730,9 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
                 enable_allreduce=not (self.disable_attn_allreduce)),
             **kwargs,
         )
+
+        if is_gen_side:
+            print(f"[DeepseekV3MTP::forward][rank={self.mapping.rank}] AFTER ATTENTION: hidden_states.shape: {hidden_states.shape}, hidden_states: {hidden_states}")
 
         # MTP Layer Must have sparse MOE
         if self.fusion_config.PRE_MOE_FUSION:
@@ -1723,6 +1749,9 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
             hidden_states, residual = self.post_attention_layernorm(
                 hidden_states, residual)
 
+        if is_gen_side:
+            print(f"[DeepseekV3MTP::forward][rank={self.mapping.rank}] BEFORE MLP: hidden_states.shape: {hidden_states.shape}, hidden_states: {hidden_states}")
+
         # MoE
         hidden_states = self.mlp(
             hidden_states,
@@ -1731,6 +1760,9 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
                 enable_allreduce=not (self.fusion_config.POST_MOE_FUSION
                                       or self.mapping.tp_size == 1)),
         )
+
+        if is_gen_side:
+            print(f"[DeepseekV3MTP::forward][rank={self.mapping.rank}] AFTER MLP: hidden_states.shape: {hidden_states.shape}, hidden_states: {hidden_states}")
 
         if self.fusion_config.POST_MOE_FUSION:
             hidden_states, residual = self.allreduce(
@@ -1745,6 +1777,9 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
         else:
             hidden_states, _ = self.shared_head.norm(hidden_states, residual)
 
+        if is_gen_side:
+            print(f"[DeepseekV3MTP::forward][rank={self.mapping.rank}] AFTER FINAL NORM: hidden_states.shape: {hidden_states.shape}, hidden_states: {hidden_states}")
+
         # It's for 2-model path, capture the hidden states
         if spec_metadata is not None:
             spec_metadata.maybe_capture_hidden_states(0, hidden_states, None)
@@ -1758,6 +1793,7 @@ class DeepseekV3Model(DecoderModel):
                  model_config: ModelConfig[PretrainedConfig],
                  mapping_with_cp: Optional[Mapping] = None):
         super().__init__(model_config)
+        self.rank = model_config.mapping.rank
         config = model_config.pretrained_config
         self.vocab_size = config.vocab_size
         self.num_hidden_layers = config.num_hidden_layers
@@ -1797,6 +1833,8 @@ class DeepseekV3Model(DecoderModel):
         spec_metadata: Optional[SpecMetadata] = None,
         **kwargs,
     ) -> torch.Tensor:
+
+        is_gen_side = attn_metadata.num_contexts == 0
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError(
                 "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
@@ -1808,8 +1846,18 @@ class DeepseekV3Model(DecoderModel):
         hidden_states = inputs_embeds
         residual = None
 
+        if is_gen_side:
+            print(f"[DeepseekV3Model::forward][rank={self.rank}] input_ids: {input_ids}")
+            print(f"[DeepseekV3Model::forward][rank={self.rank}] position_ids: {position_ids}")
+            print(f"[DeepseekV3Model::forward][rank={self.rank}] enable_helix: {getattr(attn_metadata, 'enable_helix', None)}")
+            print(f"[DeepseekV3Model::forward][rank={self.rank}] helix_position_offsets: {getattr(attn_metadata, 'helix_position_offsets', None)}")
+            print(f"[DeepseekV3Model::forward][rank={self.rank}] helix_is_inactive_rank: {getattr(attn_metadata, 'helix_is_inactive_rank', None)}")
+            print(f"[DeepseekV3Model::forward][rank={self.rank}] helix_total_input_len: {getattr(attn_metadata, 'helix_total_input_len', None)}")
+
+        # NOTE: DEBUGGING: ONLY PROCESS THE FIRST LAYER.
+        num_debug_layers = 1
         for idx, decoder_layer in enumerate(
-                self.layers[:self.num_hidden_layers]):
+                self.layers[:num_debug_layers]):
             hidden_states, residual = decoder_layer(
                 position_ids=position_ids,
                 hidden_states=hidden_states,
@@ -1901,6 +1949,7 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
                                         ckpt_prefix, model_prefix))
                     self.model_config.quant_config.exclude_modules.extend(
                         extend_exclude_modules)
+            # @B: Verify where these layers are built and that they are helix aware.
             self.model.layers.extend(self.draft_model.mtp_layers)
 
         # Undo any manipulations done to mapping.

@@ -3946,6 +3946,8 @@ class PyTorchModelEngine(ModelEngine):
             spec_metadata.prepare()
             inputs['spec_metadata'] = spec_metadata
 
+            print(f"[model_engine::_prepare_tp_inputs][rank={self.mapping.rank}] spec_metadata: {spec_metadata}")
+
             if self.enable_attention_dp:
                 all_rank_num_tokens = self.dist.tp_cp_allgather(
                     [spec_metadata.num_tokens,
@@ -3955,6 +3957,7 @@ class PyTorchModelEngine(ModelEngine):
                     [item[1] for item in all_rank_num_tokens])
 
         if mm_token_indices is not None:
+            assert False, "mm_token_indices is irrelevant to us."
             mask = torch.ones(total_num_tokens, dtype=torch.bool)
             mask[mm_token_indices] = False
             mm_idx = maybe_pin_memory(mm_token_indices)
