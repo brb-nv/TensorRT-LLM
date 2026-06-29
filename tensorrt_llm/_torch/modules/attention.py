@@ -1,3 +1,4 @@
+import contextlib
 import functools
 import math
 import os
@@ -1650,13 +1651,25 @@ class MLA(nn.Module):
                                         device=q.device,
                                         dtype=torch.float32)
             kwargs["softmax_stats_tensor"] = softmax_stats
-            partial_o = attn_backend.forward(
-                q,
-                k,
-                v,
-                attn_metadata,
-                forward_args=AttentionForwardArgs(**kwargs),
-            )
+            # Helix MTP verify: present the generation read as one q_len==1
+            # request per query row so the trtllm-gen causal slope vanishes and
+            # each row attends its exact KV bound (helix_mtp_attended_len.md §6).
+            # No-op (yields None) for plain decode / non-helix.
+            flatten_ctx = getattr(attn_metadata, "helix_flattened_generation",
+                                  None)
+            with (flatten_ctx() if flatten_ctx is not None else
+                  contextlib.nullcontext((None, None))) as (flat_cu_q,
+                                                            flat_cu_kv):
+                if flat_cu_q is not None:
+                    kwargs["cu_q_seqlens"] = flat_cu_q
+                    kwargs["cu_kv_seqlens"] = flat_cu_kv
+                partial_o = attn_backend.forward(
+                    q,
+                    k,
+                    v,
+                    attn_metadata,
+                    forward_args=AttentionForwardArgs(**kwargs),
+                )
             kv_lora_rank = partial_o.shape[-1] // self.num_heads_tp
             assert self.kv_lora_rank == kv_lora_rank
 

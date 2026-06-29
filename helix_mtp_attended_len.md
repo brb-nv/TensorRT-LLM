@@ -348,6 +348,13 @@ semantics Helix needs, and generalizes to longer draft lengths and
 mixed-ownership q-blocks. Approach B is a reasonable fallback if enabling the
 custom-mask path for non-tree generation proves too invasive.
 
+> **Superseded — see §6 for the direction we actually chose.** Approach A turned
+> out to require editing trtllm-gen host/kernel-selection code (un-gating the
+> custom-mask path in `fmhaKernels.h`, plumbing `tllmRunnerParams`, a C++ mask
+> builder). **trtllm-gen kernel changes are a no-go** for this work, which also
+> rules out Approach C (cubin regeneration). That leaves a Python-only refinement
+> of Approach B as the chosen direction.
+
 ### 5.5 Open questions to resolve before implementing
 
 1. Confirm the `Custom`-mask MLA-gen cubins are selected/available for the target
@@ -362,6 +369,131 @@ custom-mask path for non-tree generation proves too invasive.
    trace (after `SpecDecOneEngineForCausalLM`) shows the identical inactive-rank
    shrink, so whatever path is chosen must cover both the target verify and the
    MTP-layer attention.
+
+---
+
+## 6. Final direction (chosen): flatten helix verify into per-row single-token decodes
+
+Constraint: **no trtllm-gen kernel changes** (rules out Approaches A and C). The
+chosen fix is a Python-only generalization of Approach B that realizes the §2.1
+rule directly, in a single kernel launch, for *every* ownership pattern.
+
+### 6.1 The idea
+
+The entire defect (§2.2) is the kernel's intrinsic `+1`-per-row causal slope,
+applied from a single per-request scalar `seqLensKv` while in the
+`mIsCausalSpecDecodingGen` multi-token mode (`mMaxSeqLenQ > 1`). So **don't use
+that mode** for the helix generation attention: present each query row as its own
+`q_len = 1` decode "request" (`mMaxSeqLenQ = 1`), and give each row the exact
+§2.1 bound as its per-request scalar:
+
+```
+seqLensKv(r) = cached + owned_count(r)
+```
+
+With `mMaxSeqLenQ = 1` the slope term `(mMaxSeqLenQ - 1 - r)` is identically `0`,
+so the per-request scalar *is* the per-row bound. The kernel reads
+`kv[0 : cached + owned_count(r)]`, which is exactly the slope-free read §2.1
+prescribes: the full cached prefix `[0, cached)` plus precisely the owned
+new-token slots with `j ≤ r`. No slope means no tail mis-reservation, and trtllm-gen
+needs no change (the path simply doesn't enter `mIsCausalSpecDecodingGen`, which
+is gated on `mMaxSeqLenQ > 1`; `is_spec_decoding_enabled` is already forced
+`False` here anyway).
+
+### 6.2 Why this is correct for *all* ranks (not just inactive)
+
+`owned_count(r)` is the within-sequence prefix-sum of `~helix_is_inactive_rank`:
+
+- **inactive rank** → `cached + 0` for every row (fixes Examples 1–2).
+- **active owns-all** → `cached + (r + 1)`, **bit-identical** to today's correct
+  active-rank result `(cached + q_len) - (q_len - 1 - r)` (Example 3) — strict
+  generalization, active rank unchanged.
+- **straddle / lower-prefix** → also exactly correct (fixes Example 4, which
+  Approach-B-as-originally-written, scoped to "fully-inactive ranks only", does
+  **not** cover).
+
+### 6.3 Why it beats B-as-written and resolves the §5.5 open questions
+
+- **CUDA-graph friendly (§5.5.3):** the flattened row count is
+  `num_seqs × (draft_len + 1)` — static for a captured graph, unlike B's
+  data-dependent variable launch count. One launch, not `q_len` launches.
+- **Combine is already per-row:** `_helix_post_process` consumes
+  `partial_o [num_tokens, …]` and `softmax_stats [num_tokens, num_heads, 2]` —
+  exactly the per-row outputs the flattened batch produces. No combine rework.
+- **Covers the MTP layer (§5.5.4):** both the target-verify and the MTP-layer
+  `[mlaGenKernel]` blocks run through the same helix generation path, so
+  flattening fixes both.
+- **Per-row ownership (§5.5.2):** comes straight from the per-token
+  `helix_is_inactive_rank` flags via the segmented prefix-sum, including the
+  straddle case.
+
+### 6.4 Implementation plan (all in the Python MLA/Helix path)
+
+1. In `TrtllmAttentionMetadata.prepare()` (helix + spec-dec branch), build a
+   **per-query-row** kv-length vector `cached + cumsum(~helix_is_inactive_rank)`
+   segmented by sequence, instead of the current per-sequence
+   `cached + owned_total`.
+2. Reshape the helix generation attention call so each query row is a `q_len = 1`
+   request: `mMaxSeqLenQ = 1`, per-row `seqLensKv`, and KV block offsets
+   replicated per row of the same sequence (they share the same physical blocks).
+3. Keep the RoPE + KV-write step (`helixKvWriteSlot`,
+   `applyMLARopeAndAssignQKVKernelGeneration`) on the un-flattened owned-token
+   representation so owned tokens still land contiguously at the KV tail in row
+   order — the flattened read side then sees exactly the owned tokens `j ≤ r`.
+4. Remove the temporary debug `print`s in `prepare()` / `_attn_forward_gen()`.
+
+### 6.5 Validation
+
+- `draft_len = 1` **and** `draft_len ≥ 2`, plus a deliberate
+  `tokens_per_block`-straddle case to exercise the lower-prefix path.
+- Per-row `softmax_stats` / `partial_o` / `AFTER ATTENTION` / logits / end-to-end
+  token must match `MTP=0`; active-rank rows must stay bit-identical.
+
+### 6.6 Implementation notes (as landed)
+
+Implemented purely on the Python read path; no C++ / cubin changes.
+
+- `tensorrt_llm/_torch/attention_backend/trtllm.py`
+  - `_maybe_prepare_helix_flatten()` (called from `prepare()`): builds the
+    flattened per-query-row tensors into CUDA-graph-static buffers. The per-row
+    KV bound is `repeat_interleave(cached, q_len) + owned_count(r)`, where
+    `owned_count(r)` is the within-sequence inclusive prefix-sum of
+    `~helix_is_inactive_rank`. Gated on `enable_helix and num_contexts == 0 and
+    helix_is_inactive_rank_cpu is not None and total_q > num_seqs`. Note it does
+    **not** gate on `is_spec_decoding_enabled`: `update_spec_dec_param` forces
+    that False on the trtllm-gen kernel for linear MTP, so the verify flows
+    through the per-sequence kv_lens branch. The robust discriminator for "a
+    multi-token verify exposed to the slope bug" is simply `total_q > num_seqs`
+    (more query rows than sequences); plain `q_len == 1` decode is left untouched
+    since its slope term is already zero. **Ordering matters:** the call runs
+    *after* `copy_batch_block_offsets()` so the per-row block-table replication
+    reads this step's `kv_cache_block_offsets`, not a stale/zero buffer (reading
+    it too early produced all-zero K/V → `softmax_stats = [0, kv_len]` and
+    `partial_o = 0`).
+  - `helix_flattened_generation()` context manager: swaps the per-request
+    runtime fields the trtllm-gen MLA-gen FMHA consumes — `kv_lens_*_runtime`,
+    `prompt_lens_*_runtime` (this sets C++ `num_seqs =
+    host_context_lengths.size(0)`, hence `mMaxSeqLenQ == 1`),
+    `host_request_types_runtime`, `host_total_kv_lens`, `kv_cache_block_offsets`
+    (block table replicated per query row), and `max_num_requests` — then
+    restores them. Yields flattened `cu_q_seqlens` (`[0..total_q]`) and
+    `cu_kv_seqlens` (exclusive prefix sum of the per-row KV lengths), both of
+    which the C++ op size-checks against `num_seqs + 1`.
+- `tensorrt_llm/_torch/modules/attention.py` `_attn_forward_gen()`: wraps the
+  generation `attn_backend.forward` in `helix_flattened_generation()` and routes
+  the flattened `cu_q_seqlens` / `cu_kv_seqlens` through `kwargs`. The KV write
+  (`mla_rope_generation`) runs earlier and is unaffected.
+- Removed the temporary debug prints in `prepare()` and `_attn_forward_gen()`.
+  The model-level `BEFORE/AFTER ATTENTION` etc. prints are left in place for the
+  §6.5 validation pass.
+
+**Caveat to verify on hardware:** the flatten presents `total_q` generation
+"requests", so it bumps `max_num_requests` for the call. The C++ op sizes its
+semaphore / workspace arrays from `max_num_requests`; the eager warmup forward
+must therefore exercise this path at the padded batch so the workspace is large
+enough *before* CUDA-graph capture (capture cannot `resize_` the workspace). If
+graph capture complains about workspace size, pre-size `effective_workspace`
+for `max_num_tokens` requests.
 
 ---
 

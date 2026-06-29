@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
 import functools
 import math
 import os
@@ -456,6 +457,81 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 pin_memory=prefer_pinned(),
             )
 
+            # Helix MTP verify: flattened per-query-row generation view.
+            #
+            # Under Helix CP + multi-token speculative verify the trtllm-gen
+            # MLA-gen kernel derives each query row's effective KV length from a
+            # single per-request scalar plus an intrinsic +1-per-row causal
+            # slope (mMaxSeqLenQ > 1). That slope is only correct when a rank
+            # owns the contiguous bottom rows of the block; it is wrong for
+            # inactive ranks (own none) and straddle ranks (own a lower prefix).
+            # To kill the slope without touching trtllm-gen, the generation
+            # attention *read* is presented as one q_len==1 "request" per query
+            # row (mMaxSeqLenQ == 1), each carrying its exact KV bound
+            # ``cached + owned_count(r)``. See helix_mtp_attended_len.md §6.
+            # These static buffers hold that flattened view so it stays
+            # CUDA-graph capturable. The KV *write* (``mla_rope_generation``)
+            # still runs on the un-flattened per-sequence layout earlier in the
+            # forward, so only the read is reshaped here.
+            self._helix_gen_flatten_active = False
+            self._helix_flat_total_q = 0
+            self._helix_flat_kv_lens_cuda = self.get_empty(
+                buffers,
+                (self.max_num_tokens, ),
+                cache_name="helix_flat_kv_lens_cuda",
+                dtype=torch.int,
+                capture_graph=capture_graph,
+            )
+            self._helix_flat_kv_lens_cpu = torch.empty_like(
+                self._helix_flat_kv_lens_cuda,
+                device='cpu',
+                pin_memory=prefer_pinned(),
+            )
+            self._helix_flat_prompt_lens_cuda = self.get_empty(
+                buffers,
+                (self.max_num_tokens, ),
+                cache_name="helix_flat_prompt_lens_cuda",
+                dtype=torch.int,
+                capture_graph=capture_graph,
+            )
+            self._helix_flat_prompt_lens_cpu = torch.empty_like(
+                self._helix_flat_prompt_lens_cuda,
+                device='cpu',
+                pin_memory=prefer_pinned(),
+            )
+            self._helix_flat_request_types_cpu = torch.empty_like(
+                self._helix_flat_prompt_lens_cpu)
+            self._helix_flat_cu_q_seqlens = self.get_empty(
+                buffers,
+                (self.max_num_tokens + 1, ),
+                cache_name="helix_flat_cu_q_seqlens",
+                dtype=torch.int,
+                capture_graph=capture_graph,
+            )
+            self._helix_flat_cu_kv_seqlens = self.get_empty(
+                buffers,
+                (self.max_num_tokens + 1, ),
+                cache_name="helix_flat_cu_kv_seqlens",
+                dtype=torch.int,
+                capture_graph=capture_graph,
+            )
+            self._helix_flat_host_total_kv_lens = torch.empty(2,
+                                                              device='cpu',
+                                                              dtype=torch.int)
+            if self.kv_cache_manager is not None:
+                self._helix_flat_block_offsets = self.get_empty(
+                    buffers,
+                    [
+                        self.kv_cache_manager.num_pools, self.max_num_tokens, 2,
+                        self.kv_cache_manager.max_blocks_per_seq
+                    ],
+                    cache_name="helix_flat_block_offsets",
+                    dtype=torch.int32,
+                    capture_graph=capture_graph,
+                )
+            else:
+                self._helix_flat_block_offsets = None
+
     def on_update_kv_lens(self):
         # After changing the kv_lens/kv_lens_cuda, we may need to update other metadata.
         # Especially for the changes in the _preprocess_inputs() of model_engine.py.
@@ -488,6 +564,149 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         owned = torch.zeros(self.num_seqs, dtype=torch.int)
         owned.scatter_add_(0, seg_ids, active)
         return owned
+
+    def _maybe_prepare_helix_flatten(self, cached_token_lens: torch.Tensor,
+                                     kv_lens: torch.Tensor) -> None:
+        """Populate the flattened per-query-row generation view for Helix MTP.
+
+        Implements the §6 rule of ``helix_mtp_attended_len.md``: present the
+        generation attention read as one ``q_len == 1`` request per query row so
+        the trtllm-gen causal slope vanishes, and give each row its exact KV
+        bound ``cached + owned_count(r)`` where ``owned_count(r)`` is the
+        within-sequence inclusive count of query rows this CP rank owns. This is
+        correct for inactive, active-owns-all, and straddle ranks alike.
+
+        Only triggers for a pure-generation batch (``num_contexts == 0``, the
+        Helix decode phase) running a multi-token verify (``total_q >
+        num_seqs``); otherwise leaves ``_helix_gen_flatten_active`` False so the
+        normal path is used.
+
+        Note: we deliberately do NOT gate on ``is_spec_decoding_enabled`` --
+        ``update_spec_dec_param`` forces it False on the trtllm-gen kernel for
+        linear MTP, so the verify actually flows through the per-sequence kv_lens
+        branch. The robust signal that this is a multi-token verify (and thus
+        exposed to the per-row causal-slope bug) is simply more query rows than
+        sequences, with per-query-token ownership flags available.
+        """
+        self._helix_gen_flatten_active = False
+        if not (self.enable_helix and self.num_contexts == 0
+                and self.helix_is_inactive_rank_cpu is not None):
+            return
+        num_seqs = self.num_seqs
+        if num_seqs == 0:
+            return
+        seg_lens = self.seq_lens_kv[:num_seqs].to(torch.int64)
+        total_q = int(seg_lens.sum().item())
+        # Plain decode (one query row per sequence) needs no flattening: with
+        # q_len == 1 the kernel's +1-per-row slope term is already zero. This
+        # also guarantees the inactive-rank flags below are the per-token verify
+        # layout (length total_q), not the per-sequence decode layout.
+        if total_q <= num_seqs:
+            return
+
+        inactive = self.helix_is_inactive_rank_cpu[:total_q]
+        active_int = (~inactive).to(torch.int64)
+        # owned_count(r), inclusive within each sequence segment:
+        #   csum(active) - (owned tokens in all earlier segments).
+        per_seg_owned = self._helix_owned_token_counts().to(torch.int64)
+        prev_seg_owned = torch.zeros(num_seqs, dtype=torch.int64)
+        if num_seqs > 1:
+            prev_seg_owned[1:] = torch.cumsum(per_seg_owned, 0)[:-1]
+        base_per_token = torch.repeat_interleave(prev_seg_owned, seg_lens)
+        owned_incl = torch.cumsum(active_int, 0) - base_per_token
+
+        cached64 = cached_token_lens[:num_seqs].to(torch.int64)
+        # Per-row KV read bound (no extra tokens, matching kv_lens_cuda_runtime).
+        flat_kv = (torch.repeat_interleave(cached64, seg_lens) +
+                   owned_incl).to(torch.int)
+        flat_prompt = torch.repeat_interleave(self.prompt_lens_cpu[:num_seqs],
+                                              seg_lens).to(torch.int)
+
+        self._helix_flat_kv_lens_cpu[:total_q].copy_(flat_kv)
+        self._helix_flat_kv_lens_cuda[:total_q].copy_(
+            self._helix_flat_kv_lens_cpu[:total_q], non_blocking=True)
+        self._helix_flat_prompt_lens_cpu[:total_q].copy_(flat_prompt)
+        self._helix_flat_prompt_lens_cuda[:total_q].copy_(
+            self._helix_flat_prompt_lens_cpu[:total_q], non_blocking=True)
+        # Every flattened request is a generation request (RequestType 1).
+        self._helix_flat_request_types_cpu[:total_q].fill_(1)
+
+        # q_len == 1 per request -> cu_q_seqlens = [0, 1, 2, ..., total_q].
+        q_offsets = torch.arange(total_q + 1, dtype=torch.int)
+        self._helix_flat_cu_q_seqlens[:total_q + 1].copy_(q_offsets,
+                                                          non_blocking=True)
+        # Exclusive prefix sum of the per-row KV lengths (seqKVOffset layout).
+        kv_offsets = torch.zeros(total_q + 1, dtype=torch.int)
+        kv_offsets[1:] = torch.cumsum(flat_kv, 0)
+        self._helix_flat_cu_kv_seqlens[:total_q + 1].copy_(kv_offsets,
+                                                           non_blocking=True)
+
+        self._helix_flat_host_total_kv_lens[0] = 0
+        self._helix_flat_host_total_kv_lens[1] = int(flat_kv.sum().item())
+
+        # Replicate each sequence's KV block table across its query rows; the
+        # rows share the same physical KV blocks.
+        if (self._helix_flat_block_offsets is not None
+                and self.kv_cache_block_offsets is not None):
+            src = self.kv_cache_block_offsets[:, :num_seqs]
+            rep = torch.repeat_interleave(src, seg_lens.to(src.device), dim=1)
+            self._helix_flat_block_offsets[:, :total_q].copy_(rep,
+                                                              non_blocking=True)
+
+        self._helix_flat_total_q = total_q
+        self._helix_gen_flatten_active = True
+
+    @contextlib.contextmanager
+    def helix_flattened_generation(self):
+        """Temporarily swap the generation attention metadata to the flattened
+        per-query-row view (Helix MTP verify, see §6 of
+        ``helix_mtp_attended_len.md``).
+
+        Yields ``(cu_q_seqlens, cu_kv_seqlens)`` for the flattened layout, or
+        ``(None, None)`` when flattening is inactive. The swap targets exactly
+        the per-request fields the trtllm-gen MLA generation FMHA consumes
+        (``fmha/fallback.py`` -> ``thop.attention`` -> ``AttentionOp``):
+        ``num_seqs`` is derived in C++ from ``host_context_lengths.size(0)`` (=
+        ``prompt_lens_cpu_runtime``), so presenting ``total_q`` rows makes
+        ``mMaxSeqLenQ == 1``. The KV write already ran un-flattened, so this only
+        reshapes the read.
+        """
+        if not getattr(self, "_helix_gen_flatten_active", False):
+            yield None, None
+            return
+        n = self._helix_flat_total_q
+        saved = {
+            "kv_lens_cuda_runtime": self.kv_lens_cuda_runtime,
+            "kv_lens_runtime": self.kv_lens_runtime,
+            "prompt_lens_cuda_runtime": self.prompt_lens_cuda_runtime,
+            "prompt_lens_cpu_runtime": self.prompt_lens_cpu_runtime,
+            "host_request_types_runtime": self.host_request_types_runtime,
+            "kv_cache_block_offsets": self.kv_cache_block_offsets,
+            "max_num_requests": self.max_num_requests,
+        }
+        saved_total_kv = (int(self.host_total_kv_lens[0]),
+                          int(self.host_total_kv_lens[1]))
+
+        self.kv_lens_cuda_runtime = self._helix_flat_kv_lens_cuda[:n]
+        self.kv_lens_runtime = self._helix_flat_kv_lens_cpu[:n]
+        self.prompt_lens_cuda_runtime = self._helix_flat_prompt_lens_cuda[:n]
+        self.prompt_lens_cpu_runtime = self._helix_flat_prompt_lens_cpu[:n]
+        self.host_request_types_runtime = self._helix_flat_request_types_cpu[:n]
+        self.host_total_kv_lens[0] = self._helix_flat_host_total_kv_lens[0]
+        self.host_total_kv_lens[1] = self._helix_flat_host_total_kv_lens[1]
+        if self._helix_flat_block_offsets is not None:
+            self.kv_cache_block_offsets = self._helix_flat_block_offsets[:, :n]
+        # The C++ op sizes its semaphore / workspace arrays from
+        # max_num_requests; the flattened batch has total_q "requests".
+        self.max_num_requests = max(self.max_num_requests, n)
+        try:
+            yield (self._helix_flat_cu_q_seqlens[:n + 1],
+                   self._helix_flat_cu_kv_seqlens[:n + 1])
+        finally:
+            for key, value in saved.items():
+                setattr(self, key, value)
+            self.host_total_kv_lens[0] = saved_total_kv[0]
+            self.host_total_kv_lens[1] = saved_total_kv[1]
 
     def update_helix_param(
         self,
@@ -594,20 +813,6 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             kv_lens[:self.num_seqs]),
                                                 non_blocking=True)
 
-        if self.enable_helix and self.num_contexts == 0:
-            rank = self.mapping.rank if self.mapping is not None else -1
-            total_q = int(self.seq_lens_kv[:self.num_seqs].sum().item())
-            owned_counts = (self._helix_owned_token_counts() if
-                            (self.is_spec_decoding_enabled
-                             and self.helix_is_inactive_rank_cpu is not None)
-                            else None)
-            print(f"[TrtllmAttentionMetadata::prepare][rank={rank}] is_spec_decoding_enabled: {self.is_spec_decoding_enabled}, use_spec_decoding: {self.use_spec_decoding}")
-            print(f"[TrtllmAttentionMetadata::prepare][rank={rank}] num_seqs: {self.num_seqs}, num_contexts: {self.num_contexts}, num_extra_kv_tokens: {self.kv_cache_params.num_extra_kv_tokens}")
-            print(f"[TrtllmAttentionMetadata::prepare][rank={rank}] seq_lens_kv: {self.seq_lens_kv[:self.num_seqs]}")
-            print(f"[TrtllmAttentionMetadata::prepare][rank={rank}] cached_token_lens: {cached_token_lens}")
-            print(f"[TrtllmAttentionMetadata::prepare][rank={rank}] helix_owned_token_counts: {owned_counts}")
-            print(f"[TrtllmAttentionMetadata::prepare][rank={rank}] helix_is_inactive_rank_cpu: {self.helix_is_inactive_rank_cpu[:total_q] if self.helix_is_inactive_rank_cpu is not None else None}")
-            print(f"[TrtllmAttentionMetadata::prepare][rank={rank}] final kv_lens: {kv_lens[:self.num_seqs]}, kv_lens (with extra): {self.kv_lens[:self.num_seqs]}")
         # total kv lens for context requests and generation requests, without extra tokens
         self.host_total_kv_lens[0] = kv_lens[:self.num_contexts].sum().item()
         self.host_total_kv_lens[1] = kv_lens[self.num_contexts:self.
@@ -640,6 +845,30 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 self.draft_kv_cache_manager.copy_batch_block_offsets(
                     self.draft_kv_cache_block_offsets, self.request_ids,
                     self.beam_width, self.num_contexts, self.num_seqs)
+
+        # Helix MTP verify: build the flattened per-query-row generation view
+        # (see helix_mtp_attended_len.md §6). Must run *after*
+        # copy_batch_block_offsets so the per-row block-table replication reads
+        # this step's block offsets, not a stale/zero buffer.
+        self._maybe_prepare_helix_flatten(cached_token_lens, kv_lens)
+
+        if self.enable_helix and self.num_contexts == 0:
+            rank = self.mapping.rank if self.mapping is not None else -1
+            total_q = int(self.seq_lens_kv[:self.num_seqs].sum().item())
+            owned_counts = (self._helix_owned_token_counts()
+                            if self.helix_is_inactive_rank_cpu is not None else
+                            None)
+            print(f"[TrtllmAttentionMetadata::prepare][rank={rank}] is_spec_decoding_enabled: {self.is_spec_decoding_enabled}, use_spec_decoding: {self.use_spec_decoding}")
+            print(f"[TrtllmAttentionMetadata::prepare][rank={rank}] num_seqs: {self.num_seqs}, num_contexts: {self.num_contexts}, num_extra_kv_tokens: {self.kv_cache_params.num_extra_kv_tokens}")
+            print(f"[TrtllmAttentionMetadata::prepare][rank={rank}] seq_lens_kv: {self.seq_lens_kv[:self.num_seqs]}")
+            print(f"[TrtllmAttentionMetadata::prepare][rank={rank}] cached_token_lens: {cached_token_lens}")
+            print(f"[TrtllmAttentionMetadata::prepare][rank={rank}] helix_owned_token_counts: {owned_counts}")
+            print(f"[TrtllmAttentionMetadata::prepare][rank={rank}] helix_is_inactive_rank_cpu: {self.helix_is_inactive_rank_cpu[:total_q] if self.helix_is_inactive_rank_cpu is not None else None}")
+            print(f"[TrtllmAttentionMetadata::prepare][rank={rank}] final kv_lens: {kv_lens[:self.num_seqs]}, kv_lens (with extra): {self.kv_lens[:self.num_seqs]}")
+            print(f"[TrtllmAttentionMetadata::prepare][rank={rank}] helix_gen_flatten_active: {self._helix_gen_flatten_active}, flat total_q: {self._helix_flat_total_q}")
+            if self._helix_gen_flatten_active:
+                n = self._helix_flat_total_q
+                print(f"[TrtllmAttentionMetadata::prepare][rank={rank}] flat kv_lens (per query row): {self._helix_flat_kv_lens_cpu[:n]}")
 
         self.kv_lens_cuda_runtime = self.kv_lens_cuda[:self.num_seqs]
         # Don't use self.kv_lens here because it includes extra tokens.
