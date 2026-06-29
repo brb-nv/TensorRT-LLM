@@ -702,6 +702,15 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         attn_metadata.helix_position_offsets[:batch_size].copy_(
             pos.to(torch.int32))
         attn_metadata.helix_is_inactive_rank[:batch_size].copy_(~owner)
+
+        # [helix_kv][DEBUG] draft-loop position/ownership (revert after debugging).
+        if attn_metadata.num_contexts == 0:
+            _rank = self.mapping.rank
+            print(
+                f"[helix_kv::draft_owner][rank={_rank}] "
+                f"pos={pos.tolist()} total_input_len={total_input_len.tolist()} "
+                f"decode_index={decode_index.tolist()} owner={owner.tolist()} "
+                f"tpb={tpb} cp_size={cp_size} cp_rank={cp_rank}")
         return owner
 
     # Skip torch.compile for now since current Torch is not compatible with Triton 3.4
@@ -946,6 +955,18 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                                                      spec_metadata,
                                                      batch_size,
                                                      draft_step=i)
+
+                is_gen_side = attn_metadata.num_contexts == 0
+                if is_gen_side:
+                    rank = self.model_config.mapping.rank if self.model_config is not None else -1
+                    top2_vals, top2_ids = torch.topk(
+                        logits.float(), k=min(2, logits.shape[-1]), dim=-1)
+                    top1_top2_margin = (top2_vals[..., 0] - top2_vals[..., 1]
+                                        if logits.shape[-1] > 1 else
+                                        top2_vals[..., 0])
+                    print(f"[Eagle3OneModelWorker::_forward_draft_loop][rank={rank}][draft_step={i}] draft logits.shape: {logits.shape}, top2 ids: {top2_ids}, top2 logits: {top2_vals}, top1-top2 margin: {top1_top2_margin}")
+                    print(f"[Eagle3OneModelWorker::_forward_draft_loop][rank={rank}][draft_step={i}] new_draft_token: {new_draft_token}")
+
                 next_draft_tokens.append(new_draft_token)
 
                 # Update hidden states for the next iteration.

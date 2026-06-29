@@ -4452,6 +4452,19 @@ class PyExecutor:
 
                 self._maybe_prepend_logprobs_and_logits(req, beam_width)
 
+                # [helix_kv][DEBUG] post-handoff starting state (revert after debugging).
+                print(
+                    f"[helix_kv::handoff][rank={self.model_engine.mapping.rank}] "
+                    f"req={req.py_request_id} "
+                    f"g={getattr(req, 'py_helix_global_decode_len', None)} "
+                    f"py_decoding_iter={req.py_decoding_iter} "
+                    f"prompt_len={req.prompt_len} py_prompt_len={req.py_prompt_len} "
+                    f"total_input_len_cp={getattr(req, 'total_input_len_cp', None)} "
+                    f"seqlen_this_rank_cp={getattr(req, 'seqlen_this_rank_cp', None)} "
+                    f"py_helix_context_seqlen_cp={getattr(req, 'py_helix_context_seqlen_cp', None)} "
+                    f"py_helix_local_past_seen={getattr(req, 'py_helix_local_past_seen', None)} "
+                    f"first_gen_tokens={first_gen_tokens} draft_tokens={req.py_draft_tokens}")
+
     def _update_sampler_state_for_disagg_gen_request(self, req, beam_width,
                                                      first_gen_tokens) -> bool:
         """Update beam sampler state with context-side first-token data."""

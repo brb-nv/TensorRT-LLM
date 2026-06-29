@@ -756,13 +756,29 @@ class KVCacheManager(BaseResourceManager):
         # slack. New decode-indices start at g; over-reservation is rewound later.
         reserve = max(draft_len, self._kv_reserve_draft_tokens)
         n_reserve = 1 + reserve
+        _dbg_owned = []
         for j in range(n_reserve):
             if self._helix_owns_decode_index(g + j):
                 self.impl.add_token(req.py_request_id)
+                _dbg_owned.append(g + j)
 
         # Used only by the plain-decode generation path (single new token at g).
         # The speculative verify path recomputes per-token ownership separately.
         req.py_helix_is_inactive_rank = not self._helix_owns_decode_index(g)
+
+        # [helix_kv][DEBUG] reservation trace (revert after debugging).
+        _rank = self.mapping.rank
+        print(
+            f"[helix_kv::reserve][rank={_rank}] req={req.py_request_id} "
+            f"g={g} draft_len={draft_len} reserve={reserve} n_reserve={n_reserve} "
+            f"decode_indices=[{g}..{g + n_reserve - 1}] owned_added={_dbg_owned} "
+            f"num_added={len(_dbg_owned)} local_past_seen={req.py_helix_local_past_seen} "
+            f"ctx_seqlen_cp={req.py_helix_context_seqlen_cp} "
+            f"total_input_len_cp={req.total_input_len_cp} "
+            f"is_inactive_rank={req.py_helix_is_inactive_rank} "
+            f"tpb={self.tokens_per_block} cp_size={self.mapping.cp_size} "
+            f"cp_rank={self.mapping.cp_rank} py_decoding_iter={req.py_decoding_iter} "
+            f"state={req.state}")
 
     def _helix_rewind_generation_kv(self, req: LlmRequest) -> None:
         """Rewind this rank's rejected and slack draft KV, then advance lengths.
@@ -778,16 +794,33 @@ class KVCacheManager(BaseResourceManager):
 
         # Total rewound tokens (rejected drafts plus reserve slack).
         rewind_count = reserve - accepted
+        _dbg_owned_rewind = 0
+        _dbg_rewind_start = g + 1 + accepted
         if rewind_count > 0:
             owned_rewind = self._helix_count_owned(g + 1 + accepted,
                                                    rewind_count)
+            _dbg_owned_rewind = owned_rewind
             if owned_rewind > 0:
                 self.rewind_kv_cache(req, owned_rewind)
 
         # Advance the committed decode length and recompute the per-rank KV length.
+        _dbg_g_before = g
         req.py_helix_global_decode_len = g + 1 + accepted
         req.seqlen_this_rank_cp = self._helix_rank_kv_len(
             req, req.py_helix_global_decode_len)
+
+        # [helix_kv][DEBUG] rollback / g-advance trace (revert after debugging).
+        _rank = self.mapping.rank
+        print(
+            f"[helix_kv::rewind][rank={_rank}] req={req.py_request_id} "
+            f"g_before={_dbg_g_before} accepted={accepted} "
+            f"py_rewind_len={req.py_rewind_len} runtime_draft_len={runtime_draft_len} "
+            f"reserve={reserve} rewind_count={rewind_count} "
+            f"rewind_decode_indices=[{_dbg_rewind_start}..{_dbg_rewind_start + rewind_count - 1}] "
+            f"owned_rewind(tokens removed this rank)={_dbg_owned_rewind} "
+            f"g_after={req.py_helix_global_decode_len} "
+            f"seqlen_this_rank_cp={req.seqlen_this_rank_cp} "
+            f"py_decoding_iter={req.py_decoding_iter} state={req.state}")
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
         # Cross/encoder K/V is allocated once and never grows; handle it on a
@@ -1048,6 +1081,19 @@ class KVCacheManager(BaseResourceManager):
             #   With overlap scheduler, the scheduler pauses a request and frees KV cache at iteration N,
             #   while the previous batch (N-1) is still trying to update the KV cache after forward pass.
             for request in scheduled_batch.generation_requests:
+                # [helix_kv][DEBUG] update_resources visit (revert after debugging).
+                if self.mapping.has_cp_helix() and not self.is_draft:
+                    _skip = request.state in (
+                        LlmRequestState.GENERATION_COMPLETE,
+                        LlmRequestState.CONTEXT_INIT)
+                    print(
+                        f"[helix_kv::update_resources][rank={self.mapping.rank}] "
+                        f"req={request.py_request_id} state={request.state} "
+                        f"py_decoding_iter={request.py_decoding_iter} "
+                        f"g={request.py_helix_global_decode_len} "
+                        f"py_rewind_len={request.py_rewind_len} "
+                        f"py_num_accepted_draft_tokens={request.py_num_accepted_draft_tokens} "
+                        f"will_advance_g={not _skip}")
                 if request.state in (LlmRequestState.GENERATION_COMPLETE,
                                      LlmRequestState.CONTEXT_INIT):
                     continue
@@ -1597,6 +1643,11 @@ class KVCacheManager(BaseResourceManager):
         return self.impl.get_iteration_stats()
 
     def rewind_kv_cache(self, request: LlmRequest, rewind_len: int):
+        # [helix_kv][DEBUG] low-level KV rollback trace (revert after debugging).
+        _rank = self.mapping.rank if self.mapping is not None else -1
+        print(
+            f"[helix_kv::rewind_kv_cache][rank={_rank}] req={request.py_request_id} "
+            f"rewind_len={rewind_len} is_draft={self.is_draft}")
         self.impl.rewind_kv_cache(request.py_request_id, rewind_len)
 
     def calculate_cache_size_per_token(self,

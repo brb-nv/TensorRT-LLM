@@ -432,8 +432,10 @@ def run_client_tests(example_dir,
             str(server_start_timeout)
         ]
         if prompt_file == "long_prompts.json":
-            # Use max_tokens 4 for long prompts to reduce test time
-            client_cmd.extend(['--max-tokens', '2'])
+            # Bumped for Helix-CP vs TP MTP debugging: run enough decode steps
+            # that a verify q-block crosses a tokens_per_block boundary (the
+            # straddle / mixed-ownership case). Revert to 16 once done.
+            client_cmd.extend(['--max-tokens', '64'])
 
         # Prepare poll processes
         worker_processes = []

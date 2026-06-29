@@ -2870,37 +2870,55 @@ class PyTorchModelEngine(ModelEngine):
         global_positions are the absolute positions of the 1 + num_draft query
         tokens, computed globally because each rank holds only a shard for RoPE.
         inactive_flags mark, per query token, whether this rank does not write its
-        KV; a draft at global decode-index d is owned by rank
-        (d // tokens_per_block) % cp_size, and the re-fed last-accepted token is
-        inactive on every rank (already cached, never re-written). num_active is
-        the count of query tokens this rank writes KV for, used to grow kv_lens.
+        KV; a query token at global decode-index d is owned by rank
+        (d // tokens_per_block) % cp_size. num_active is the count of query tokens
+        this rank writes KV for, used to grow kv_lens.
 
-        The verify forward re-feeds the last committed token at decode-index g - 1
-        followed by the draft tokens. On the first generation forward (g == 0)
-        there is no re-fed token and the single new token is at decode-index 0.
+        Decode-index bookkeeping: ``g`` (``py_helix_global_decode_len``) counts the
+        decode tokens whose KV is already committed on the gen ranks. The KV of the
+        most recent golden token is written only when that token is fed back in, so
+        ``g`` always lags the output count by one (output_count == g + 1) -- both
+        after the disagg handoff (first gen token written on its first re-feed) and
+        in steady state. The token re-fed this step is therefore the last output
+        token, at decode-index ``g`` (== output_count - 1), and the new query
+        tokens span decode-indices ``[g, g + num_draft]``, matching the reservation
+        side (``_helix_prepare_generation_kv`` reserves ``[g, g + reserve]``).
+
+        The re-fed token is always that last (still-unwritten) golden token, never
+        an already-cached accepted draft: in MTP one-model verify only a single
+        token is re-fed, while accepted drafts stay mid-sequence in KV and are not
+        re-fed. So it must be written this step and follows normal block-cyclic
+        ownership rather than being forced inactive. This holds for any acceptance
+        count; empirically validated so far on the accepted == 0 path.
         """
         cp_size = self.mapping.cp_size
         cp_rank = self.mapping.cp_rank
         g = request.py_helix_global_decode_len
         total_input_len = request.total_input_len_cp
-        is_refed = g > 0
-        first_decode_index = (g - 1) if is_refed else g
+        first_decode_index = g
         first_pos = total_input_len + first_decode_index
         global_positions = list(range(first_pos, first_pos + 1 + num_draft))
         inactive_flags = []
         num_active = 0
         for j in range(1 + num_draft):
-            if is_refed and j == 0:
-                # Re-fed last-accepted token: already cached on its owner rank,
-                # never re-written.
-                inactive_flags.append(True)
-                continue
-            # Newly written token: draft j (or the single new token when not refed).
+            # Every query token (including the re-fed token at decode-index g) is
+            # newly written this step by its owner rank under the block-cyclic
+            # ownership rule.
             decode_index = first_decode_index + j
             owned = (decode_index // tokens_per_block) % cp_size == cp_rank
             inactive_flags.append(not owned)
             if owned:
                 num_active += 1
+
+        # [helix_kv][DEBUG] verify position computation (revert after debugging).
+        print(
+            f"[helix_kv::verify_token_params][rank={self.mapping.rank}] "
+            f"req={request.py_request_id} g={g} total_input_len={total_input_len} "
+            f"first_decode_index={first_decode_index} "
+            f"first_pos={first_pos} num_draft={num_draft} "
+            f"global_positions={global_positions} inactive_flags={inactive_flags} "
+            f"num_active={num_active} py_decoding_iter={request.py_decoding_iter} "
+            f"tpb={tokens_per_block} cp_size={cp_size} cp_rank={cp_rank}")
         return global_positions, inactive_flags, num_active
 
     def _prepare_tp_inputs(

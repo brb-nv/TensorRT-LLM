@@ -1854,10 +1854,8 @@ class DeepseekV3Model(DecoderModel):
             print(f"[DeepseekV3Model::forward][rank={self.rank}] helix_is_inactive_rank: {getattr(attn_metadata, 'helix_is_inactive_rank', None)}")
             print(f"[DeepseekV3Model::forward][rank={self.rank}] helix_total_input_len: {getattr(attn_metadata, 'helix_total_input_len', None)}")
 
-        # NOTE: DEBUGGING: ONLY PROCESS THE FIRST LAYER.
-        num_debug_layers = 1
         for idx, decoder_layer in enumerate(
-                self.layers[:num_debug_layers]):
+                self.layers[:self.num_hidden_layers]):
             hidden_states, residual = decoder_layer(
                 position_ids=position_ids,
                 hidden_states=hidden_states,
