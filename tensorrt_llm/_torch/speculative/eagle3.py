@@ -987,6 +987,16 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                     attn_metadata._seq_lens[:batch_size].fill_(1)
                     attn_metadata._seq_lens_cuda[:batch_size].fill_(1)
                     attn_metadata.on_update()
+                    # Helix verify-flatten (one q_len==1 request per verify row)
+                    # only matches draft step 0, which reuses the full
+                    # verify-length input. From step 1 on the loop gathers to a
+                    # single token per sequence, so the flattened num_seqs
+                    # (num_seqs * (1 + draft_len)) no longer matches num_tokens
+                    # and the C++ op would assert. The gathered steps are plain
+                    # q_len==1 decodes (no causal-slope bug), so disable the
+                    # flatten for them.
+                    if getattr(attn_metadata, "_helix_gen_flatten_active", False):
+                        attn_metadata._helix_gen_flatten_active = False
                     has_kv_cache = inputs[
                         "attn_metadata"].kv_cache_manager is not None
                     if has_kv_cache:
