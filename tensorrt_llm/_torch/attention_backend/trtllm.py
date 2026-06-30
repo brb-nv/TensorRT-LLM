@@ -430,11 +430,13 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 device='cpu',
                 pin_memory=prefer_pinned(),
             )
-            # Per query token (not per sequence): a speculative verify forward has
-            # multiple query tokens per sequence and ownership is resolved per token.
+            # Per request (one flag per sequence): Helix ownership is per verify
+            # group -- all of a sequence's query tokens (golden + drafts) are owned
+            # by a single CP rank -- and the Helix KV-write kernel indexes the flag
+            # per sequence (batch_idx).
             self.helix_is_inactive_rank = self.get_empty(
                 buffers,
-                (self.max_num_tokens, ),
+                (self.max_num_sequences, ),
                 cache_name="helix_is_inactive_rank",
                 dtype=torch.bool,
                 capture_graph=capture_graph,
@@ -545,26 +547,6 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         if self.enable_flash_mla:
             self._flash_mla_metadata_valid = False
 
-    def _helix_owned_token_counts(self) -> torch.Tensor:
-        """Per-sequence count of query tokens this CP rank owns (writes KV for).
-
-        Derived from the per-query-token ``helix_is_inactive_rank`` flags grouped by
-        ``seq_lens_kv``. With one query token per sequence (plain decode) this is 1
-        for an active rank and 0 for an inactive rank; with a multi-token verify it
-        is the owned subset. When no inactive flags are set, all query tokens are
-        treated as owned.
-        """
-        seq_lens_kv = self.seq_lens_kv[:self.num_seqs].to(torch.int64)
-        if self.helix_is_inactive_rank_cpu is None:
-            return seq_lens_kv.to(torch.int)
-        total_q = int(seq_lens_kv.sum().item())
-        active = (~self.helix_is_inactive_rank_cpu[:total_q]).to(torch.int)
-        seg_ids = torch.repeat_interleave(
-            torch.arange(self.num_seqs, dtype=torch.int64), seq_lens_kv)
-        owned = torch.zeros(self.num_seqs, dtype=torch.int)
-        owned.scatter_add_(0, seg_ids, active)
-        return owned
-
     def _maybe_prepare_helix_flatten(self, cached_token_lens: torch.Tensor,
                                      kv_lens: torch.Tensor) -> None:
         """Populate the flattened per-query-row generation view for Helix MTP.
@@ -572,21 +554,20 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         Implements the §6 rule of ``helix_mtp_attended_len.md``: present the
         generation attention read as one ``q_len == 1`` request per query row so
         the trtllm-gen causal slope vanishes, and give each row its exact KV
-        bound ``cached + owned_count(r)`` where ``owned_count(r)`` is the
-        within-sequence inclusive count of query rows this CP rank owns. This is
-        correct for inactive, active-owns-all, and straddle ranks alike.
+        bound ``cached + owned_count(r)``. With per-request ownership a rank either
+        owns all of a sequence's query rows (active) or none (inactive), so
+        ``owned_count(r)`` is just the inclusive within-segment row index on an
+        active sequence and 0 on an inactive one. This keeps inactive ranks (which
+        own no new tokens but still attend the cached prefix) from losing cached
+        positions to the kernel's causal-tail reservation.
 
         Only triggers for a pure-generation batch (``num_contexts == 0``, the
         Helix decode phase) running a multi-token verify (``total_q >
         num_seqs``); otherwise leaves ``_helix_gen_flatten_active`` False so the
-        normal path is used.
-
-        Note: we deliberately do NOT gate on ``is_spec_decoding_enabled`` --
-        ``update_spec_dec_param`` forces it False on the trtllm-gen kernel for
-        linear MTP, so the verify actually flows through the per-sequence kv_lens
-        branch. The robust signal that this is a multi-token verify (and thus
-        exposed to the per-row causal-slope bug) is simply more query rows than
-        sequences, with per-query-token ownership flags available.
+        normal path is used. ``total_q > num_seqs`` (more query rows than
+        sequences) is the robust signal for a multi-token verify exposed to the
+        per-row causal-slope bug; plain ``q_len == 1`` decode needs no flattening
+        because its slope term is already zero.
         """
         self._helix_gen_flatten_active = False
         if not (self.enable_helix and self.num_contexts == 0
@@ -597,23 +578,17 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             return
         seg_lens = self.seq_lens_kv[:num_seqs].to(torch.int64)
         total_q = int(seg_lens.sum().item())
-        # Plain decode (one query row per sequence) needs no flattening: with
-        # q_len == 1 the kernel's +1-per-row slope term is already zero. This
-        # also guarantees the inactive-rank flags below are the per-token verify
-        # layout (length total_q), not the per-sequence decode layout.
         if total_q <= num_seqs:
             return
 
-        inactive = self.helix_is_inactive_rank_cpu[:total_q]
-        active_int = (~inactive).to(torch.int64)
-        # owned_count(r), inclusive within each sequence segment:
-        #   csum(active) - (owned tokens in all earlier segments).
-        per_seg_owned = self._helix_owned_token_counts().to(torch.int64)
-        prev_seg_owned = torch.zeros(num_seqs, dtype=torch.int64)
-        if num_seqs > 1:
-            prev_seg_owned[1:] = torch.cumsum(per_seg_owned, 0)[:-1]
-        base_per_token = torch.repeat_interleave(prev_seg_owned, seg_lens)
-        owned_incl = torch.cumsum(active_int, 0) - base_per_token
+        # Per-request ownership: every query row of a sequence is owned (active
+        # rank) or not (inactive rank). owned_count(r) is the inclusive
+        # within-segment row index (1..q_len) on an active sequence, 0 otherwise.
+        active = (~self.helix_is_inactive_rank_cpu[:num_seqs]).to(torch.int64)
+        seg_starts = torch.cumsum(seg_lens, 0) - seg_lens
+        row_incl = (torch.arange(total_q, dtype=torch.int64) -
+                    torch.repeat_interleave(seg_starts, seg_lens) + 1)
+        owned_incl = row_incl * torch.repeat_interleave(active, seg_lens)
 
         cached64 = cached_token_lens[:num_seqs].to(torch.int64)
         # Per-row KV read bound (no extra tokens, matching kv_lens_cuda_runtime).
@@ -719,9 +694,9 @@ class TrtllmAttentionMetadata(AttentionMetadata):
 
         Args:
             helix_position_offsets: Position offsets for helix parallelism with shape (num_tokens,).
-            helix_is_inactive_rank: Whether the current rank is inactive, per query token,
-                with shape (num_tokens,). For plain decode this is one entry per sequence
-                (single query token); for speculative verify it is one entry per query token.
+            helix_is_inactive_rank: Whether the current rank is inactive, per request,
+                with shape (num_seqs,). Ownership is per verify group, so a single flag
+                covers all of a sequence's query tokens (golden + drafts).
             helix_total_input_len: Global prompt length per sequence, with shape
                 (batch_size,). Used by the draft loop to derive draft-token ownership.
         """
@@ -789,18 +764,14 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         if self.enable_helix:
             assert cached_token_lens is not None, "cached_token_lens should be set for helix"
             kv_lens = cached_token_lens.clone()
-            if self.is_spec_decoding_enabled and self.helix_is_inactive_rank_cpu is not None:
-                # Speculative verify: multiple query tokens per sequence, each
-                # potentially owned by a different rank. Grow kv_lens by the count
-                # of query tokens this rank owns, derived from the per-query-token
-                # inactive flags.
-                kv_lens += self._helix_owned_token_counts().to(kv_lens.dtype)
-            else:
-                # Plain decode / context: one inactive flag per sequence. An active
-                # rank attends the previously cached tokens plus the new token(s);
-                # an inactive rank attends the cached tokens only.
-                active_rank = ~self.helix_is_inactive_rank_cpu[:self.num_seqs]
-                kv_lens[active_rank] += self.seq_lens_kv[active_rank]
+            # Ownership is per request (one inactive flag per sequence): an active
+            # rank owns all of a sequence's query tokens -- 1 for plain decode,
+            # 1 + draft_len for a speculative verify -- and an inactive rank owns
+            # none. So the per-rank kv length grows by seq_lens_kv on active
+            # sequences and not at all on inactive ones. The same rule covers plain
+            # decode, context, and the multi-token verify.
+            active_rank = ~self.helix_is_inactive_rank_cpu[:self.num_seqs]
+            kv_lens[active_rank] += self.seq_lens_kv[active_rank]
         else:
             kv_lens = cached_token_lens + \
                 self.seq_lens_kv if cached_token_lens is not None else self.seq_lens_kv
@@ -854,16 +825,11 @@ class TrtllmAttentionMetadata(AttentionMetadata):
 
         if self.enable_helix and self.num_contexts == 0:
             rank = self.mapping.rank if self.mapping is not None else -1
-            total_q = int(self.seq_lens_kv[:self.num_seqs].sum().item())
-            owned_counts = (self._helix_owned_token_counts()
-                            if self.helix_is_inactive_rank_cpu is not None else
-                            None)
             print(f"[TrtllmAttentionMetadata::prepare][rank={rank}] is_spec_decoding_enabled: {self.is_spec_decoding_enabled}, use_spec_decoding: {self.use_spec_decoding}")
             print(f"[TrtllmAttentionMetadata::prepare][rank={rank}] num_seqs: {self.num_seqs}, num_contexts: {self.num_contexts}, num_extra_kv_tokens: {self.kv_cache_params.num_extra_kv_tokens}")
             print(f"[TrtllmAttentionMetadata::prepare][rank={rank}] seq_lens_kv: {self.seq_lens_kv[:self.num_seqs]}")
             print(f"[TrtllmAttentionMetadata::prepare][rank={rank}] cached_token_lens: {cached_token_lens}")
-            print(f"[TrtllmAttentionMetadata::prepare][rank={rank}] helix_owned_token_counts: {owned_counts}")
-            print(f"[TrtllmAttentionMetadata::prepare][rank={rank}] helix_is_inactive_rank_cpu: {self.helix_is_inactive_rank_cpu[:total_q] if self.helix_is_inactive_rank_cpu is not None else None}")
+            print(f"[TrtllmAttentionMetadata::prepare][rank={rank}] helix_is_inactive_rank_cpu (per request): {self.helix_is_inactive_rank_cpu[:self.num_seqs] if self.helix_is_inactive_rank_cpu is not None else None}")
             print(f"[TrtllmAttentionMetadata::prepare][rank={rank}] final kv_lens: {kv_lens[:self.num_seqs]}, kv_lens (with extra): {self.kv_lens[:self.num_seqs]}")
             print(f"[TrtllmAttentionMetadata::prepare][rank={rank}] helix_gen_flatten_active: {self._helix_gen_flatten_active}, flat total_q: {self._helix_flat_total_q}")
             if self._helix_gen_flatten_active:

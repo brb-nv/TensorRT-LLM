@@ -677,41 +677,26 @@ class Eagle3OneModelWorker(SpecWorkerBase):
             self._saved_generation_lengths = None
 
     def _helix_draft_owner_mask(self, attn_metadata, position_ids, batch_size):
-        """Owner CP rank mask for a draft-loop step under Helix.
+        """Per-request owner mask for a draft-loop step under Helix.
 
-        Each draft step processes one token per sequence at the global positions in
-        position_ids. A token's owner rank is derived from its global decode-index
-        (global_position minus total_input_len_cp). Only the owner writes the draft
-        token's KV; the others treat it as query-only. This also writes the
-        per-token Helix buffers (positions for RoPE, inactive flags, active counts)
-        read by the generation kernel.
+        Ownership is per request and fixed for the whole decode group: the draft
+        tokens a request generates stay on the same CP rank that owns its verify
+        group (the owner of the group's anchor decode-index g). So we do not
+        recompute ownership here -- we reuse the verify's per-request
+        ``helix_is_inactive_rank`` flags and only refresh the RoPE positions, which
+        advance each draft step. This keeps the golden token, the verified drafts,
+        and the newly generated drafts all on one rank (no mixed ownership) and
+        matches how the Helix MLA-generation KV-write kernel indexes the flag (per
+        request, by batch_idx).
 
         Returns the boolean owner mask of shape [batch_size], or None when Helix is
         not active.
         """
         if self.mapping is None or not self.mapping.has_cp_helix():
             return None
-        tpb = attn_metadata.tokens_per_block
-        cp_size = self.mapping.cp_size
-        cp_rank = self.mapping.cp_rank
-        pos = position_ids[:batch_size].to(torch.int64).reshape(-1)
-        total_input_len = attn_metadata.helix_total_input_len[:batch_size].to(
-            torch.int64)
-        decode_index = pos - total_input_len
-        owner = ((decode_index // tpb) % cp_size) == cp_rank
-        attn_metadata.helix_position_offsets[:batch_size].copy_(
-            pos.to(torch.int32))
-        attn_metadata.helix_is_inactive_rank[:batch_size].copy_(~owner)
-
-        # [helix_kv][DEBUG] draft-loop position/ownership (revert after debugging).
-        if attn_metadata.num_contexts == 0:
-            _rank = self.mapping.rank
-            print(
-                f"[helix_kv::draft_owner][rank={_rank}] "
-                f"pos={pos.tolist()} total_input_len={total_input_len.tolist()} "
-                f"decode_index={decode_index.tolist()} owner={owner.tolist()} "
-                f"tpb={tpb} cp_size={cp_size} cp_rank={cp_rank}")
-        return owner
+        pos = position_ids[:batch_size].to(torch.int32).reshape(-1)
+        attn_metadata.helix_position_offsets[:batch_size].copy_(pos)
+        return ~attn_metadata.helix_is_inactive_rank[:batch_size]
 
     # Skip torch.compile for now since current Torch is not compatible with Triton 3.4
     # @torch.compile(options={"max-autotune": True})

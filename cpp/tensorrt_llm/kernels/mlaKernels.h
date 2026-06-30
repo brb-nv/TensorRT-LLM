@@ -114,17 +114,12 @@ struct MlaParams
     // for Helix parallelism: the rotary position offsets [b]
     int32_t const* helix_position_offsets{nullptr};
 
-    // for Helix parallelism: whether the current rank is inactive for each query
-    // token. Plain decode has one query token per sequence, so this is shape [b];
-    // a speculative verify forward processes multiple query tokens per sequence,
-    // so this is shape [total_s_len] and ownership is resolved per token (each CP
-    // rank only appends the KV of the tokens it owns). The generation RoPE kernel
-    // detects the per-token layout via helix_is_inactive_rank_per_token.
+    // for Helix parallelism: whether the current rank is inactive for each
+    // sequence, shape [b]. Helix ownership is per request (per verify group): all
+    // of a sequence's new query tokens -- one for plain decode, golden + drafts for
+    // a speculative verify -- are owned by a single CP rank, which appends their KV
+    // contiguously while other ranks skip the write.
     bool const* helix_is_inactive_rank{nullptr};
-
-    // Whether helix_is_inactive_rank is indexed per query token (true, spec
-    // verify) or per sequence (false, plain decode).
-    bool helix_is_inactive_rank_per_token{false};
 };
 
 template <typename T, typename KVCacheBuffer>

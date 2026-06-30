@@ -582,28 +582,22 @@ def test_mla_helix_distributed(
 # new tokens' KV is sharded across CP ranks; the all-to-all + post-process must
 # reassemble the same result as a single-GPU multi-token forward.
 #
-# Two ownership layouts are exercised at the attention level:
-#   - non-straddler: all query tokens of a request owned by one rank;
-#   - straddler:     query tokens split across ranks (token j -> rank j % cp).
-# The block-round-robin scheduling that produces these layouts is covered
+# Ownership is per request (per verify group): the whole group of query tokens is
+# owned by a single CP rank (the others attend the cached prefix only). The
+# block-cyclic scheduling that picks which rank owns each group is covered
 # separately by the pure-Python ownership test.
 # ---------------------------------------------------------------------------
 
 
-def _spec_token_ownership(num_query_tokens, rank, world_size, straddle):
-    """Per-rank ownership for a multi-token verify step.
+def _spec_token_ownership(num_query_tokens, rank, world_size):
+    """Per-request ownership for a multi-token verify step.
 
-    Returns ``(inactive_flags, num_active)``: a per-query-token list of whether
-    this rank does NOT write the token's KV, and the count of tokens it owns.
+    Helix ownership is per request (per verify group): the whole group of query
+    tokens (golden + drafts) is owned by a single CP rank. Returns
+    ``(is_inactive, num_active)`` for this rank.
     """
-    inactive = []
-    num_active = 0
-    for j in range(num_query_tokens):
-        owner = (j % world_size) if straddle else (world_size - 1)
-        owned = owner == rank
-        inactive.append(not owned)
-        num_active += int(owned)
-    return inactive, num_active
+    owned = rank == world_size - 1
+    return (not owned), (num_query_tokens if owned else 0)
 
 
 def _run_mla_distributed_spec(
@@ -611,7 +605,6 @@ def _run_mla_distributed_spec(
     world_size: int,
     scenario: Scenario,
     num_query_tokens: int,
-    straddle: bool,
     mapping: Mapping,
     test_params: tuple,
     ref_output: torch.Tensor,
@@ -675,13 +668,13 @@ def _run_mla_distributed_spec(
     # one-token gen step and would corrupt the per-draft-token K/V here.
     latent_cache_gen = None
 
-    # Per-token ownership for this rank's query tokens, and KV slots for the
-    # tokens it owns.
+    # Per-request ownership (one flag per sequence), and KV slots for the tokens
+    # the owner rank writes (the whole group on the owner, none elsewhere).
     inactive_flags = []
     num_active_per_seq = []
     for _ in range(scenario.batch):
-        flags, num_active = _spec_token_ownership(num_query_tokens, rank, world_size, straddle)
-        inactive_flags.extend(flags)
+        is_inactive, num_active = _spec_token_ownership(num_query_tokens, rank, world_size)
+        inactive_flags.append(is_inactive)
         num_active_per_seq.append(num_active)
     for req_id in range(scenario.batch):
         for _ in range(num_active_per_seq[req_id]):
@@ -715,7 +708,6 @@ def _full_test_multi_gpu_spec(
     rank: int,
     world_size: int,
     scenario: Scenario,
-    straddle: bool,
     use_nccl_for_alltoall: bool = False,
     fifo_version: int = 2,
 ):
@@ -845,7 +837,7 @@ def _full_test_multi_gpu_spec(
         ref_attn_metadata,
     )
     return _run_mla_distributed_spec(
-        rank, world_size, scenario, num_query_tokens, straddle, mapping, test_params, ref_output
+        rank, world_size, scenario, num_query_tokens, mapping, test_params, ref_output
     )
 
 
@@ -859,16 +851,14 @@ spec_test_scenarios = [
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 GPUs to run this test")
 @skip_pre_blackwell
 @pytest.mark.parametrize("scenario", spec_test_scenarios, ids=lambda x: f"scenario: {x}")
-@pytest.mark.parametrize("straddle", [False, True], ids=["non_straddler", "straddler"])
 @pytest.mark.parametrize("comms_medium", ["nccl", "fifo_v1", "fifo_v2"])
 def test_mla_helix_spec_distributed(
     scenario: Scenario,
-    straddle: bool,
     comms_medium: str,
 ):
     """Multi-token (Eagle3 verify) Helix MLA attention: distributed output must
-    match a single-GPU multi-token spec-dec forward for both non-straddler and
-    straddler KV-ownership layouts."""
+    match a single-GPU multi-token spec-dec forward. Ownership is per request --
+    the whole verify group (golden + drafts) is owned by a single CP rank."""
     world_size = 2
     use_nccl_for_alltoall, fifo_version = parse_comms_medium(comms_medium)
     with MPIPoolExecutor(max_workers=world_size) as executor:
@@ -878,7 +868,6 @@ def test_mla_helix_spec_distributed(
                 _full_test_multi_gpu_spec,
                 world_size,
                 scenario,
-                straddle,
                 use_nccl_for_alltoall,
                 fifo_version,
             )] * world_size),

@@ -739,6 +739,12 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         # Context (prompt) tokens this CP rank owns. The per-rank KV length is this
         # base plus the owned decode-token count.
         self.py_helix_context_seqlen_cp = self.prompt_len
+        # Running count of decode tokens in [0, py_helix_global_decode_len) whose KV
+        # this CP rank owns. With per-request (per verify-group) Helix ownership the
+        # owned set is no longer a closed-form block-cyclic count -- it depends on
+        # which rank owned each committed group -- so it is tracked incrementally as
+        # groups commit (see resource_manager._helix_rewind_generation_kv).
+        self.py_helix_owned_decode_seen = 0
         self.py_batch_idx = None
         self.py_draft_pages_allocated = 0
         self.py_rewind_len = 0
