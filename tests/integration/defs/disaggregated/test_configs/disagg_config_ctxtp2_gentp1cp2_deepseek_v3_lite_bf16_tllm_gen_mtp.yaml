@@ -36,6 +36,7 @@ generation_servers:
   cp_config:
     cp_type: HELIX
     tokens_per_block: 32
+    use_nccl_for_alltoall: true
   kv_cache_config:
     enable_block_reuse: false
     enable_partial_reuse: false
