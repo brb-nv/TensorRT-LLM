@@ -1247,7 +1247,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             "pipeline_parallel_size": 1,
             "tensor_parallel_size": 2,
             "context_parallel_size": 1,
-            "max_batch_size": 1,
+            "max_batch_size": 16,
             "disable_overlap_scheduler": True,
             "kv_cache_config": kv_cache_config,
             "enable_chunked_prefill": False,
@@ -1262,7 +1262,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             "pipeline_parallel_size": gen_pp,
             "context_parallel_size": gen_cp,
             "moe_expert_parallel_size": gen_ep,
-            "max_batch_size": 1,
+            "max_batch_size": 64,
             "cp_config": {
                 "cp_type": "HELIX",
                 "tokens_per_block": 32,

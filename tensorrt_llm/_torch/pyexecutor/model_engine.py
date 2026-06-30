@@ -3950,8 +3950,6 @@ class PyTorchModelEngine(ModelEngine):
             spec_metadata.prepare()
             inputs['spec_metadata'] = spec_metadata
 
-            print(f"[model_engine::_prepare_tp_inputs][rank={self.mapping.rank}] spec_metadata: {spec_metadata}")
-
             if self.enable_attention_dp:
                 all_rank_num_tokens = self.dist.tp_cp_allgather(
                     [spec_metadata.num_tokens,

@@ -1673,10 +1673,6 @@ class MLA(nn.Module):
             kv_lora_rank = partial_o.shape[-1] // self.num_heads_tp
             assert self.kv_lora_rank == kv_lora_rank
 
-            if attn_metadata.num_contexts == 0:
-                print(f"[MLA::_attn_forward_gen][rank={self.mapping.rank}] PRE-COMBINE softmax_stats.shape: {softmax_stats.shape}, softmax_stats: {softmax_stats}")
-                print(f"[MLA::_attn_forward_gen][rank={self.mapping.rank}] PRE-COMBINE partial_o.shape: {partial_o.shape}, partial_o: {partial_o}")
-
             return _helix_post_process(partial_o, softmax_stats, self.mapping,
                                        self.num_heads_tp_cp, kv_lora_rank,
                                        self.aux_stream, self.ln_events)
@@ -2993,9 +2989,6 @@ class MLA(nn.Module):
                               output=attn_output,
                               latent_cache_gen=latent_cache_gen)
 
-        is_gen_side = attn_metadata.num_contexts == 0
-        if is_gen_side:
-            print(f"[MLA::forward][rank={self.mapping.rank}] BEFORE o_proj: attn_output.shape: {attn_output.shape}, attn_output: {attn_output}")
         attn_output = _helix_cp_output_projection(self.o_proj, attn_output,
                                                   attn_metadata,
                                                   all_reduce_params,

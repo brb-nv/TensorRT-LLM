@@ -941,17 +941,6 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                                                      batch_size,
                                                      draft_step=i)
 
-                is_gen_side = attn_metadata.num_contexts == 0
-                if is_gen_side:
-                    rank = self.model_config.mapping.rank if self.model_config is not None else -1
-                    top2_vals, top2_ids = torch.topk(
-                        logits.float(), k=min(2, logits.shape[-1]), dim=-1)
-                    top1_top2_margin = (top2_vals[..., 0] - top2_vals[..., 1]
-                                        if logits.shape[-1] > 1 else
-                                        top2_vals[..., 0])
-                    print(f"[Eagle3OneModelWorker::_forward_draft_loop][rank={rank}][draft_step={i}] draft logits.shape: {logits.shape}, top2 ids: {top2_ids}, top2 logits: {top2_vals}, top1-top2 margin: {top1_top2_margin}")
-                    print(f"[Eagle3OneModelWorker::_forward_draft_loop][rank={rank}][draft_step={i}] new_draft_token: {new_draft_token}")
-
                 next_draft_tokens.append(new_draft_token)
 
                 # Update hidden states for the next iteration.
