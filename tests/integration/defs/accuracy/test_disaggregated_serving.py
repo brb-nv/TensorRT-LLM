@@ -1268,7 +1268,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                 "use_nccl_for_alltoall": use_nccl_for_alltoall,
                 "fifo_version": fifo_version,
             },
-            "disable_overlap_scheduler": True,
+            "disable_overlap_scheduler": False,
             "kv_cache_config": kv_cache_config,
             "enable_chunked_prefill": False,
             "cuda_graph_config": cuda_graph_config,

@@ -17,17 +17,26 @@ ownership and global-position bookkeeping.
 
 These guard the core invariants used by the Helix speculative-decode integration:
 - a verify group's anchor decode-index is owned by exactly one CP rank
-  (block-cyclic by anchor decode-index);
+  (block-cyclic by anchor decode-index).
 - the global positions and ownership computed for a speculative verify forward are
-  consistent. Ownership is **per request (per verify group)**: the whole group of
-  query tokens (re-fed golden token plus drafts) is assigned to a single CP rank --
-  the owner of the group's anchor decode-index ``g`` -- so golden and draft tokens
-  always land on the same rank and a verify block crossing a tokens_per_block
-  boundary is never split across ranks.
+  consistent. Ownership is per request (per verify group): the whole group of
+  query tokens (re-fed golden token plus drafts) is assigned to the CP rank that
+  owns the anchor decode-index `g`. Golden and draft tokens always land on the
+  same rank, so a verify block crossing a tokens_per_block boundary is never split
+  across ranks.
 
 The helpers below mirror the production formulas in
-``tensorrt_llm/_torch/pyexecutor/resource_manager.py`` (``_helix_owns_decode_index``)
-and ``model_engine._helix_verify_token_params``.
+`tensorrt_llm/_torch/pyexecutor/resource_manager.py`
+(`_helix_owns_decode_group`, `_helix_prepare_generation_kv`,
+`_helix_rewind_generation_kv`) and `model_engine._helix_verify_token_params`.
+
+Under the overlap scheduler the accepted-token count is only known on-device, so
+ownership is anchored on a deterministic per-request verify-group counter (which
+advances by exactly one per reserved group, independent of the accepted count)
+rather than on the accept-dependent global decode length. The reserve-time
+decision is stashed in a FIFO so the (one-iteration-later) rewind consumes exactly
+the decision reserve made. The overlap tests below guard that reserve and rewind
+never disagree even when a rewind of an earlier group runs between them.
 """
 
 import pytest
@@ -42,20 +51,16 @@ def owns_decode_index(decode_index, tpb, cp_size, cp_rank):
 @pytest.mark.parametrize("g", [0, 1, 5, 31, 32, 33, 64, 100, 257])
 def test_verify_group_owned_by_exactly_one_rank(tpb, cp_size, g):
     # A verify group anchored at decode-index g is owned by exactly one rank.
-    owners = [
-        cp_rank for cp_rank in range(cp_size)
-        if owns_decode_index(g, tpb, cp_size, cp_rank)
-    ]
+    owners = [cp_rank for cp_rank in range(cp_size) if owns_decode_index(g, tpb, cp_size, cp_rank)]
     assert owners == [(g // tpb) % cp_size]
 
 
 def verify_token_params(total_input_len, g, num_draft, tpb, cp_size, cp_rank):
     """Mirror of model_engine._helix_verify_token_params (per-request ownership).
 
-    The whole verify group -- the re-fed golden token at decode-index ``g`` plus
-    the drafts at ``[g + 1, g + num_draft]`` -- is owned by the single rank that
-    owns the anchor decode-index ``g``. Every query token therefore shares one
-    inactive flag.
+    The whole verify group (the re-fed golden token at decode-index `g` plus the
+    drafts at `[g + 1, g + num_draft]`) is owned by the single rank that owns the
+    anchor decode-index `g`. Every query token therefore shares one inactive flag.
     """
     first_decode_index = g
     first_pos = total_input_len + first_decode_index
@@ -118,8 +123,7 @@ def test_verify_token_params_no_mixed_ownership(tpb, cp_size, g, num_draft):
     expected_owner = (g // tpb) % cp_size
     per_rank_active = []
     for cp_rank in range(cp_size):
-        _, inactive, num_active = verify_token_params(100, g, num_draft, tpb,
-                                                      cp_size, cp_rank)
+        _, inactive, num_active = verify_token_params(100, g, num_draft, tpb, cp_size, cp_rank)
         per_rank_active.append(num_active)
         # Flags uniform within the request.
         assert len(set(inactive)) == 1
@@ -132,3 +136,118 @@ def test_verify_token_params_no_mixed_ownership(tpb, cp_size, g, num_draft):
     ranks_with_writes = sum(1 for a in per_rank_active if a > 0)
     assert ranks_with_writes == 1
     assert per_rank_active[expected_owner] == group_size
+
+
+# ---------------------------------------------------------------------------
+# Overlap scheduler: deterministic verify-group ownership + reserve/rewind FIFO
+# ---------------------------------------------------------------------------
+
+
+def owns_decode_group(group_index, tpb, cp_size, cp_rank):
+    """Mirror of resource_manager._helix_owns_decode_group.
+
+    Ownership is anchored on the deterministic per-request verify-group index
+    (advances by exactly one per reserved group) rather than the accept-dependent
+    global decode length, so it is host-computable under the overlap scheduler.
+    """
+    return (group_index // tpb) % cp_size == cp_rank
+
+
+@pytest.mark.parametrize("tpb", [1, 4, 32])
+@pytest.mark.parametrize("cp_size", [2, 4, 8])
+@pytest.mark.parametrize("group_index", [0, 1, 5, 31, 32, 33, 64, 100, 257])
+def test_decode_group_owned_by_exactly_one_rank(tpb, cp_size, group_index):
+    owners = [
+        cp_rank
+        for cp_rank in range(cp_size)
+        if owns_decode_group(group_index, tpb, cp_size, cp_rank)
+    ]
+    assert owners == [(group_index // tpb) % cp_size]
+
+
+@pytest.mark.parametrize("tpb", [1, 4, 32])
+@pytest.mark.parametrize("cp_size", [2, 4])
+def test_decode_group_ownership_is_balanced(tpb, cp_size):
+    # Over a full rotation (cp_size * tpb groups) each rank owns an equal share.
+    counts = [0] * cp_size
+    for group_index in range(cp_size * tpb):
+        counts[(group_index // tpb) % cp_size] += 1
+    assert counts == [tpb] * cp_size
+
+
+class _FifoRankState:
+    """Minimal mirror of the per-rank reserve/rewind bookkeeping.
+
+    Reproduces resource_manager._helix_prepare_generation_kv (reserve) and
+    _helix_rewind_generation_kv (rewind): reserve resolves ownership from the
+    deterministic group index and pushes it to a FIFO; rewind pops the FIFO. This
+    is the exact interleaving the overlap scheduler produces (reserve of the next
+    forward runs before the rewind of the current one).
+    """
+
+    def __init__(self, tpb, cp_size, cp_rank):
+        self.tpb = tpb
+        self.cp_size = cp_size
+        self.cp_rank = cp_rank
+        self.group_index = 0
+        self.pending = []
+        self.reserve_log = []
+        self.rewind_log = []
+
+    def reserve(self):
+        owns = owns_decode_group(self.group_index, self.tpb, self.cp_size, self.cp_rank)
+        self.group_index += 1
+        self.pending.append(owns)
+        self.reserve_log.append(owns)
+        return owns
+
+    def rewind(self):
+        owns = self.pending.pop(0)
+        self.rewind_log.append(owns)
+        return owns
+
+
+@pytest.mark.parametrize("tpb", [1, 4])
+@pytest.mark.parametrize("cp_size", [2, 4])
+@pytest.mark.parametrize("pipeline_depth", [0, 1])
+@pytest.mark.parametrize("num_iters", [1, 2, 5, 40])
+def test_reserve_rewind_fifo_consistency(tpb, cp_size, pipeline_depth, num_iters):
+    """Reserve and rewind must agree on ownership for every group.
+
+    pipeline_depth == 0 models the non-overlap scheduler (reserve then rewind in
+    the same iteration). pipeline_depth == 1 models the overlap scheduler, where
+    the rewind of a group lags its reserve by one iteration, so the reserve of the
+    next group (which advances the group counter) runs in between. In both cases
+    the FIFO must make reserve and rewind consume the same decision for a given
+    group, on every rank.
+    """
+    for cp_rank in range(cp_size):
+        state = _FifoRankState(tpb, cp_size, cp_rank)
+        # Prime the pipeline: reserve `pipeline_depth` forwards before rewinding.
+        for _ in range(pipeline_depth):
+            state.reserve()
+        for _ in range(num_iters):
+            state.reserve()
+            state.rewind()
+        # Drain any in-flight forwards.
+        while state.pending:
+            state.rewind()
+
+        # rewind_log is reserve_log consumed in FIFO order: identical sequences.
+        assert state.rewind_log == state.reserve_log
+        # And the sequence matches the deterministic group-ownership formula.
+        expected = [
+            owns_decode_group(i, tpb, cp_size, cp_rank) for i in range(len(state.reserve_log))
+        ]
+        assert state.reserve_log == expected
+
+
+@pytest.mark.parametrize("tpb", [1, 4])
+@pytest.mark.parametrize("cp_size", [2, 4])
+@pytest.mark.parametrize("num_iters", [8, 40])
+def test_each_group_owned_by_exactly_one_rank_across_ranks(tpb, cp_size, num_iters):
+    # Across all ranks, every verify group index is owned by exactly one rank,
+    # so no committed decode group is dropped or double-written under overlap.
+    for group_index in range(num_iters):
+        owners = [r for r in range(cp_size) if owns_decode_group(group_index, tpb, cp_size, r)]
+        assert len(owners) == 1

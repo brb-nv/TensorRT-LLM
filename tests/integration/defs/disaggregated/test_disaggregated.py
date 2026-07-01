@@ -358,9 +358,8 @@ ClientTestSet = namedtuple('ClientTestSet', [
 def get_client_test_set(test_desc):
     """Get the set of client tests to run for a given test description."""
     if test_desc == "deepseek_v3_lite_bf16_tllm_gen_helix_mtp" or test_desc == "deepseek_v3_lite_bf16_tllm_gen_helix_mtp_ref":
-        # Streaming under Helix CP + MTP is under investigation (the streaming
-        # client path appears to hang). Run non-streaming completion only for
-        # now; revisit streaming once the hang is root-caused.
+        # Streaming under Helix CP + MTP is not supported (the streaming client
+        # path hangs), so run non-streaming completion only.
         return ClientTestSet(completion=True,
                              completion_streaming=False,
                              chat=False,
@@ -432,9 +431,8 @@ def run_client_tests(example_dir,
             str(server_start_timeout)
         ]
         if prompt_file == "long_prompts.json":
-            # Bumped for Helix-CP vs TP MTP debugging: run enough decode steps
-            # that a verify q-block crosses a tokens_per_block boundary (the
-            # straddle / mixed-ownership case). Revert to 16 once done.
+            # Use enough decode steps that a verify q-block crosses a
+            # tokens_per_block boundary (the mixed-ownership case).
             client_cmd.extend(['--max-tokens', '64'])
 
         # Prepare poll processes

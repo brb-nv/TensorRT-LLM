@@ -495,6 +495,16 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 dtype=torch.int,
                 capture_graph=capture_graph,
             )
+            # Per flattened row: index of the sequence it belongs to. Used to
+            # broadcast a per-request overlap kv-length correction onto the
+            # flattened per-row bounds (see apply_helix_overlap_flatten_correction).
+            self._helix_flat_row_to_seq = self.get_empty(
+                buffers,
+                (self.max_num_tokens, ),
+                cache_name="helix_flat_row_to_seq",
+                dtype=torch.int,
+                capture_graph=capture_graph,
+            )
             self._helix_flat_host_total_kv_lens = torch.empty(2,
                                                               device='cpu',
                                                               dtype=torch.int)
@@ -591,6 +601,15 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         self._helix_flat_cu_kv_seqlens[:total_q + 1].copy_(kv_offsets,
                                                            non_blocking=True)
 
+        # Row -> sequence index, so an overlap-scheduler per-request kv-length
+        # correction can be broadcast onto the per-row bounds on-device (the
+        # cached lengths used above are stale under overlap; see
+        # apply_helix_overlap_flatten_correction).
+        row_to_seq = torch.repeat_interleave(
+            torch.arange(num_seqs, dtype=torch.int), seg_lens.to(torch.int))
+        self._helix_flat_row_to_seq[:total_q].copy_(row_to_seq,
+                                                    non_blocking=True)
+
         self._helix_flat_host_total_kv_lens[0] = 0
         self._helix_flat_host_total_kv_lens[1] = int(flat_kv.sum().item())
 
@@ -605,6 +624,56 @@ class TrtllmAttentionMetadata(AttentionMetadata):
 
         self._helix_flat_total_q = total_q
         self._helix_gen_flatten_active = True
+
+    def apply_helix_overlap_flatten_correction(
+            self,
+            per_request_kv_offset: torch.Tensor,
+            max_extra_per_row: int,
+            sign: int = 1) -> None:
+        """Correct the flattened per-row KV bounds for the overlap scheduler.
+
+        _maybe_prepare_helix_flatten builds the per-row bounds from cached lengths
+        that, under overlap, are stale by the prior step's committed count. This
+        adds the per-request kv-length correction (per_request_kv_offset, the
+        Helix owner-gated value already applied to kv_lens_cuda) to every
+        flattened row of the request and rebuilds the cumulative KV offsets.
+
+        Applied with sign=+1 in _preprocess_inputs and undone with sign=-1 in
+        _postprocess_inputs, so CUDA-graph capture (which replays the forward over
+        a base built once) stays consistent.
+
+        host_total_kv_lens[1] is a host scalar and cannot be made exact without a
+        device-to-host sync, so it is bumped by a safe upper bound
+        (total_q * max_extra_per_row); the FMHA op treats it as a sizing hint. A
+        no-op when flattening is inactive.
+        """
+        if not getattr(self, "_helix_gen_flatten_active", False):
+            return
+        n = self._helix_flat_total_q
+        if n == 0:
+            return
+        off_rows = per_request_kv_offset[self._helix_flat_row_to_seq[:n].to(
+            torch.long)].to(self._helix_flat_kv_lens_cuda.dtype)
+        self._helix_flat_kv_lens_cuda[:n] += sign * off_rows
+        # Only the device kv-length is corrected; the host copy (kv_lens_runtime)
+        # is left stale, matching how the non-Helix overlap path corrects only
+        # kv_lens_cuda. The device tensor is the authoritative per-request read
+        # bound, and a device-to-host copy here would serialize the pipeline.
+        #
+        # This runs inside the captured CUDA-graph region, so the leading zero is
+        # written with a device memset rather than a Python-scalar assignment,
+        # which would synchronize and abort capture.
+        self._helix_flat_cu_kv_seqlens[:1].zero_()
+        torch.cumsum(self._helix_flat_kv_lens_cuda[:n],
+                     0,
+                     out=self._helix_flat_cu_kv_seqlens[1:n + 1])
+        # Safe upper bound on the flattened generation total; over-provision is
+        # tolerated (the FMHA op treats it as a sizing hint, matching capture).
+        # host_total_kv_lens lives on the CPU, so this stays a host-only update
+        # and does not touch the captured stream.
+        self._helix_flat_host_total_kv_lens[1] = (
+            int(self._helix_flat_host_total_kv_lens[1]) +
+            sign * n * max_extra_per_row)
 
     @contextlib.contextmanager
     def helix_flattened_generation(self):

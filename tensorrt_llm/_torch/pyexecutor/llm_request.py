@@ -746,6 +746,18 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         # incrementally as groups commit (see
         # resource_manager._helix_rewind_generation_kv).
         self.py_helix_owned_decode_seen = 0
+        # Deterministic verify-group counter used to anchor Helix KV ownership:
+        # owner = (py_helix_decode_group_index // tokens_per_block) % cp_size.
+        # It advances by one per reserved group, independent of the accepted-token
+        # count, so ownership is host-computable even when that count is known only
+        # on-device. py_helix_pending_group_owns is the FIFO of reserve-time
+        # ownership decisions; each rewind consumes the decision for its group.
+        self.py_helix_decode_group_index = 0
+        self.py_helix_pending_group_owns = []
+        # Whether this rank owns the verify group committed by the prior decode
+        # iteration. Gates the on-device kv-length correction: only that owner
+        # grew its per-rank kv length by the prior group's committed-token count.
+        self.py_helix_prev_group_owns = False
         self.py_batch_idx = None
         self.py_draft_pages_allocated = 0
         self.py_rewind_len = 0

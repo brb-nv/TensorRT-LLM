@@ -415,26 +415,37 @@ def create_py_executor(
                 f"decoding requires multiple tokens per sequence. Please use 'TRTLLM' attention "
                 f"backend instead by setting attn_backend='TRTLLM'.")
 
-        # Helix CP with speculative decoding does not support the overlap
-        # scheduler yet. Under the overlap scheduler the number of accepted
-        # tokens per step is only known on-device, so the host-computed Helix
-        # verify metadata (global RoPE positions, per-block KV ownership, and the
-        # per-rank kv-len and cached-length accounting) would be stale. Plain
-        # (non-spec) Helix decode is unaffected because it advances exactly one
-        # token per step. Force-disable overlap with a warning until Helix with
-        # speculative decoding and overlap is implemented.
+        # Helix CP + speculative decoding supports the overlap scheduler only for
+        # the one-model MTP-Eagle / Eagle3 modes on the TRTLLM attention backend.
+        # Under overlap the per-step accepted-token count is known only
+        # on-device, so the host-computed Helix verify metadata would be stale.
+        # For the supported modes this is handled by keeping KV ownership
+        # host-deterministic (resource_manager._helix_prepare_generation_kv) and
+        # correcting the accept-dependent RoPE positions and per-rank kv-lengths
+        # on-device (model_engine._apply_helix_overlap_corrections). Any other
+        # Helix + speculative-decoding combination still force-disables overlap.
         if (not llm_args.disable_overlap_scheduler
                 and llm_args.context_parallel_size > 1
                 and llm_args.cp_config is not None
                 and llm_args.cp_config.cp_type == CpType.HELIX):
-            logger.warning(
-                "Disabling overlap scheduler: Helix context parallelism combined "
-                "with speculative decoding does not support the overlap scheduler "
-                "yet. The per-step accepted-token count is only known on-device, "
-                "so the host-side Helix verify metadata would be stale. Running "
-                "with disable_overlap_scheduler=True; enabling "
-                "helix+speculative-decoding+overlap is a planned follow-up.")
-            llm_args.disable_overlap_scheduler = True
+            spec_mode = spec_config.spec_dec_mode
+            helix_overlap_supported = (llm_args.attn_backend == "TRTLLM"
+                                       and (spec_mode.is_mtp_eagle_one_model()
+                                            or spec_mode.is_eagle3_one_model()))
+            if not helix_overlap_supported:
+                logger.warning(
+                    "Disabling overlap scheduler: Helix context parallelism with "
+                    f"speculative-decoding mode '{spec_mode.name}' on attention "
+                    f"backend '{llm_args.attn_backend}' does not support the "
+                    "overlap scheduler. Only one-model MTP-Eagle / Eagle3 on the "
+                    "TRTLLM backend are supported. Running with "
+                    "disable_overlap_scheduler=True.")
+                llm_args.disable_overlap_scheduler = True
+            else:
+                logger.info(
+                    "Enabling overlap scheduler for Helix context parallelism "
+                    f"with one-model speculative-decoding mode '{spec_mode.name}'."
+                )
 
     if mm_encoder_only:
         llm_args.mm_encoder_only = True

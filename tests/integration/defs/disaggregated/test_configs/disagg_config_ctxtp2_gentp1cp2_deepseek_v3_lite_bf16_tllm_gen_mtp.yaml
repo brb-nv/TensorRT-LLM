@@ -6,9 +6,6 @@ cuda_graph_config: null
 context_servers:
   num_instances: 1
   enable_chunked_prefill: false
-  # ################################REMOVE############################
-  # load_format: dummy
-  # ################################REMOVE############################
   speculative_config:
     decoding_type: MTP
     max_draft_len: 1
@@ -27,9 +24,6 @@ generation_servers:
   context_parallel_size: 2
   enable_chunked_prefill: false
   disable_overlap_scheduler: true
-  # ################################REMOVE############################
-  # load_format: dummy
-  # ################################REMOVE############################
   speculative_config:
     decoding_type: MTP
     max_draft_len: 1
