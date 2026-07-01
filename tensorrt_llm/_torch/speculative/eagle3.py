@@ -628,6 +628,16 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         self._saved_helix_position_offsets = None
         self._saved_helix_is_inactive_rank = None
         self._saved_kv_lens_cuda = None
+        # The draft loop disables the Helix MTP verify-flatten flag (see the
+        # gathered-step handling in _forward_linear_draft_loop) but never turns
+        # it back on. Under CUDA graph capture, prepare() runs once but the
+        # forward runs multiple times (warmup + capture): if the flag were left
+        # False, the 2nd warmup and the actual capture would record the target
+        # verify attention on the *non-flattened* path, so replay would silently
+        # drop cached KV on inactive CP ranks. Save the pre-loop value here and
+        # restore it after the loop so every capture iteration re-flattens.
+        self._saved_helix_gen_flatten_active = getattr(
+            attn_metadata, '_helix_gen_flatten_active', None)
         if getattr(attn_metadata, 'helix_position_offsets', None) is not None:
             self._saved_helix_position_offsets = attn_metadata.helix_position_offsets.clone(
             )
@@ -657,6 +667,13 @@ class Eagle3OneModelWorker(SpecWorkerBase):
             attn_metadata.kv_lens_cuda[:batch_size].copy_(
                 self._saved_kv_lens_cuda)
             self._saved_kv_lens_cuda = None
+        # Re-arm the Helix MTP verify-flatten flag (disabled by the draft loop)
+        # so the next target verify forward -- and, critically, each CUDA graph
+        # capture/warmup iteration -- takes the flattened per-query-row read path.
+        if self._saved_helix_gen_flatten_active is not None:
+            attn_metadata._helix_gen_flatten_active = (
+                self._saved_helix_gen_flatten_active)
+            self._saved_helix_gen_flatten_active = None
 
         if self._saved_packed_mask is not None:
             batch_size = self._saved_packed_mask.shape[0]
@@ -967,8 +984,7 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                     # longer matches num_tokens and the C++ op would assert. Those
                     # gathered steps are plain q_len==1 decodes with no causal-slope
                     # bug, so disable the flatten for them.
-                    if getattr(attn_metadata, "_helix_gen_flatten_active",
-                               False):
+                    if getattr(attn_metadata, "_helix_gen_flatten_active", False):
                         attn_metadata._helix_gen_flatten_active = False
                     has_kv_cache = inputs[
                         "attn_metadata"].kv_cache_manager is not None
@@ -1072,9 +1088,7 @@ class Eagle3OneModelWorker(SpecWorkerBase):
             spec_metadata, step_idx)
 
         if self.is_mtp_eagle:
-            assert len(
-                draft_model.mtp_layers
-            ) == 1, f"expect only one MTP layer, found {len(draft_model.mtp_layers)} instead."
+            assert len(draft_model.mtp_layers) == 1, f"expect only one MTP layer, found {len(draft_model.mtp_layers)} instead."
             hidden_states = draft_model.mtp_layers[0](
                 embed_tokens=draft_model.embed_tokens,
                 all_rank_num_tokens=all_rank_num_tokens,
