@@ -415,15 +415,14 @@ def create_py_executor(
                 f"decoding requires multiple tokens per sequence. Please use 'TRTLLM' attention "
                 f"backend instead by setting attn_backend='TRTLLM'.")
 
-        # Helix CP + speculative decoding does not support the overlap scheduler
-        # yet. Under the overlap scheduler the number of accepted tokens per step
-        # is only known on-device, so the host-computed Helix verify metadata
-        # (global RoPE positions, round-robin per-block KV ownership, and the
-        # per-rank kv-lens / cached-length accounting) would be stale and the
-        # generic overlap correction does not understand Helix ownership. Plain
+        # Helix CP with speculative decoding does not support the overlap
+        # scheduler yet. Under the overlap scheduler the number of accepted
+        # tokens per step is only known on-device, so the host-computed Helix
+        # verify metadata (global RoPE positions, per-block KV ownership, and the
+        # per-rank kv-len and cached-length accounting) would be stale. Plain
         # (non-spec) Helix decode is unaffected because it advances exactly one
-        # token per step. Force-disable overlap with a loud warning until
-        # helix+spec+overlap is implemented (tracked as a follow-up).
+        # token per step. Force-disable overlap with a warning until Helix with
+        # speculative decoding and overlap is implemented.
         if (not llm_args.disable_overlap_scheduler
                 and llm_args.context_parallel_size > 1
                 and llm_args.cp_config is not None

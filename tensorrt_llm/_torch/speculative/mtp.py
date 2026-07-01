@@ -1120,18 +1120,18 @@ class MTPWorker(SpecWorkerBase):
                 [batch_size * max_draft_len]
                 Draft token ids. Flattened.
 
-        Under Helix CP the vocab is sharded over the repurposed CP->TP group, so
-        ``sampler_mapping`` (not ``model_config.mapping``) is the group to reduce
-        over -- exactly as plain TP would.
+        Under Helix CP the vocab is sharded over the repurposed CP-to-TP group,
+        so sampler_mapping (not model_config.mapping) is the group to reduce
+        over, exactly as plain TP would.
         '''
         mapping = self.sampler_mapping
-        if (mapping is not None and mapping.tp_size
-                > 1) and not (mapping.enable_attention_dp):
+        if (mapping is not None
+                and mapping.tp_size > 1) and not (mapping.enable_attention_dp):
             combined = self.get_local_max_and_combined(logits)
             gathered = allgather(combined, mapping, dim=-1)
             draft_tokens = self.get_draft_tokens_from_gathered(gathered)
-        elif (mapping is not None and mapping.tp_size
-              > 1) and mapping.enable_lm_head_tp_in_adp:
+        elif (mapping is not None
+              and mapping.tp_size > 1) and mapping.enable_lm_head_tp_in_adp:
             # For ADP + LM head TP mode, we need to find the global argmax across all TP ranks
             combined = self.get_local_max_and_combined(logits,
                                                        mapping_lm_head_tp)

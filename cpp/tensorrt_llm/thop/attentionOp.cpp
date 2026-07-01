@@ -525,8 +525,6 @@ public:
                 }
                 if (helix_is_inactive_rank.has_value())
                 {
-                    // Helix ownership is per request (per verify group): one flag per sequence, indexed by
-                    // batch_idx. The owner rank appends all of a sequence's new tokens' KV contiguously.
                     mla_params.helix_is_inactive_rank = helix_is_inactive_rank->data_ptr<bool>();
                 }
             }

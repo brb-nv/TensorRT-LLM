@@ -863,23 +863,22 @@ class SpecWorkerBase(nn.Module, ABC):
         # seed/offset pattern in `_sample_tokens_for_batch`).
         self._force_accept_rng_pool: Optional[torch.Tensor] = None
         self._force_accept_rng_counter: Optional[torch.Tensor] = None
-        # Lazily-built repurposed (CP->TP) mapping used for draft-token sampling
-        # under Helix CP (see ``sampler_mapping``).
+        # Lazily-built repurposed (CP-to-TP) mapping used for draft-token
+        # sampling under Helix CP (see sampler_mapping).
         self._sampler_mapping_cache = None
 
     @property
     def sampler_mapping(self):
         """Mapping used for vocab-parallel draft-token sampling.
 
-        Helix CP is only relevant to attention; past attention the CP ranks are
+        Helix CP is only relevant to attention. Past attention the CP ranks are
         repurposed to TP, so the draft LM head shards the vocab over the
-        repurposed CP->TP group exactly as plain TP would. The draft sampler
-        must therefore reduce over that same repurposed group. For every other
-        case (including no CP) this is just ``model_config.mapping``.
+        repurposed CP-to-TP group exactly as plain TP would, and the draft
+        sampler must reduce over that same group. For every other case (including
+        no CP) this is just model_config.mapping.
 
-        Returns ``None`` when no ``model_config`` / ``mapping`` is available
-        (e.g. the Eagle3 non-MTP path), matching the previous behavior of
-        guarding on ``self.model_config``.
+        Returns None when no model_config or mapping is available, such as the
+        Eagle3 non-MTP path.
         """
         model_config = getattr(self, "model_config", None)
         if model_config is None or not hasattr(model_config, "mapping"):

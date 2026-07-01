@@ -1,6 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import copy
 import enum
 import math
@@ -26,6 +37,8 @@ from tensorrt_llm.llmapi.llm_args import KvCacheConfig, PeftCacheConfig
 from tensorrt_llm.lora_helper import LoraConfig
 from tensorrt_llm.lora_manager import LoraManager, LoraModelConfig
 from tensorrt_llm.runtime import ModelConfig as ModelConfigPython
+from tensorrt_llm.runtime.kv_cache_hash import (KV_CACHE_HASH_ALGO_AUTO,
+                                                KV_CACHE_HASH_ALGO_V1)
 
 # isort: off
 # isort: on
@@ -87,6 +100,15 @@ class ResourceManagerType(enum.Enum):
 
 def compute_page_count(token_count: int, tokens_per_page: int) -> int:
     return (token_count + tokens_per_page) // tokens_per_page
+
+
+def _warn_if_unsupported_v1_kv_cache_event_hash_algo(hash_algo: str) -> None:
+    if hash_algo in (KV_CACHE_HASH_ALGO_AUTO, KV_CACHE_HASH_ALGO_V1):
+        return
+    logger.warning(
+        f"KVCacheManager only supports kv_cache_event_hash_algo={KV_CACHE_HASH_ALGO_V1}; "
+        f"requested {hash_algo}. The V1 event manager will emit {KV_CACHE_HASH_ALGO_V1} "
+        "event hashes.")
 
 
 class BaseResourceManager(ABC):
@@ -573,6 +595,8 @@ class KVCacheManager(BaseResourceManager):
         }
 
         if self.event_buffer_max_size > 0:
+            _warn_if_unsupported_v1_kv_cache_event_hash_algo(
+                kv_cache_config.kv_cache_event_hash_algo)
             if mapping.enable_attention_dp:
                 kwargs['event_manager'] = KVCacheEventManagerCpp(
                     max_kv_event_entries=self.event_buffer_max_size,
@@ -703,7 +727,7 @@ class KVCacheManager(BaseResourceManager):
         decode-index d (the golden token) is assigned to rank
         (d // tokens_per_block) % cp_size, and the whole group lands there. The
         per-rank owned-decode count is tracked incrementally in
-        py_helix_owned_decode_seen (per-group ownership has no closed form).
+        py_helix_owned_decode_seen, since per-group ownership has no closed form.
         """
         block_id = decode_index // self.tokens_per_block
         return block_id % self.mapping.cp_size == self.mapping.cp_rank
@@ -713,18 +737,17 @@ class KVCacheManager(BaseResourceManager):
         """Reserve KV cache slots for a Helix generation or verify forward.
 
         Ownership is per request (per verify group), not per token: the whole
-        group of query tokens written this forward -- the re-fed golden token at
-        global decode-index g plus the drafts at [g + 1, g + draft_len] -- is
+        group of query tokens written this forward, the re-fed golden token at
+        global decode-index g plus the drafts at [g + 1, g + draft_len], is
         assigned to a single CP rank, the owner of the group's anchor decode-index
-        g (``(g // tokens_per_block) % cp_size``). This removes the mixed-ownership
-        (straddle) case where a verify block crossing a tokens_per_block boundary
-        would otherwise be split across ranks. The owner reserves slots for every
-        token in the group; non-owner ranks reserve none.
+        g, (g // tokens_per_block) % cp_size. This keeps golden and draft tokens
+        on the same rank even when a verify block crosses a tokens_per_block
+        boundary. The owner reserves slots for every token in the group;
+        non-owner ranks reserve none.
 
         py_helix_local_past_seen is the per-rank cached length passed as
-        num_cached_tokens. With per-group ownership the owned-decode count is not a
-        closed-form block-cyclic count, so it is tracked incrementally in
-        py_helix_owned_decode_seen.
+        num_cached_tokens. With per-group ownership the owned-decode count has no
+        closed form, so it is tracked incrementally in py_helix_owned_decode_seen.
         """
         g = req.py_helix_global_decode_len
         owns_group = self._helix_owns_decode_index(g)
@@ -749,13 +772,13 @@ class KVCacheManager(BaseResourceManager):
     def _helix_rewind_generation_kv(self, req: LlmRequest) -> None:
         """Rewind this rank's rejected and slack draft KV, then advance lengths.
 
-        Ownership is per request (per verify group): the whole group [g, g + reserve]
-        is owned by the anchor rank ``(g // tokens_per_block) % cp_size``. On the
-        owner rank the kept new decode-indices are [g, g + accepted] (golden plus
-        accepted drafts) and the rewound range is [g + 1 + accepted, g + reserve];
-        non-owner ranks reserved nothing and rewind nothing. The per-rank owned
-        decode count is advanced incrementally because per-group ownership has no
-        closed form.
+        Ownership is per request (per verify group): the whole group
+        [g, g + reserve] is owned by the anchor rank
+        (g // tokens_per_block) % cp_size. On the owner rank the kept new
+        decode-indices are [g, g + accepted] (golden plus accepted drafts) and
+        the rewound range is [g + 1 + accepted, g + reserve]. Non-owner ranks
+        reserved nothing and rewind nothing. The per-rank owned decode count is
+        advanced incrementally because per-group ownership has no closed form.
         """
         g = req.py_helix_global_decode_len
         accepted = req.py_num_accepted_draft_tokens

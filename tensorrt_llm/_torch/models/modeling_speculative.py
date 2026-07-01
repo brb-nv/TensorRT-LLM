@@ -1797,7 +1797,6 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                                     draft_model=self.draft_model,
                                     resource_manager=resource_manager)
         else:
-            # assert False, "expect spec-decoding to be active."
             logits = self.logits_processor.forward(
                 hidden_states,
                 self.lm_head,

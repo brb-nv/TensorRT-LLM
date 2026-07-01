@@ -360,22 +360,6 @@ __global__ void applyMLARopeAndAssignQKVKernelOptContext(T* q_ptr, T* q_pe, T* k
     }
 }
 
-// Compute the KV cache write slot for Helix parallelism. Returns -1 when this rank
-// does not own the sequence's new tokens (and must not write their KV); otherwise
-// returns the standard contiguous slot. Helix ownership is per request (per verify
-// group): all of a sequence's new query tokens -- the golden token plus its drafts
-// -- are owned by a single CP rank, so a single per-sequence flag (indexed by
-// batch_idx) is sufficient, and the owned tokens are appended contiguously.
-__device__ __forceinline__ int helixKvWriteSlot(
-    bool const* helix_is_inactive_rank, int batch_idx, int local_token_idx, int seq_len, int kv_cache_len)
-{
-    if (helix_is_inactive_rank == nullptr)
-    {
-        return kv_cache_len - seq_len + local_token_idx;
-    }
-    return helix_is_inactive_rank[batch_idx] ? -1 : kv_cache_len - seq_len + local_token_idx;
-}
-
 template <typename T, int BLOCK_SIZE, int K_DIM, int ROPE_DIM, typename KVCacheBuffer>
 __global__ void applyMLARopeAndAssignQKVKernelGeneration(T* qkv_output, T* q_pe, T const* fuse_buf, void* quant_q,
     KVCacheBuffer kv_cache, float2 const* cos_sin_cache, size_t head_num, int c_k, int total_s_len, int seq_len,
@@ -493,12 +477,11 @@ __global__ void applyMLARopeAndAssignQKVKernelGeneration(T* qkv_output, T* q_pe,
             {
                 if (head_idx == head_num)
                 {
-                    // If helix parallelism is being used, only write to KV cache if current rank owns the
-                    // token. With speculative decoding ownership/slot are resolved per query token.
-                    auto const token_kv_idx = helixKvWriteSlot(
-                        helix_is_inactive_rank, batch_idx, local_token_idx, seq_len, kv_cache_lengths[batch_idx]);
-                    if (token_kv_idx >= 0)
+                    // If helix parallelism is being used, only write to KV cache if current rank is active.
+                    if (helix_is_inactive_rank == nullptr || !helix_is_inactive_rank[batch_idx])
                     {
+                        auto const token_kv_idx = kv_cache_lengths[batch_idx] - seq_len + local_token_idx;
+
                         {
                             auto kDst = reinterpret_cast<T*>(kv_cache.getKBlockPtr(batch_idx, token_kv_idx));
                             auto inBlockIdx = kv_cache.getKVLocalIdx(
@@ -557,12 +540,10 @@ __global__ void applyMLARopeAndAssignQKVKernelGeneration(T* qkv_output, T* q_pe,
                     seqQOffset[batch_idx + 1] = head_num * seq_len * (batch_idx + 1);
                 }
 
-                // If helix parallelism is being used, only write to KV cache if current rank owns the
-                // token. With speculative decoding ownership/slot are resolved per query token.
-                auto const token_kv_idx = helixKvWriteSlot(
-                    helix_is_inactive_rank, batch_idx, local_token_idx, seq_len, kv_cache_lengths[batch_idx]);
-                if (token_kv_idx >= 0)
+                // If helix parallelism is being used, only write to KV cache if current rank is active.
+                if (helix_is_inactive_rank == nullptr || !helix_is_inactive_rank[batch_idx])
                 {
+                    auto const token_kv_idx = kv_cache_lengths[batch_idx] - seq_len + local_token_idx;
                     auto const src_kv_global_offset = static_cast<size_t>(global_token_idx) * (c_k + ROPE_DIM);
 
                     {

@@ -51,7 +51,7 @@ from tensorrt_llm.quantization.mode import QuantAlgo
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
 from ..distributed import (AllReduce, AllReduceFusionOp, AllReduceParams,
-                          MoEAllReduce, MoEAllReduceParams, allgather)
+                           MoEAllReduce, MoEAllReduceParams, allgather)
 from ..model_config import ModelConfig
 from ..modules.attention import (MLA, maybe_allgather_for_helix_cp,
                                  maybe_slice_for_helix_cp)
@@ -1844,6 +1844,9 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
         # affected by CP. For other layers, CP ranks are repurposed to TP. This shall be undone
         # at the end of __init__.
         if model_config.mapping.has_cp_helix():
+            print(
+                f"[DeepseekV3ForCausalLM::__init__] Repurposing KVP ranks to TP while keeping other details the same."
+            )
             self.mapping_with_cp = copy.deepcopy(model_config.mapping)
             # Repurpose KVP ranks to TP while keeping other details the same.
             model_config._frozen = False
@@ -1904,11 +1907,13 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
                                         ckpt_prefix, model_prefix))
                     self.model_config.quant_config.exclude_modules.extend(
                         extend_exclude_modules)
-            # @B: Verify where these layers are built and that they are helix aware.
             self.model.layers.extend(self.draft_model.mtp_layers)
 
         # Undo any manipulations done to mapping.
         if self.mapping_with_cp is not None:
+            print(
+                f"[DeepseekV3ForCausalLM::__init__] Restoring original mapping."
+            )
             model_config._frozen = False
             model_config.mapping = self.mapping_with_cp
             model_config._frozen = True

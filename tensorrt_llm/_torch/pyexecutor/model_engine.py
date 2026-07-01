@@ -2866,32 +2866,29 @@ class PyTorchModelEngine(ModelEngine):
                                    tokens_per_block: int):
         """Compute Helix parameters for a speculative verify forward.
 
-        Returns (global_positions, is_inactive, num_active):
-        global_positions are the absolute positions of the 1 + num_draft query
-        tokens, computed globally because each rank holds only a shard for RoPE.
-        is_inactive is a single per-request flag (this rank does not write KV for
-        this request's query tokens). num_active is the count of query tokens this
-        rank writes KV for.
+        Returns (global_positions, is_inactive, num_active). global_positions
+        are the absolute positions of the 1 + num_draft query tokens, computed
+        globally because each rank holds only a shard for RoPE. is_inactive is a
+        single per-request flag (this rank does not write KV for this request's
+        query tokens). num_active is the count of query tokens this rank writes
+        KV for.
 
         Ownership is per request (per verify group): the whole group of query
-        tokens -- the re-fed golden token at decode-index ``g`` plus the drafts at
-        ``[g + 1, g + num_draft]`` -- is assigned to a single CP rank, the owner of
-        the group's anchor decode-index ``g`` (``(g // tokens_per_block) % cp_size``).
-        Assigning one owner to the whole group eliminates the mixed-ownership
-        (straddle) case where a verify block crossing a tokens_per_block boundary
-        would split across ranks; golden and draft tokens always land on the same
-        rank. The Helix KV-write kernel indexes ``helix_is_inactive_rank`` per
-        request (one flag per sequence), so a single flag is all that is needed.
+        tokens, the re-fed golden token at decode-index g plus the drafts at
+        [g + 1, g + num_draft], is assigned to a single CP rank, the owner of the
+        group's anchor decode-index g, (g // tokens_per_block) % cp_size.
+        Assigning one owner to the whole group keeps golden and draft tokens on
+        the same rank even when a verify block crosses a tokens_per_block
+        boundary. The Helix KV-write kernel indexes helix_is_inactive_rank per
+        request, so a single flag is all that is needed.
 
-        Decode-index bookkeeping: ``g`` (``py_helix_global_decode_len``) counts the
-        decode tokens whose KV is already committed on the gen ranks. The KV of the
-        most recent golden token is written only when that token is fed back in, so
-        ``g`` always lags the output count by one (output_count == g + 1) -- both
-        after the disagg handoff (first gen token written on its first re-feed) and
-        in steady state. The token re-fed this step is the last output token, at
-        decode-index ``g``, and the new query tokens span decode-indices
-        ``[g, g + num_draft]``, matching the reservation side
-        (``_helix_prepare_generation_kv`` reserves the group on the same owner).
+        Decode-index bookkeeping: g (py_helix_global_decode_len) counts the
+        decode tokens whose KV is already committed on the generation ranks. The
+        KV of the most recent golden token is written only when that token is fed
+        back in, so g always lags the output count by one (output_count == g + 1).
+        The token re-fed this step is the last output token, at decode-index g,
+        and the new query tokens span decode-indices [g, g + num_draft], matching
+        the reservation done by _helix_prepare_generation_kv on the same owner.
         """
         cp_size = self.mapping.cp_size
         cp_rank = self.mapping.cp_rank
@@ -3193,13 +3190,12 @@ class PyTorchModelEngine(ModelEngine):
         previous_batch_indices = []
         previous_pos_indices = []
 
-        # Helix CP parameters. helix_position_offsets is per query token (RoPE
-        # needs each token's global position); helix_is_inactive_rank is per
-        # request (ownership is per verify group, and the Helix KV-write kernel
-        # indexes the flag per sequence). Populated in the extend (speculative
-        # verify) and generation loops below.
+        # Helix CP parameters. helix_position_offsets is per query token, since
+        # RoPE needs each token's global position. helix_is_inactive_rank is per
+        # request, since ownership is per verify group and the Helix KV-write
+        # kernel indexes the flag per sequence. Both are populated in the extend
+        # (speculative verify) and generation loops below.
         helix_is_inactive_rank, helix_position_offsets = [], []
-        helix_total_input_len = []
         # Cache invariant method result to avoid repeated calls per-request.
         _has_cp_helix = self.mapping.has_cp_helix()
         _helix_tokens_per_block = (kv_cache_manager.tokens_per_block
@@ -3251,7 +3247,6 @@ class PyTorchModelEngine(ModelEngine):
                     position_ids.extend(positions_h)
                     helix_position_offsets.extend(positions_h)
                     helix_is_inactive_rank.append(is_inactive_h)
-                    helix_total_input_len.append(request.total_input_len_cp)
                 else:
                     position_ids.extend(
                         list(
@@ -3285,7 +3280,6 @@ class PyTorchModelEngine(ModelEngine):
                     position_ids.extend(positions_h)
                     helix_position_offsets.extend(positions_h)
                     helix_is_inactive_rank.append(is_inactive_h)
-                    helix_total_input_len.append(request.total_input_len_cp)
                 else:
                     position_ids.extend(
                         list(
@@ -3424,7 +3418,6 @@ class PyTorchModelEngine(ModelEngine):
                         helix_is_inactive_rank.append(
                             request.py_helix_is_inactive_rank)
                         helix_position_offsets.append(position_id)
-                        helix_total_input_len.append(request.total_input_len_cp)
 
                 request.cached_tokens = past_seen_token_num
                 for beam in range(beam_width):
@@ -3807,7 +3800,6 @@ class PyTorchModelEngine(ModelEngine):
             attn_metadata.update_helix_param(
                 helix_position_offsets=helix_position_offsets,
                 helix_is_inactive_rank=helix_is_inactive_rank,
-                helix_total_input_len=helix_total_input_len,
             )
 
         if not attn_metadata.is_cuda_graph:
@@ -3959,7 +3951,6 @@ class PyTorchModelEngine(ModelEngine):
                     [item[1] for item in all_rank_num_tokens])
 
         if mm_token_indices is not None:
-            assert False, "mm_token_indices is irrelevant to us."
             mask = torch.ones(total_num_tokens, dtype=torch.bool)
             mask[mm_token_indices] = False
             mm_idx = maybe_pin_memory(mm_token_indices)
