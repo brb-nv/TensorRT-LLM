@@ -37,7 +37,12 @@ import torch
 
 from tensorrt_llm.logger import logger
 
-from .backend import _write_main_kv_slots, get_minimax_m3_attention_backend_cls
+from .backend import (
+    _INIT_SCORE,
+    _LOCAL_SCORE,
+    _write_main_kv_slots,
+    get_minimax_m3_attention_backend_cls,
+)
 from .metadata import (
     MiniMaxM3SparseAttentionMetadata,
     MiniMaxM3SparseConfig,
@@ -239,6 +244,114 @@ def _select_proxy_fmha_class():
     return None
 
 
+def _per_token_valid_blocks(
+    qo_lens_cpu: torch.Tensor,
+    kv_lens_cpu: torch.Tensor,
+    qo_offset_cpu: Optional[torch.Tensor],
+    *,
+    causal: bool,
+    block_size: int,
+) -> torch.Tensor:
+    """Per-query number of valid KV blocks (causal-aware), on CPU.
+
+    ``qo_lens_cpu`` / ``kv_lens_cpu`` / ``qo_offset_cpu`` are per-request
+    (batch-length). This expands them to a per-*token* ``[total_q]`` tensor
+    so the block selection can honour each query token's own causal extent
+    — which ``sparse_topk_select``'s scalar ``num_valid_pages`` /
+    ``force_end_blocks`` cannot express.
+
+    For request ``b`` with ``qo_lens_cpu[b]`` query tokens, token ``j``'s
+    K-side position is ``qo_offset[b] + j`` and its effective KV length is
+    ``min(pos + 1, kv_len[b])`` when causal (prefill) or ``kv_len[b]`` when
+    not (pure decode). The valid-block count is ``ceil(eff / block_size)``.
+    """
+    qo = qo_lens_cpu.to(torch.long)
+    kv = kv_lens_cpu.to(torch.long)
+    batch = int(qo.shape[0])
+    total = int(qo.sum().item())
+    if total == 0:
+        return torch.zeros(0, dtype=torch.long)
+    batch_row = torch.repeat_interleave(torch.arange(batch, dtype=torch.long), qo)
+    starts = torch.zeros(batch, dtype=torch.long)
+    if batch > 1:
+        starts[1:] = torch.cumsum(qo, 0)[:-1]
+    intra = torch.arange(total, dtype=torch.long) - starts[batch_row]
+    kv_per = kv[batch_row]
+    if causal:
+        if qo_offset_cpu is not None:
+            off = qo_offset_cpu.to(torch.long)[batch_row]
+        else:
+            off = (kv - qo)[batch_row]
+        eff = torch.minimum(off + intra + 1, kv_per)
+    else:
+        eff = kv_per
+    return (eff + block_size - 1) // block_size
+
+
+def _select_blocks_from_maxscore(
+    max_score_kv: torch.Tensor,
+    *,
+    topk: int,
+    n_valid_blocks: torch.Tensor,
+    init_blocks: int,
+    local_blocks: int,
+) -> torch.Tensor:
+    """Per-query block selection from per-KV-head block scores, in torch.
+
+    Mirrors the reference :func:`...backend._index_attention_and_select`
+    selection (init/local forced blocks + per-query valid-block masking +
+    top-k) but operates on the already-``amax``-reduced per-KV-head scores
+    ``max_score_kv`` (``[num_kv_heads, n_blocks, total_q]``) instead of the
+    per-index-head scores.
+
+    This replaces ``fmha_sm100.sparse_topk_select``'s scalar
+    ``num_valid_pages`` / ``force_begin_blocks`` / ``force_end_blocks``,
+    which pin the forced local/init blocks and the OOB clamp to a single
+    batch-wide value — wrong for every query shorter than the batch-longest.
+
+    Returns ``[total_q, num_kv_heads, topk]`` int32, ascending by block
+    index with ``-1`` padding at the tail (the same contract as
+    ``sparse_topk_select``, so downstream consumers are unchanged).
+    """
+    num_kv_heads, n_blocks, total_q = max_score_kv.shape
+    device = max_score_kv.device
+    scores = max_score_kv.permute(2, 0, 1).to(torch.float32)  # [total_q, kv, blk]
+    scores = scores.clone()
+    block_ids = torch.arange(n_blocks, device=device, dtype=torch.long)
+    nvb = n_valid_blocks.to(device=device, dtype=torch.long)  # [total_q]
+
+    # Init blocks (sink) forced to the highest priority.
+    if init_blocks > 0:
+        init_mask = block_ids.view(1, 1, -1) < init_blocks
+        scores = torch.where(init_mask, torch.full_like(scores, _INIT_SCORE), scores)
+    # Local blocks (window ending at each query's own last valid block).
+    if local_blocks > 0:
+        local_start = (nvb - local_blocks).clamp_min(0)  # [total_q]
+        local_mask = (block_ids.view(1, -1) >= local_start.view(-1, 1)) & (
+            block_ids.view(1, -1) < nvb.view(-1, 1)
+        )  # [total_q, n_blocks]
+        scores = torch.where(
+            local_mask.unsqueeze(1), torch.full_like(scores, _LOCAL_SCORE), scores
+        )
+    # Mask blocks past each query's valid extent so they can never be
+    # selected (this is the per-query replacement for the kernel's scalar
+    # num_valid_pages OOB clamp).
+    block_valid = block_ids.view(1, -1) < nvb.view(-1, 1)  # [total_q, n_blocks]
+    scores = scores.masked_fill(~block_valid.unsqueeze(1), float("-inf"))
+
+    k = min(topk, n_blocks)
+    vals, idx = scores.topk(k=k, dim=-1)  # [total_q, kv, k]
+    idx = torch.where(vals != float("-inf"), idx, torch.full_like(idx, -1))
+    # Ascending by block index with -1 at the tail (kernel output contract).
+    sort_key = torch.where(idx < 0, torch.full_like(idx, n_blocks), idx)
+    sort_key, _ = torch.sort(sort_key, dim=-1)
+    idx = torch.where(sort_key >= n_blocks, torch.full_like(sort_key, -1), sort_key)
+    if k < topk:
+        pad = torch.full((total_q, num_kv_heads, topk - k), -1, dtype=idx.dtype, device=device)
+        idx = torch.cat([idx, pad], dim=-1)
+    return idx.to(torch.int32)
+
+
 def _msa_index_proxy_and_topk(
     idx_q: torch.Tensor,
     idx_k_paged: torch.Tensor,
@@ -258,9 +371,12 @@ def _msa_index_proxy_and_topk(
     The proxy attention is delegated to an :class:`IndexerProxyFmha`
     implementation looked up via the standard FMHA registry (defaults
     to :class:`MsaProxyMqaFmha` when MSA is installed). The
-    group-reduction and ``sparse_topk_select`` step remain here because
-    they are MiniMax-M3-specific algorithmic choices, not generic
-    proxy concerns.
+    group-reduction and top-k selection remain here because they are
+    MiniMax-M3-specific algorithmic choices, not generic proxy concerns.
+    The selection is done in torch (see :func:`_select_blocks_from_maxscore`)
+    rather than ``fmha_sm100.sparse_topk_select`` so that per-query
+    valid-block counts and forced init/local blocks are honoured (the
+    kernel only supports batch-wide scalars for those).
 
     Inputs
     ------
@@ -285,15 +401,14 @@ def _msa_index_proxy_and_topk(
         ``[total_q, num_kv_heads, topk]`` int32 ascending top-k block
         indices with ``-1`` padding (MSA kernel contract). When
         ``num_index_heads > num_kv_heads`` the per-block max score is
-        reduced across each KV head's index-head group before
-        ``sparse_topk_select``, mirroring the
-        ``score_type='max'`` reduction the reference path performs.
+        reduced across each KV head's index-head group via ``amax`` before
+        top-k, mirroring the ``score_type='max'`` reduction. NOTE: this
+        amax-then-top-k differs from the reference path's
+        per-index-head-top-k-then-union and, for ``group > 1`` (e.g. under
+        tensor parallelism where index heads are replicated but KV heads
+        are sharded), selects a strict subset of the reference blocks. See
+        the module TODO / the parity test's Stage 2b for the open revisit.
     """
-    # ``sparse_topk_select`` still lives in fmha_sm100 -- the
-    # top-k step is not factored into the FMHA registry today.
-    # (Future work: register it as a separate selector library.)
-    fmha_sm100 = _require_msa_module()
-
     proxy_cls = _select_proxy_fmha_class()
     if proxy_cls is None:
         raise RuntimeError(
@@ -309,8 +424,8 @@ def _msa_index_proxy_and_topk(
     proxy = proxy_cls()
     logger.info_once(
         f"[HAIDER] MSA kernel dispatch: running index-proxy FMHA "
-        f"({proxy_cls.__name__}.forward_proxy) + fmha_sm100.sparse_topk_select "
-        f"for M3 block selection.",
+        f"({proxy_cls.__name__}.forward_proxy) + per-query torch top-k "
+        f"selection for M3 block selection.",
         key="haider_msa_proxy_topk_dispatch",
     )
     max_score = proxy.forward_proxy(
@@ -334,6 +449,17 @@ def _msa_index_proxy_and_topk(
             f"num_kv_heads ({config.num_kv_heads}) for MSA group-max reduction."
         )
     group = config.num_index_heads // config.num_kv_heads
+    # !!! NEEDS REVISIT (bug #3): amax-vs-union index-head reduction. !!!
+    # For group > 1 this amax-then-top-k selects a strict SUBSET of the
+    # reference path's per-index-head-top-k-then-union. group > 1 arises
+    # under tensor parallelism, where the M3 index projection is replicated
+    # but KV heads are sharded, so each rank sees more index heads than KV
+    # heads. The reference union is an accuracy-safe superset; this amax
+    # subset may drop blocks the reference keeps. The correct fix is to use
+    # only the index head matching the rank's KV head (group == 1), which
+    # also fits the fixed 16-block budget natively. Revisit once the
+    # end-to-end accuracy of this path is measured (see the parity test's
+    # Stage 2 / Stage 2b).
     if group > 1:
         max_score_kv = max_score.view(
             config.num_kv_heads, group, max_score.shape[1], max_score.shape[2]
@@ -341,28 +467,41 @@ def _msa_index_proxy_and_topk(
     else:
         max_score_kv = max_score
 
-    # ``num_valid_pages`` is per-call so the kernel masks out the
-    # rounded-up tail tiles; we pass the maximum across the batch and
-    # rely on the kernel's ``idx >= num_valid_pages`` check.
     page_size = int(idx_k_paged.shape[2])
-    max_valid_pages = (
-        int(((kv_lens_cpu + page_size - 1) // page_size).max().item()) if kv_lens_cpu.numel() else 0
-    )
-    if max_valid_pages <= 0:
-        # Degenerate batch (no KV) — return all-padded indices.
+    total_q = int(idx_q.shape[0])
+    if total_q == 0:
         return torch.full(
-            (idx_q.shape[0], config.num_kv_heads, _MSA_REQUIRED_TOPK),
+            (0, config.num_kv_heads, _MSA_REQUIRED_TOPK),
             -1,
             dtype=torch.int32,
             device=idx_q.device,
         )
 
-    return fmha_sm100.sparse_topk_select(
-        max_score_kv.contiguous(),
-        _MSA_REQUIRED_TOPK,
-        num_valid_pages=max_valid_pages,
-        force_begin_blocks=init_blocks,
-        force_end_blocks=local_blocks,
+    # Block selection is performed in torch rather than via
+    # ``fmha_sm100.sparse_topk_select`` because that kernel only accepts a
+    # *scalar* ``num_valid_pages`` and scalar ``force_begin_blocks`` /
+    # ``force_end_blocks``, which pin the OOB clamp and the forced
+    # init/local blocks to a single batch-wide value. For any batch with
+    # mixed sequence lengths (and for prefill, where each query token has
+    # its own causal extent) that forces the wrong local block and admits
+    # out-of-range block ids for every request shorter than the
+    # batch-longest. We instead derive the per-query valid-block count and
+    # run the reference selection (init/local forcing + masking + top-k)
+    # against the same per-KV-head scores. The kernel remains available for
+    # a future per-query-capable selector.
+    n_valid_blocks = _per_token_valid_blocks(
+        qo_lens_cpu,
+        kv_lens_cpu,
+        qo_offset_cpu,
+        causal=causal,
+        block_size=page_size,
+    )
+    return _select_blocks_from_maxscore(
+        max_score_kv,
+        topk=_MSA_REQUIRED_TOPK,
+        n_valid_blocks=n_valid_blocks,
+        init_blocks=init_blocks,
+        local_blocks=local_blocks,
     )
 
 
