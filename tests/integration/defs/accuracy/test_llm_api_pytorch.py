@@ -7261,23 +7261,43 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
-    @pytest.mark.skip_less_device(8)
+    @pytest.mark.skip_less_device(4)
     @pytest.mark.skip_less_device_memory(140000)
-    @parametrize_with_ids("tp_size,ep_size", [(8, 8)])
-    def test_mxfp8(self, tp_size, ep_size):
+    @parametrize_with_ids("use_msa", [False, True])
+    def test_mxfp8(self, use_msa):
+        tp_size, ep_size = 4, 4
         # MXFP8 checkpoint: weights are MXFP8 (e4m3 + UE8M0 1x32 block
         # scales) with MXFP8 dynamic activations; the KV cache stays in
-        # BF16 and the sparse attention path is unchanged from BF16.
+        # BF16.
+        #
+        # ``use_msa`` selects the sparse-attention kernel path without any
+        # code changes:
+        #   * use_msa=False -> in-tree Triton + SDPA reference path.
+        #   * use_msa=True  -> MSA-backed FMHA runtime (fmha_sm100 +
+        #     sparse_topk_select). Requires SM100 + the external
+        #     ``fmha_sm100`` package installed in the container.
         model_name = "MiniMaxAI/MiniMax-M3-MXFP8"
         model_path = f"{llm_models_root()}/MiniMax-M3-MXFP8"
+        # When use_msa=True, kv_cache_config.tokens_per_block is
+        # auto-derived to sparse_block_size (128) by TorchLlmArgs so the
+        # paged block-sparse kernel's page size matches the block
+        # selection granularity; no manual coupling needed here.
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6,
                                         enable_block_reuse=False)
-        sparse_attention_config = MiniMaxM3SparseAttentionConfig()
+        sparse_attention_config = MiniMaxM3SparseAttentionConfig(
+            sparse_use_msa=use_msa)
+        # MSA builds its fmha_sm100 kernel plan inside the model forward,
+        # which performs host->device copies that are illegal during
+        # CUDA-graph capture. Disable CUDA graphs for the MSA path until
+        # the plan build is hoisted outside the capture window; the Triton
+        # reference path keeps the default (capture-enabled) config.
+        cuda_graph_config = None if use_msa else CudaGraphConfig()
         with LLM(model_path,
                  tensor_parallel_size=tp_size,
                  moe_expert_parallel_size=ep_size,
                  kv_cache_config=kv_cache_config,
                  sparse_attention_config=sparse_attention_config,
+                 cuda_graph_config=cuda_graph_config,
                  max_seq_len=4096,
                  trust_remote_code=True) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.MXFP8

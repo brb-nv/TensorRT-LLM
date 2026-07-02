@@ -35,6 +35,8 @@ from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
 
+from tensorrt_llm.logger import logger
+
 from .backend import _write_main_kv_slots, get_minimax_m3_attention_backend_cls
 from .metadata import (
     MiniMaxM3SparseAttentionMetadata,
@@ -219,7 +221,15 @@ def _select_proxy_fmha_class():
         if not issubclass(cls, IndexerProxyFmha):
             continue
         if cls.is_available():
+            logger.info(
+                f"[HAIDER] MSA index-proxy FMHA backend selected: "
+                f"{cls.__name__} (is_available=True). fmha_sm100 kernels "
+                f"will drive the M3 index attention + top-k selection.")
             return cls
+    logger.warning(
+        "[HAIDER] MSA index-proxy FMHA backend NOT available: no enabled "
+        "IndexerProxyFmha subclass reported is_available=True (check "
+        "fmha_sm100 install + SM100 + TLLM_FMHA_LIBS).")
     return None
 
 
@@ -291,6 +301,12 @@ def _msa_index_proxy_and_topk(
         )
 
     proxy = proxy_cls()
+    logger.info_once(
+        f"[HAIDER] MSA kernel dispatch: running index-proxy FMHA "
+        f"({proxy_cls.__name__}.forward_proxy) + fmha_sm100.sparse_topk_select "
+        f"for M3 block selection.",
+        key="haider_msa_proxy_topk_dispatch",
+    )
     max_score = proxy.forward_proxy(
         idx_q,
         idx_k_paged,
@@ -361,7 +377,15 @@ def _select_block_sparse_fmha_class():
         if not issubclass(cls, BlockSparseFmha):
             continue
         if cls.is_available():
+            logger.info(
+                f"[HAIDER] MSA block-sparse FMHA backend selected: "
+                f"{cls.__name__} (is_available=True). fmha_sm100 kernels "
+                f"will drive the M3 sparse GQA.")
             return cls
+    logger.warning(
+        "[HAIDER] MSA block-sparse FMHA backend NOT available: no enabled "
+        "BlockSparseFmha subclass reported is_available=True (check "
+        "fmha_sm100 install + SM100 + TLLM_FMHA_LIBS).")
     return None
 
 
@@ -402,6 +426,11 @@ def _msa_sparse_attention(
         )
 
     sparse = sparse_cls()
+    logger.info_once(
+        f"[HAIDER] MSA kernel dispatch: running block-sparse GQA "
+        f"({sparse_cls.__name__}.forward_block_sparse) via fmha_sm100.",
+        key="haider_msa_block_sparse_dispatch",
+    )
     return sparse.forward_block_sparse(
         q,
         k_paged,
@@ -678,6 +707,12 @@ def get_minimax_m3_msa_attention_backend_cls():
                 raise NotImplementedError(
                     f"MSA backend requires topk={_MSA_REQUIRED_TOPK}, got {self.m3_config.topk}."
                 )
+            logger.info_once(
+                f"[HAIDER] MiniMaxM3MSARuntimeBackend constructed "
+                f"(layer={self.layer_idx}): MSA (fmha_sm100) kernels will "
+                f"drive this sparse attention layer.",
+                key="haider_msa_backend_ctor",
+            )
 
         def forward_sparse(
             self,
@@ -745,6 +780,11 @@ def get_minimax_m3_msa_attention_backend_cls():
             _write_main_kv_slots(idx_k_cache, out_cache_loc, idx_k_view)
 
             if m3_metadata.is_prefill:
+                logger.info_once(
+                    f"[HAIDER] MSA forward_sparse: PREFILL path "
+                    f"(layer={self.layer_idx}) -> minimax_m3_msa_sparse_prefill.",
+                    key="haider_msa_forward_prefill",
+                )
                 return minimax_m3_msa_sparse_prefill(
                     q_view,
                     k_cache,
@@ -756,6 +796,11 @@ def get_minimax_m3_msa_attention_backend_cls():
                     sm_scale=sm_scale,
                     idx_sm_scale=idx_sm_scale,
                 )
+            logger.info_once(
+                f"[HAIDER] MSA forward_sparse: DECODE path "
+                f"(layer={self.layer_idx}) -> minimax_m3_msa_sparse_decode.",
+                key="haider_msa_forward_decode",
+            )
             return minimax_m3_msa_sparse_decode(
                 q_view,
                 idx_q_view,

@@ -5303,6 +5303,44 @@ class TorchLlmArgs(BaseLlmArgs):
         return self
 
     @model_validator(mode='after')
+    def sync_minimax_m3_msa_tokens_per_block(self) -> 'TorchLlmArgs':
+        """Couple ``kv_cache_config.tokens_per_block`` to ``sparse_block_size`` for MiniMax-M3 MSA.
+
+        The MiniMax-M3 MSA backend (``sparse_use_msa=True``) runs a paged
+        block-sparse kernel that selects KV blocks at ``sparse_block_size``
+        granularity, so the KV-cache page size (``tokens_per_block``) must
+        equal ``sparse_block_size``. Auto-derive it when unset so callers
+        do not have to remember the coupling; raise a clear error if an
+        explicit, conflicting value was provided.
+        """
+        sparse_cfg = self.sparse_attention_config
+        if sparse_cfg is None or self.kv_cache_config is None:
+            return self
+        if getattr(sparse_cfg, "algorithm", None) != "minimax_m3":
+            return self
+        if not getattr(sparse_cfg, "sparse_use_msa", False):
+            return self
+
+        required = int(sparse_cfg.sparse_block_size)
+        current = self.kv_cache_config.tokens_per_block
+        if current == required:
+            return self
+        if "tokens_per_block" in self.kv_cache_config.model_fields_set:
+            raise ValueError(
+                "MiniMax-M3 MSA backend (sparse_use_msa=True) requires "
+                "kv_cache_config.tokens_per_block == sparse_block_size "
+                f"({required}), but tokens_per_block={current} was set "
+                f"explicitly. Remove the explicit value to auto-derive it, "
+                f"or set it to {required}.")
+        logger.info(
+            "MiniMax-M3 MSA backend: setting "
+            f"kv_cache_config.tokens_per_block to sparse_block_size "
+            f"({required}) so the paged block-sparse kernel's page size "
+            "matches the block-selection granularity.")
+        self.kv_cache_config.tokens_per_block = required
+        return self
+
+    @model_validator(mode='after')
     def validate_helix_tokens_per_block(self) -> 'TorchLlmArgs':
         """Validate that cp_config.tokens_per_block matches kv_cache_config.tokens_per_block when HELIX parallelism is active."""
         if self.context_parallel_size == 1 or self.cp_config is None:

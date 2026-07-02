@@ -48,10 +48,22 @@ def _resolve_minimax_m3_backend_cls(
     reference path when the flag is unset, preserving the legacy
     behaviour for callers that have not opted in.
     """
+    from tensorrt_llm.logger import logger
+
     from .minimax_m3 import (get_minimax_m3_attention_backend_cls,
                              get_minimax_m3_msa_attention_backend_cls)
     if getattr(sparse_attention_config, "sparse_use_msa", False):
+        logger.info_once(
+            "[HAIDER] MiniMax-M3: sparse_use_msa=True -> selecting "
+            "MSA-backed attention backend (MiniMaxM3MSARuntimeBackend).",
+            key="haider_msa_resolve",
+        )
         return get_minimax_m3_msa_attention_backend_cls()
+    logger.info_once(
+        "[HAIDER] MiniMax-M3: sparse_use_msa=False -> selecting Triton "
+        "reference attention backend (MiniMaxM3SparseRuntimeBackend).",
+        key="haider_triton_resolve",
+    )
     return get_minimax_m3_attention_backend_cls()
 
 
