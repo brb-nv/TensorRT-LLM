@@ -167,7 +167,6 @@ def _build_kv_indices_and_lens(
     slot_ids_long = metadata.slot_ids.to(torch.long)
     req_rows = metadata.req_to_token.index_select(0, slot_ids_long).to(torch.long)
     batch = int(req_rows.shape[0])
-    max_kv_len = int(req_rows.shape[1])
     seq_lens_cpu = metadata.seq_lens_cpu.to(torch.long).tolist()
 
     page_lists = []
@@ -176,16 +175,23 @@ def _build_kv_indices_and_lens(
         if kv_len <= 0:
             continue
         num_pages = (kv_len + page_size - 1) // page_size
-        # First slot of each page gives the page id (each block is a
-        # contiguous run of page_size slots, see KVCacheManagerV2).
-        # Clamp so trailing pages (rounded up beyond the request's
-        # block count) reuse the last valid block - they are masked out
-        # by seq_lens in the kernel.
-        max_page = max_kv_len // page_size
+        # First slot of each page gives the *global* page id into the paged
+        # cache (each block is a contiguous run of page_size slots, see
+        # KVCacheManagerV2). ``req_rows[b]`` already holds valid slot ids,
+        # so ``// page_size`` yields valid global page ids by construction.
+        #
+        # Do NOT clamp these to a per-request bound: ``max_kv_len //
+        # page_size`` is the per-request page count, not a global page-id
+        # bound. Clamping page ids to ``max_page - 1`` collapses the page
+        # table for every request whose pages exceed that count (i.e. every
+        # request after the first in a contiguous layout, and virtually all
+        # requests in production where block ids are global and
+        # non-contiguous), making the proxy FMHA read the wrong K/V and
+        # corrupting the block scores.
         page_starts = torch.arange(num_pages, device=device, dtype=torch.long) * page_size
-        page_starts = page_starts.clamp_max(max(0, max_kv_len - 1))
+        # ``page_starts`` is bounded by ``(num_pages - 1) * page_size < kv_len``
+        # so it never over-reads; no clamp needed on the read index either.
         page_ids = req_rows[b].gather(0, page_starts) // page_size
-        page_ids = page_ids.clamp_min(0).clamp_max(max(0, max_page - 1))
         page_lists.append(page_ids.to(torch.int32))
 
     if page_lists:
