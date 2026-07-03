@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import copy
 import dataclasses
+import os
 from functools import partial
 from typing import Any, Dict, List, Optional, Tuple
 from typing import Mapping as TMapping
@@ -46,6 +47,54 @@ from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
 from ..utils import ActivationType, AuxStreamType, EventType
 from .modeling_utils import DecoderModel, DecoderModelForCausalLM, ModelConfig, register_auto_model
+
+# ---------------------------------------------------------------------------
+# Debug instrumentation (temporary): dump first-MoE-layer tensors so an FP8 run
+# and an FP4 run can be diffed to localize where they deviate. No-op unless
+# ``TLLM_MINIMAX_MOE_DUMP_DIR`` is set. Files are overwritten each call so the
+# final (post-warmup) prefill/decode wins:
+#   {dir}/L{layer}_R{rank}_{pf|dc}_{name}.pt
+# ---------------------------------------------------------------------------
+def _minimax_moe_dump_enabled(layer_idx: Optional[int]) -> bool:
+    # Read env at call time so it works regardless of import ordering in the
+    # spawned MPI workers.
+    if os.environ.get("TLLM_MINIMAX_MOE_DUMP_DIR") is None:
+        return False
+    target = int(os.environ.get("TLLM_MINIMAX_MOE_DUMP_LAYER", "3"))
+    return layer_idx == target
+
+
+def _minimax_layer_dump_enabled(layer_idx: Optional[int]) -> bool:
+    # Dump the residual stream for the first few decoder layers so an FP8 vs FP4
+    # diff can locate the first point of divergence (upstream of the MoE).
+    if os.environ.get("TLLM_MINIMAX_MOE_DUMP_DIR") is None:
+        return False
+    max_layer = int(os.environ.get("TLLM_MINIMAX_DUMP_MAX_LAYER", "3"))
+    return layer_idx is not None and layer_idx <= max_layer
+
+
+def _minimax_moe_dump(module: nn.Module, name: str,
+                      tensor: Optional[torch.Tensor]) -> None:
+    if tensor is None or not isinstance(tensor, torch.Tensor):
+        return
+    dump_dir = os.environ.get("TLLM_MINIMAX_MOE_DUMP_DIR")
+    if dump_dir is None:
+        return
+    try:
+        os.makedirs(dump_dir, exist_ok=True)
+        rank = getattr(getattr(module, "mapping", None), "rank", 0)
+        num_tokens = tensor.shape[0] if tensor.dim() >= 1 else 1
+        phase = "pf" if num_tokens > 1 else "dc"
+        path = os.path.join(
+            dump_dir, f"L{module.layer_idx}_R{rank}_{phase}_{name}.pt")
+        torch.save(tensor.detach().float().cpu(), path)
+        # "Last write wins": warmup forwards run before the real generate step,
+        # so the final overwrite of each file is the non-warmup iteration.
+        print(f"[minimax-moe-dump] wrote {path} "
+              f"shape={tuple(tensor.shape)} num_tokens={num_tokens} phase={phase}")
+    except Exception as exc:  # never let debug dumping break the forward pass
+        print(f"[minimax-moe-dump] failed to dump {name}: {exc}")
+
 
 # ---------------------------------------------------------------------------
 # Config normalization helpers
@@ -358,7 +407,7 @@ class MiniMaxM3MoE(nn.Module):
         """Return the per-layer quant config for the routed experts.
 
         For MIXED_PRECISION checkpoints (MXFP8 base + NVFP4 experts),
-        ``ModelConfig._set_minimax_m3_moe_quant_config`` pre-populates
+        ``ModelConfig._set_minimax_m3_layer_quant_config`` pre-populates
         ``quant_config_dict`` with coarse entries keyed by
         ``model.layers.N.block_sparse_moe.experts``.  Falls back to the
         global ``quant_config`` when no per-layer entry exists (e.g. BF16
@@ -378,6 +427,7 @@ class MiniMaxM3MoE(nn.Module):
         layer_idx: Optional[int] = None,
     ):
         super().__init__()
+        self.layer_idx = layer_idx
         config = model_config.pretrained_config
         self.hidden_dim = config.hidden_size
         self.ffn_dim = config.intermediate_size
@@ -506,8 +556,15 @@ class MiniMaxM3MoE(nn.Module):
     ) -> torch.Tensor:
         all_rank_num_tokens = attn_metadata.all_rank_num_tokens
 
+        _dbg = _minimax_moe_dump_enabled(self.layer_idx)
+        if _dbg:
+            _minimax_moe_dump(self, "moe_input", hidden_states)
+        _captured: Dict[str, torch.Tensor] = {}
+
         def _compute_routed_output():
             router_logits = self.gate(hidden_states)
+            if _dbg:
+                _captured["router_logits"] = router_logits.detach()
             return self.experts(
                 hidden_states,
                 router_logits,
@@ -519,7 +576,9 @@ class MiniMaxM3MoE(nn.Module):
             return self.shared_experts(hidden_states)
 
         if self.shared_experts is None:
-            result = _compute_routed_output()
+            routed_output = _compute_routed_output()
+            shared_output = None
+            result = routed_output
         else:
             routed_output, shared_output = maybe_execute_in_parallel(
                 _compute_routed_output,
@@ -529,12 +588,23 @@ class MiniMaxM3MoE(nn.Module):
                 self.aux_stream,
                 disable_on_compile=True,
             )
+            if _dbg:
+                # Capture the pure shared output before the in-place add below.
+                _minimax_moe_dump(self, "shared_output", shared_output)
             # In-place add into ``shared_output`` to avoid allocating a
             # temporary (matches DeepSeekV3 / GLM convention).
             result = shared_output.add_(routed_output)
 
+        if _dbg:
+            _minimax_moe_dump(self, "router_logits", _captured.get("router_logits"))
+            _minimax_moe_dump(self, "routed_output", routed_output)
+            _minimax_moe_dump(self, "result_pre_allreduce", result)
+
         if self.allreduce is not None:
             result = self.allreduce(result, all_reduce_params=final_all_reduce_params)
+
+        if _dbg:
+            _minimax_moe_dump(self, "result_final", result)
         return result
 
 
@@ -1254,6 +1324,15 @@ class MiniMaxM3DecoderLayer(DecoderLayer):
         residual: Optional[torch.Tensor],
         **kwargs,
     ) -> torch.Tensor:
+        _dbg = _minimax_layer_dump_enabled(self.layer_idx)
+        if _dbg:
+            # Reconstruct the residual stream entering this layer (for layer 0
+            # this is the embedding output, so a matching L0 confirms the two
+            # checkpoints share the same base and the diff is meaningful).
+            stream_in = hidden_states if residual is None else (hidden_states +
+                                                                residual)
+            _minimax_moe_dump(self, "layer_in", stream_in)
+
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
@@ -1266,12 +1345,16 @@ class MiniMaxM3DecoderLayer(DecoderLayer):
             attn_metadata=attn_metadata,
             **kwargs,
         )
+        if _dbg:
+            _minimax_moe_dump(self, "attn_out", hidden_states)
 
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         if self.block_sparse_moe is not None:
             hidden_states = self.block_sparse_moe(hidden_states, attn_metadata)
         else:
             hidden_states = self.mlp(hidden_states)
+        if _dbg:
+            _minimax_moe_dump(self, "block_out", hidden_states)
         return hidden_states, residual
 
 

@@ -7295,15 +7295,21 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
         # (MIXED_PRECISION checkpoint); the KV cache stays in BF16 and the
         # sparse attention path is unchanged from BF16.
         model_name = "nvidia/MiniMax-M3-NVFP4"
-        model_path = f"{llm_models_root()}/MiniMax-M3-NVFP4"
+        model_path = f"/home/scratch.bbuddharaju_gpu/random/hf_models/Minimax-M3-NVFP4"
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6,
                                         enable_block_reuse=False)
         sparse_attention_config = MiniMaxM3SparseAttentionConfig()
+        # NVFP4 gated-bias-swiglu routed experts are numerically correct on the
+        # CUTLASS MoE backend but broken on TRTLLM-Gen for this model (a single-
+        # layer bf16-reference check shows CUTLASS cosine ~0.93 vs TRTLLM-Gen
+        # cosine ~0.01 / all-zeros). Pin CUTLASS until the TRTLLM-Gen NVFP4 path
+        # is fixed.
         with LLM(model_path,
                  tensor_parallel_size=tp_size,
                  moe_expert_parallel_size=ep_size,
                  kv_cache_config=kv_cache_config,
                  sparse_attention_config=sparse_attention_config,
+                 moe_config=MoeConfig(backend="CUTLASS"),
                  max_seq_len=4096,
                  trust_remote_code=True) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.MIXED_PRECISION

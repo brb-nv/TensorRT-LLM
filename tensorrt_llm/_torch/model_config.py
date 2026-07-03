@@ -680,22 +680,49 @@ class ModelConfig(Generic[TConfig]):
         return layer_quant_config
 
     @staticmethod
-    def _set_minimax_m3_moe_quant_config(pretrained_config, layer_quant_config):
-        """Inject per-MoE-layer NVFP4 quant config entries for Minimax M3.
+    def _set_minimax_m3_layer_quant_config(pretrained_config,
+                                           layer_quant_config):
+        """Normalize the Minimax M3 MIXED_PRECISION per-layer quant config.
 
-        The M3 NVFP4 checkpoint uses MIXED_PRECISION with per-linear entries
-        like ``language_model.model.layers.N.block_sparse_moe.experts.E.w1 ->
-        NVFP4`` in ``hf_quant_config.json``.  Those fine-grained keys cannot
-        be used directly by ``MiniMaxM3MoE._get_experts_quant_config``, which
-        needs a single coarse entry ``model.layers.N.block_sparse_moe.experts``
-        to select the NVFP4 backend.  This method detects the NVFP4 expert
-        entries and adds the coarse keys.
+        Two fix-ups are applied:
 
-        Does nothing when no NVFP4 expert entries are found (e.g. BF16
-        checkpoint).
+        1. Strip the ``language_model.`` prefix from every per-layer key.
+           The M3 VL checkpoint stores keys like
+           ``language_model.model.layers.0.self_attn.o_proj -> MXFP8`` in
+           ``hf_quant_config.json``, but the TRT-LLM module tree names the text
+           decoder ``model.layers.0.self_attn.o_proj`` (no ``language_model.``
+           prefix -- the loader strips it). ``apply_layerwise_quant_config``
+           matches *standalone* Linears (e.g. ``o_proj``, ``down_proj``) with an
+           **exact** ``name == key`` comparison, so the prefixed keys never match
+           and those layers silently fall back to the global ``MIXED_PRECISION``
+           config -> loaded unquantized (MXFP8 ``weight_scale`` dropped) -> the
+           attention/MLP output magnitude explodes. Stripping the prefix makes
+           the exact match succeed. (Fused qkv/gate_up Linears and the Attention
+           wrapper use substring matches and happened to work regardless.)
+
+        2. Inject a single coarse ``model.layers.N.block_sparse_moe.experts``
+           entry per MoE layer so ``MiniMaxM3MoE._get_experts_quant_config`` can
+           select the NVFP4 backend for the routed experts (the fine-grained
+           per-linear NVFP4 expert keys can't be used directly).
+
+        Does nothing when there is no per-layer config (e.g. the uniform MXFP8
+        or a BF16 checkpoint).
         """
         from tensorrt_llm.models.modeling_utils import QuantAlgo
-        has_nvfp4_experts = layer_quant_config is not None and any(
+        if layer_quant_config is None:
+            return layer_quant_config
+
+        # (1) Strip the ``language_model.`` prefix so exact-match per-layer
+        # quant assignment works for standalone base Linears.
+        _LM_PREFIX = "language_model."
+        layer_quant_config = {
+            (k[len(_LM_PREFIX):] if k.startswith(_LM_PREFIX) else k): v
+            for k, v in layer_quant_config.items()
+        }
+
+        # (2) Inject coarse NVFP4 expert entries (only when routed experts are
+        # NVFP4).
+        has_nvfp4_experts = any(
             "block_sparse_moe.experts" in k and isinstance(v, QuantConfig)
             and v.quant_algo == QuantAlgo.NVFP4
             for k, v in layer_quant_config.items())
@@ -704,9 +731,11 @@ class ModelConfig(Generic[TConfig]):
 
         experts_quant_config = QuantConfig()
         experts_quant_config.quant_algo = QuantAlgo.NVFP4
+        # TODO: remove the hardcoded group_size and read it from the per-linear
+        # NVFP4 expert entries in hf_quant_config.json instead. 16 is correct
+        # for standard NVFP4 today, but this is a latent bug if a checkpoint
+        # ever ships a different group size.
         experts_quant_config.group_size = 16
-
-        layer_quant_config = dict(layer_quant_config)
 
         text_config = getattr(pretrained_config, "text_config",
                               pretrained_config)
@@ -1112,7 +1141,7 @@ class ModelConfig(Generic[TConfig]):
                 require_layout=require_deepseek_v4_routed_moe_layout)
 
         if architecture in _MINIMAX_M3_ARCHITECTURES:
-            layer_quant_config = cls._set_minimax_m3_moe_quant_config(
+            layer_quant_config = cls._set_minimax_m3_layer_quant_config(
                 pretrained_config, layer_quant_config)
 
         model_config = cls(pretrained_config=pretrained_config,
