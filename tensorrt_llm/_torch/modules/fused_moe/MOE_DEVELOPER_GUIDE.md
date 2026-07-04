@@ -224,6 +224,29 @@ Each backend's `can_implement(quant_algo, dtype_activation, swiglu_gptoss_style,
   `num_slots % ep_size == 0`. `MegaMoECuteDsl` declares `eplb_support_status = SUPPORTED`: its quantization method registers the four MegaMoE-format derived params (`mega_fc{1,2}_weight{,_sf}`) and the per-expert `fc1_norm_const` with the load balancer alongside the raw NVFP4 family, so per-slot migration stays byte-consistent.
 - `FUSED_COMM` backends use `ignore_allreduce=False` for EPLB statistic update because the fused kernel AllReduces routing stats internally.
 
+## Routed-expert MoE LoRA
+
+Routed-expert MoE LoRA (LoRA on `moe_h_to_4h` / `moe_gate` / `moe_4h_to_h`) is
+supported on two backends, each with its own compute path (there is no shared
+LoRA math — only shared discovery in `moe_lora.py`):
+
+| Backend | Base weights | How LoRA is applied |
+|---------|--------------|---------------------|
+| Cutlass | unquantized fp16/bf16 or per-tensor FP8 (qdq) | fused inside `torch.ops.trtllm.fused_moe` |
+| TRTLLMGen | **FP8 block-scale only** | GEMM1 delta fused as an `Mn` bias into `fp8_block_scale_moe_lora`; FC2 delta added to the output. Deltas built by the native BGMV ops (`torch.ops.trtllm.bgmv_moe_{shrink,expand}`) via `moe_lora_delta.py` |
+
+Deferred: **BF16** MoE LoRA on TRTLLMGen (no native BF16 trtllm-gen MoE runner)
+and **FP4** MoE LoRA (no `Mn`-bias GEMM1 kernel). Enforced by
+`check_moe_lora_supported` in `peft/lora/validation.py`.
+
+TRTLLMGen LoRA requires: precomputed routing (the scheduler forces
+`router_logits=None` so the BGMV delta and MoE kernel share top-k), no
+multi-chunk execution, `do_finalize=True`, and the trtllm-gen `Mn`-bias FP8
+block-scale cubins. The BGMV kernels live in `cpp/tensorrt_llm/kernels/bgmvMoe/`
+(no FlashInfer dependency). CUDA graph support and the PEFT-cache -> BGMV
+contiguous-bank weight bridging (`TRTLLMGenFusedMoE._build_moe_lora_bgmv_inputs`)
+are follow-ups.
+
 ## Canonical Examples
 
 When adding new components, use these reference implementations:

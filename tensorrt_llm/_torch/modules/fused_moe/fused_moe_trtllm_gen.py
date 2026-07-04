@@ -338,6 +338,27 @@ class TRTLLMGenFusedMoE(MoE):
         layer (mirrors CutlassFusedMoE._moe_lora_active via the shared helper)."""
         return moe_lora_active(self.layer_idx, lora_params)
 
+    def reserve_moe_lora_cuda_graph_workspace(self, max_num_tokens: int,
+                                              max_lora_rank: int,
+                                              max_lora_size: int) -> None:
+        """CUDA-graph workspace reservation hook for routed-expert MoE LoRA.
+
+        Duck-typed by CudaGraphLoraManager (same contract as
+        CutlassFusedMoE.reserve_moe_lora_cuda_graph_workspace): called during
+        warmup, before capture, on every MoE layer exposing it.
+
+        No-op today. Unlike the Cutlass path (whose C++ FusedMoeRunner owns a
+        LoRA scratch that must be pre-sized), the TRTLLM-gen path builds its
+        deltas with the BGMV delta builders (moe_lora_delta.py) and the
+        fp8_block_scale_moe_lora op, which currently allocate their scratch
+        (gemm1_lora_delta, BGMV shrink/expand buffers, permuted_idx_to_expanded_idx,
+        the dequantized activation) per call. Graph-safe replay therefore still
+        needs those allocations moved into pre-reserved, address-stable buffers
+        owned here and reused across replays -- that is the remaining CUDA-graph
+        work and is gated on the eager path (see _build_moe_lora_bgmv_inputs).
+        """
+        del max_num_tokens, max_lora_rank, max_lora_size
+
     def _build_moe_lora_bgmv_inputs(self, lora_params: Dict, x: torch.Tensor):
         """Build the BGMV inputs (per-token adapter ids, per-(slice, expert) LoRA
         weight-pointer tables, adapter stride, rank, scale) for this layer.
