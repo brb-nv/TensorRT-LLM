@@ -87,6 +87,7 @@ add_library(
   llama4MinLatency.cpp
   logitsBitmaskOp.cpp
   mambaConv1dOp.cpp
+  bgmvMoeOp.cpp
   moeOp.cpp
   moeUtilOp.cpp
   moeGateOp.cpp
