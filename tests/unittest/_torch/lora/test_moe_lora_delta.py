@@ -5,7 +5,10 @@
 Compares ``bgmv_moe_gemm1_lora_delta`` / ``bgmv_moe_gemm2_lora_delta`` (which drive
 ``torch.ops.trtllm.bgmv_moe_{shrink,expand}``) against a plain PyTorch reference.
 
-Requires a CUDA GPU and the built TensorRT-LLM C++ extension. `feat` dims must be
+Per-adapter pointer model: ``w_ptr[slice, lora_id]`` points to that adapter's
+contiguous ``[num_experts, ...]`` bank; the kernel adds the per-expert offset.
+
+Requires a CUDA GPU and the built TensorRT-LLM C++ extension. ``feat`` dims must be
 in the compiled BGMV list (moeBgmvKernels.cuh); rank in {8,16,32,64}.
 """
 
@@ -45,20 +48,16 @@ def test_gemm1_lora_delta_matches_reference():
     topk_ids = torch.randint(0, num_experts, (T, k), device=device)
     lora_ids = torch.randint(-1, max_loras, (T, ), device=device)
 
-    wpa = torch.zeros(2, num_experts, dtype=torch.int64, device=device)
-    s_a = fill_w_ptr(wpa, a_gate, num_experts, 0)
-    s_a = fill_w_ptr(wpa, a_up, num_experts, 1)
-    wpb = torch.zeros(2, num_experts, dtype=torch.int64, device=device)
-    s_b = fill_w_ptr(wpb, b_gate, num_experts, 0)
-    s_b = fill_w_ptr(wpb, b_up, num_experts, 1)
-    # fill_w_ptr assumes a shared adapter stride across slices; here both slices
-    # come from separate equally-shaped banks, so drive each slice's stride via
-    # its own bank (gate and up have identical shape => identical stride).
-    assert a_gate.stride(0) == a_up.stride(0)
-    assert b_gate.stride(0) == b_up.stride(0)
+    # w_ptr[slice, lora_id] per-adapter base pointers (slice 0 = gate, 1 = up).
+    wpa = torch.zeros(2, max_loras, dtype=torch.int64, device=device)
+    fill_w_ptr(wpa, a_gate, 0)
+    fill_w_ptr(wpa, a_up, 1)
+    wpb = torch.zeros(2, max_loras, dtype=torch.int64, device=device)
+    fill_w_ptr(wpb, b_gate, 0)
+    fill_w_ptr(wpb, b_up, 1)
 
-    delta = bgmv_moe_gemm1_lora_delta(x, wpa, s_a, wpb, s_b, topk_ids, lora_ids,
-                                      rank, inter, scale=scale)
+    delta = bgmv_moe_gemm1_lora_delta(x, wpa, wpb, topk_ids, lora_ids, rank, inter,
+                                      scale=scale)
     assert delta.shape == (T, k, 2 * inter)
 
     ref = torch.zeros(T, k, 2 * inter, dtype=torch.float32, device=device)
@@ -96,13 +95,13 @@ def test_gemm2_lora_delta_matches_reference():
     topk_w = torch.rand(T, k, device=device)
     lora_ids = torch.randint(-1, max_loras, (T, ), device=device)
 
-    wpa = torch.zeros(1, num_experts, dtype=torch.int64, device=device)
-    s_a = fill_w_ptr(wpa, a_down, num_experts, 0)
-    wpb = torch.zeros(1, num_experts, dtype=torch.int64, device=device)
-    s_b = fill_w_ptr(wpb, b_down, num_experts, 0)
+    wpa = torch.zeros(1, max_loras, dtype=torch.int64, device=device)
+    fill_w_ptr(wpa, a_down, 0)
+    wpb = torch.zeros(1, max_loras, dtype=torch.int64, device=device)
+    fill_w_ptr(wpb, b_down, 0)
 
-    delta = bgmv_moe_gemm2_lora_delta(act, exp2perm, wpa, s_a, wpb, s_b, topk_ids,
-                                      topk_w, lora_ids, rank, hidden, scale=scale)
+    delta = bgmv_moe_gemm2_lora_delta(act, exp2perm, wpa, wpb, topk_ids, topk_w,
+                                      lora_ids, rank, hidden, scale=scale)
     assert delta.shape == (T, hidden)
 
     ref = torch.zeros(T, hidden, dtype=torch.float32, device=device)

@@ -46,14 +46,14 @@ TLLM_FOR_MOE_ALL_WIDE_NARROW(TLLM_INST_MOE_BGMV_TWOSIDE, __nv_bfloat16, __nv_bfl
 template <typename T, bool PER_PAIR_INPUT>
 static bool launchMoeShrink(T* Y, T const* X, T** wPtr, int64_t const* sortedTokenIds, int64_t const* expertIds,
     int64_t const* loraIndices, uint32_t featIn, uint32_t featOut, int64_t numPairs, int64_t numSlices,
-    int64_t numExperts, int64_t numTokens, int64_t loraStride, cudaStream_t stream)
+    int64_t maxLoras, int64_t numTokens, cudaStream_t stream)
 {
     switch (packU32(featIn, featOut))
     {
 #define TLLM_CASE_MOE_SHRINK(in_T, out_T, W_T, narrow, wide)                                                           \
     case packU32(wide, narrow):                                                                                        \
         moeBgmvShrinkSliced<wide, narrow, in_T, out_T, W_T, PER_PAIR_INPUT>(Y, X, wPtr, sortedTokenIds, expertIds,     \
-            loraIndices, numPairs, numSlices, numExperts, numTokens, loraStride, 1.0f, stream);                        \
+            loraIndices, numPairs, numSlices, maxLoras, numTokens, 1.0f, stream);                                     \
         return true;
         TLLM_FOR_MOE_ALL_WIDE_NARROW(TLLM_CASE_MOE_SHRINK, T, T, T)
 #undef TLLM_CASE_MOE_SHRINK
@@ -64,16 +64,15 @@ static bool launchMoeShrink(T* Y, T const* X, T** wPtr, int64_t const* sortedTok
 template <typename T, bool FINALIZE>
 static bool launchMoeExpand(float* Y, T const* X, T** wPtr, int64_t const* sortedTokenIds, int64_t const* expertIds,
     int64_t const* loraIndices, float const* topkWeights, int64_t const* sliceStartLoc, uint32_t featIn,
-    uint32_t featOut, int64_t numPairs, int64_t numSlices, int64_t numExperts, int64_t totalFeatOut, int64_t numTokens,
-    int64_t loraStride, cudaStream_t stream)
+    uint32_t featOut, int64_t numPairs, int64_t numSlices, int64_t maxLoras, int64_t totalFeatOut, int64_t numTokens,
+    cudaStream_t stream)
 {
     switch (packU32(featIn, featOut))
     {
 #define TLLM_CASE_MOE_EXPAND(in_T, out_T, W_T, narrow, wide)                                                           \
     case packU32(narrow, wide):                                                                                        \
         moeBgmvExpandSliced<narrow, wide, in_T, W_T, FINALIZE>(Y, X, wPtr, sortedTokenIds, expertIds, loraIndices,     \
-            topkWeights, sliceStartLoc, numPairs, numSlices, numExperts, totalFeatOut, wide, numTokens, loraStride,    \
-            1.0f, stream);                                                                                             \
+            topkWeights, sliceStartLoc, numPairs, numSlices, maxLoras, totalFeatOut, wide, numTokens, 1.0f, stream);   \
         return true;
         TLLM_FOR_MOE_ALL_WIDE_NARROW(TLLM_CASE_MOE_EXPAND, T, T, T)
 #undef TLLM_CASE_MOE_EXPAND
@@ -84,42 +83,40 @@ static bool launchMoeExpand(float* Y, T const* X, T** wPtr, int64_t const* sorte
 template <typename T>
 bool bgmvMoeShrink(T* Y, T const* X, T** wPtr, int64_t const* sortedTokenIds, int64_t const* expertIds,
     int64_t const* loraIndices, int64_t featIn, int64_t featOut, int64_t numPairs, int64_t numSlices,
-    int64_t numExperts, int64_t numTokens, int64_t loraStride, bool perPairInput, cudaStream_t stream)
+    int64_t maxLoras, int64_t numTokens, bool perPairInput, cudaStream_t stream)
 {
     return perPairInput ? launchMoeShrink<T, true>(Y, X, wPtr, sortedTokenIds, expertIds, loraIndices,
-               static_cast<uint32_t>(featIn), static_cast<uint32_t>(featOut), numPairs, numSlices, numExperts,
-               numTokens, loraStride, stream)
+               static_cast<uint32_t>(featIn), static_cast<uint32_t>(featOut), numPairs, numSlices, maxLoras,
+               numTokens, stream)
                         : launchMoeShrink<T, false>(Y, X, wPtr, sortedTokenIds, expertIds, loraIndices,
                               static_cast<uint32_t>(featIn), static_cast<uint32_t>(featOut), numPairs, numSlices,
-                              numExperts, numTokens, loraStride, stream);
+                              maxLoras, numTokens, stream);
 }
 
 template <typename T>
 bool bgmvMoeExpand(float* Y, T const* X, T** wPtr, int64_t const* sortedTokenIds, int64_t const* expertIds,
     int64_t const* loraIndices, float const* topkWeights, int64_t const* sliceStartLoc, int64_t featIn,
-    int64_t featOut, int64_t numPairs, int64_t numSlices, int64_t numExperts, int64_t totalFeatOut, int64_t numTokens,
-    int64_t loraStride, bool finalize, cudaStream_t stream)
+    int64_t featOut, int64_t numPairs, int64_t numSlices, int64_t maxLoras, int64_t totalFeatOut, int64_t numTokens,
+    bool finalize, cudaStream_t stream)
 {
     return finalize ? launchMoeExpand<T, true>(Y, X, wPtr, sortedTokenIds, expertIds, loraIndices, topkWeights,
                sliceStartLoc, static_cast<uint32_t>(featIn), static_cast<uint32_t>(featOut), numPairs, numSlices,
-               numExperts, totalFeatOut, numTokens, loraStride, stream)
+               maxLoras, totalFeatOut, numTokens, stream)
                     : launchMoeExpand<T, false>(Y, X, wPtr, sortedTokenIds, expertIds, loraIndices, topkWeights,
                           sliceStartLoc, static_cast<uint32_t>(featIn), static_cast<uint32_t>(featOut), numPairs,
-                          numSlices, numExperts, totalFeatOut, numTokens, loraStride, stream);
+                          numSlices, maxLoras, totalFeatOut, numTokens, stream);
 }
 
 // Public entry-point instantiations (half and bf16).
 template bool bgmvMoeShrink<half>(half*, half const*, half**, int64_t const*, int64_t const*, int64_t const*, int64_t,
-    int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, bool, cudaStream_t);
+    int64_t, int64_t, int64_t, int64_t, int64_t, bool, cudaStream_t);
 template bool bgmvMoeShrink<__nv_bfloat16>(__nv_bfloat16*, __nv_bfloat16 const*, __nv_bfloat16**, int64_t const*,
-    int64_t const*, int64_t const*, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, bool,
-    cudaStream_t);
+    int64_t const*, int64_t const*, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, bool, cudaStream_t);
 template bool bgmvMoeExpand<half>(float*, half const*, half**, int64_t const*, int64_t const*, int64_t const*,
-    float const*, int64_t const*, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, bool,
-    cudaStream_t);
+    float const*, int64_t const*, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, bool, cudaStream_t);
 template bool bgmvMoeExpand<__nv_bfloat16>(float*, __nv_bfloat16 const*, __nv_bfloat16**, int64_t const*,
     int64_t const*, int64_t const*, float const*, int64_t const*, int64_t, int64_t, int64_t, int64_t, int64_t,
-    int64_t, int64_t, int64_t, bool, cudaStream_t);
+    int64_t, int64_t, bool, cudaStream_t);
 
 } // namespace bgmv_moe
 } // namespace kernels

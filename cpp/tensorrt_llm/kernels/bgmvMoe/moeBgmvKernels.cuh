@@ -112,8 +112,14 @@ template <int feat_in, int feat_out, int RANK_TILE, int PAIRS_PER_BLOCK, int NUM
 __global__ void moeBgmvShrinkSlicedKernel(out_T* __restrict__ Y, in_T const* __restrict__ X,
     W_T** __restrict__ w_ptr, int64_t const* __restrict__ sorted_token_ids,
     int64_t const* __restrict__ expert_ids, int64_t const* __restrict__ lora_indices, int64_t num_pairs,
-    int64_t num_experts, int64_t num_tokens, int64_t lora_stride, float scale)
+    int64_t max_loras, int64_t num_tokens, float scale)
 {
+    // Per-adapter pointer model (TRT-LLM PEFT layout): w_ptr[slice, lora_id]
+    // points to that adapter's [num_experts, feat_out, feat_in]-contiguous LoRA-A
+    // bank, so the per-expert offset is a compile-time constant feat_in*feat_out.
+    // (This deliberately diverges from FlashInfer's per-expert base + adapter
+    // stride model; see moeBgmvKernels.h.)
+    constexpr int64_t kExpertStride = static_cast<int64_t>(feat_in) * feat_out;
     int const slice_id = blockIdx.z;
     int const pair_block_idx = blockIdx.x;
     int const rank_tile_idx = blockIdx.y;
@@ -145,7 +151,7 @@ __global__ void moeBgmvShrinkSlicedKernel(out_T* __restrict__ Y, in_T const* __r
                     // PER_PAIR_INPUT: input row = pair (FC2 activation) vs token (FC1).
                     int64_t const in_row = PER_PAIR_INPUT ? static_cast<int64_t>(pair_idx) : token_idx;
                     X_tok[pp] = X + in_row * feat_in;
-                    W_base[pp] = w_ptr[slice_id * num_experts + eid] + lid * lora_stride + j0 * feat_in;
+                    W_base[pp] = w_ptr[slice_id * max_loras + lid] + eid * kExpertStride + j0 * feat_in;
                     pair_valid[pp] = true;
                     continue;
                 }
@@ -414,9 +420,13 @@ __global__ void moeBgmvExpandSlicedKernel(float* __restrict__ Y, in_T const* __r
     W_T** __restrict__ w_ptr, int64_t const* __restrict__ sorted_token_ids,
     int64_t const* __restrict__ expert_ids, int64_t const* __restrict__ lora_indices,
     float const* __restrict__ topk_weights, int64_t const* __restrict__ slice_start_loc, int64_t num_pairs,
-    int64_t num_experts, int64_t total_feat_out, int32_t current_feat_out, int64_t num_tokens, int64_t lora_stride,
-    float scale)
+    int64_t max_loras, int64_t total_feat_out, int32_t current_feat_out, int64_t num_tokens, float scale)
 {
+    // Per-adapter pointer model: w_ptr[slice, lora_id] is that adapter's
+    // [num_experts, feat_out, feat_in]-contiguous LoRA-B bank; per-expert offset
+    // is the compile-time constant feat_in*feat_out. (Diverges from FlashInfer;
+    // see moeBgmvKernels.h.)
+    constexpr int64_t kExpertStride = static_cast<int64_t>(feat_in) * feat_out;
     size_t pair_idx = blockIdx.x;
     size_t tile_idx = blockIdx.y;
     int64_t token_idx = sorted_token_ids[pair_idx];
@@ -432,7 +442,7 @@ __global__ void moeBgmvExpandSlicedKernel(float* __restrict__ Y, in_T const* __r
     int slice_id = blockIdx.z;
     int64_t expert_id = expert_ids[pair_idx];
     int64_t col_offset = slice_start_loc[slice_id];
-    W_T const* W = w_ptr[slice_id * num_experts + expert_id] + lora_id * lora_stride;
+    W_T const* W = w_ptr[slice_id * max_loras + lora_id] + expert_id * kExpertStride;
     auto block = cg::this_thread_block();
     VecT<in_T, vec_size> x_vec;
     x_vec.load(X + slice_id * num_pairs * feat_in + pair_idx * feat_in + threadIdx.x * vec_size);
@@ -472,8 +482,7 @@ __global__ void moeBgmvExpandSlicedKernel(float* __restrict__ Y, in_T const* __r
 template <int feat_in, int feat_out, typename in_T, typename out_T, typename W_T, bool PER_PAIR_INPUT>
 void moeBgmvShrinkSliced(out_T* __restrict__ Y, in_T const* __restrict__ X, W_T** __restrict__ w_ptr,
     int64_t const* sorted_token_ids, int64_t const* expert_ids, int64_t const* lora_indices, int64_t num_pairs,
-    int64_t num_slices, int64_t num_experts, int64_t num_tokens, int64_t lora_stride, float scale,
-    cudaStream_t stream)
+    int64_t num_slices, int64_t max_loras, int64_t num_tokens, float scale, cudaStream_t stream)
 {
     constexpr int cfg_tx = MoeShrinkKernelConfig::tx;
     constexpr int cfg_ty = MoeShrinkKernelConfig::ty;
@@ -508,8 +517,7 @@ void moeBgmvShrinkSliced(out_T* __restrict__ Y, in_T const* __restrict__ X, W_T*
         }                                                                                                              \
         dim3 g((int) ((num_pairs + (PPB) -1) / (PPB)), gy, num_slices);                                                \
         kfn<<<g, dim3(cfg_tx, cfg_ty), shmem, stream>>>(                                                               \
-            Y, X, w_ptr, sorted_token_ids, expert_ids, lora_indices, num_pairs, num_experts, num_tokens, lora_stride,  \
-            scale);                                                                                                    \
+            Y, X, w_ptr, sorted_token_ids, expert_ids, lora_indices, num_pairs, max_loras, num_tokens, scale);        \
     } while (0)
 
 #define TLLM_BGMV_MOE_DISPATCH(VS)                                                                                     \
@@ -553,8 +561,8 @@ template <int feat_in, int feat_out, typename in_T, typename W_T, bool FINALIZE>
 void moeBgmvExpandSliced(float* __restrict__ Y, in_T const* __restrict__ X, W_T** __restrict__ w_ptr,
     int64_t const* sorted_token_ids, int64_t const* expert_ids, int64_t const* lora_indices,
     float const* topk_weights, int64_t const* slice_start_loc, int64_t num_pairs, int64_t num_slices,
-    int64_t num_experts, int64_t total_feat_out, int32_t current_feat_out, int64_t num_tokens, int64_t lora_stride,
-    float scale, cudaStream_t stream)
+    int64_t max_loras, int64_t total_feat_out, int32_t current_feat_out, int64_t num_tokens, float scale,
+    cudaStream_t stream)
 {
     constexpr size_t vec_size = MoeExpandKernelConfig::vec_size;
     constexpr int tz = MoeExpandKernelConfig::tz;
@@ -566,24 +574,24 @@ void moeBgmvExpandSliced(float* __restrict__ Y, in_T const* __restrict__ X, W_T*
         constexpr int ty = 32 / tx;
         moeBgmvExpandSlicedKernel<feat_in, feat_out, vec_size, tx, ty, tz, in_T, W_T, FINALIZE>
             <<<dim3(num_pairs, feat_out / (ty * tz), num_slices), dim3(tx, ty, tz), 0, stream>>>(Y, X, w_ptr,
-                sorted_token_ids, expert_ids, lora_indices, topk_weights, slice_start_loc, num_pairs, num_experts,
-                total_feat_out, current_feat_out, num_tokens, lora_stride, scale);
+                sorted_token_ids, expert_ids, lora_indices, topk_weights, slice_start_loc, num_pairs, max_loras,
+                total_feat_out, current_feat_out, num_tokens, scale);
     }
     else if constexpr (16 % tx == 0 && feat_out % (16 / tx * tz) == 0)
     {
         constexpr int ty = 16 / tx;
         moeBgmvExpandSlicedKernel<feat_in, feat_out, vec_size, tx, ty, tz, in_T, W_T, FINALIZE>
             <<<dim3(num_pairs, feat_out / (ty * tz), num_slices), dim3(tx, ty, tz), 0, stream>>>(Y, X, w_ptr,
-                sorted_token_ids, expert_ids, lora_indices, topk_weights, slice_start_loc, num_pairs, num_experts,
-                total_feat_out, current_feat_out, num_tokens, lora_stride, scale);
+                sorted_token_ids, expert_ids, lora_indices, topk_weights, slice_start_loc, num_pairs, max_loras,
+                total_feat_out, current_feat_out, num_tokens, scale);
     }
     else if constexpr (8 % tx == 0 && feat_out % (8 / tx * tz) == 0)
     {
         constexpr int ty = 8 / tx;
         moeBgmvExpandSlicedKernel<feat_in, feat_out, vec_size, tx, ty, tz, in_T, W_T, FINALIZE>
             <<<dim3(num_pairs, feat_out / (ty * tz), num_slices), dim3(tx, ty, tz), 0, stream>>>(Y, X, w_ptr,
-                sorted_token_ids, expert_ids, lora_indices, topk_weights, slice_start_loc, num_pairs, num_experts,
-                total_feat_out, current_feat_out, num_tokens, lora_stride, scale);
+                sorted_token_ids, expert_ids, lora_indices, topk_weights, slice_start_loc, num_pairs, max_loras,
+                total_feat_out, current_feat_out, num_tokens, scale);
     }
 }
 
@@ -614,19 +622,17 @@ void moeBgmvExpandSliced(float* __restrict__ Y, in_T const* __restrict__ X, W_T*
 // feat_out=rank); expand is [narrow -> wide] (feat_in=rank, feat_out=wide).
 #define TLLM_INST_MOE_BGMV_SHRINK_SLICED(feat_in, feat_out, in_T, out_T, W_T)                                          \
     template void moeBgmvShrinkSliced<feat_in, feat_out, in_T, out_T, W_T, false>(out_T*, in_T const*, W_T**,          \
-        int64_t const*, int64_t const*, int64_t const*, int64_t, int64_t, int64_t, int64_t, int64_t, float,           \
-        cudaStream_t);                                                                                                 \
+        int64_t const*, int64_t const*, int64_t const*, int64_t, int64_t, int64_t, int64_t, float, cudaStream_t);     \
     template void moeBgmvShrinkSliced<feat_in, feat_out, in_T, out_T, W_T, true>(out_T*, in_T const*, W_T**,           \
-        int64_t const*, int64_t const*, int64_t const*, int64_t, int64_t, int64_t, int64_t, int64_t, float,           \
-        cudaStream_t);
+        int64_t const*, int64_t const*, int64_t const*, int64_t, int64_t, int64_t, int64_t, float, cudaStream_t);
 
 #define TLLM_INST_MOE_BGMV_EXPAND_SLICED(feat_in, feat_out, in_T, W_T)                                                 \
     template void moeBgmvExpandSliced<feat_in, feat_out, in_T, W_T, true>(float*, in_T const*, W_T**, int64_t const*,  \
         int64_t const*, int64_t const*, float const*, int64_t const*, int64_t, int64_t, int64_t, int64_t, int32_t,    \
-        int64_t, int64_t, float, cudaStream_t);                                                                        \
+        int64_t, float, cudaStream_t);                                                                                \
     template void moeBgmvExpandSliced<feat_in, feat_out, in_T, W_T, false>(float*, in_T const*, W_T**, int64_t const*, \
         int64_t const*, int64_t const*, float const*, int64_t const*, int64_t, int64_t, int64_t, int64_t, int32_t,    \
-        int64_t, int64_t, float, cudaStream_t);
+        int64_t, float, cudaStream_t);
 
 #define TLLM_INST_MOE_BGMV_TWOSIDE(in_T, out_T, W_T, narrow, wide)                                                     \
     TLLM_INST_MOE_BGMV_SHRINK_SLICED(wide, narrow, in_T, out_T, W_T)                                                   \

@@ -243,9 +243,14 @@ TRTLLMGen LoRA requires: precomputed routing (the scheduler forces
 `router_logits=None` so the BGMV delta and MoE kernel share top-k), no
 multi-chunk execution, `do_finalize=True`, and the trtllm-gen `Mn`-bias FP8
 block-scale cubins. The BGMV kernels live in `cpp/tensorrt_llm/kernels/bgmvMoe/`
-(no FlashInfer dependency). CUDA graph support and the PEFT-cache -> BGMV
-contiguous-bank weight bridging (`TRTLLMGenFusedMoE._build_moe_lora_bgmv_inputs`)
-are follow-ups.
+(no FlashInfer dependency) and use TRT-LLM's **per-adapter** pointer model
+(`w_ptr[slice, adapter]` -> that adapter's contiguous `[num_experts, rank, feat]`
+bank; the per-expert offset is a compile-time constant added in-kernel), which
+matches the PEFT cache's per-adapter base pointers (`weight_pointers` / `h_b_ptrs`)
+rather than FlashInfer's per-expert base + adapter-stride model. Wiring
+`TRTLLMGenFusedMoE._build_moe_lora_bgmv_inputs` to those pointers (+ the
+token->adapter `lora_ids` expansion and a uniform-rank check) and CUDA graph
+support are follow-ups.
 
 ## Canonical Examples
 

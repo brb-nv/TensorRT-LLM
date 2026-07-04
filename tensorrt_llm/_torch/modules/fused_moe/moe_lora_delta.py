@@ -29,10 +29,14 @@ MoE expert FFN:
     output (shrink ``per_pair_input=True`` over the gathered post-SwiGLU activation +
     expand ``finalize=True`` -> routing-weighted combine).
 
-The LoRA weights are **caller-managed**: the builders take the ``[num_slices,
-num_experts]`` int64 base-pointer tables (``w_ptr``) and the element ``lora_stride``
-built once with :func:`fill_w_ptr` over weight banks of layout
-``[max_loras, num_experts, *, *]`` -- not the weight tensors themselves.
+The LoRA weights are **caller-managed** and use TRT-LLM's per-adapter pointer
+model (not FlashInfer's per-expert + adapter-stride model): the builders take
+``[num_slices, max_loras]`` int64 base-pointer tables (``w_ptr``), where
+``w_ptr[slice, lora_id]`` points to that adapter's contiguous
+``[num_experts, rank, feat]`` bank. The BGMV kernel adds the per-expert offset
+internally, so there is no ``lora_stride``. At runtime these pointers come
+straight from the PEFT cache (``weight_pointers`` / ``h_b_ptrs``); :func:`fill_w_ptr`
+builds them over a contiguous ``[max_loras, num_experts, *, *]`` bank for tests.
 """
 
 from typing import Tuple
@@ -43,18 +47,26 @@ import torch
 def fill_w_ptr(
     w_ptr: torch.Tensor,
     weights: torch.Tensor,
-    num_experts: int,
     slice_id: int,
-) -> int:
-    """Fill ``w_ptr[slice_id, 0:num_experts]`` with per-expert base pointers into a
-    ``[max_loras, num_experts, rank, feat]`` weight bank; return the element stride
-    (``weights.stride(0)``) between adapters.
+) -> None:
+    """Fill ``w_ptr[slice_id, 0:max_loras]`` with per-**adapter** base pointers.
+
+    Per-adapter pointer model (matches TRT-LLM's PEFT layout, not FlashInfer's):
+    ``weights`` is a ``[max_loras, num_experts, rank, feat]`` bank where each
+    adapter's ``[num_experts, rank, feat]`` slice is contiguous, and
+    ``w_ptr[slice_id, lora_id]`` points to that adapter's slice base. The BGMV
+    kernel adds the per-expert offset (compile-time ``feat_in*feat_out``)
+    internally, so no adapter stride is returned.
+
+    At runtime the eager backend builds ``w_ptr`` directly from the PEFT cache's
+    per-adapter base pointers (``weight_pointers`` / ``h_b_ptrs``) instead of
+    calling this; this helper is mainly for tests over contiguous banks.
     """
+    max_loras = weights.shape[0]
     base_ptr = weights.data_ptr()
-    expert_stride_bytes = weights.stride(1) * weights.element_size()
-    arange = torch.arange(num_experts, dtype=torch.int64, device=weights.device)
-    w_ptr[slice_id, :num_experts] = arange * expert_stride_bytes + base_ptr
-    return weights.stride(0)
+    adapter_stride_bytes = weights.stride(0) * weights.element_size()
+    arange = torch.arange(max_loras, dtype=torch.int64, device=weights.device)
+    w_ptr[slice_id, :max_loras] = arange * adapter_stride_bytes + base_ptr
 
 
 def _expanded_pairs(
@@ -78,9 +90,7 @@ def _expanded_pairs(
 def bgmv_moe_gemm1_lora_delta(
     hidden_states: torch.Tensor,
     w_ptr_a: torch.Tensor,
-    lora_stride_a: int,
     w_ptr_b: torch.Tensor,
-    lora_stride_b: int,
     topk_ids: torch.Tensor,
     lora_ids: torch.Tensor,
     rank: int,
@@ -116,8 +126,7 @@ def bgmv_moe_gemm1_lora_delta(
     # Shrink: x @ A -> [2, P, rank]. Per-token input read (default mode).
     shrink_out = torch.zeros(2, P, rank, dtype=lora_dtype, device=device)
     torch.ops.trtllm.bgmv_moe_shrink(shrink_out, x, w_ptr_a, token_per_pair,
-                                     expert_per_pair, lora_idx, lora_stride_a,
-                                     False)
+                                     expert_per_pair, lora_idx, False)
 
     # Expand: shrink_out @ B -> [P, 2I], per-pair unweighted store; zeroed so
     # skipped pairs stay 0. topk_weights is ignored (finalize=False) but must be
@@ -127,8 +136,7 @@ def bgmv_moe_gemm1_lora_delta(
     y = torch.zeros(P, 2 * inter, dtype=torch.float32, device=device)
     torch.ops.trtllm.bgmv_moe_expand(y, shrink_out, w_ptr_b, token_per_pair,
                                      expert_per_pair, unit_w, lora_idx,
-                                     slice_start_loc, inter, lora_stride_b,
-                                     False)
+                                     slice_start_loc, inter, False)
 
     if scale != 1.0:
         y = y * scale
@@ -139,9 +147,7 @@ def bgmv_moe_gemm2_lora_delta(
     gemm1_activation_output: torch.Tensor,
     expanded_idx_to_permuted_idx: torch.Tensor,
     w_ptr_a: torch.Tensor,
-    lora_stride_a: int,
     w_ptr_b: torch.Tensor,
-    lora_stride_b: int,
     topk_ids: torch.Tensor,
     topk_weights: torch.Tensor,
     lora_ids: torch.Tensor,
@@ -182,8 +188,7 @@ def bgmv_moe_gemm2_lora_delta(
     # Shrink: a_exp @ A_down -> [1, P, rank]. Per-pair input read.
     shrink_out = torch.zeros(1, P, rank, dtype=lora_dtype, device=device)
     torch.ops.trtllm.bgmv_moe_shrink(shrink_out, a_exp, w_ptr_a, token_per_pair,
-                                     expert_per_pair, lora_idx, lora_stride_a,
-                                     True)
+                                     expert_per_pair, lora_idx, True)
 
     # Expand (finalize): shrink_out @ B_down -> [T, H], routing-weighted combine.
     slice_start_loc = torch.tensor([0], dtype=torch.int64, device=device)
@@ -191,8 +196,7 @@ def bgmv_moe_gemm2_lora_delta(
     y = torch.zeros(T, hidden, dtype=torch.float32, device=device)
     torch.ops.trtllm.bgmv_moe_expand(y, shrink_out, w_ptr_b, token_per_pair,
                                      expert_per_pair, topk_w, lora_idx,
-                                     slice_start_loc, hidden, lora_stride_b,
-                                     True)
+                                     slice_start_loc, hidden, True)
 
     if scale != 1.0:
         y = y * scale

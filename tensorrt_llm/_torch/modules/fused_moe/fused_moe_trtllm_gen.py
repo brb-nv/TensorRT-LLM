@@ -360,38 +360,38 @@ class TRTLLMGenFusedMoE(MoE):
         del max_num_tokens, max_lora_rank, max_lora_size
 
     def _build_moe_lora_bgmv_inputs(self, lora_params: Dict, x: torch.Tensor):
-        """Build the BGMV inputs (per-token adapter ids, per-(slice, expert) LoRA
-        weight-pointer tables, adapter stride, rank, scale) for this layer.
+        """Build the BGMV inputs (per-(slice, adapter) LoRA weight-pointer tables,
+        per-token adapter ids, uniform rank, scale) for this layer.
 
-        ASSUMED-BUT-NOT-PRESENT: the BGMV delta builders (moe_lora_delta.py) follow
-        FlashInfer's contiguous-bank model: each LoRA slice is a single
-        ``[max_loras, num_experts, rank, feat]`` weight bank, addressed as
-        ``w_ptr[slice, expert] + lora_id * lora_stride``, with a uniform rank
-        across adapters and a per-token ``lora_ids`` array.
+        The BGMV ops now use TRT-LLM's per-adapter pointer model
+        (``w_ptr[slice, lora_id]`` -> that adapter's contiguous
+        ``[num_experts, rank, feat]`` bank; per-expert offset added in-kernel), so
+        the op ABI is no longer a blocker. The tables map directly onto the PEFT
+        cache's per-adapter base pointers:
+          - eager: ``lora_params[layer][module]['weight_pointers']`` = [num_seqs, 3]
+            (weights_in = A base, weights_out = B base) + per-seq ``adapter_size``.
+          - cuda-graph: ``CudaGraphLoraParams.h_b_ptrs`` / ``h_b_prime_ptrs``
+            = [num_modules, max_lora_size] per-slot pointers + token_to_slot.
+        Slices: moe_h_to_4h -> gate, moe_gate -> up (FC1 has 2 slices);
+        moe_4h_to_h -> down (FC2 has 1 slice).
 
-        TRT-LLM's PEFT cache instead exposes per-request base pointers
-        (``lora_params[layer][module]['weight_pointers']`` = [num_seqs, 3]) with a
-        per-seq ``adapter_size`` (rank), and does NOT guarantee a single contiguous
-        per-expert adapter bank or a uniform rank. Bridging the two is the one
-        remaining integration step for the eager path and requires either:
-          (a) repacking the per-adapter MoE LoRA weights into contiguous
-              ``[max_loras, num_experts, rank, feat]`` banks (+ padding ranks to a
-              uniform max) at load time in the PEFT cache, or
-          (b) extending the BGMV op to accept per-(slice, adapter, expert) pointer
-              tables instead of a single base pointer + stride.
-
-        This needs the PEFT MoE-LoRA weight layout and GPU validation, so it is
-        left explicit here rather than guessed.
+        ASSUMED-BUT-NOT-PRESENT (narrowed to two runtime details, both needing GPU
+        validation with real lora_params):
+          1. token->adapter ``lora_ids`` expansion: map each of x's [num_tokens]
+             rows to its sequence/slot adapter id (-1 when none), mirroring the
+             per-seq expansion the Cutlass C++ op does from host_request_types /
+             prompt_lens (eager) or CudaGraphLoraParams.token_to_slot (graph).
+          2. uniform rank: BGMV compiles one rank per call, so all active adapters
+             in the batch must share a rank (or be padded); assert/enforce here.
         """
         raise NotImplementedError(
-            "TRTLLM-gen FP8 block-scale MoE LoRA: the BGMV delta builders need "
-            "contiguous per-expert LoRA weight banks (w_ptr + uniform-rank stride), "
-            "but the PEFT cache exposes per-request pointers with per-seq ranks. "
-            "Wire _build_moe_lora_bgmv_inputs to the PEFT MoE-LoRA weight layout "
-            "(repack into [max_loras, num_experts, rank, feat] banks, or extend the "
-            "bgmv_moe ops to per-(slice, adapter, expert) pointer tables). The rest "
-            "of the eager flow (GEMM1 delta -> fp8_block_scale_moe_lora -> FC2 delta) "
-            "is implemented in _run_fp8_block_scale_lora.")
+            "TRTLLM-gen FP8 block-scale MoE LoRA: wire _build_moe_lora_bgmv_inputs "
+            "to the PEFT per-adapter pointers (eager weight_pointers / graph "
+            "h_b_ptrs) as w_ptr[slice, adapter], plus the token->adapter lora_ids "
+            "expansion and a uniform-rank check. The BGMV op ABI already matches "
+            "the per-adapter model; the rest of the eager flow (GEMM1 delta -> "
+            "fp8_block_scale_moe_lora -> FC2 delta) is implemented in "
+            "_run_fp8_block_scale_lora.")
 
     def _dequant_activation(self, act: torch.Tensor,
                             act_scale: torch.Tensor) -> torch.Tensor:
@@ -444,9 +444,8 @@ class TRTLLMGenFusedMoE(MoE):
 
         # FC1 (gate+up) LoRA delta -> [T, top_k, 2*inter] bf16, fused as Mn bias.
         gemm1_delta = bgmv_moe_gemm1_lora_delta(
-            x, lora["fc1_w_ptr_a"], lora["fc1_stride_a"], lora["fc1_w_ptr_b"],
-            lora["fc1_stride_b"], topk_ids, lora["lora_ids"], lora["rank"], inter,
-            scale=lora["scale"])
+            x, lora["fc1_w_ptr_a"], lora["fc1_w_ptr_b"], topk_ids, lora["lora_ids"],
+            lora["rank"], inter, scale=lora["scale"])
 
         # Quantize activations for the FP8 block-scale MoE.
         x_fp8, x_fp8_sf = torch.ops.trtllm.fp8_quantize_1x128(x)
@@ -463,9 +462,9 @@ class TRTLLMGenFusedMoE(MoE):
         # FC2 (down) LoRA delta over the dequantized post-SwiGLU activation.
         act_bf16 = self._dequant_activation(act, act_scale)
         fc2_delta = bgmv_moe_gemm2_lora_delta(
-            act_bf16, exp2perm, lora["fc2_w_ptr_a"], lora["fc2_stride_a"],
-            lora["fc2_w_ptr_b"], lora["fc2_stride_b"], topk_ids, token_final_scales,
-            lora["lora_ids"], lora["rank"], hidden, scale=lora["scale"])
+            act_bf16, exp2perm, lora["fc2_w_ptr_a"], lora["fc2_w_ptr_b"], topk_ids,
+            token_final_scales, lora["lora_ids"], lora["rank"], hidden,
+            scale=lora["scale"])
         return output + fc2_delta.to(output.dtype)
 
     def _to_trtllm_gen_activation_type(self,

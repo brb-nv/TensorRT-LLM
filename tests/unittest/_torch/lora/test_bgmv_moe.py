@@ -7,8 +7,12 @@ routed-expert MoE LoRA building blocks ported from FlashInfer's bgmv_moe into
 TRT-LLM's native kernels, see cpp/tensorrt_llm/kernels/bgmvMoe/) against a plain
 PyTorch reference.
 
+Per-adapter pointer model (TRT-LLM PEFT layout): ``w_ptr[slice, lora_id]`` points
+to that adapter's contiguous ``[num_experts, feat_out, feat_in]`` bank; the kernel
+adds the per-expert offset internally (no adapter stride).
+
 Requires a CUDA GPU and the built TensorRT-LLM C++ extension. The BGMV kernels
-target sm_80+ (tuned for sm_90). `feat` dims must be in the compiled list in
+target sm_80+ (tuned for sm_90). ``feat`` dims must be in the compiled list in
 moeBgmvKernels.cuh (e.g. 768, 2048); rank in {8, 16, 32, 64}.
 """
 
@@ -25,22 +29,22 @@ requires_cuda_and_op = pytest.mark.skipif(
 )
 
 
-def _fill_w_ptr(w_ptr, weights, num_experts, slice_id):
-    """Mirror of fill_w_ptr: populate w_ptr[slice_id, :] with per-expert base
-    pointers into a [max_loras, num_experts, *, *] weight bank; return the
-    element stride between adapters (stride(0))."""
+def _fill_w_ptr(w_ptr, weights, slice_id):
+    """Fill w_ptr[slice_id, lora_id] with per-adapter base pointers into a
+    [max_loras, num_experts, *, *] bank (each adapter's per-expert block is
+    contiguous; the kernel adds the per-expert offset)."""
+    max_loras = weights.shape[0]
     base = weights.data_ptr()
-    expert_stride_bytes = weights.stride(1) * weights.element_size()
-    arange = torch.arange(num_experts, dtype=torch.int64, device=weights.device)
-    w_ptr[slice_id, :num_experts] = arange * expert_stride_bytes + base
-    return weights.stride(0)
+    adapter_stride_bytes = weights.stride(0) * weights.element_size()
+    arange = torch.arange(max_loras, dtype=torch.int64, device=weights.device)
+    w_ptr[slice_id, :max_loras] = arange * adapter_stride_bytes + base
 
 
 @requires_cuda_and_op
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("rank", [8, 16])
 def test_bgmv_moe_shrink_matches_reference(dtype, rank):
-    """y[slice, pair, rank] += x[token] @ A[expert, lora]^T (per-token input)."""
+    """y[slice, pair, rank] += x[token] @ A[lora, expert]^T (per-token input)."""
     torch.manual_seed(0)
     device = "cuda"
     num_experts, top_k, num_tokens = 4, 2, 6
@@ -49,24 +53,23 @@ def test_bgmv_moe_shrink_matches_reference(dtype, rank):
     max_loras = 3
 
     x = torch.randn(num_tokens, feat_in, dtype=dtype, device=device) * 0.1
-    # A bank: [max_loras, num_experts, rank, feat_in]
+    # A bank: [num_slices, max_loras, num_experts, rank, feat_in]. Each adapter's
+    # [num_experts, rank, feat_in] is contiguous.
     a = torch.randn(num_slices, max_loras, num_experts, rank, feat_in, dtype=dtype, device=device) * 0.05
 
-    # Per-token routing: expert ids per (token, slot) and per-token adapter id.
     topk_ids = torch.randint(0, num_experts, (num_tokens, top_k), device=device)
     lora_ids = torch.randint(-1, max_loras, (num_tokens, ), device=device)
     num_pairs = num_tokens * top_k
     token_per_pair = torch.arange(num_tokens, device=device).repeat_interleave(top_k).to(torch.int64)
     expert_per_pair = topk_ids.reshape(-1).to(torch.int64)
 
-    w_ptr = torch.zeros(num_slices, num_experts, dtype=torch.int64, device=device)
-    lora_stride = 0
+    w_ptr = torch.zeros(num_slices, max_loras, dtype=torch.int64, device=device)
     for s in range(num_slices):
-        lora_stride = _fill_w_ptr(w_ptr, a[s], num_experts, s)
+        _fill_w_ptr(w_ptr, a[s], s)
 
     y = torch.zeros(num_slices, num_pairs, rank, dtype=dtype, device=device)
     torch.ops.trtllm.bgmv_moe_shrink(y, x, w_ptr, token_per_pair, expert_per_pair,
-                                     lora_ids.to(torch.int64), lora_stride, False)
+                                     lora_ids.to(torch.int64), False)
 
     ref = torch.zeros(num_slices, num_pairs, rank, dtype=torch.float32, device=device)
     for s in range(num_slices):
@@ -83,7 +86,7 @@ def test_bgmv_moe_shrink_matches_reference(dtype, rank):
 @requires_cuda_and_op
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_bgmv_moe_expand_finalize_matches_reference(dtype):
-    """finalize=True: y[token, feat] += w[pair] * (shrink[pair] @ B[expert, lora]^T)."""
+    """finalize=True: y[token, feat] += w[pair] * (shrink[pair] @ B[lora, expert]^T)."""
     torch.manual_seed(1)
     device = "cuda"
     num_experts, top_k, num_tokens = 4, 2, 6
@@ -93,6 +96,7 @@ def test_bgmv_moe_expand_finalize_matches_reference(dtype):
     max_loras = 3
 
     shrink = torch.randn(num_slices, num_tokens * top_k, rank, dtype=dtype, device=device) * 0.1
+    # B bank: [num_slices, max_loras, num_experts, feat_out, rank].
     b = torch.randn(num_slices, max_loras, num_experts, feat_out, rank, dtype=dtype, device=device) * 0.05
 
     topk_ids = torch.randint(0, num_experts, (num_tokens, top_k), device=device)
@@ -102,16 +106,15 @@ def test_bgmv_moe_expand_finalize_matches_reference(dtype):
     token_per_pair = torch.arange(num_tokens, device=device).repeat_interleave(top_k).to(torch.int64)
     expert_per_pair = topk_ids.reshape(-1).to(torch.int64)
 
-    w_ptr = torch.zeros(num_slices, num_experts, dtype=torch.int64, device=device)
-    lora_stride = 0
+    w_ptr = torch.zeros(num_slices, max_loras, dtype=torch.int64, device=device)
     for s in range(num_slices):
-        lora_stride = _fill_w_ptr(w_ptr, b[s], num_experts, s)
+        _fill_w_ptr(w_ptr, b[s], s)
     slice_start_loc = torch.zeros(num_slices, dtype=torch.int64, device=device)
 
     y = torch.zeros(num_tokens, feat_out, dtype=torch.float32, device=device)
     torch.ops.trtllm.bgmv_moe_expand(y, shrink, w_ptr, token_per_pair, expert_per_pair,
                                      topk_w.reshape(-1).float().contiguous(), lora_ids.to(torch.int64),
-                                     slice_start_loc, feat_out, lora_stride, True)
+                                     slice_start_loc, feat_out, True)
 
     ref = torch.zeros(num_tokens, feat_out, dtype=torch.float32, device=device)
     for p in range(num_pairs):
