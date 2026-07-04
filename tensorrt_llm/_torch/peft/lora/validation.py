@@ -81,6 +81,36 @@ def _is_supported_quant(quant_mode) -> bool:
     return has_supported
 
 
+def _is_quantized(quant_mode) -> bool:
+    """Return True iff the layer has any active (non-kv-cache) quantization."""
+    if quant_mode is None or not hasattr(quant_mode, "has_any_quant"):
+        return False
+    try:
+        return bool(quant_mode.has_any_quant(exclude_kv_cache=True))
+    except TypeError:
+        # Older signatures may not accept the kwarg; fall back.
+        return bool(quant_mode.has_any_quant())
+
+
+def _is_fp8_block_scale(quant_mode) -> bool:
+    """Return True iff every underlying QuantMode uses FP8 block scales.
+
+    This is the only base-weight quantization the native TRTLLM-gen MoE LoRA
+    path supports today (the FP8 block-scale runner + Mn-bias GEMM1 + BGMV
+    delta). BF16 and FP4 are deferred to follow-ups.
+    """
+    if quant_mode is None:
+        return False
+    objs = getattr(quant_mode, "objs", None)
+    modes = objs if objs is not None else [quant_mode]
+    saw_fp8_block = False
+    for mode in modes:
+        if not mode.has_fp8_block_scales():
+            return False
+        saw_fp8_block = True
+    return saw_fp8_block
+
+
 def check_moe_lora_supported(
     *,
     moe_backend_name: str,
@@ -100,11 +130,13 @@ def check_moe_lora_supported(
         layer_idx: Optional layer index for diagnostic messages.
 
     Constraints:
-        - MoE backend MUST be CUTLASS.
-        - Base weight quantization MUST be off (fp16/bf16) or per-tensor FP8
-          (qdq). FP8 block-scale / FP4 / INT8 / INT4 / W4A8 ... are rejected.
+        - MoE backend MUST be CUTLASS or TRTLLM.
+        - CUTLASS: base weight quantization MUST be off (fp16/bf16) or per-tensor
+          FP8 (qdq). FP8 block-scale / FP4 / INT8 / INT4 / W4A8 ... are rejected.
+        - TRTLLM (trtllm-gen): base weight quantization MUST be FP8 block-scale.
+          BF16 (no native runner) and FP4 (no Mn-bias GEMM1 kernel) are deferred.
 
-    Other constraints (alltoall, min-latency, FP4, CUDA-graph) are enforced at
+    Other constraints (alltoall, min-latency, CUDA-graph) are enforced at
     runtime; we do not pre-check them here because they depend on per-call
     state that isn't available at factory time.
     """
@@ -112,28 +144,33 @@ def check_moe_lora_supported(
         return
 
     prefix = f"[layer_idx={layer_idx}] " if layer_idx is not None else ""
+    backend = (moe_backend_name or "").upper()
 
-    if (moe_backend_name or "").upper() != "CUTLASS":
+    if backend not in ("CUTLASS", "TRTLLM"):
         raise ValueError(
-            f"{prefix}Routed-expert MoE LoRA requires moe_backend='CUTLASS'; got "
-            f"moe_backend={moe_backend_name!r}. Disable LoRA on MoE modules "
-            f"(remove {sorted(MOE_LORA_MODULE_NAMES)} from "
-            "lora_config.lora_target_modules) or switch to the Cutlass MoE backend."
+            f"{prefix}Routed-expert MoE LoRA requires moe_backend in "
+            f"{{'CUTLASS', 'TRTLLM'}}; got moe_backend={moe_backend_name!r}. "
+            f"Disable LoRA on MoE modules (remove {sorted(MOE_LORA_MODULE_NAMES)} "
+            "from lora_config.lora_target_modules) or switch backend."
         )
 
-    if quant_config is not None:
-        quant_mode = getattr(quant_config, "quant_mode", None)
-        is_quantized = False
-        if quant_mode is not None and hasattr(quant_mode, "has_any_quant"):
-            try:
-                is_quantized = bool(quant_mode.has_any_quant(exclude_kv_cache=True))
-            except TypeError:
-                # Older signatures may not accept the kwarg; fall back.
-                is_quantized = bool(quant_mode.has_any_quant())
+    quant_mode = getattr(quant_config, "quant_mode", None) if quant_config is not None else None
+    is_quantized = _is_quantized(quant_mode)
+
+    if backend == "CUTLASS":
         if is_quantized and not _is_supported_quant(quant_mode):
             raise ValueError(
-                f"{prefix}Routed-expert MoE LoRA only supports unquantized "
-                f"fp16/bf16 or per-tensor FP8 (qdq) base weights; got "
-                f"quant_mode={quant_mode}. FP8 block-scale / FP4 / INT4 / INT8 / "
-                "W4A8 base weights combined with MoE LoRA are not supported."
+                f"{prefix}Routed-expert MoE LoRA on the Cutlass backend only "
+                f"supports unquantized fp16/bf16 or per-tensor FP8 (qdq) base "
+                f"weights; got quant_mode={quant_mode}. FP8 block-scale / FP4 / "
+                "INT4 / INT8 / W4A8 base weights are not supported."
+            )
+    else:  # TRTLLM (trtllm-gen)
+        if not (is_quantized and _is_fp8_block_scale(quant_mode)):
+            raise ValueError(
+                f"{prefix}Routed-expert MoE LoRA on the TRTLLM (trtllm-gen) "
+                f"backend requires FP8 block-scale base weights; got "
+                f"quant_mode={quant_mode}. BF16 (no native trtllm-gen MoE runner) "
+                "and FP4 (no Mn-bias GEMM1 kernel) MoE LoRA are deferred; use the "
+                "Cutlass backend for unquantized / per-tensor-FP8 MoE LoRA."
             )

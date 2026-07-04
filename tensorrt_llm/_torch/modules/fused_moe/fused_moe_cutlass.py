@@ -15,13 +15,13 @@ from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
 from ...distributed import allgather
 from ...expert_statistic import ExpertStatistic
 from ...model_config import ModelConfig
-from ...peft.lora.layer import (MOE_LORA_MODULE_NAMES,
-                                MOE_LORA_MODULE_TO_KERNEL_SLOT, LoraModuleType,
+from ...peft.lora.layer import (MOE_LORA_MODULE_TO_KERNEL_SLOT, LoraModuleType,
                                 MoeLoraLayer)
 from ...peft.lora.validation import has_moe_lora_targets
 from ...utils import (ActivationType, AuxStreamType, EventType,
                       Fp4QuantizedTensor)
 from .interface import AlltoallMethodType, MoE
+from .moe_lora import make_moe_lora_marker, moe_lora_active
 from .quantization import UnquantizedFusedMoEMethod
 
 # isort: off
@@ -416,30 +416,8 @@ class CutlassFusedMoE(MoE):
         LoRA-side GEMM (not per-expert weight shapes): MOE_H_TO_4H / MOE_GATE
         produce intermediate_size, MOE_4H_TO_H produces hidden_size.
         """
-        lora_config = getattr(model_config, "lora_config", None)
-        if lora_config is None:
-            return None
-        # Normalize to lowercase to match has_moe_lora_targets (which lowercases
-        # before comparing), so a mixed-case config marks the layer and builds
-        # the discovery marker consistently.
-        targets = {
-            name.lower()
-            for name in (getattr(lora_config, "lora_target_modules", []) or [])
-        }
-        active_modules: List[LoraModuleType] = []
-        active_out_sizes: List[int] = []
-        for name in MOE_LORA_MODULE_NAMES:
-            if name not in targets:
-                continue
-            module_type = LoraModuleType.from_string(name)
-            if name == "moe_4h_to_h":
-                active_out_sizes.append(self.hidden_size)
-            else:
-                active_out_sizes.append(self.intermediate_size)
-            active_modules.append(module_type)
-        if not active_modules:
-            return None
-        return MoeLoraLayer(active_modules, active_out_sizes)
+        return make_moe_lora_marker(model_config, self.hidden_size,
+                                    self.intermediate_size)
 
     def reserve_moe_lora_cuda_graph_workspace(self, max_num_tokens: int,
                                               max_lora_rank: int,
@@ -528,28 +506,7 @@ class CutlassFusedMoE(MoE):
         """Return True when lora_params carries routed-expert MoE LoRA tensors
         for this layer, meaning run_moe would fuse a LoRA delta.
         """
-        if not lora_params or self.layer_idx is None:
-            return False
-        # CUDA-graph slot-indexed mode carries MoE LoRA in cuda_graph_params
-        # rather than a per-layer eager dict (mirrors _extract_moe_lora_tensors),
-        # so consult the graph layer map to keep the stray-param and multi-chunk
-        # guards effective during capture/replay.
-        if lora_params.get("use_cuda_graph_mode", False):
-            cuda_graph_params = lora_params.get("cuda_graph_params")
-            if cuda_graph_params is None:
-                return False
-            layer_module2key = getattr(cuda_graph_params, "layer_module2key",
-                                       {})
-            return any(
-                (self.layer_idx,
-                 int(LoraModuleType.from_string(name))) in layer_module2key
-                for name in MOE_LORA_MODULE_NAMES)
-        layer_params = lora_params.get(self.layer_idx, {})
-        if not layer_params:
-            return False
-        return any(
-            int(LoraModuleType.from_string(name)) in layer_params
-            for name in MOE_LORA_MODULE_NAMES)
+        return moe_lora_active(self.layer_idx, lora_params)
 
     @staticmethod
     def _empty_kernel_slot_dict() -> Dict[str, Optional[torch.Tensor]]:

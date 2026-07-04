@@ -121,17 +121,59 @@ def test_check_moe_lora_rejects_fp8_block_scale():
         "VANILLA",
         "DENSEGEMM",
         "CUTEDSL",
-        "TRTLLM",
         "MEGAMOE_DEEPGEMM",
     ],
 )
-def test_check_moe_lora_rejects_non_cutlass_backend(backend):
+def test_check_moe_lora_rejects_unsupported_backend(backend):
     cfg = _FakeLoraConfig(["moe_gate", "moe_4h_to_h"])
-    with pytest.raises(ValueError, match="moe_backend='CUTLASS'"):
+    with pytest.raises(ValueError, match="moe_backend in"):
         check_moe_lora_supported(
             moe_backend_name=backend,
             lora_config=cfg,
             quant_config=None,
+        )
+
+
+def test_check_moe_lora_trtllm_fp8_block_scale_ok():
+    # trtllm-gen supports MoE LoRA on FP8 block-scale base weights.
+    cfg = _FakeLoraConfig(["moe_h_to_4h", "moe_4h_to_h", "moe_gate"])
+    check_moe_lora_supported(
+        moe_backend_name="TRTLLM",
+        lora_config=cfg,
+        quant_config=_FakeQuantConfig(_FP8_BLOCK_SCALE),
+    )
+
+
+def test_check_moe_lora_trtllm_rejects_bf16():
+    # BF16 (unquantized) MoE LoRA on trtllm-gen is deferred (no native runner).
+    cfg = _FakeLoraConfig(["moe_h_to_4h", "moe_4h_to_h", "moe_gate"])
+    with pytest.raises(ValueError, match="FP8 block-scale"):
+        check_moe_lora_supported(
+            moe_backend_name="TRTLLM",
+            lora_config=cfg,
+            quant_config=None,
+        )
+
+
+def test_check_moe_lora_trtllm_rejects_nvfp4():
+    # FP4 MoE LoRA on trtllm-gen is deferred (no Mn-bias GEMM1 kernel).
+    cfg = _FakeLoraConfig(["moe_h_to_4h", "moe_4h_to_h", "moe_gate"])
+    with pytest.raises(ValueError, match="FP8 block-scale"):
+        check_moe_lora_supported(
+            moe_backend_name="TRTLLM",
+            lora_config=cfg,
+            quant_config=_FakeQuantConfig(_NVFP4),
+        )
+
+
+def test_check_moe_lora_cutlass_still_rejects_fp8_block_scale():
+    # The Cutlass path must NOT accept FP8 block-scale (unchanged behavior).
+    cfg = _FakeLoraConfig(["moe_h_to_4h", "moe_4h_to_h", "moe_gate"])
+    with pytest.raises(ValueError, match="Cutlass"):
+        check_moe_lora_supported(
+            moe_backend_name="CUTLASS",
+            lora_config=cfg,
+            quant_config=_FakeQuantConfig(_FP8_BLOCK_SCALE),
         )
 
 
