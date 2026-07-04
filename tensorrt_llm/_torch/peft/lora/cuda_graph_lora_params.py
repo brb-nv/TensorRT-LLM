@@ -479,3 +479,32 @@ class CudaGraphLoraParams:
         packed[:, 1].copy_(ptrs_b.to(torch.int64))
         # Column 2 (dora) stays zero.
         return self.slot_ranks_host, packed
+
+    def get_moe_slot_inputs_device(
+        self,
+        layer_idx: int,
+        module_id: int,
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        """Device-side counterpart of get_moe_slot_inputs, for CUDA-graph-safe
+        consumers (e.g. the TRTLLM-gen BGMV MoE LoRA path) that must assemble
+        their inputs with captured GPU ops rather than host ops.
+
+        Returns ``(slot_ranks, a_ptrs, b_ptrs)`` where all three are the
+        persistent, address-stable **device** buffers this instance refreshes
+        in place every step (``slot_ranks`` is ``[max_lora_size]`` int32 and a
+        shared alias across modules; ``a_ptrs`` / ``b_ptrs`` are
+        ``[max_lora_size]`` int64 rows of ``d_b_ptrs`` / ``d_b_prime_ptrs`` for
+        this module). Because the addresses are stable and the contents are
+        refreshed each step outside graph capture, a captured kernel that reads
+        them replays correctly when adapters change. Returns None if
+        ``(layer_idx, module_id)`` is not in this layer's map.
+        """
+        key = self.layer_module2key.get((layer_idx, module_id))
+        if key is None:
+            return None
+        layer_param = self.layer_params.get(key)
+        if layer_param is None:
+            return None
+        local_module_id = key.module_ids.index(module_id)
+        return (self.slot_ranks, layer_param.d_b_ptrs[local_module_id],
+                layer_param.d_b_prime_ptrs[local_module_id])

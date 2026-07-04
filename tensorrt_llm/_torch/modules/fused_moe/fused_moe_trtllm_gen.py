@@ -34,6 +34,7 @@ from ...distributed import allgather
 from ...expert_statistic import ExpertStatistic
 from ...model_config import ModelConfig
 from ...utils import ActivationType, AuxStreamType, Fp4QuantizedTensor
+from ...peft.lora.layer import LoraModuleType
 from .interface import AlltoallMethodType, MoE, MoEWeightLoadingMode
 from .moe_lora import (has_moe_lora_targets, make_moe_lora_marker,
                        moe_lora_active)
@@ -359,39 +360,156 @@ class TRTLLMGenFusedMoE(MoE):
         """
         del max_num_tokens, max_lora_rank, max_lora_size
 
-    def _build_moe_lora_bgmv_inputs(self, lora_params: Dict, x: torch.Tensor):
-        """Build the BGMV inputs (per-(slice, adapter) LoRA weight-pointer tables,
-        per-token adapter ids, uniform rank, scale) for this layer.
+    @staticmethod
+    def _uniform_active_rank(ranks_1d: torch.Tensor) -> int:
+        """Return the shared rank across active (rank>0) adapters, or 0 if none.
 
-        The BGMV ops now use TRT-LLM's per-adapter pointer model
-        (``w_ptr[slice, lora_id]`` -> that adapter's contiguous
-        ``[num_experts, rank, feat]`` bank; per-expert offset added in-kernel), so
-        the op ABI is no longer a blocker. The tables map directly onto the PEFT
-        cache's per-adapter base pointers:
-          - eager: ``lora_params[layer][module]['weight_pointers']`` = [num_seqs, 3]
-            (weights_in = A base, weights_out = B base) + per-seq ``adapter_size``.
-          - cuda-graph: ``CudaGraphLoraParams.h_b_ptrs`` / ``h_b_prime_ptrs``
-            = [num_modules, max_lora_size] per-slot pointers + token_to_slot.
-        Slices: moe_h_to_4h -> gate, moe_gate -> up (FC1 has 2 slices);
-        moe_4h_to_h -> down (FC2 has 1 slice).
-
-        ASSUMED-BUT-NOT-PRESENT (narrowed to two runtime details, both needing GPU
-        validation with real lora_params):
-          1. token->adapter ``lora_ids`` expansion: map each of x's [num_tokens]
-             rows to its sequence/slot adapter id (-1 when none), mirroring the
-             per-seq expansion the Cutlass C++ op does from host_request_types /
-             prompt_lens (eager) or CudaGraphLoraParams.token_to_slot (graph).
-          2. uniform rank: BGMV compiles one rank per call, so all active adapters
-             in the batch must share a rank (or be padded); assert/enforce here.
+        BGMV compiles one rank per call, so all active adapters in a batch must
+        share the same rank. Raises if they differ (varying-rank MoE LoRA on the
+        trtllm-gen BGMV path is a follow-up; use the Cutlass backend for that).
         """
-        raise NotImplementedError(
-            "TRTLLM-gen FP8 block-scale MoE LoRA: wire _build_moe_lora_bgmv_inputs "
-            "to the PEFT per-adapter pointers (eager weight_pointers / graph "
-            "h_b_ptrs) as w_ptr[slice, adapter], plus the token->adapter lora_ids "
-            "expansion and a uniform-rank check. The BGMV op ABI already matches "
-            "the per-adapter model; the rest of the eager flow (GEMM1 delta -> "
-            "fp8_block_scale_moe_lora -> FC2 delta) is implemented in "
-            "_run_fp8_block_scale_lora.")
+        active = ranks_1d[ranks_1d > 0]
+        if active.numel() == 0:
+            return 0
+        r = int(active[0].item())
+        if not bool((active == r).all().item()):
+            raise NotImplementedError(
+                "TRTLLM-gen MoE LoRA (BGMV) requires a uniform LoRA rank across "
+                f"active adapters; got varying ranks {sorted(set(active.tolist()))}. "
+                "Use the Cutlass MoE backend for varying-rank MoE LoRA.")
+        return r
+
+    def _build_moe_lora_bgmv_inputs(self, lora_params: Dict, x: torch.Tensor):
+        """Build the BGMV inputs for this layer, or None when no adapter is active
+        this step (caller then runs the ordinary FP8 block-scale path).
+
+        Uses TRT-LLM's per-adapter pointer model (``w_ptr[slice, adapter]`` -> that
+        adapter's contiguous ``[num_experts, rank, feat]`` bank; the per-expert
+        offset is added in-kernel). Slices: moe_h_to_4h -> gate (FC1 slice 0),
+        moe_gate -> up (FC1 slice 1), moe_4h_to_h -> down (FC2). Returns a dict with
+        fc1/fc2 w_ptr_a/w_ptr_b, per-token ``lora_ids``, uniform ``rank``, ``scale``.
+
+        The LoRA scale (alpha/rank) is already folded into the B (weights_out)
+        tensors at load time (see lora_manager.py ``t_out *= scale``), so ``scale``
+        here is 1.0.
+        """
+        if lora_params.get("use_cuda_graph_mode", False):
+            return self._build_moe_lora_bgmv_inputs_cuda_graph(lora_params, x)
+        return self._build_moe_lora_bgmv_inputs_eager(lora_params, x)
+
+    def _build_moe_lora_bgmv_inputs_eager(self, lora_params: Dict, x: torch.Tensor):
+        device = x.device
+        num_tokens = x.shape[0]
+        num_seqs = lora_params["num_seqs"]
+        layer = lora_params.get(self.layer_idx, {})
+
+        gate = layer.get(int(LoraModuleType.MOE_H_TO_4H))
+        up = layer.get(int(LoraModuleType.MOE_GATE))
+        down = layer.get(int(LoraModuleType.MOE_4H_TO_H))
+        if gate is None or up is None or down is None:
+            raise NotImplementedError(
+                "TRTLLM-gen MoE LoRA requires LoRA on all of moe_h_to_4h (gate), "
+                "moe_gate (up), and moe_4h_to_h (down) for the SwiGLU FP8 "
+                "block-scale path.")
+
+        # Uniform rank across active adapters (0 => no active adapter this step).
+        adapter_size = gate["adapter_size"][:num_seqs]
+        rank = self._uniform_active_rank(adapter_size)
+        if rank == 0:
+            return None
+
+        # Per-adapter (per-seq) base pointer tables. weight_pointers is flat
+        # [num_seqs*3] (A, B, dora) per seq; column 0 = A base, 1 = B base.
+        def _col(mod, col):
+            return mod["weight_pointers"].reshape(-1, 3)[:num_seqs, col]
+
+        fc1_w_ptr_a = torch.stack([_col(gate, 0), _col(up, 0)]).to(device)
+        fc1_w_ptr_b = torch.stack([_col(gate, 1), _col(up, 1)]).to(device)
+        fc2_w_ptr_a = _col(down, 0).unsqueeze(0).to(device)
+        fc2_w_ptr_b = _col(down, 1).unsqueeze(0).to(device)
+
+        # token -> seq (adapter) expansion. A context seq contributes prompt_len
+        # tokens; a generation seq contributes 1 (spec decode is re-labeled as
+        # context with prompt_lens=tokens_per_req upstream). Inactive seqs -> -1.
+        host_request_types = lora_params["host_request_types"][:num_seqs].to(torch.int64)
+        prompt_lens = lora_params["prompt_lens_cpu"][:num_seqs].to(torch.int64)
+        seq_token_counts = torch.where(host_request_types == 0, prompt_lens,
+                                       torch.ones_like(prompt_lens))
+        seq_ids = torch.arange(num_seqs, dtype=torch.int64)
+        seq_lora_ids = torch.where(adapter_size.to(torch.int64) > 0, seq_ids,
+                                   torch.full_like(seq_ids, -1))
+        lora_ids = torch.repeat_interleave(seq_lora_ids, seq_token_counts)
+        assert lora_ids.numel() == num_tokens, (
+            f"MoE LoRA token->seq expansion produced {lora_ids.numel()} ids but "
+            f"x has {num_tokens} tokens; check host_request_types/prompt_lens.")
+
+        return {
+            "fc1_w_ptr_a": fc1_w_ptr_a,
+            "fc1_w_ptr_b": fc1_w_ptr_b,
+            "fc2_w_ptr_a": fc2_w_ptr_a,
+            "fc2_w_ptr_b": fc2_w_ptr_b,
+            "lora_ids": lora_ids.to(device),
+            "rank": rank,
+            "scale": 1.0,
+        }
+
+    def _build_moe_lora_bgmv_inputs_cuda_graph(self, lora_params: Dict,
+                                               x: torch.Tensor):
+        # CUDA-graph safety: assemble entirely from CudaGraphLoraParams' persistent,
+        # address-stable DEVICE buffers (d_b_ptrs / slot_ranks, refreshed in place
+        # each step outside capture) plus a captured H2D copy of the refreshed
+        # pinned token_to_slot_host. All ops below are GPU ops (captured kernels /
+        # memcpy) reading stable addresses, so replay picks up new adapters. Doing
+        # the stack/where on host tensors instead would bake capture-time values.
+        device = x.device
+        num_tokens = x.shape[0]
+        cg = lora_params.get("cuda_graph_params")
+        if cg is None:
+            return None
+
+        gate = cg.get_moe_slot_inputs_device(self.layer_idx, int(LoraModuleType.MOE_H_TO_4H))
+        up = cg.get_moe_slot_inputs_device(self.layer_idx, int(LoraModuleType.MOE_GATE))
+        down = cg.get_moe_slot_inputs_device(self.layer_idx, int(LoraModuleType.MOE_4H_TO_H))
+        if gate is None or up is None or down is None:
+            raise NotImplementedError(
+                "TRTLLM-gen MoE LoRA requires LoRA on all of moe_h_to_4h (gate), "
+                "moe_gate (up), and moe_4h_to_h (down) for the SwiGLU FP8 "
+                "block-scale path.")
+
+        # (slot_ranks [max_lora_size] int32 device, A_ptrs / B_ptrs [max_lora_size]
+        # int64 device rows). slot_ranks is a shared alias across modules.
+        slot_ranks, gate_a, gate_b = gate
+        _, up_a, up_b = up
+        _, down_a, down_b = down
+        # Determine the (uniform) compiled kernel rank from the PINNED HOST ranks,
+        # NOT the device tensor: the compiled BGMV kernel rank is fixed for a
+        # captured graph, and a device->host readback here would force a sync that
+        # is illegal during CUDA-graph capture. slot_ranks_host is a host op.
+        rank = self._uniform_active_rank(cg.slot_ranks_host)
+        if rank == 0:
+            return None
+
+        fc1_w_ptr_a = torch.stack([gate_a, up_a])  # [2, max_lora_size] device
+        fc1_w_ptr_b = torch.stack([gate_b, up_b])
+        fc2_w_ptr_a = down_a.unsqueeze(0)  # [1, max_lora_size] device
+        fc2_w_ptr_b = down_b.unsqueeze(0)
+
+        # Per-token slot ids on device (captured H2D from refreshed pinned host);
+        # tokens routed to an empty slot (rank 0) -> -1.
+        token_to_slot = cg.token_to_slot_host[:num_tokens].to(device, non_blocking=True).to(torch.int64)
+        slot_active = (slot_ranks > 0)
+        lora_ids = torch.where(slot_active[token_to_slot], token_to_slot,
+                               torch.full_like(token_to_slot, -1))
+
+        return {
+            "fc1_w_ptr_a": fc1_w_ptr_a,
+            "fc1_w_ptr_b": fc1_w_ptr_b,
+            "fc2_w_ptr_a": fc2_w_ptr_a,
+            "fc2_w_ptr_b": fc2_w_ptr_b,
+            "lora_ids": lora_ids,
+            "rank": rank,
+            "scale": 1.0,
+        }
 
     def _dequant_activation(self, act: torch.Tensor,
                             act_scale: torch.Tensor) -> torch.Tensor:
@@ -414,14 +532,15 @@ class TRTLLMGenFusedMoE(MoE):
                                   x_sf: Optional[torch.Tensor],
                                   do_finalize: bool,
                                   moe_output: Optional[torch.Tensor],
-                                  lora_params: Dict,
+                                  lora: Dict,
                                   routing_params: "RoutingParams") -> torch.Tensor:
         """Eager routed-expert MoE LoRA on the FP8 block-scale path.
 
         Flow: build the FC1 (gate+up) delta via BGMV -> run the native
         fp8_block_scale_moe_lora op with the delta fused as an Mn GEMM1 bias ->
         dequantize the returned post-SwiGLU activation -> build the FC2 (down)
-        delta via BGMV -> add it to the MoE output.
+        delta via BGMV -> add it to the MoE output. ``lora`` is the input dict
+        built by _build_moe_lora_bgmv_inputs.
         """
         from .moe_lora_delta import (bgmv_moe_gemm1_lora_delta,
                                      bgmv_moe_gemm2_lora_delta)
@@ -439,8 +558,6 @@ class TRTLLMGenFusedMoE(MoE):
         hidden = self.hidden_size
         topk_ids = token_selected_experts.to(torch.int32)
         topk_weights = token_final_scales.to(torch.bfloat16)
-
-        lora = self._build_moe_lora_bgmv_inputs(lora_params, x)
 
         # FC1 (gate+up) LoRA delta -> [T, top_k, 2*inter] bf16, fused as Mn bias.
         gemm1_delta = bgmv_moe_gemm1_lora_delta(
@@ -868,18 +985,21 @@ class TRTLLMGenFusedMoE(MoE):
         # Routed-expert MoE LoRA (FP8 block-scale only): build the GEMM1 delta,
         # run the native fp8_block_scale_moe_lora op with it fused as an Mn bias,
         # then add the FC2 delta. Requires precomputed routing (router_logits is
-        # forced to None by the scheduler when LoRA is active).
+        # forced to None by the scheduler when LoRA is active). When no adapter is
+        # active this step (_build returns None), fall through to the normal path.
         if lora_params and self._moe_lora_active(lora_params):
-            return self._run_fp8_block_scale_lora(
-                x=x,
-                token_selected_experts=token_selected_experts,
-                token_final_scales=token_final_scales,
-                x_sf=x_sf,
-                do_finalize=do_finalize,
-                moe_output=moe_output,
-                lora_params=lora_params,
-                routing_params=routing_params,
-            )
+            lora = self._build_moe_lora_bgmv_inputs(lora_params, x)
+            if lora is not None:
+                return self._run_fp8_block_scale_lora(
+                    x=x,
+                    token_selected_experts=token_selected_experts,
+                    token_final_scales=token_final_scales,
+                    x_sf=x_sf,
+                    do_finalize=do_finalize,
+                    moe_output=moe_output,
+                    lora=lora,
+                    routing_params=routing_params,
+                )
 
         # Ensure x_sf is 2D before flattening
         if x_sf is not None:

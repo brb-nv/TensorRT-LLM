@@ -247,10 +247,13 @@ block-scale cubins. The BGMV kernels live in `cpp/tensorrt_llm/kernels/bgmvMoe/`
 (`w_ptr[slice, adapter]` -> that adapter's contiguous `[num_experts, rank, feat]`
 bank; the per-expert offset is a compile-time constant added in-kernel), which
 matches the PEFT cache's per-adapter base pointers (`weight_pointers` / `h_b_ptrs`)
-rather than FlashInfer's per-expert base + adapter-stride model. Wiring
-`TRTLLMGenFusedMoE._build_moe_lora_bgmv_inputs` to those pointers (+ the
-token->adapter `lora_ids` expansion and a uniform-rank check) and CUDA graph
-support are follow-ups.
+rather than FlashInfer's per-expert base + adapter-stride model.
+`TRTLLMGenFusedMoE._build_moe_lora_bgmv_inputs` wires those pointers with the
+token->adapter `lora_ids` expansion and a uniform-rank check (varying-rank MoE
+LoRA is rejected -- use the Cutlass backend). Both the eager (`weight_pointers`)
+and CUDA-graph (`CudaGraphLoraParams.get_moe_slot_inputs_device` + captured H2D of
+the refreshed pinned `token_to_slot_host`, so replay picks up new adapters) paths
+are implemented; numerics need build-node validation.
 
 ## Canonical Examples
 
