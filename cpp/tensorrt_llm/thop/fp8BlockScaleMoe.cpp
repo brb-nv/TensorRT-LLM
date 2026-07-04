@@ -25,6 +25,7 @@
 #include <cstdint>
 #include <memory>
 #include <unordered_map>
+#include <vector>
 
 TRTLLM_NAMESPACE_BEGIN
 
@@ -36,7 +37,14 @@ using tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::Routing::RoutingMethodTy
 using MoeRunnerType = tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::MoE::Runner;
 using tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::computeSelectedTileN;
 
-at::Tensor run_fp8_block_scale_moe(at::optional<at::Tensor> const& routing_logits,
+// Returns a list of tensors. Element 0 is always the finalized MoE output.
+// When gemm1_lora_delta is provided (routed-expert MoE LoRA), the list also
+// carries the intermediates the FC2 LoRA delta builder needs:
+//   [output, expanded_idx_to_permuted_idx, activation_output, activation_output_scale]
+// (see tensorrt_llm/_torch/modules/fused_moe/moe_lora_delta.py). The
+// gemm1_lora_delta is [num_tokens, top_k, 2 * intermediate_size] bf16 and is
+// fused into GEMM1 as a per-element (Mn) bias before the activation.
+std::vector<at::Tensor> run_fp8_block_scale_moe(at::optional<at::Tensor> const& routing_logits,
     std::optional<at::Tensor> const& routing_bias, at::Tensor const& hidden_states,
     at::Tensor const& hidden_states_scale, at::Tensor const& gemm1_weights, at::Tensor const& gemm1_weights_scale,
     at::Tensor const& gemm2_weights, at::Tensor const& gemm2_weights_scale, int64_t const num_experts,
@@ -45,8 +53,10 @@ at::Tensor run_fp8_block_scale_moe(at::optional<at::Tensor> const& routing_logit
     std::optional<double> const routed_scaling_factor, int64_t const tile_tokens_dim, int64_t const routing_method_type,
     MoeRunnerType& moe_runner, int64_t moeConfigIndex, std::optional<at::Tensor> const& topk_weights,
     std::optional<at::Tensor> const& topk_ids, std::optional<double> const& gemm1_clamp_limit = std::nullopt,
-    std::optional<at::Tensor> const& out_tensor = std::nullopt)
+    std::optional<at::Tensor> const& out_tensor = std::nullopt,
+    std::optional<at::Tensor> const& gemm1_lora_delta = std::nullopt)
 {
+    bool const use_gemm1_lora_delta = gemm1_lora_delta.has_value();
     TORCH_CHECK(tensorrt_llm::common::isSM100Family(), "Only SM100f is supported by FP8 block scale MOE");
 
     if (topk_ids.has_value() && topk_weights.has_value())
@@ -182,6 +192,22 @@ at::Tensor run_fp8_block_scale_moe(at::optional<at::Tensor> const& routing_logit
         args.has_gemm1_clamp_limit_value = true;
     }
 
+    // Routed-expert MoE LoRA: the gemm1_lora_delta is fused into GEMM1 as a
+    // per-element (Mn) bias. It must be routed identically to the MoE kernel, so
+    // the caller is expected to pass precomputed topk_ids/topk_weights.
+    if (use_gemm1_lora_delta)
+    {
+        TORCH_CHECK(gemm1_lora_delta->scalar_type() == at::ScalarType::BFloat16,
+            "gemm1_lora_delta must be bfloat16.");
+        TORCH_CHECK(gemm1_lora_delta->dim() == 3, "gemm1_lora_delta must be 3D [num_tokens, top_k, 2*inter].");
+        TORCH_CHECK(gemm1_lora_delta->sizes()[0] == hidden_states.sizes()[0]
+                && gemm1_lora_delta->sizes()[1] == top_k
+                && gemm1_lora_delta->sizes()[2] == 2 * intermediate_size,
+            "gemm1_lora_delta must have shape [num_tokens, top_k, 2 * intermediate_size].");
+        args.gemm1_lora_delta = gemm1_lora_delta->data_ptr();
+        args.gemm1_bias_type = batchedGemm::gemm::BiasType::Mn;
+    }
+
     // allocate workspace for routing kernel
     if (routing_logits.has_value() && topk_ids.has_value())
     {
@@ -206,6 +232,13 @@ at::Tensor run_fp8_block_scale_moe(at::optional<at::Tensor> const& routing_logit
         = at::detail::empty_cuda({args.num_tokens * args.top_k}, at::ScalarType::Int, routing_device, std::nullopt);
     at::Tensor permuted_idx_to_token_idx
         = at::detail::empty_cuda({max_num_padded_tokens}, at::ScalarType::Int, routing_device, std::nullopt);
+    // Maps each permuted padded GEMM1 row to its expanded (token * top_k + slot)
+    // index. Only needed for the routed-expert MoE LoRA path, where it is the
+    // Mn bias row map for gemm1_lora_delta and (as expanded_idx_to_permuted_idx's
+    // inverse) is returned for the FC2 LoRA delta gather.
+    at::Tensor permuted_idx_to_expanded_idx = use_gemm1_lora_delta
+        ? at::detail::empty_cuda({max_num_padded_tokens}, at::ScalarType::Int, routing_device, std::nullopt)
+        : at::Tensor();
     // expert_weights is the routing kernel's topk-weights output and is consumed by moe_finalize,
     // which requires `dtype == scale_dtype` against gemm2_output. Track args.mDtypeOut so the two
     // buffers stay in lock-step automatically; do NOT tie this to the bias dtype, which is allowed
@@ -264,7 +297,8 @@ at::Tensor run_fp8_block_scale_moe(at::optional<at::Tensor> const& routing_logit
     routing_runner.run(args.routing_logits, args.routing_bias, args.num_tokens, args.num_experts, args.top_k,
         args.n_group, args.topk_group, args.local_expert_offset, args.local_num_experts, args.routed_scaling_factor,
         expert_indexes.data_ptr<int>(), expert_count_histogram.data_ptr<int>(), total_num_padded_tokens.data_ptr<int>(),
-        expanded_idx_to_permuted_idx.data_ptr<int>(), nullptr /*permuted_idx_to_expanded_idx.data_ptr<int>()*/,
+        expanded_idx_to_permuted_idx.data_ptr<int>(),
+        use_gemm1_lora_delta ? permuted_idx_to_expanded_idx.data_ptr<int>() : nullptr,
         permuted_idx_to_token_idx.data_ptr<int>(), expert_weights_ptr, args.topk_ids,
         num_tokens_per_expert.data_ptr<int>(), cta_idx_xy_to_batch_idx.data_ptr<int>(),
         cta_idx_xy_to_mn_limit.data_ptr<int>(), num_non_exiting_ctas.data_ptr<int>(), args.mDtypeElt, false, true,
@@ -325,6 +359,9 @@ at::Tensor run_fp8_block_scale_moe(at::optional<at::Tensor> const& routing_logit
     workspace.permuted_idx_size = total_num_padded_tokens.data_ptr<int>();
     workspace.expanded_idx_to_permuted_idx
         = expanded_idx_to_permuted_idx.data_ptr<int>(); // Needed by activation/finalize kernels
+    // Mn bias row map for the routed-expert MoE LoRA gemm1_lora_delta (null otherwise).
+    workspace.permuted_idx_to_expanded_idx
+        = use_gemm1_lora_delta ? permuted_idx_to_expanded_idx.data_ptr<int>() : nullptr;
     workspace.permuted_idx_to_token_idx = permuted_idx_to_token_idx.data_ptr<int>(); // Needed by permuteGemm1 kernel
     workspace.expert_weights = expert_weights_ptr;                                   // Consumed by finalize kernel
 
@@ -354,7 +391,15 @@ at::Tensor run_fp8_block_scale_moe(at::optional<at::Tensor> const& routing_logit
 
     auto const& moe_stream = at::cuda::getCurrentCUDAStream(hidden_states.get_device());
     moe_runner.run(args, workspace, hidden_states.get_device(), moe_stream, moeConfigIndex);
-    return output;
+    if (use_gemm1_lora_delta)
+    {
+        // FC2 LoRA needs the permuted post-SwiGLU activation (+ its block scale)
+        // and the expanded->permuted map to gather per-pair activations. The
+        // activation output is fp8 for the DeepSeek FP8 path; the caller
+        // dequantizes with activation_output_scale before the down-proj BGMV.
+        return {output, expanded_idx_to_permuted_idx, activation_output, activation_output_scale};
+    }
+    return {output};
 }
 
 // Wrapped the TRTLLM-Gen kernel runner in a Torch custom class to allow
@@ -421,10 +466,54 @@ public:
                 top_k, hidden_size, intermediate_size, local_num_experts, num_tokens);
         }
 
+        // Non-LoRA path: element 0 of the returned list is the finalized output.
         return run_fp8_block_scale_moe(routing_logits, routing_bias, hidden_states, hidden_states_scale, gemm1_weights,
             gemm1_weights_scale, gemm2_weights, gemm2_weights_scale, num_experts, top_k, n_group, topk_group,
             intermediate_size, local_expert_offset, local_num_experts, routed_scaling_factor, tileN,
-            routing_method_type, *mRunners.at(tileN), config, topk_weights, topk_ids, gemm1_clamp_limit, output);
+            routing_method_type, *mRunners.at(tileN), config, topk_weights, topk_ids, gemm1_clamp_limit, output)[0];
+    }
+
+    // Routed-expert MoE LoRA entry point. Requires precomputed topk_ids/topk_weights
+    // (routing must match the LoRA delta), FP8 block-scale weights, and the
+    // trtllm-gen Mn-bias cubins. Uses the default tactic for the selected tileN
+    // (LoRA-path autotuning is a follow-up). Returns
+    // [output, expanded_idx_to_permuted_idx, activation_output, activation_output_scale].
+    [[nodiscard]] std::vector<at::Tensor> runLora(at::optional<at::Tensor> const& routing_logits,
+        std::optional<at::Tensor> const& routing_bias, at::Tensor const& hidden_states,
+        at::Tensor const& hidden_states_scale, at::Tensor const& gemm1_weights, at::Tensor const& gemm1_weights_scale,
+        at::Tensor const& gemm2_weights, at::Tensor const& gemm2_weights_scale, int64_t num_experts, int64_t top_k,
+        std::optional<int64_t> const n_group, std::optional<int64_t> const topk_group, int64_t const intermediate_size,
+        int64_t const local_expert_offset, int64_t const local_num_experts,
+        std::optional<double> const routed_scaling_factor, int64_t routing_method_type,
+        std::optional<at::Tensor> const& topk_weights, std::optional<at::Tensor> const& topk_ids,
+        at::Tensor const& gemm1_lora_delta, std::optional<double> const& gemm1_clamp_limit = std::nullopt,
+        std::optional<at::Tensor> const& output = std::nullopt)
+    {
+        auto const num_tokens = hidden_states.sizes()[0];
+        auto const hidden_size = hidden_states.sizes()[1];
+        float const avg_tokens_per_expert = static_cast<float>(num_tokens * top_k) / local_num_experts;
+        int32_t const tileN
+            = std::clamp(nextPowerOfTwo(avg_tokens_per_expert), mSupportedTileN.front(), mSupportedTileN.back());
+
+        // Lazily build the Mn-bias runner for this tileN so the non-LoRA path is
+        // never forced to construct Mn runners (which require the Mn cubins).
+        auto it = mMnRunners.find(tileN);
+        if (it == mMnRunners.end())
+        {
+            it = mMnRunners
+                     .emplace(tileN,
+                         std::make_unique<RunnerType>(
+                             mDtypeElt, mUseDeepSeekFp8, tileN, batchedGemm::gemm::BiasType::Mn))
+                     .first;
+        }
+        int64_t const config = it->second->getDefaultValidConfigIndex(
+            top_k, hidden_size, intermediate_size, local_num_experts, num_tokens);
+
+        return run_fp8_block_scale_moe(routing_logits, routing_bias, hidden_states, hidden_states_scale, gemm1_weights,
+            gemm1_weights_scale, gemm2_weights, gemm2_weights_scale, num_experts, top_k, n_group, topk_group,
+            intermediate_size, local_expert_offset, local_num_experts, routed_scaling_factor, tileN,
+            routing_method_type, *it->second, config, topk_weights, topk_ids, gemm1_clamp_limit, output,
+            gemm1_lora_delta);
     }
 
 private:
@@ -432,6 +521,9 @@ private:
 
     std::vector<int32_t> const mSupportedTileN;
     std::unordered_map<int32_t, std::unique_ptr<RunnerType>> mRunners;
+    // Mn-bias runners for the routed-expert MoE LoRA path, built lazily (they
+    // require the trtllm-gen Mn-bias cubins, absent on the ordinary path).
+    std::unordered_map<int32_t, std::unique_ptr<RunnerType>> mMnRunners;
 
     btg::Dtype mDtypeElt{btg::Dtype::E4m3}; // FP8 runner so hard-coded
     bool mUseDeepSeekFp8{true};             // Always true for BlockScaleMoe
@@ -446,5 +538,6 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
     m.class_<tensorrt_llm::torch_ext::FP8BlockScaleMoeRunner>("FP8BlockScaleMoERunner")
         .def(torch::init<>())
         .def("get_valid_configs", &tensorrt_llm::torch_ext::FP8BlockScaleMoeRunner::getValidConfigs)
-        .def("run_moe", &tensorrt_llm::torch_ext::FP8BlockScaleMoeRunner::run);
+        .def("run_moe", &tensorrt_llm::torch_ext::FP8BlockScaleMoeRunner::run)
+        .def("run_moe_lora", &tensorrt_llm::torch_ext::FP8BlockScaleMoeRunner::runLora);
 }

@@ -1129,6 +1129,79 @@ def _(routing_logits: torch.Tensor,
                                    dtype=torch.bfloat16)
 
 
+@torch.library.custom_op("trtllm::fp8_block_scale_moe_lora", mutates_args=())
+def fp8_block_scale_moe_lora(
+        routing_logits: Optional[torch.Tensor],
+        routing_bias: Optional[torch.Tensor], hidden_states: torch.Tensor,
+        hidden_states_scale: torch.Tensor, gemm1_weights: torch.Tensor,
+        gemm1_weights_scale: torch.Tensor, gemm2_weights: torch.Tensor,
+        gemm2_weights_scale: torch.Tensor, gemm1_lora_delta: torch.Tensor,
+        num_experts: int, top_k: int, n_group: Optional[int],
+        topk_group: Optional[int], intermediate_size: int,
+        local_expert_offset: int, local_num_experts: int,
+        routed_scaling_factor: Optional[float], routing_method_type: int,
+        topk_weights: Optional[torch.Tensor] = None,
+        topk_ids: Optional[torch.Tensor] = None,
+        gemm1_clamp_limit: Optional[float] = None) -> List[torch.Tensor]:
+    """Routed-expert MoE LoRA on the FP8 block-scale path.
+
+    Fuses gemm1_lora_delta ([num_tokens, top_k, 2*intermediate_size] bf16) into
+    GEMM1 as a per-element (Mn) bias, and returns the intermediates the FC2 LoRA
+    delta builder needs. Requires precomputed topk_ids/topk_weights (routing must
+    match the LoRA delta) and the trtllm-gen Mn-bias FP8 block-scale cubins.
+
+    Returns [output, expanded_idx_to_permuted_idx, activation_output,
+    activation_output_scale]. Uses the default tactic (LoRA-path autotuning is a
+    follow-up).
+    """
+    runner = torch.classes.trtllm.FP8BlockScaleMoERunner()
+    return runner.run_moe_lora(
+        routing_logits, routing_bias, hidden_states, hidden_states_scale,
+        gemm1_weights, gemm1_weights_scale, gemm2_weights, gemm2_weights_scale,
+        num_experts, top_k, n_group, topk_group, intermediate_size,
+        local_expert_offset, local_num_experts, routed_scaling_factor,
+        routing_method_type, topk_weights, topk_ids, gemm1_lora_delta,
+        gemm1_clamp_limit, None)
+
+
+@fp8_block_scale_moe_lora.register_fake
+def _(routing_logits: Optional[torch.Tensor],
+      routing_bias: Optional[torch.Tensor],
+      hidden_states: torch.Tensor,
+      hidden_states_scale: torch.Tensor,
+      gemm1_weights: torch.Tensor,
+      gemm1_weights_scale: torch.Tensor,
+      gemm2_weights: torch.Tensor,
+      gemm2_weights_scale: torch.Tensor,
+      gemm1_lora_delta: torch.Tensor,
+      num_experts: int,
+      top_k: int,
+      n_group: Optional[int],
+      topk_group: Optional[int],
+      intermediate_size: int,
+      local_expert_offset: int,
+      local_num_experts: int,
+      routed_scaling_factor: Optional[float],
+      routing_method_type: int,
+      topk_weights: Optional[torch.Tensor] = None,
+      topk_ids: Optional[torch.Tensor] = None,
+      gemm1_clamp_limit: Optional[float] = None) -> List[torch.Tensor]:
+    num_tokens = hidden_states.shape[0]
+    hidden_size = hidden_states.shape[1]
+    # Best-effort meta shapes. The activation intermediates are padded at runtime
+    # (permuted padded rows >= num_tokens * top_k); the exact padded row count is
+    # only known after routing, so the meta uses num_tokens * top_k as a stand-in.
+    padded = num_tokens * top_k
+    output = hidden_states.new_empty((num_tokens, hidden_size),
+                                     dtype=torch.bfloat16)
+    exp2perm = hidden_states.new_empty((padded, ), dtype=torch.int32)
+    act = hidden_states.new_empty((padded, intermediate_size),
+                                  dtype=torch.float8_e4m3fn)
+    act_scale = hidden_states.new_empty((intermediate_size // 128, padded),
+                                        dtype=torch.float32)
+    return [output, exp2perm, act, act_scale]
+
+
 @dataclass(frozen=True)
 class MxE4m3MxE2m1BlockScaleMoEInputs:
     routing_logits: Optional[torch.Tensor]
