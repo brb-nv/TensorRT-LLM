@@ -398,10 +398,18 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
 namespace PermuteGemm1
 {
 
-tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(
-    btg::Dtype dtypeAct, btg::Dtype dtypeWeights, int32_t tileTokensDim, bool useDeepSeekFp8, ActType actType)
+tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(btg::Dtype dtypeAct, btg::Dtype dtypeWeights,
+    int32_t tileTokensDim, bool useDeepSeekFp8, ActType actType, batchedGemm::gemm::BiasType biasType)
 {
     bool is_gated_activation = actType == ActType::SwiGlu;
+    // For the routed-expert MoE LoRA delta (BiasType::Mn), the bias buffer is
+    // provided in expanded token-major row-major layout. trtllm-gen only exports
+    // the shuffle variant for the non-fused-act (DeepSeek FP8) path and the
+    // reorder+shuffle variant for the fused-act path.
+    auto fusedBiasShuffleMode = (biasType == batchedGemm::gemm::BiasType::Mn)
+        ? (useDeepSeekFp8 ? batchedGemm::gemm::FusedBiasShuffleMode::Shuffle
+                          : batchedGemm::gemm::FusedBiasShuffleMode::ReorderAndShuffle)
+        : batchedGemm::gemm::FusedBiasShuffleMode::None;
     tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions options;
 
     if (is_gated_activation)
@@ -415,7 +423,9 @@ tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(
             .routeAct = true,
             .staticBatch = false,
             .tileSize = tileTokensDim,
-            .epilogueTileM = useDeepSeekFp8 ? 64 : 128};
+            .epilogueTileM = useDeepSeekFp8 ? 64 : 128,
+            .biasType = biasType,
+            .fusedBiasShuffleMode = fusedBiasShuffleMode};
     }
     else
     {
@@ -437,18 +447,22 @@ tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(
             .staticBatch = false,
             .tileSize = tileTokensDim,
             .epilogueTileM = 128,
+            .biasType = biasType,
+            .fusedBiasShuffleMode = fusedBiasShuffleMode,
         };
     }
     return options;
 }
 
-Runner::Runner(btg::Dtype dtypeAct, btg::Dtype dtypeWeights, bool useDeepSeekFp8, int tileTokensDim, ActType actType)
+Runner::Runner(btg::Dtype dtypeAct, btg::Dtype dtypeWeights, bool useDeepSeekFp8, int tileTokensDim, ActType actType,
+    batchedGemm::gemm::BiasType biasType)
     : mDtypeAct(dtypeAct)
     , mDtypeWeights(dtypeWeights)
     , mTileTokensDim(tileTokensDim)
-    , mRunner(tensorrt_llm::kernels::TrtllmGenBatchedGemmRunner(
-          getOptions(mDtypeAct, mDtypeWeights, mTileTokensDim, useDeepSeekFp8, actType)))
     , mActType(actType)
+    , mBiasType(biasType)
+    , mRunner(tensorrt_llm::kernels::TrtllmGenBatchedGemmRunner(
+          getOptions(mDtypeAct, mDtypeWeights, mTileTokensDim, useDeepSeekFp8, actType, biasType)))
 {
 }
 
@@ -458,8 +472,15 @@ void Runner::run(void* hiddenState, void* hiddenStateScale, void* weights, void*
     int32_t numExperts, int32_t numTokens, int32_t* permutedIdxToTokenIdx, int32_t* ptrNumNonExitingCtas,
     int32_t* ptrTotalNumPaddedTokens, int32_t* ptrCtaIdxXyToBatchIdx, int32_t* ptrCtaIdxXyToMnLimit,
     void* bmm1Workspace, bool useRoutingScalesOnInput, int device, cudaStream_t stream, int32_t configIndex,
-    int32_t validHiddenSize, int32_t validIntermediateSize)
+    int32_t validHiddenSize, int32_t validIntermediateSize, int32_t* permutedIdxToBiasRowIdx)
 {
+    if (mBiasType == batchedGemm::gemm::BiasType::Mn)
+    {
+        TLLM_CHECK_WITH_INFO(ptrBias != nullptr,
+            "PermuteGemm1 configured with BiasType::Mn requires a non-null bias (gemm1_lora_delta) pointer.");
+        TLLM_CHECK_WITH_INFO(permutedIdxToBiasRowIdx != nullptr,
+            "PermuteGemm1 configured with BiasType::Mn requires a non-null permutedIdxToBiasRowIdx.");
+    }
     if (mDtypeWeights == btg::Dtype::MxE2m1 && mDtypeAct == btg::Dtype::MxE4m3)
     {
         // The multiple is no less than 128 as TMA requires it for CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN16B types
@@ -477,7 +498,7 @@ void Runner::run(void* hiddenState, void* hiddenStateScale, void* weights, void*
         useRoutingScalesOnInput ? expertWeights : nullptr, /* perTokensSfB */ nullptr, outputScalesScalar,
         outputScalesGateScalar, ptrBias, ptrAlpha, ptrBeta, ptrClampLimit, output, outputScale, permutedIdxToTokenIdx,
         ptrTotalNumPaddedTokens, ptrCtaIdxXyToBatchIdx, ptrCtaIdxXyToMnLimit, ptrNumNonExitingCtas, bmm1Workspace,
-        stream, device, configIndex);
+        stream, device, configIndex, permutedIdxToBiasRowIdx);
 }
 
 size_t Runner::getWorkspaceSizeInBytes(int32_t topK, int32_t hiddenSize, int32_t intermediateSize, int32_t numExperts,
@@ -617,9 +638,10 @@ std::string Runner::getKernelNameFromConfigIndex(int32_t configIndex) const
 
 namespace MoE
 {
-Runner::Runner(
-    btg::Dtype dtypeAct, btg::Dtype dtypeWeights, bool useDeepSeekFp8, int32_t tileTokensDim, ActType actType)
-    : mPermuteGemm1(PermuteGemm1::Runner(dtypeAct, dtypeWeights, useDeepSeekFp8, tileTokensDim, actType))
+Runner::Runner(btg::Dtype dtypeAct, btg::Dtype dtypeWeights, bool useDeepSeekFp8, int32_t tileTokensDim,
+    ActType actType, batchedGemm::gemm::BiasType gemm1BiasType)
+    : mPermuteGemm1(
+          PermuteGemm1::Runner(dtypeAct, dtypeWeights, useDeepSeekFp8, tileTokensDim, actType, gemm1BiasType))
     , mGemm2(Gemm2::Runner(dtypeAct, dtypeWeights, btg::Dtype::Bfloat16, useDeepSeekFp8, tileTokensDim))
     , mActType(actType)
 {
@@ -640,8 +662,9 @@ Runner::Runner(
     TLLM_CHECK_WITH_INFO(!mPassingConfigs.empty(), "No compatible configs found for the fp8 block scale MoE runner.");
 }
 
-Runner::Runner(btg::Dtype dtypeElt, bool useDeepSeekFp8, int32_t tileTokensDim)
-    : Runner(dtypeElt, dtypeElt, useDeepSeekFp8, tileTokensDim, ActType::SwiGlu)
+Runner::Runner(btg::Dtype dtypeElt, bool useDeepSeekFp8, int32_t tileTokensDim,
+    batchedGemm::gemm::BiasType gemm1BiasType)
+    : Runner(dtypeElt, dtypeElt, useDeepSeekFp8, tileTokensDim, ActType::SwiGlu, gemm1BiasType)
 {
 }
 
@@ -777,15 +800,23 @@ void Runner::run(
 
     auto const& config = mPassingConfigs[configIndex];
 
+    // Routed-expert MoE LoRA: fuse the gemm1_lora_delta into GEMM1 as a
+    // per-element (Mn) bias, mapped from permuted padded rows to expanded
+    // token-major delta rows via permuted_idx_to_expanded_idx. The FP8
+    // block-scale path leaves args.gemm1_bias null, so we reuse the bias slot.
+    bool const useGemm1LoraDelta = args.gemm1_bias_type == batchedGemm::gemm::BiasType::Mn;
+    float* gemm1BiasPtr = useGemm1LoraDelta ? reinterpret_cast<float*>(args.gemm1_lora_delta) : args.gemm1_bias;
+    int32_t* permutedIdxToBiasRowIdx = useGemm1LoraDelta ? workspace.permuted_idx_to_expanded_idx : nullptr;
+
     mPermuteGemm1.run(args.hidden_states, hidden_states_scale_linear, args.gemm1_weights, args.gemm1_weights_scale,
-        workspace.expert_weights, args.output1_scales_scalar, args.output1_scales_gate_scalar, args.gemm1_bias,
+        workspace.expert_weights, args.output1_scales_scalar, args.output1_scales_gate_scalar, gemm1BiasPtr,
         args.gemm1_alpha, args.gemm1_beta, args.gemm1_clamp_limit, workspace.gemm1_output, workspace.gemm1_output_scale,
         args.top_k, args.hidden_size, args.intermediate_size, args.local_num_experts, args.num_tokens,
         workspace.permuted_idx_to_token_idx, workspace.num_non_exiting_ctas, workspace.total_num_padded_tokens,
         workspace.cta_idx_xy_to_batch_idx, workspace.cta_idx_xy_to_mn_limit, workspace.bmm1_workspace,
         args.mUseRoutingScalesOnInput, device, stream, config.gemm1Config,
         args.valid_hidden_size.value_or(args.hidden_size),
-        args.valid_intermediate_size.value_or(args.intermediate_size));
+        args.valid_intermediate_size.value_or(args.intermediate_size), permutedIdxToBiasRowIdx);
 
     // We do not fuse activation with FC1 for DeepSeek FP8 due to the weights shuffling constraint.
     void* gemm2_input = workspace.gemm1_output;
