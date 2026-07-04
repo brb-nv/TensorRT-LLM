@@ -256,6 +256,32 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(TrtllmGenBatchedGemmRunne
             continue;
         }
 
+        // Bias-type selection. The per-element (Mn) bias used to fuse a routed-expert
+        // MoE LoRA delta into GEMM1 is a compile-time kernel trait. When the caller
+        // requests it (biasType == Mn) we must select an Mn kernel with the matching
+        // fused-bias shuffle mode. When the caller does not (default None) we must
+        // exclude Mn kernels so the non-LoRA selection is byte-for-byte unchanged from
+        // before the trtllm-gen Mn cubins were added.
+        if (mOptions.biasType == batchedGemm::gemm::BiasType::Mn)
+        {
+            if (!acceptIf(options.mBiasType == batchedGemm::gemm::BiasType::Mn,
+                    fmtstr("biasType mismatch (kernel: %d, expected Mn)", static_cast<int>(options.mBiasType))))
+            {
+                continue;
+            }
+            if (!acceptIf(options.mFusedBiasShuffleMode == mOptions.fusedBiasShuffleMode,
+                    fmtstr("fusedBiasShuffleMode mismatch (kernel: %d, expected: %d)",
+                        static_cast<int>(options.mFusedBiasShuffleMode),
+                        static_cast<int>(mOptions.fusedBiasShuffleMode))))
+            {
+                continue;
+            }
+        }
+        else if (!acceptIf(options.mBiasType != batchedGemm::gemm::BiasType::Mn, "excluding Mn kernel for non-Mn bias"))
+        {
+            continue;
+        }
+
         // Kernel passed all filters
         mPassingConfigIndices.push_back(i);
     }
@@ -324,9 +350,9 @@ void TrtllmGenBatchedGemmRunner::run(int32_t m, int32_t n, int32_t k, int32_t va
     std::vector<int32_t> const& batchedTokens, int32_t numTokens, int32_t numBatches, int32_t maxNumCtasInBatchDim,
     void const* a, void const* sfA, void const* b, void const* sfB, void const* perTokensSfA, void const* perTokensSfB,
     float const* scaleC, float const* scaleGateC, float const* ptrBias, float const* ptrAlpha, float const* ptrBeta,
-    float const* ptrClampLimit, void* c, void* outSfC, int32_t const* routeMap, int32_t const* totalNumPaddedTokens,
+    float const* ptrClampLimit, void* c, void* outSfC,     int32_t const* routeMap, int32_t const* totalNumPaddedTokens,
     int32_t const* ctaIdxXyToBatchIdx, int32_t const* ctaIdxXyToMnLimit, int32_t const* numNonExitingCtas,
-    void* workspace, CUstream stream, int device, int32_t configIndex)
+    void* workspace, CUstream stream, int device, int32_t configIndex, int32_t const* permutedIdxToBiasRowIdx)
 {
     auto bmm = BatchedGemmInterface();
 
@@ -378,6 +404,10 @@ void TrtllmGenBatchedGemmRunner::run(int32_t m, int32_t n, int32_t k, int32_t va
     gemmData.mInputBuffers.mPtrPerTokenSfA = transposeMmaOutput ? perTokensSfB : perTokensSfA;
     gemmData.mInputBuffers.mPtrPerTokenSfB = transposeMmaOutput ? perTokensSfA : perTokensSfB;
     gemmData.mInputBuffers.mPtrBias = ptrBias;
+    // Optional map from permuted padded GEMM1 row to the row in the Mn bias buffer
+    // (the routed-expert MoE LoRA delta is in expanded token-major order). nullptr
+    // means the bias is already in permuted padded row-major layout.
+    gemmData.mInputBuffers.mPtrPermutedIdxToBiasRowIdx = permutedIdxToBiasRowIdx;
     gemmData.mInputBuffers.mPtrGatedActAlpha = ptrAlpha;
     gemmData.mInputBuffers.mPtrGatedActBeta = ptrBeta;
     gemmData.mInputBuffers.mPtrClampLimit = ptrClampLimit;

@@ -21,6 +21,7 @@
 #include <cuda.h>
 #include <vector>
 
+#include "trtllmGen_bmm_export/Enums.h"
 #include "trtllmGen_bmm_export/trtllm/gen/DtypeDecl.h"
 
 TRTLLM_NAMESPACE_BEGIN
@@ -85,6 +86,14 @@ struct TrtllmGenBatchedGemmRunnerOptions
     bool transposeMmaOutput{false};
     int32_t tileSize{8};
     int32_t epilogueTileM{128};
+    // Per-element (Mn) GEMM bias, used to fuse a routed-expert MoE LoRA delta into
+    // GEMM1 before the activation. Defaults to None so non-LoRA callers are
+    // unaffected: config selection excludes Mn kernels unless biasType == Mn.
+    batchedGemm::gemm::BiasType biasType{batchedGemm::gemm::BiasType::None};
+    // Shuffle layout of the Mn bias buffer relative to the epilogue. Only meaningful
+    // when biasType == Mn. DeepSeek FP8 (non-fused activation) uses Shuffle; fused-act
+    // paths use ReorderAndShuffle. Ignored when biasType == None.
+    batchedGemm::gemm::FusedBiasShuffleMode fusedBiasShuffleMode{batchedGemm::gemm::FusedBiasShuffleMode::None};
 };
 
 class TrtllmGenBatchedGemmRunner
@@ -104,7 +113,7 @@ public:
         float const* swiGluAlpha, float const* swiGluBeta, float const* clampLimit, void* c, void* outSfC,
         int32_t const* routeMap, int32_t const* totalNumPaddedTokens, int32_t const* ctaIdxXyToBatchIdx,
         int32_t const* ctaIdxXyToMnLimit, int32_t const* numNonExitingCtas, void* workspace, CUstream stream,
-        int device, int32_t configIndex);
+        int device, int32_t configIndex, int32_t const* permutedIdxToBiasRowIdx = nullptr);
 
     // Block-scaling GEMM
     void run(int32_t m, int32_t n, int32_t k, std::vector<int32_t> const& batchedTokens, void const* a, void const* sfA,
