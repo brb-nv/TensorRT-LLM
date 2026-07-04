@@ -35,6 +35,8 @@ from ...expert_statistic import ExpertStatistic
 from ...model_config import ModelConfig
 from ...utils import ActivationType, AuxStreamType, Fp4QuantizedTensor
 from .interface import AlltoallMethodType, MoE, MoEWeightLoadingMode
+from .moe_lora import (has_moe_lora_targets, make_moe_lora_marker,
+                       moe_lora_active)
 from .moe_op_backend import MoEOpBackend, get_op_backend
 
 # isort: off
@@ -317,9 +319,133 @@ class TRTLLMGenFusedMoE(MoE):
             self.use_low_precision_combine = False
             self.moe_a2a = None
 
+        # Routed-expert MoE LoRA is applied around the native FP8 block-scale MoE
+        # op: the GEMM1 delta is fused as an Mn bias and the FC2 delta is added to
+        # the output (see run_moe / _run_fp8_block_scale_lora). The MoeLoraLayer
+        # marker is discovery-only (same role as on the Cutlass backend) so that
+        # CudaGraphLoraManager / the target-module validator can find this layer.
+        self._moe_lora_enabled = has_moe_lora_targets(
+            getattr(model_config, "lora_config", None))
+        self.lora = make_moe_lora_marker(model_config, self.hidden_size,
+                                         self.intermediate_size)
+
         self._weights_created = False
         if not model_config.skip_create_weights_in_init:
             self.create_weights()
+
+    def _moe_lora_active(self, lora_params: Optional[Dict]) -> bool:
+        """True when lora_params carries a routed-expert MoE LoRA delta for this
+        layer (mirrors CutlassFusedMoE._moe_lora_active via the shared helper)."""
+        return moe_lora_active(self.layer_idx, lora_params)
+
+    def _build_moe_lora_bgmv_inputs(self, lora_params: Dict, x: torch.Tensor):
+        """Build the BGMV inputs (per-token adapter ids, per-(slice, expert) LoRA
+        weight-pointer tables, adapter stride, rank, scale) for this layer.
+
+        ASSUMED-BUT-NOT-PRESENT: the BGMV delta builders (moe_lora_delta.py) follow
+        FlashInfer's contiguous-bank model: each LoRA slice is a single
+        ``[max_loras, num_experts, rank, feat]`` weight bank, addressed as
+        ``w_ptr[slice, expert] + lora_id * lora_stride``, with a uniform rank
+        across adapters and a per-token ``lora_ids`` array.
+
+        TRT-LLM's PEFT cache instead exposes per-request base pointers
+        (``lora_params[layer][module]['weight_pointers']`` = [num_seqs, 3]) with a
+        per-seq ``adapter_size`` (rank), and does NOT guarantee a single contiguous
+        per-expert adapter bank or a uniform rank. Bridging the two is the one
+        remaining integration step for the eager path and requires either:
+          (a) repacking the per-adapter MoE LoRA weights into contiguous
+              ``[max_loras, num_experts, rank, feat]`` banks (+ padding ranks to a
+              uniform max) at load time in the PEFT cache, or
+          (b) extending the BGMV op to accept per-(slice, adapter, expert) pointer
+              tables instead of a single base pointer + stride.
+
+        This needs the PEFT MoE-LoRA weight layout and GPU validation, so it is
+        left explicit here rather than guessed.
+        """
+        raise NotImplementedError(
+            "TRTLLM-gen FP8 block-scale MoE LoRA: the BGMV delta builders need "
+            "contiguous per-expert LoRA weight banks (w_ptr + uniform-rank stride), "
+            "but the PEFT cache exposes per-request pointers with per-seq ranks. "
+            "Wire _build_moe_lora_bgmv_inputs to the PEFT MoE-LoRA weight layout "
+            "(repack into [max_loras, num_experts, rank, feat] banks, or extend the "
+            "bgmv_moe ops to per-(slice, adapter, expert) pointer tables). The rest "
+            "of the eager flow (GEMM1 delta -> fp8_block_scale_moe_lora -> FC2 delta) "
+            "is implemented in _run_fp8_block_scale_lora.")
+
+    def _dequant_activation(self, act: torch.Tensor,
+                            act_scale: torch.Tensor) -> torch.Tensor:
+        """Dequantize the permuted post-SwiGLU activation (DeepSeek FP8 block
+        scale) to bf16 for the FC2 LoRA delta gather.
+
+        act: [padded_rows, inter] fp8 (e4m3). act_scale: [inter/128, padded_rows]
+        float32, one scale per 128-wide block per row. Returns [padded_rows, inter]
+        bf16. NOTE: numerics need GPU validation against the kernel's finalize.
+        """
+        padded, inter = act.shape
+        blocks = inter // 128
+        a = act.to(torch.float32).view(padded, blocks, 128)
+        s = act_scale.transpose(0, 1).contiguous().view(padded, blocks, 1)
+        return (a * s).view(padded, inter).to(torch.bfloat16)
+
+    def _run_fp8_block_scale_lora(self, *, x: torch.Tensor,
+                                  token_selected_experts: torch.Tensor,
+                                  token_final_scales: Optional[torch.Tensor],
+                                  x_sf: Optional[torch.Tensor],
+                                  do_finalize: bool,
+                                  moe_output: Optional[torch.Tensor],
+                                  lora_params: Dict,
+                                  routing_params: "RoutingParams") -> torch.Tensor:
+        """Eager routed-expert MoE LoRA on the FP8 block-scale path.
+
+        Flow: build the FC1 (gate+up) delta via BGMV -> run the native
+        fp8_block_scale_moe_lora op with the delta fused as an Mn GEMM1 bias ->
+        dequantize the returned post-SwiGLU activation -> build the FC2 (down)
+        delta via BGMV -> add it to the MoE output.
+        """
+        from .moe_lora_delta import (bgmv_moe_gemm1_lora_delta,
+                                     bgmv_moe_gemm2_lora_delta)
+
+        assert self.has_deepseek_fp8_block_scales, (
+            "TRTLLM-gen MoE LoRA is only supported on the FP8 block-scale path.")
+        assert do_finalize, "TRTLLM-gen MoE LoRA requires do_finalize=True."
+        assert token_selected_experts is not None and token_final_scales is not None, (
+            "TRTLLM-gen MoE LoRA requires precomputed routing.")
+        assert x_sf is None and x.dtype == torch.bfloat16, (
+            "TRTLLM-gen MoE LoRA expects bf16 activations at the MoE input.")
+
+        top_k = token_selected_experts.shape[-1]
+        inter = self.intermediate_size_per_partition
+        hidden = self.hidden_size
+        topk_ids = token_selected_experts.to(torch.int32)
+        topk_weights = token_final_scales.to(torch.bfloat16)
+
+        lora = self._build_moe_lora_bgmv_inputs(lora_params, x)
+
+        # FC1 (gate+up) LoRA delta -> [T, top_k, 2*inter] bf16, fused as Mn bias.
+        gemm1_delta = bgmv_moe_gemm1_lora_delta(
+            x, lora["fc1_w_ptr_a"], lora["fc1_stride_a"], lora["fc1_w_ptr_b"],
+            lora["fc1_stride_b"], topk_ids, lora["lora_ids"], lora["rank"], inter,
+            scale=lora["scale"])
+
+        # Quantize activations for the FP8 block-scale MoE.
+        x_fp8, x_fp8_sf = torch.ops.trtllm.fp8_quantize_1x128(x)
+
+        output, exp2perm, act, act_scale = torch.ops.trtllm.fp8_block_scale_moe_lora(
+            None, routing_params.routing_bias, x_fp8, x_fp8_sf, self.w3_w1_weight,
+            self.w3_w1_weight_scaling_factor, self.w2_weight,
+            self.w2_weight_scaling_factor, gemm1_delta, self.num_slots, top_k,
+            routing_params.n_group, routing_params.topk_group, inter, self.slot_start,
+            self.expert_size_per_partition, routing_params.routed_scaling_factor,
+            self.routing_method.routing_method_type, topk_weights, topk_ids,
+            self.swiglu_limit_scalar)
+
+        # FC2 (down) LoRA delta over the dequantized post-SwiGLU activation.
+        act_bf16 = self._dequant_activation(act, act_scale)
+        fc2_delta = bgmv_moe_gemm2_lora_delta(
+            act_bf16, exp2perm, lora["fc2_w_ptr_a"], lora["fc2_stride_a"],
+            lora["fc2_w_ptr_b"], lora["fc2_stride_b"], topk_ids, token_final_scales,
+            lora["lora_ids"], lora["rank"], hidden, scale=lora["scale"])
+        return output + fc2_delta.to(output.dtype)
 
     def _to_trtllm_gen_activation_type(self,
                                        activation_type: ActivationType) -> int:
@@ -679,6 +805,7 @@ class TRTLLMGenFusedMoE(MoE):
         router_logits: Optional[torch.Tensor] = None,
         do_finalize: bool = True,
         moe_output: Optional[torch.Tensor] = None,
+        lora_params: Optional[Dict] = None,
     ) -> Union[torch.Tensor, tuple]:
         """
         Run MoE computation with TRTLLMGen backend.
@@ -717,6 +844,22 @@ class TRTLLMGenFusedMoE(MoE):
         if token_selected_experts is not None:
             # for cases like deepep low latency where fake top_k=1 might be used
             top_k = token_selected_experts.shape[-1]
+
+        # Routed-expert MoE LoRA (FP8 block-scale only): build the GEMM1 delta,
+        # run the native fp8_block_scale_moe_lora op with it fused as an Mn bias,
+        # then add the FC2 delta. Requires precomputed routing (router_logits is
+        # forced to None by the scheduler when LoRA is active).
+        if lora_params and self._moe_lora_active(lora_params):
+            return self._run_fp8_block_scale_lora(
+                x=x,
+                token_selected_experts=token_selected_experts,
+                token_final_scales=token_final_scales,
+                x_sf=x_sf,
+                do_finalize=do_finalize,
+                moe_output=moe_output,
+                lora_params=lora_params,
+                routing_params=routing_params,
+            )
 
         # Ensure x_sf is 2D before flattening
         if x_sf is not None:

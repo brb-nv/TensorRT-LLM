@@ -155,7 +155,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
 
         if (
             num_chunks > 1
-            and moe.backend.__class__ == CutlassFusedMoE
+            and moe.backend.__class__ in (CutlassFusedMoE, TRTLLMGenFusedMoE)
             and moe.backend._moe_lora_active(lora_params)
         ):
             raise_moe_lora_multichunk_unsupported(num_chunks)
@@ -745,10 +745,12 @@ class ExternalCommMoEScheduler(MoEScheduler):
             - Cutlass: is_sf_swizzled, enable_alltoall, tuner_*, moe_output, lora_params
             - CuteDSL: enable_alltoall, moe_output
             - DeepGemm: workspace
-            - TRTLLMGen: router_logits, do_finalize, moe_output
+            - TRTLLMGen: router_logits, do_finalize, moe_output, lora_params (when active)
 
-        Only CutlassFusedMoE.run_moe accepts lora_params (routed-expert MoE LoRA
-        is fused there), so it is set on the Cutlass branch alone.
+        CutlassFusedMoE fuses the routed-expert MoE LoRA into torch.ops.trtllm.fused_moe;
+        TRTLLMGenFusedMoE (FP8 block-scale) builds BGMV deltas around the native
+        fp8_block_scale_moe_lora op. Both take lora_params on their run_moe; other
+        backends do not accept it.
         """
         moe = self.moe
         kwargs: Dict = {}
@@ -788,15 +790,25 @@ class ExternalCommMoEScheduler(MoEScheduler):
                 kwargs["workspace"] = workspace
 
         elif moe.backend.__class__ == TRTLLMGenFusedMoE:
+            # Routed-expert MoE LoRA requires precomputed routing so the BGMV
+            # LoRA delta and the MoE kernel share identical top-k; force
+            # router_logits=None (the backend then uses token_selected_experts).
+            lora_active = moe.backend._moe_lora_active(lora_params)
             # When the scheduler precomputes top-k for DP/load-balancer paths,
             # the backend must not route again.  Single-rank TRTLLMGen paths do
             # not get precomputed top-k, so they still need router_logits.
-            router_logits_arg = None if moe.backend._supports_load_balancer() else router_logits
+            router_logits_arg = (
+                None if (moe.backend._supports_load_balancer() or lora_active) else router_logits
+            )
             kwargs["router_logits"] = router_logits_arg
             kwargs["do_finalize"] = do_finalize
             kwargs["moe_output"] = self._get_nvlink_onesided_moe_output(
                 all_rank_num_tokens=all_rank_num_tokens, output_dtype=output_dtype
             )
+            # Only forward lora_params when this layer actually carries routed-expert
+            # MoE LoRA; run_moe treats a null/absent value as the ordinary path.
+            if lora_active:
+                kwargs["lora_params"] = lora_params
 
         elif moe.backend.__class__ == MarlinFusedMoE:
             kwargs["router_logits"] = router_logits
