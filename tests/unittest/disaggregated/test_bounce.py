@@ -124,14 +124,20 @@ class TestResultTail:
         # message = [msg_type, packed_prefix, *tail]; tail lives at [2:].
         msg = [b"KV_AGENT_RESULT", b"prefix"] + btr.encode_result_tail(wm)
         assert len(msg) == 5
-        dst, sizes, src_base = btr.decode_result_tail(msg)
+        dst, sizes, src_base, structured_tail = btr.decode_result_tail(msg)
         assert np.array_equal(dst, wm.dst_ptrs)
         assert np.array_equal(sizes, wm.sizes)
         assert src_base == 0xABCD
+        assert structured_tail is None  # legacy 3-frame tail, not the structured form
 
     def test_no_tail_returns_none(self):
         # non-bounced result: only [msg_type, prefix] -> no tail.
-        assert btr.decode_result_tail([b"KV_AGENT_RESULT", b"prefix"]) == (None, None, None)
+        assert btr.decode_result_tail([b"KV_AGENT_RESULT", b"prefix"]) == (
+            None,
+            None,
+            None,
+            None,
+        )
 
     def test_encode_tail_handles_unset_base(self):
         wm = self._wm([1, 2], [8, 8], None)

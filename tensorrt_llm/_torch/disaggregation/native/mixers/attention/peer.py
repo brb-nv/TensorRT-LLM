@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import numpy as np
 
@@ -13,6 +14,12 @@ from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
 from tensorrt_llm._torch.disaggregation.resource.page import MapperKind
 from tensorrt_llm._torch.disaggregation.resource.utils import get_pool_view_mapper_kinds
 from tensorrt_llm._utils import nvtx_range
+
+if TYPE_CHECKING:
+    from tensorrt_llm._torch.disaggregation.native.bounce.nhd_plan import (
+        NHDGatherSpec,
+        NHDScatterTemplate,
+    )
 
 
 @dataclass(frozen=True)
@@ -609,6 +616,9 @@ class NHDHeadMismatchMapper(HeadMismatchMapper):
             peer_kv_heads=peer_heads,
             bytes_per_head=self_bytes_per_token_head,
         )
+        # kept so recv_scatter_template can rebase the flat offsets to fan-in writer 0
+        self._src_head_off = src_head_off
+        self._dst_head_off = dst_head_off
 
         self._src_flat_offsets = self._build_flat_offsets(
             transfer_layers=transfer_layers,
@@ -627,6 +637,84 @@ class NHDHeadMismatchMapper(HeadMismatchMapper):
             heads=peer_heads,
             bytes_per_token_head=peer_bytes_per_token_head,
             head_offset=dst_head_off,
+        )
+
+    @property
+    def supports_structured_staging(self) -> bool:
+        """NHD head-mismatch fragments are perfectly regular (constant size, addresses
+        analytic in (block, layer, K/V, token)), so the bounce staging fast path can
+        replace the materialized fragment tables with an NHDGatherSpec."""
+        return True
+
+    def src_gather_spec(self, src_block_ptrs: np.ndarray) -> "NHDGatherSpec":
+        """Analytic bounce gather plan over this rank's paged blocks.
+
+        Calling this requires cuda-python: the bounce package init pulls cudart at
+        import time, so this accessor (unlike the rest of this module) is unusable in
+        a CPU-only environment without CUDA bindings.
+
+        Args:
+            src_block_ptrs: [n_blocks] absolute source slot base addresses, in the
+                aligned transfer order.
+        """
+        # local import: the bounce package init pulls CUDA-binding modules, and peer.py
+        # must stay importable without them (CPU unit tests)
+        from tensorrt_llm._torch.disaggregation.native.bounce.nhd_plan import NHDGatherSpec
+
+        return NHDGatherSpec(
+            block_ptrs=np.ascontiguousarray(src_block_ptrs, dtype=np.int64),
+            flat_offsets=self._src_flat_offsets,
+            # int(): harden against np.integer from the geometry arithmetic; the spec
+            # validates isinstance(frag_bytes, int)
+            frag_bytes=int(self._bytes_cont_heads),
+        )
+
+    def dst_scatter_spec(self, dst_block_ptrs: np.ndarray) -> "NHDGatherSpec":
+        """The mirror plan for the peer's paged blocks: same fragment order and sizes,
+        with the peer-side flat offsets (its head offset already baked in).
+
+        Calling this requires cuda-python, exactly as :meth:`src_gather_spec` does.
+
+        Args:
+            dst_block_ptrs: [n_blocks] absolute destination slot base addresses, in the
+                aligned transfer order.
+        """
+        from tensorrt_llm._torch.disaggregation.native.bounce.nhd_plan import NHDGatherSpec
+
+        return NHDGatherSpec(
+            block_ptrs=np.ascontiguousarray(dst_block_ptrs, dtype=np.int64),
+            flat_offsets=self._dst_flat_offsets,
+            frag_bytes=int(self._bytes_cont_heads),
+        )
+
+    def recv_scatter_template(self, self_block_ptrs: np.ndarray) -> "NHDScatterTemplate":
+        """Receiver-side scatter template over this rank's OWN paged blocks.
+
+        The template's flat offsets are the self-side offsets rebased to fan-in
+        writer 0 (head offset zero); writer ``i``'s offsets follow at
+        ``i * bytes_cont_heads`` — the head span each fan-in writer contributes,
+        matching what :meth:`HeadMismatchMapper._compute_head_offsets` assigns to the
+        sender's tp_rank (fan-in writers are indexed in ``PeerOverlap.ranks`` order,
+        tp innermost). The baked-in ``_src_head_off`` is subtracted rather than
+        assumed zero so the template is independent of which peer rank's RankInfo
+        built this mapper.
+
+        Calling this requires cuda-python, exactly as :meth:`src_gather_spec` does.
+
+        Args:
+            self_block_ptrs: [n_blocks] absolute local slot base addresses covering
+                every block this receiver advertised for the pool's layer group.
+        """
+        from tensorrt_llm._torch.disaggregation.native.bounce.nhd_plan import NHDScatterTemplate
+
+        flat_offsets = self._src_flat_offsets
+        if int(self._src_head_off) != 0:
+            flat_offsets = flat_offsets - np.int64(self._src_head_off)
+        return NHDScatterTemplate(
+            block_ptrs=np.ascontiguousarray(self_block_ptrs, dtype=np.int64),
+            flat_offsets=flat_offsets,
+            frag_bytes=int(self._bytes_cont_heads),
+            writer_head_stride=int(self._bytes_cont_heads),
         )
 
     @staticmethod
