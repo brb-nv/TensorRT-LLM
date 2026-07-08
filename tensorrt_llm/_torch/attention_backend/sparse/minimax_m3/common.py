@@ -11,10 +11,6 @@ import Triton-backend internals:
   * MSA cache-layout adapters (pool NHD to `fmha_sm100` HND).
   * Per-query valid-block counting and torch top-k block selection.
   * The lazy `fmha_sm100` import guard and kernel precondition constants.
-
-None of these functions require CUDA graph capture windows to be closed:
-they either operate on device tensors with static shapes on the forward
-hot path, or run once per scheduler step during `prepare()`.
 """
 
 from __future__ import annotations

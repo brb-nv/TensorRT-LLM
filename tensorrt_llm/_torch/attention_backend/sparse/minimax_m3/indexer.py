@@ -2,25 +2,17 @@
 # SPDX-License-Identifier: Apache-2.0
 """MiniMax-M3 MSA sparse-attention indexer.
 
-Mirrors the DSA `Indexer` pattern: a small submodule owned by the
-sparse-attention backend that runs the predictor pass and produces the
-per-query selected KV block indices the main attention consumes.
+Mirrors the DSA `Indexer` pattern: a submodule owned by the sparse
+backend that runs the predictor pass and produces the per-query selected
+KV block indices the main attention consumes. It calls `fmha_sm100`
+directly in `output_maxscore` mode (prefill) or the graph-safe in-tree
+decode kernels (`decode_wrapper.dispatch`, decode), reduces the
+per-index-head max score to KV-head granularity, and selects top-k blocks
+per query.
 
-The proxy attention calls `fmha_sm100` directly (like DSA's
-`sparse_attn_indexer` calls `fp8_paged_mqa_logits`) rather than wrapping
-it as an `Fmha` registry library:
-
-  * Prefill runs `fmha_sm100_plan` + `fmha_sm100` eagerly in
-    `output_maxscore` mode, reduces the per-index-head max score to
-    KV-head granularity, and selects top-k blocks per query.
-  * Decode runs through the CUDA-graph-safe in-tree driver
-    (`decode_wrapper.dispatch`), which itself calls the same `fmha_sm100`
-    kernel binaries with device-tensor launch arguments.
-
-The selected block indices are returned as `[total_q, num_kv_heads,
-topk]` int32 (ascending, -1 padded) and published on
-`forward_args.sparse_prediction.sparse_attn_indices` by the owning
-`sparse_attn_predict`.
+Results are `[total_q, num_kv_heads, topk]` int32 (ascending, -1 padded),
+published on `forward_args.sparse_prediction.sparse_attn_indices` by the
+owning `sparse_attn_predict`.
 """
 
 from __future__ import annotations

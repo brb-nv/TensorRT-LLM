@@ -5,29 +5,20 @@
 Mimics `DSATrtllmAttention`:
 
   * `MiniMaxM3MSATrtllmAttention` subclasses `TrtllmAttention` and reuses
-    its inherited `forward` (the standard `fmha_libs` dispatch loop). It
-    overrides only the sparse hooks (`sparse_attn_predict`,
-    `sparse_kv_predict`) and owns an `MsaIndexer`. It does not inherit the
-    Triton reference backend.
-  * The main sparse GQA runs through the registered `MsaSparseGqaFmha`
-    (an `Fmha` that does its own whole-batch dispatch) selected by the
-    dispatch loop.
+    its inherited `forward`, overriding only the sparse hooks
+    (`sparse_attn_predict`, `sparse_kv_predict`) and owning an `MsaIndexer`.
+  * The main sparse GQA runs through the registered `MsaSparseGqaFmha`.
   * The indexer calls `fmha_sm100` directly (prefill) or the graph-safe
-    decode driver (decode) to produce the per-query selected block
+    decode kernels (decode) to produce the per-query selected block
     indices, which the model layer threads through
     `forward_args.topk_indices`.
   * `MiniMaxM3MSATrtllmAttentionMetadata` subclasses
-    `TrtllmAttentionMetadata`, so the inherited `forward` reads the
-    standard metadata fields. It owns the CUDA-graph-stable page-table
-    buffers and the built attachment; the paged K/V views and sparse GQA
-    dispatch are handled directly in `MsaSparseGqaFmha`.
+    `TrtllmAttentionMetadata` and owns the CUDA-graph-stable buffers and
+    the built sparse metadata.
 
-The backend and metadata classes are defined inside
-`get_minimax_m3_msa_attention_backend_cls` (with a lazy `trtllm` import)
-so that importing this module during attention-backend package init does
-not pull in `trtllm` -> `fmha` -> `interface` and form an import cycle.
-This mirrors the Triton reference backend's
-`get_minimax_m3_attention_backend_cls` factory.
+The classes are defined inside `get_minimax_m3_msa_attention_backend_cls`
+with a deferred `trtllm` import, avoiding a `trtllm` -> `fmha` ->
+`interface` import cycle at package init.
 """
 
 from __future__ import annotations
@@ -141,12 +132,7 @@ def run_msa_sparse_decode(
 
 @functools.lru_cache(maxsize=1)
 def get_minimax_m3_msa_attention_backend_cls():
-    """Return `MiniMaxM3MSATrtllmAttention` (selection entry point).
-
-    Defined lazily (with a deferred `trtllm` import) so importing this
-    module during attention-backend package init does not form the
-    `trtllm` -> `fmha` -> `interface` import cycle.
-    """
+    """Return `MiniMaxM3MSATrtllmAttention` (selection entry point)."""
     from dataclasses import dataclass
 
     from tensorrt_llm._torch.attention_backend.trtllm import (
@@ -158,11 +144,9 @@ def get_minimax_m3_msa_attention_backend_cls():
     class MiniMaxM3MSATrtllmAttentionMetadata(TrtllmAttentionMetadata):
         """`TrtllmAttentionMetadata` for MiniMax-M3 MSA sparse layers.
 
-        Holds the MSA staging (page-table buffers, per-request CPU
-        lengths, index-K writes) on top of the standard metadata. The
-        whole-batch paged K/V views and sparse GQA dispatch live in
-        `MsaSparseGqaFmha`; this class only owns the CUDA-graph-stable
-        buffers and the built sparse metadata.
+        Owns the CUDA-graph-stable buffers and the per-forward sparse
+        metadata; the paged K/V views and sparse GQA dispatch live in
+        `MsaSparseGqaFmha`.
         """
 
         def __init__(self, *args, **kwargs):
@@ -231,9 +215,7 @@ def get_minimax_m3_msa_attention_backend_cls():
                 )
             return self.m3_sparse_metadata
 
-        # Index-K cache access + write (consumed by the MsaIndexer via
-        # run_indexer). The main-KV paged views and sparse GQA dispatch
-        # are handled directly in MsaSparseGqaFmha.
+        # Index-K cache access + write, consumed by the MsaIndexer.
 
         def msa_idx_k_cache(self, layer_idx: int) -> torch.Tensor:
             """Raw paged index-K view for the indexer; HND conversion is done there."""
@@ -306,11 +288,9 @@ def get_minimax_m3_msa_attention_backend_cls():
                 )
 
         def _register_global_geometry(self) -> None:
-            # Register the per-rank sparse config process-wide at
-            # construction, before any forward or CUDA graph capture, so
-            # every metadata instance's prepare() can pre-build the MSA
-            # plans. The config is the single geometry source of truth; the
-            # decode driver derives its own alloc-time key from it.
+            # Register the config process-wide at construction, before any
+            # forward or CUDA graph capture, so every metadata's prepare()
+            # can pre-build the MSA plans.
             from .metadata import set_global_msa_geometry
 
             set_global_msa_geometry(self.m3_config)
@@ -322,13 +302,9 @@ def get_minimax_m3_msa_attention_backend_cls():
             return False
 
         def create_fmha_libs(self) -> None:
-            # The MSA layer runs its main attention exclusively through the
-            # fmha_sm100 block-sparse GQA kernel. Restrict the dispatch loop
-            # to MsaSparseGqaFmha so the standard libs (flashinfer
-            # trtllm-gen, fallback), which come first in the registry and
-            # would otherwise claim the request but cannot handle the M3
-            # sparse contract (unfused q/k/v plus selected block indices),
-            # never win.
+            # Restrict the dispatch loop to MsaSparseGqaFmha; the standard
+            # libs come first in the registry but cannot handle the M3
+            # sparse contract (unfused q/k/v plus selected block indices).
             from tensorrt_llm._torch.attention_backend.fmha import MsaSparseGqaFmha
 
             self.fmha_libs = [MsaSparseGqaFmha(self)]

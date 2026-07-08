@@ -959,17 +959,11 @@ class MiniMaxM3Attention(Attention):
         k_view = k.view(num_tokens, self.num_key_value_heads, self.head_dim)
         v_view = v.view(num_tokens, self.num_key_value_heads, self.head_dim)
 
-        # 4. Paged-block main K/V pool. Keep the multi-dim view (do not
-        # reshape) so writes propagate to the underlying pool storage:
-        # ``kv_pool[:, 0]`` is a non-contiguous view (its dim-0 stride
-        # is 2× the contiguous stride because dim 1 separates K from
-        # V), so reshaping to ``[-1, num_kv_heads, head_dim]`` silently
-        # forks a copy. Writing to the copy and then discarding it is
-        # exactly the bug that drove dense layer-0 decode attention to
-        # near-zero output: the next forward call would read zeros for
-        # the prefilled positions because the pool was never updated.
-        # Pass the 4-D view directly; the helpers below address slots
-        # via ``(page, within)`` fancy indexing.
+        # 4. Paged-block main K/V pool. Keep the 4-D view: kv_pool[:, 0] is
+        # non-contiguous (dim-0 stride is 2x because dim 1 separates K from
+        # V), so reshaping to [-1, num_kv_heads, head_dim] silently forks a
+        # copy and drops the cache write. The helpers address slots via
+        # (page, within) fancy indexing.
         kv_pool = kv_cache_manager.get_buffers(self.layer_idx)
         k_cache_view = kv_pool[:, 0]
         v_cache_view = kv_pool[:, 1]
@@ -1098,17 +1092,10 @@ class MiniMaxM3Attention(Attention):
                     dropout_p=0.0,
                     is_causal=False,
                 )  # [batch, H, 1, d]
-            # Drop the singleton Q-length axis and write the resulting
-            # ``[batch, num_heads, head_dim]`` tensor into the final buffer.
-            # The prior ``.transpose(1, 2).reshape(batch, H, d)`` pattern
-            # was wrong: with ``H != head_dim`` (M3 TP=8 has H=8, d=128)
-            # the non-contiguous transpose forces ``reshape`` to copy the
-            # data in C-order under its current ``[batch, d, H]`` shape,
-            # then reinterpret as ``[batch, H, d]`` — which scrambles
-            # ``(head, head_dim)`` ordering and feeds permuted activations
-            # into ``o_proj``. Prefill is unaffected because its
-            # ``transpose(0, 1)`` runs between q-len and num_heads axes
-            # which the per-batch loop already laid out correctly.
+            # Drop the singleton Q-length axis. Use squeeze(2) + a
+            # [batch, num_heads, head_dim] view rather than
+            # transpose(1, 2).reshape, which (with H != head_dim) copies in
+            # C-order and scrambles the (head, head_dim) ordering into o_proj.
             output.view(batch, self.num_heads, self.head_dim).copy_(out_b.squeeze(2))
 
         return output
@@ -1310,19 +1297,9 @@ class MiniMaxM3Attention(Attention):
         kv_cache_manager,
     ) -> torch.Tensor:
         """Triton reference path: keyword-driven `forward` with M3 caches."""
-        # 4. Get the paged-block main K/V cache + flat side index-K cache.
-        # The base KVCacheManagerV2 layout is
-        # ``[num_pages, kv_factor, tokens_per_block, num_kv_heads, head_dim]``
-        # with NHD layout. Pass the multi-dim view ``kv_pool[:, kv_index]``
-        # ``[num_pages, tokens_per_block, num_kv_heads, head_dim]`` directly:
-        # ``_gather_paged_batched`` decomposes the flat slot id into
-        # ``(page, within)`` for 4-D caches, and writes go through
-        # :func:`_write_main_kv_slots_to_pool` which uses multi-dim
-        # fancy assignment. The previously used reshape pattern
-        # silently copied the K (or V) slice because ``kv_pool[:, 0]``
-        # is non-contiguous, so writes never propagated to the pool —
-        # the bug that drove the dense layer-0 decode attention to
-        # near-zero output and produced the GSM8K-100 0.0 score.
+        # Pass the 4-D pool views directly (kv_pool[:, 0] / [:, 1]); they are
+        # non-contiguous, so reshaping forks a copy and drops the cache write
+        # (see _dense_forward). The helpers address slots via (page, within).
         kv_pool = kv_cache_manager.get_buffers(self.layer_idx)
         # Index 0 = K, 1 = V on the kv_factor axis.
         k_cache = kv_pool[:, 0]
