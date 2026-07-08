@@ -405,7 +405,7 @@ class M3DecodeKernelDriver:
 
 
 # ---------------------------------------------------------------------------
-# Module-level convenience API (driver cache + functional entry points)
+# Driver cache
 # ---------------------------------------------------------------------------
 
 _driver_cache: dict[tuple, M3DecodeKernelDriver] = {}
@@ -424,58 +424,8 @@ def get_decode_driver(geometry: M3DecodeGeometry, device: torch.device) -> M3Dec
     return driver
 
 
-def proxy_mqa_decode(
-    idx_q: torch.Tensor,
-    idx_k_paged: torch.Tensor,
-    *,
-    geometry: M3DecodeGeometry,
-    seq_lens: torch.Tensor,
-    kv_page_indptr: torch.Tensor,
-    kv_indices: torch.Tensor,
-    sm_scale: float,
-) -> torch.Tensor:
-    """Functional proxy pass: returns per-KV-block max scores."""
-    driver = get_decode_driver(geometry, idx_q.device)
-    return driver.proxy_max_score(
-        idx_q,
-        idx_k_paged,
-        seq_lens=seq_lens,
-        kv_page_indptr=kv_page_indptr,
-        kv_indices=kv_indices,
-        sm_scale=sm_scale,
-    )
-
-
-def sparse_gqa_decode(
-    q: torch.Tensor,
-    k_paged: torch.Tensor,
-    v_paged: torch.Tensor,
-    kv_block_indexes: torch.Tensor,
-    *,
-    geometry: M3DecodeGeometry,
-    seq_lens: torch.Tensor,
-    kv_page_indptr: torch.Tensor,
-    kv_indices: torch.Tensor,
-    sm_scale: float,
-) -> torch.Tensor:
-    """Functional sparse GQA pass over selected KV blocks."""
-    driver = get_decode_driver(geometry, q.device)
-    return driver.sparse_attention(
-        q,
-        k_paged,
-        v_paged,
-        kv_block_indexes,
-        seq_lens=seq_lens,
-        kv_page_indptr=kv_page_indptr,
-        kv_indices=kv_indices,
-        sm_scale=sm_scale,
-    )
-
-
 __all__ = [
     "M3DecodeGeometry",
     "M3DecodeKernelDriver",
     "get_decode_driver",
-    "proxy_mqa_decode",
-    "sparse_gqa_decode",
 ]

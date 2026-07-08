@@ -33,7 +33,7 @@ This mirrors the Triton reference backend's
 from __future__ import annotations
 
 import functools
-from typing import TYPE_CHECKING, ClassVar, Optional, Tuple
+from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
 
@@ -45,10 +45,17 @@ from .common import (
     write_main_kv_slots,
 )
 from .indexer import MsaIndexer
-from .metadata import MiniMaxM3SparseConfig, build_m3_sparse_metadata_and_plans
+from .metadata import (
+    MiniMaxM3SparseConfig,
+    build_m3_sparse_metadata_and_plans,
+    get_global_msa_geometry,
+    m3_cache_device,
+    maybe_build_static_buffers_placeholder,
+    whole_batch_qo_lens,
+)
 
 if TYPE_CHECKING:
-    from .metadata import MiniMaxM3SparseAttentionMetadata, MsaGeometry
+    from .metadata import MiniMaxM3SparseAttentionMetadata
 
 
 def _whole_batch_lens(
@@ -69,18 +76,12 @@ def _whole_batch_lens(
             msa_plans["qo_offset_cpu"],
             msa_plans["kv_indices"],
         )
-    seq_lens_cpu = m3_meta.seq_lens_cpu.to(torch.int32)
-    if m3_meta.is_prefill:
-        if m3_meta.extend_seq_lens_cpu is None or m3_meta.prefix_lens is None:
-            raise RuntimeError("prefill metadata requires extend_seq_lens_cpu / prefix_lens")
-        qo_lens_cpu = torch.tensor(m3_meta.extend_seq_lens_cpu, dtype=torch.int32)
-        qo_offset_cpu = m3_meta.prefix_lens.detach().to(device="cpu", dtype=torch.int32)
-    else:
-        batch = int(seq_lens_cpu.shape[0])
-        qo_lens_cpu = torch.ones(batch, dtype=torch.int32)
-        qo_offset_cpu = (seq_lens_cpu - 1).to(torch.int32)
+    lens = whole_batch_qo_lens(m3_meta)
+    if lens is None:
+        raise RuntimeError("prefill metadata requires extend_seq_lens_cpu / prefix_lens")
+    qo_lens_cpu, kv_lens_cpu, qo_offset_cpu = lens
     kv_indices, _ = build_kv_indices_and_lens(m3_meta, page_size)
-    return qo_lens_cpu, seq_lens_cpu, qo_offset_cpu, kv_indices
+    return qo_lens_cpu, kv_lens_cpu, qo_offset_cpu, kv_indices
 
 
 def run_msa_sparse_decode(
@@ -164,10 +165,6 @@ def get_minimax_m3_msa_attention_backend_cls():
         buffers and the built attachment.
         """
 
-        # Published by the model layer's first sparse forward. Set on the
-        # class so CUDA-graph metadata clones see it before capture.
-        _msa_geometry: ClassVar[Optional["MsaGeometry"]] = None
-
         def __init__(self, *args, **kwargs):
             super().__init__(*args, **kwargs)
             self.minimax_m3: Optional[dict] = None
@@ -177,50 +174,16 @@ def get_minimax_m3_msa_attention_backend_cls():
 
         # lifecycle
 
-        def _cache_device(self) -> torch.device:
-            kv_cache_manager = getattr(self, "kv_cache_manager", None)
-            if kv_cache_manager is not None:
-                try:
-                    return kv_cache_manager.get_buffers(0).device
-                except Exception:
-                    pass
-            return torch.device(f"cuda:{torch.cuda.current_device()}")
-
-        def _maybe_static_buffers(self, cache_device: torch.device) -> Optional[dict]:
-            """Return persistent M3 buffers when CUDA-graph stability is needed."""
-            need_static = bool(getattr(self, "is_cuda_graph", False)) or (
-                self._m3_static_buffers is not None
-            )
-            if not need_static:
-                return None
-            if (
-                self._m3_static_buffers is not None
-                and self._m3_static_buffers.get("device") == cache_device
-            ):
-                return self._m3_static_buffers
-            placeholder: dict = {
-                "device": cache_device,
-                "max_num_sequences_hint": int(
-                    getattr(self, "max_num_sequences", None) or self.max_num_requests
-                ),
-                "max_num_tokens_hint": int(
-                    getattr(self, "max_num_tokens", None)
-                    or (int(getattr(self, "max_num_sequences", None) or self.max_num_requests))
-                ),
-            }
-            self._m3_static_buffers = placeholder
-            return placeholder
-
         def prepare(self) -> None:
             super().prepare()
             self.minimax_m3 = None
-            geometry = type(self)._msa_geometry
-            if geometry is None:
-                from .metadata import get_global_msa_geometry
-
-                geometry = get_global_msa_geometry()
-            cache_device = self._cache_device()
-            static_buffers = self._maybe_static_buffers(cache_device)
+            # The per-rank geometry is registered process-wide by the MSA
+            # attention layer's constructor, before any forward or CUDA
+            # graph capture, so every metadata instance (including the
+            # separate clones the graph runner creates) reads it here.
+            geometry = get_global_msa_geometry()
+            cache_device = m3_cache_device(self)
+            static_buffers = maybe_build_static_buffers_placeholder(self, cache_device)
             (
                 attachment,
                 self._msa_kv_indices_buf,

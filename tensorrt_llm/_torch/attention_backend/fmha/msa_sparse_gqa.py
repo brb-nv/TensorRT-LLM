@@ -45,7 +45,7 @@ importable for focused unit tests that drive the kernel directly.
 from __future__ import annotations
 
 import importlib.util
-from typing import TYPE_CHECKING, Optional, Tuple
+from typing import TYPE_CHECKING, Optional
 
 import torch
 

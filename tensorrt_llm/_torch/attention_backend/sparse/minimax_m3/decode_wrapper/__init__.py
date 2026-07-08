@@ -5,17 +5,19 @@
 Drives the external MSA (`fmha_sm100`) SM100 kernels with launch
 arguments assembled from device tensors, so decode steps can be captured
 into CUDA graphs and replayed correctly as sequence state advances.
+
 Public surface:
 
-* `proxy_mqa_decode`: proxy MQA (indexer) pass, one KV head, per-KV-block
-  max-score output.
-* `sparse_gqa_decode`: block-sparse GQA main pass over the top-k selected
-  KV blocks.
+* `M3DecodeGeometry`: compile/alloc-time geometry key for one layer family.
+* `M3DecodeKernelDriver`: persistent-state driver (proxy MQA + top-k block
+  selection + block-sparse GQA) for one `(device, geometry)` pair.
+* `get_decode_driver`: cached driver lookup keyed by `(geometry, device)`.
 """
 
-from .dispatch import proxy_mqa_decode, sparse_gqa_decode
+from .dispatch import M3DecodeGeometry, M3DecodeKernelDriver, get_decode_driver
 
 __all__ = [
-    "proxy_mqa_decode",
-    "sparse_gqa_decode",
+    "M3DecodeGeometry",
+    "M3DecodeKernelDriver",
+    "get_decode_driver",
 ]
