@@ -1241,10 +1241,10 @@ class MiniMaxM3Attention(Attention):
         """
         if getattr(attn_metadata, "_msa_geometry", None) is not None:
             return
-        from ..attention_backend.sparse.minimax_m3.msa_plan_cache import MsaPlanCacheGeometry
+        from ..attention_backend.sparse.minimax_m3.metadata import MsaGeometry
 
         m3_config = self.attn.m3_config
-        type(attn_metadata)._msa_geometry = MsaPlanCacheGeometry(
+        type(attn_metadata)._msa_geometry = MsaGeometry(
             num_q_heads=int(m3_config.num_q_heads),
             num_kv_heads=int(m3_config.num_kv_heads),
             num_index_heads=int(m3_config.num_index_heads),

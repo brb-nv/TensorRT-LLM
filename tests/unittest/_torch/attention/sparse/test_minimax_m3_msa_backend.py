@@ -114,23 +114,11 @@ def test_cache_view_to_msa_paged_3d_flat_slot_layout():
     assert torch.equal(paged, cache_view.permute(1, 0, 2).unsqueeze(0).contiguous())
 
 
-def test_idx_cache_to_msa_paged_handles_both_ranks():
-    num_pages, tokens_per_block, sparse_index_dim = 2, 128, 128
-    paged_4d = torch.randn(num_pages, tokens_per_block, 1, sparse_index_dim, dtype=torch.bfloat16)
-    out_4d = common.idx_cache_to_msa_paged(paged_4d)
-    assert out_4d.shape == (num_pages, 1, tokens_per_block, sparse_index_dim)
-    assert torch.equal(out_4d, paged_4d.permute(0, 2, 1, 3).contiguous())
-
-    flat_3d = torch.randn(num_pages * tokens_per_block, 1, sparse_index_dim, dtype=torch.bfloat16)
-    out_3d = common.idx_cache_to_msa_paged(flat_3d)
-    assert out_3d.shape == (1, 1, flat_3d.shape[0], sparse_index_dim)
-
-
 def test_cache_view_to_msa_paged_rejects_other_ranks():
     with pytest.raises(ValueError, match="rank"):
         common.cache_view_to_msa_paged(torch.empty(4, 8))
     with pytest.raises(ValueError, match="rank"):
-        common.idx_cache_to_msa_paged(torch.empty(2))
+        common.cache_view_to_msa_paged(torch.empty(2))
 
 
 # ---------------------------------------------------------------------------
@@ -242,7 +230,11 @@ def test_msa_sparse_gqa_is_supported_gates_on_sparse_prediction():
     """is_supported must reject non-M3-MSA requests (no sparse block indices)."""
     from tensorrt_llm._torch.attention_backend.fmha import MsaSparseGqaFmha
 
-    fmha = MsaSparseGqaFmha()  # owner-less construction is tolerated for tests
+    class _DummyAttn:
+        layer_idx = 0
+        num_heads = 8
+
+    fmha = MsaSparseGqaFmha(_DummyAttn())
     # No forward_args / no sparse_prediction -> not an MSA sparse request.
     assert fmha.is_supported(None, None, None, None, None) is False
 

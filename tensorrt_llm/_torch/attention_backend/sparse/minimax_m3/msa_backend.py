@@ -18,10 +18,9 @@ Mimics `DSATrtllmAttention`:
     `forward_args.topk_indices`.
   * `MiniMaxM3MSATrtllmAttentionMetadata` subclasses
     `TrtllmAttentionMetadata`, so the inherited `forward` reads the
-    standard metadata fields, while the MSA-specific paged views, page
-    tables, and block writes are supplied through the
-    `MsaSparseMetadataProtocol` methods added here (reusing the staging in
-    `metadata`).
+    standard metadata fields. It owns the CUDA-graph-stable page-table
+    buffers and the built attachment; the paged K/V views and sparse GQA
+    dispatch are handled directly in `MsaSparseGqaFmha`.
 
 The backend and metadata classes are defined inside
 `get_minimax_m3_msa_attention_backend_cls` (with a lazy `trtllm` import)
@@ -42,16 +41,14 @@ from .common import (
     _MSA_REQUIRED_HEAD_DIM,
     _MSA_REQUIRED_TOPK,
     build_kv_indices_and_lens,
-    cache_view_to_msa_paged,
-    page_size_from_view,
+    msa_paged_kv,
     write_main_kv_slots,
 )
 from .indexer import MsaIndexer
 from .metadata import MiniMaxM3SparseConfig, build_m3_sparse_metadata_and_plans
 
 if TYPE_CHECKING:
-    from .metadata import MiniMaxM3SparseAttentionMetadata
-    from .msa_plan_cache import MsaPlanCacheGeometry
+    from .metadata import MiniMaxM3SparseAttentionMetadata, MsaGeometry
 
 
 def _whole_batch_lens(
@@ -86,6 +83,61 @@ def _whole_batch_lens(
     return qo_lens_cpu, seq_lens_cpu, qo_offset_cpu, kv_indices
 
 
+def run_msa_sparse_decode(
+    config: "MiniMaxM3SparseConfig",
+    kv_cache_manager,
+    layer_idx: int,
+    m3_meta: "MiniMaxM3SparseAttentionMetadata",
+    q: torch.Tensor,
+    kv_block_indexes: torch.Tensor,
+    sm_scale: float,
+) -> torch.Tensor:
+    """CUDA-graph-safe decode sparse GQA via the in-tree driver.
+
+    Decode is CUDA-graph captured, so it must not go through the eager
+    `fmha_sm100_plan` host driver, which uses unpinned H2D staging,
+    per-call device allocations, and a device-side cost sweep. The staged
+    page tables come from the metadata's pre-built `msa_plans`. Returns
+    `[num_tokens, num_q_heads * head_dim]`.
+    """
+    from .decode_wrapper.dispatch import M3DecodeGeometry, get_decode_driver
+
+    msa_plans = getattr(m3_meta, "msa_plans", None)
+    if msa_plans is None:
+        raise RuntimeError(
+            "MiniMax-M3 MSA decode requires pre-staged msa_plans; "
+            "prepare() did not build them (missing geometry / use_msa)."
+        )
+    k_paged, v_paged = msa_paged_kv(kv_cache_manager, layer_idx)
+    page_size = int(k_paged.shape[2])
+    seq_lens = m3_meta.seq_lens.to(torch.int32)
+    batch = int(q.shape[0])
+    geometry = M3DecodeGeometry(
+        num_q_heads=config.num_q_heads,
+        num_kv_heads=config.num_kv_heads,
+        num_index_heads=config.num_index_heads,
+        head_dim=config.head_dim,
+        page_size=page_size,
+        topk=config.topk,
+        init_blocks=config.init_blocks,
+        local_blocks=config.local_blocks,
+        max_batch=int(msa_plans.get("max_batch") or 0) or max(64, 1 << (batch - 1).bit_length()),
+        max_kv_len=int(msa_plans.get("max_kv_len") or 0) or int(m3_meta.req_to_token.shape[1]),
+    )
+    driver = get_decode_driver(geometry, q.device)
+    out = driver.sparse_attention(
+        q,
+        k_paged,
+        v_paged,
+        kv_block_indexes,
+        seq_lens=seq_lens,
+        kv_page_indptr=msa_plans["kv_page_indptr"],
+        kv_indices=msa_plans["kv_indices"],
+        sm_scale=sm_scale,
+    )
+    return out.reshape(batch, config.num_q_heads * config.head_dim)
+
+
 @functools.lru_cache(maxsize=1)
 def get_minimax_m3_msa_attention_backend_cls():
     """Return `MiniMaxM3MSATrtllmAttention` (selection entry point).
@@ -105,21 +157,23 @@ def get_minimax_m3_msa_attention_backend_cls():
     class MiniMaxM3MSATrtllmAttentionMetadata(TrtllmAttentionMetadata):
         """`TrtllmAttentionMetadata` for MiniMax-M3 MSA sparse layers.
 
-        Layers the MSA staging (paged HND views, page tables, per-request
-        CPU lengths, main/index-K writes) on top of the standard metadata
-        so `MsaSparseGqaFmha` can drive its whole-batch dispatch.
-        Implements `MsaSparseMetadataProtocol`.
+        Holds the MSA staging (page-table buffers, per-request CPU
+        lengths, index-K writes) on top of the standard metadata. The
+        whole-batch paged K/V views and sparse GQA dispatch live in
+        `MsaSparseGqaFmha`; this class only owns the CUDA-graph-stable
+        buffers and the built attachment.
         """
 
         # Published by the model layer's first sparse forward. Set on the
         # class so CUDA-graph metadata clones see it before capture.
-        _msa_geometry: ClassVar[Optional["MsaPlanCacheGeometry"]] = None
+        _msa_geometry: ClassVar[Optional["MsaGeometry"]] = None
 
         def __init__(self, *args, **kwargs):
             super().__init__(*args, **kwargs)
             self.minimax_m3: Optional[dict] = None
             self._m3_static_buffers: Optional[dict] = None
-            self._msa_plan_cache = None
+            self._msa_kv_indices_buf = None
+            self._msa_kv_page_indptr_buf = None
 
         # lifecycle
 
@@ -162,15 +216,20 @@ def get_minimax_m3_msa_attention_backend_cls():
             self.minimax_m3 = None
             geometry = type(self)._msa_geometry
             if geometry is None:
-                from .msa_plan_cache import get_global_msa_geometry
+                from .metadata import get_global_msa_geometry
 
                 geometry = get_global_msa_geometry()
             cache_device = self._cache_device()
             static_buffers = self._maybe_static_buffers(cache_device)
-            attachment, self._msa_plan_cache = build_m3_sparse_metadata_and_plans(
+            (
+                attachment,
+                self._msa_kv_indices_buf,
+                self._msa_kv_page_indptr_buf,
+            ) = build_m3_sparse_metadata_and_plans(
                 self,
                 static_buffers=static_buffers,
-                plan_cache=self._msa_plan_cache,
+                kv_indices_buf=self._msa_kv_indices_buf,
+                kv_page_indptr_buf=self._msa_kv_page_indptr_buf,
                 geometry=geometry,
             )
             self.minimax_m3 = attachment
@@ -193,33 +252,13 @@ def get_minimax_m3_msa_attention_backend_cls():
         def m3_out_cache_loc(self) -> torch.Tensor:
             return self._require_attachment()["out_cache_loc"]
 
-        def _kv_views(self, layer_idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-            """Per-layer NHD K/V slot views `[num_pages, page_size, num_kv_heads, head_dim]`."""
-            buffers = self.kv_cache_manager.get_buffers(layer_idx)
-            return buffers[:, 0], buffers[:, 1]
-
-        # MsaSparseMetadataProtocol
-
-        def msa_get_paged_kv(self, layer_idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-            k_view, v_view = self._kv_views(layer_idx)
-            return cache_view_to_msa_paged(k_view), cache_view_to_msa_paged(v_view)
+        # Index-K cache access + write (consumed by the MsaIndexer via
+        # run_indexer). The main-KV paged views and sparse GQA dispatch
+        # are handled directly in MsaSparseGqaFmha.
 
         def msa_idx_k_cache(self, layer_idx: int) -> torch.Tensor:
             """Raw paged index-K view for the indexer; HND conversion is done there."""
             return self.kv_cache_manager.get_index_k_buffer(layer_idx)
-
-        def msa_write_main_kv(self, layer_idx: int, k: torch.Tensor, v: torch.Tensor) -> None:
-            k_view, v_view = self._kv_views(layer_idx)
-            num_kv_heads = int(k_view.shape[2])
-            head_dim = int(k_view.shape[3])
-            num_tokens = int(k.shape[0])
-            out_cache_loc = self.m3_out_cache_loc
-            write_main_kv_slots(
-                k_view, out_cache_loc, k.reshape(num_tokens, num_kv_heads, head_dim)
-            )
-            write_main_kv_slots(
-                v_view, out_cache_loc, v.reshape(num_tokens, num_kv_heads, head_dim)
-            )
 
         def msa_write_idx_k(self, layer_idx: int, idx_k: torch.Tensor) -> None:
             idx_cache = self.msa_idx_k_cache(layer_idx)
@@ -228,82 +267,6 @@ def get_minimax_m3_msa_attention_backend_cls():
             write_main_kv_slots(
                 idx_cache, self.m3_out_cache_loc, idx_k.reshape(num_tokens, 1, sparse_index_dim)
             )
-
-        def msa_is_prefill(self) -> bool:
-            return bool(self.m3_meta.is_prefill)
-
-        def msa_whole_batch_lens(
-            self,
-            *,
-            causal: bool,
-        ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
-            # The indexer and metadata are built over the whole batch, and
-            # fmha_sm100 handles mixed decode/prefill varlen batches in one
-            # call (decode rows are 1-token causal extends), so the FMHA
-            # runs the whole batch at once rather than splitting into
-            # per-request context/generation phases. Returning whole-batch
-            # lengths keeps the plan's total_q consistent with the
-            # whole-batch q the model passes and the whole-batch block
-            # indices the indexer produced.
-            page_size = int(self._kv_views(0)[0].shape[1])
-            qo_all, kv_all, qo_off_all, kv_indices_all = _whole_batch_lens(self.m3_meta, page_size)
-            return qo_all, kv_all, (qo_off_all if causal else None), kv_indices_all
-
-        def msa_run_sparse_decode(
-            self,
-            *,
-            layer_idx: int,
-            q: torch.Tensor,
-            kv_block_indexes: torch.Tensor,
-            sm_scale: float,
-        ) -> torch.Tensor:
-            """CUDA-graph-safe decode sparse GQA via the in-tree driver.
-
-            Reuses the same geometry-keyed driver instance the indexer used
-            for proxy and block selection (`get_decode_driver` caches by
-            `(geometry, device)`), so the persistent buffers are shared.
-            Returns `[num_tokens, num_q_heads * head_dim]`.
-            """
-            from .decode_wrapper.dispatch import M3DecodeGeometry, get_decode_driver
-
-            attachment = self._require_attachment()
-            msa_plans = attachment.get("msa_plans")
-            if msa_plans is None:
-                raise RuntimeError(
-                    "MiniMax-M3 MSA decode requires pre-staged msa_plans; "
-                    "prepare() did not build them (missing geometry / use_msa)."
-                )
-            geometry_cfg = msa_plans["geometry"]
-            k_paged, v_paged = self.msa_get_paged_kv(layer_idx)
-            page_size = int(k_paged.shape[2])
-            seq_lens = self.m3_meta.seq_lens.to(torch.int32)
-            geometry = M3DecodeGeometry(
-                num_q_heads=geometry_cfg.num_q_heads,
-                num_kv_heads=geometry_cfg.num_kv_heads,
-                num_index_heads=geometry_cfg.num_index_heads,
-                head_dim=geometry_cfg.head_dim,
-                page_size=page_size,
-                topk=geometry_cfg.topk,
-                init_blocks=geometry_cfg.init_blocks,
-                local_blocks=geometry_cfg.local_blocks,
-                max_batch=int(msa_plans.get("max_batch") or 0)
-                or max(64, 1 << (int(q.shape[0]) - 1).bit_length()),
-                max_kv_len=int(msa_plans.get("max_kv_len") or 0)
-                or int(self.m3_meta.req_to_token.shape[1]),
-            )
-            driver = get_decode_driver(geometry, q.device)
-            out = driver.sparse_attention(
-                q,
-                k_paged,
-                v_paged,
-                kv_block_indexes,
-                seq_lens=seq_lens,
-                kv_page_indptr=msa_plans["kv_page_indptr"],
-                kv_indices=msa_plans["kv_indices"],
-                sm_scale=sm_scale,
-            )
-            batch = int(q.shape[0])
-            return out.reshape(batch, geometry_cfg.num_q_heads * geometry_cfg.head_dim)
 
     class MiniMaxM3MSATrtllmAttention(TrtllmAttention):
         """MSA-backed MiniMax-M3 sparse attention (mimics `DSATrtllmAttention`)."""
@@ -368,10 +331,10 @@ def get_minimax_m3_msa_attention_backend_cls():
             # construction, before any forward or CUDA graph capture, so
             # every metadata instance's prepare() can pre-build the MSA
             # plans.
-            from .msa_plan_cache import MsaPlanCacheGeometry, set_global_msa_geometry
+            from .metadata import MsaGeometry, set_global_msa_geometry
 
             set_global_msa_geometry(
-                MsaPlanCacheGeometry(
+                MsaGeometry(
                     num_q_heads=int(self.m3_config.num_q_heads),
                     num_kv_heads=int(self.m3_config.num_kv_heads),
                     num_index_heads=int(self.m3_config.num_index_heads),
@@ -429,7 +392,10 @@ def get_minimax_m3_msa_attention_backend_cls():
             metadata.msa_write_idx_k(self.layer_idx, idx_k_view)
             idx_k_cache = metadata.msa_idx_k_cache(self.layer_idx)
             m3_meta = metadata.m3_meta
-            page_size = page_size_from_view(metadata._kv_views(self.layer_idx)[0])
+            # The cache's tokens_per_block equals the sparse block size
+            # (enforced by the M3 KV cache manager), so read it from the
+            # config instead of the cache view.
+            page_size = self.m3_config.block_size
 
             if m3_meta.is_prefill:
                 qo, kv, qo_off, kv_indices = _whole_batch_lens(m3_meta, page_size)

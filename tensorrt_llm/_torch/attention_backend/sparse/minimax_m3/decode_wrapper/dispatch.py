@@ -25,7 +25,6 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Dict, Tuple
 
 import torch
 
@@ -143,15 +142,15 @@ class M3DecodeKernelDriver:
 
         # Per-batch-size constants, built lazily and cached (bounded by
         # the distinct batch sizes seen: CUDA graph buckets + eager).
-        self._qo_const_cache: Dict[Tuple[int, int], Tuple[torch.Tensor, torch.Tensor]] = {}
-        self._worklist_cache: Dict[Tuple[int, int], Tuple[torch.Tensor, torch.Tensor]] = {}
+        self._qo_const_cache: dict[tuple[int, int], tuple[torch.Tensor, torch.Tensor]] = {}
+        self._worklist_cache: dict[tuple[int, int], tuple[torch.Tensor, torch.Tensor]] = {}
 
     # ------------------------------------------------------------------
     # Cached per-batch-size constants (host work happens once per shape,
     # outside any capture; callers warm shapes up before capturing).
     # ------------------------------------------------------------------
 
-    def _qo_consts(self, batch: int, pack_factor: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _qo_consts(self, batch: int, pack_factor: int) -> tuple[torch.Tensor, torch.Tensor]:
         """(qo_segment_lens, qo_segment_offsets) for packed decode lens."""
         key = (batch, pack_factor)
         cached = self._qo_const_cache.get(key)
@@ -166,7 +165,7 @@ class M3DecodeKernelDriver:
             self._qo_const_cache[key] = cached
         return cached
 
-    def _worklist(self, batch: int, num_packed_heads: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _worklist(self, batch: int, num_packed_heads: int) -> tuple[torch.Tensor, torch.Tensor]:
         key = (batch, num_packed_heads)
         cached = self._worklist_cache.get(key)
         if cached is None:
@@ -409,7 +408,7 @@ class M3DecodeKernelDriver:
 # Module-level convenience API (driver cache + functional entry points)
 # ---------------------------------------------------------------------------
 
-_driver_cache: Dict[Tuple, M3DecodeKernelDriver] = {}
+_driver_cache: dict[tuple, M3DecodeKernelDriver] = {}
 
 
 def get_decode_driver(geometry: M3DecodeGeometry, device: torch.device) -> M3DecodeKernelDriver:

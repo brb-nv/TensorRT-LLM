@@ -32,7 +32,7 @@ import torch
 from .common import (
     _MSA_REQUIRED_TOPK,
     build_kv_indices_and_lens,
-    idx_cache_to_msa_paged,
+    cache_view_to_msa_paged,
     per_token_valid_blocks,
     require_msa_module,
     select_blocks_from_maxscore,
@@ -141,7 +141,7 @@ class MsaIndexer:
     ) -> torch.Tensor:
         """Return `[total_q, num_kv_heads, topk]` selected block indices."""
         config = self.config
-        idx_k_paged = idx_cache_to_msa_paged(idx_k_cache)
+        idx_k_paged = cache_view_to_msa_paged(idx_k_cache)
 
         max_score = _proxy_max_score_direct(
             idx_q,
@@ -198,7 +198,7 @@ class MsaIndexer:
         from .decode_wrapper.dispatch import M3DecodeGeometry, get_decode_driver
 
         config = self.config
-        idx_k_paged = idx_cache_to_msa_paged(idx_k_cache)
+        idx_k_paged = cache_view_to_msa_paged(idx_k_cache)
         batch = int(idx_q.shape[0])
         seq_lens = metadata.seq_lens.to(torch.int32)
 

@@ -151,17 +151,11 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         **kwargs,
     ):
         # Resolve M3 sparse-layer metadata from explicit kwargs first,
-        # then from ``sparse_attn_config``, then from the M3 checkpoint
-        # convention (layers 0..2 dense, 3..N-1 sparse,
-        # disable_index_value=True, sparse_index_dim=128).
-        # The pyexecutor passes `sparse_attention_config`, so accept that
-        # name as well as the short `sparse_attn_config` used by direct
-        # test construction. Reading only the short name yields
-        # `use_msa=False`, which skips MSA plan pre-build and forces the
-        # captured decode into in-forward planning.
-        sparse_attn_config = kwargs.get("sparse_attn_config") or kwargs.get(
-            "sparse_attention_config"
-        )
+        # then from `sparse_attention_config` (the name the pyexecutor
+        # passes), then from the M3 checkpoint convention (layers 0..2
+        # dense, 3..N-1 sparse, disable_index_value=True,
+        # sparse_index_dim=128).
+        sparse_attn_config = kwargs.get("sparse_attention_config")
         num_layers = kwargs.get("num_layers")
 
         if sparse_index_dim is None:

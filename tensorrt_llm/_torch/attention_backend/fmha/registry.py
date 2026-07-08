@@ -29,12 +29,12 @@ FMHA_LIBS: dict[str, FmhaCls] = {
     # MiniMax-M3 MSA block-sparse main-attention FMHA (SM100-only,
     # fmha_sm100). An Fmha that participates in the standard
     # TrtllmAttention.forward dispatch loop: is_supported() returns True
-    # only for MiniMax-M3 MSA sparse requests (whose metadata implements
-    # MsaSparseMetadataProtocol and whose forward_args carry the indexer's
-    # selected block indices). It does its own whole-batch dispatch (no
-    # PhasedFmha ctx/gen split). The per-query block indices come from the
-    # DSA-style MsaIndexer (sparse.minimax_m3.indexer), which calls
-    # fmha_sm100 directly rather than through this registry.
+    # only for MiniMax-M3 MSA sparse requests (whose metadata is the M3
+    # MSA metadata and whose forward_args carry the indexer's selected
+    # block indices). It does its own whole-batch dispatch (no PhasedFmha
+    # ctx/gen split). The per-query block indices come from the DSA-style
+    # MsaIndexer (sparse.minimax_m3.indexer), which calls fmha_sm100
+    # directly rather than through this registry.
     "msa_sparse_gqa": MsaSparseGqaFmha,
 }
 DEFAULT_FMHA_LIBS: tuple[str, ...] = tuple(FMHA_LIBS)

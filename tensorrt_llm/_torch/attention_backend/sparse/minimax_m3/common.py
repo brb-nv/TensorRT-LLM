@@ -19,7 +19,6 @@ hot path, or run once per scheduler step during `prepare()`.
 
 from __future__ import annotations
 
-import os
 from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
@@ -69,45 +68,6 @@ def require_msa_module():
 # ---------------------------------------------------------------------------
 
 
-def _assert_paged_write_in_bounds(
-    name: str,
-    cache: torch.Tensor,
-    page: torch.Tensor,
-    within: torch.Tensor,
-) -> None:
-    """Optional CPU-side bounds check for paged-cache writes.
-
-    The runtime computes per-token slot ids from `KVCacheManagerV2`'s
-    block ids. If it ever produces a block id that does not fit the
-    per-layer view's dim-0, the write falls into another layer's memory
-    and corrupts the cache, or fires the CUDA device-side assert during
-    fancy indexing.
-
-    When `TRTLLM_MINIMAX_M3_DEBUG_BOUNDS` is set, this runs a CPU-side
-    max/min comparison that surfaces the misindex with exact tensor names
-    and values instead of a device-side assert. It is opt-in because the
-    comparison forces a CPU sync.
-    """
-    if not os.environ.get("TRTLLM_MINIMAX_M3_DEBUG_BOUNDS"):
-        return
-    num_pages = int(cache.shape[0])
-    tokens_per_block = int(cache.shape[1]) if cache.ndim == 4 else int(cache.shape[2])
-    page_max = int(page.max().item()) if page.numel() else -1
-    page_min = int(page.min().item()) if page.numel() else 0
-    within_max = int(within.max().item()) if within.numel() else -1
-    within_min = int(within.min().item()) if within.numel() else 0
-    assert 0 <= page_min and page_max < num_pages, (
-        f"{name}: page index out of bounds: page.min={page_min} "
-        f"page.max={page_max} but cache.shape[0]={num_pages} "
-        f"(shape={tuple(cache.shape)})."
-    )
-    assert 0 <= within_min and within_max < tokens_per_block, (
-        f"{name}: within-page offset out of bounds: within.min="
-        f"{within_min} within.max={within_max} but tokens_per_block="
-        f"{tokens_per_block} (shape={tuple(cache.shape)})."
-    )
-
-
 def write_main_kv_slots(
     cache: torch.Tensor,
     out_cache_loc: torch.Tensor,
@@ -135,7 +95,6 @@ def write_main_kv_slots(
             out_long = out_cache_loc.to(torch.long)
             page = out_long // tokens_per_block
             within = out_long % tokens_per_block
-            _assert_paged_write_in_bounds("cache", cache, page, within)
             cache[page, within] = values.to(cache.dtype)
         else:
             cache.index_copy_(0, out_cache_loc.to(torch.long), values.to(cache.dtype))
@@ -161,7 +120,8 @@ def cache_view_to_msa_paged(cache_view: torch.Tensor) -> torch.Tensor:
 
     A flat-slot 3-D cache (unit tests) is treated as a single virtual
     page of size `num_slots`, giving `[1, num_kv_heads, num_slots,
-    head_dim]`.
+    head_dim]`. The side index-K cache shares this layout with a single
+    replicated head (`num_kv_heads == 1`), so it uses the same adapter.
     """
     if cache_view.dim() == 4:
         return cache_view.permute(0, 2, 1, 3).contiguous()
@@ -173,28 +133,36 @@ def cache_view_to_msa_paged(cache_view: torch.Tensor) -> torch.Tensor:
     )
 
 
-def idx_cache_to_msa_paged(idx_cache: torch.Tensor) -> torch.Tensor:
-    """Convert the side index-K cache to MSA's HND paged layout.
+def msa_paged_kv(kv_cache_manager, layer_idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Per-layer paged K/V in `fmha_sm100` HND layout.
 
-    Accepts:
-      * 3-D `[num_slots, 1, sparse_index_dim]` to
-        `[1, 1, num_slots, sparse_index_dim]`
-      * 4-D `[num_pages, tokens_per_block, 1, sparse_index_dim]` to
-        `[num_pages, 1, tokens_per_block, sparse_index_dim]`
+    Reads the coalesced K+V slot view from the KV cache manager and
+    converts each half to `[num_pages, num_kv_heads, page_size, head_dim]`.
     """
-    if idx_cache.dim() == 4:
-        return idx_cache.permute(0, 2, 1, 3).contiguous()
-    if idx_cache.dim() == 3:
-        return idx_cache.permute(1, 0, 2).unsqueeze(0).contiguous()
-    raise ValueError(f"Unsupported index cache rank {idx_cache.dim()} for MSA paged conversion.")
+    buffers = kv_cache_manager.get_buffers(layer_idx)
+    return cache_view_to_msa_paged(buffers[:, 0]), cache_view_to_msa_paged(buffers[:, 1])
 
 
-def page_size_from_view(cache_view: torch.Tensor) -> int:
-    if cache_view.dim() == 4:
-        return int(cache_view.shape[1])
-    if cache_view.dim() == 3:
-        return int(cache_view.shape[0])
-    raise ValueError(f"Unsupported cache view rank {cache_view.dim()} for page-size lookup.")
+def write_msa_main_kv(
+    kv_cache_manager,
+    layer_idx: int,
+    out_cache_loc: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+) -> None:
+    """Write new-token K/V into the paged main cache at `out_cache_loc`.
+
+    `fmha_sm100` reads the paged cache directly, so (unlike the standard
+    C++ FMHA path) the new-token K/V must be written into the cache before
+    the sparse GQA runs.
+    """
+    buffers = kv_cache_manager.get_buffers(layer_idx)
+    k_view, v_view = buffers[:, 0], buffers[:, 1]
+    num_kv_heads = int(k_view.shape[2])
+    head_dim = int(k_view.shape[3])
+    num_tokens = int(k.shape[0])
+    write_main_kv_slots(k_view, out_cache_loc, k.reshape(num_tokens, num_kv_heads, head_dim))
+    write_main_kv_slots(v_view, out_cache_loc, v.reshape(num_tokens, num_kv_heads, head_dim))
 
 
 def build_kv_indices_and_lens(
@@ -331,10 +299,10 @@ __all__ = [
     "_MSA_REQUIRED_TOPK",
     "build_kv_indices_and_lens",
     "cache_view_to_msa_paged",
-    "idx_cache_to_msa_paged",
-    "page_size_from_view",
+    "msa_paged_kv",
     "per_token_valid_blocks",
     "require_msa_module",
     "select_blocks_from_maxscore",
     "write_main_kv_slots",
+    "write_msa_main_kv",
 ]
