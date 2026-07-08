@@ -117,9 +117,10 @@ def _group_max_reduce(max_score: torch.Tensor, config: "MiniMaxM3SparseConfig") 
 class MsaIndexer:
     """Predictor submodule: proxy MQA and top-k block selection.
 
-    Owned by `MiniMaxM3MSATrtllmAttention`. Stateless except for a cached
-    decode driver (keyed by geometry/device) that keeps CUDA-graph-stable
-    persistent buffers.
+    Owned by `MiniMaxM3MSATrtllmAttention`. Stateless: the decode path's
+    CUDA-graph-stable persistent buffers live on the attention metadata's
+    decode driver (`m3_meta.decode_driver`), built once in the metadata's
+    `prepare()` outside any capture.
     """
 
     def __init__(self, config: "MiniMaxM3SparseConfig"):
@@ -195,7 +196,7 @@ class MsaIndexer:
         top-k with persistent buffers, so this path is CUDA-graph
         capturable.
         """
-        from .decode_wrapper.dispatch import M3DecodeGeometry, get_decode_driver
+        from .decode_wrapper.dispatch import M3DecodeGeometry, resolve_decode_driver
 
         config = self.config
         idx_k_paged = cache_view_to_msa_paged(idx_k_cache)
@@ -227,19 +228,13 @@ class MsaIndexer:
         if max_kv_len <= 0:
             max_kv_len = int(metadata.req_to_token.shape[1])
 
-        geometry = M3DecodeGeometry(
-            num_q_heads=config.num_q_heads,
-            num_kv_heads=config.num_kv_heads,
-            num_index_heads=config.num_index_heads,
-            head_dim=config.head_dim,
-            page_size=page_size,
-            topk=config.topk,
-            init_blocks=config.init_blocks,
-            local_blocks=config.local_blocks,
+        geometry = M3DecodeGeometry.from_config(
+            config,
             max_batch=max_batch,
             max_kv_len=max_kv_len,
+            page_size=page_size,
         )
-        driver = get_decode_driver(geometry, idx_q.device)
+        driver = resolve_decode_driver(metadata, geometry, idx_q.device)
         max_score = driver.proxy_max_score(
             idx_q,
             idx_k_paged,

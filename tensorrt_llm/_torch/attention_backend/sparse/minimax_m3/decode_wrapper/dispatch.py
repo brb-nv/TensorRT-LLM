@@ -25,11 +25,15 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
 from .topk import select_topk_blocks
 from .worklist import build_decode_worklist
+
+if TYPE_CHECKING:
+    from ..metadata import MiniMaxM3SparseConfig
 
 # Mirrors fmha_sm100.jit._PACK_FACTORS.
 _PACK_FACTORS = (1, 2, 4, 6, 8, 16)
@@ -85,6 +89,33 @@ class M3DecodeGeometry:
             raise ValueError("num_q_heads must be divisible by num_kv_heads")
         if self.num_index_heads % self.num_kv_heads != 0:
             raise ValueError("num_index_heads must be divisible by num_kv_heads")
+
+    @classmethod
+    def from_config(
+        cls,
+        config: "MiniMaxM3SparseConfig",
+        *,
+        max_batch: int,
+        max_kv_len: int,
+        page_size: Optional[int] = None,
+    ) -> "M3DecodeGeometry":
+        """Build the decode alloc-time key from the layer config.
+
+        Adds the two runtime dims the driver needs to size its buffers
+        (`max_batch`, `max_kv_len`). `page_size` defaults to `block_size`.
+        """
+        return cls(
+            num_q_heads=int(config.num_q_heads),
+            num_kv_heads=int(config.num_kv_heads),
+            num_index_heads=int(config.num_index_heads),
+            head_dim=int(config.head_dim),
+            page_size=int(config.block_size if page_size is None else page_size),
+            topk=int(config.topk),
+            init_blocks=int(config.init_blocks),
+            local_blocks=int(config.local_blocks),
+            max_batch=int(max_batch),
+            max_kv_len=int(max_kv_len),
+        )
 
 
 class M3DecodeKernelDriver:
@@ -405,27 +436,38 @@ class M3DecodeKernelDriver:
 
 
 # ---------------------------------------------------------------------------
-# Driver cache
+# Metadata-owned driver resolution
 # ---------------------------------------------------------------------------
 
-_driver_cache: dict[tuple, M3DecodeKernelDriver] = {}
 
+def resolve_decode_driver(
+    m3_meta,
+    geometry: M3DecodeGeometry,
+    device: torch.device,
+) -> M3DecodeKernelDriver:
+    """Return the decode driver that owns the CUDA-graph-stable buffers.
 
-def get_decode_driver(geometry: M3DecodeGeometry, device: torch.device) -> M3DecodeKernelDriver:
-    key = (
-        geometry,
-        device.type,
-        device.index if device.index is not None else torch.cuda.current_device(),
-    )
-    driver = _driver_cache.get(key)
-    if driver is None:
-        driver = M3DecodeKernelDriver(geometry, device)
-        _driver_cache[key] = driver
+    Those buffers must keep a stable `data_ptr()` across graph replays, so
+    the driver is built once outside capture and held on the attention
+    metadata as `m3_meta.decode_driver`. The eager and test paths may reach
+    here without one; there we build a per-call driver and cache it on the
+    metadata for reuse.
+    """
+    driver = getattr(m3_meta, "decode_driver", None)
+    if driver is not None and driver.geom == geometry and driver.device == device:
+        return driver
+    driver = M3DecodeKernelDriver(geometry, device)
+    try:
+        m3_meta.decode_driver = driver
+    except AttributeError:
+        # Metadata forbids attribute assignment (e.g. a slotted/frozen
+        # test double); the eager path still works with a per-call driver.
+        pass
     return driver
 
 
 __all__ = [
     "M3DecodeGeometry",
     "M3DecodeKernelDriver",
-    "get_decode_driver",
+    "resolve_decode_driver",
 ]

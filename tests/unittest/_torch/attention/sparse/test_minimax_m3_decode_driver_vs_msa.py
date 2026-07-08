@@ -212,10 +212,10 @@ def _msa_sparse(inp, kv_block_indexes, causal=False):
 
 def _driver(max_batch):
     from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.decode_wrapper.dispatch import (  # noqa: E501
-        get_decode_driver,
+        M3DecodeKernelDriver,
     )
 
-    return get_decode_driver(_geometry(max_batch), torch.device("cuda"))
+    return M3DecodeKernelDriver(_geometry(max_batch), torch.device("cuda"))
 
 
 def _intree_proxy(driver, inp):

@@ -50,7 +50,6 @@ from .metadata import (
     build_m3_sparse_metadata_and_plans,
     get_global_msa_geometry,
     m3_cache_device,
-    maybe_build_static_buffers_placeholder,
     whole_batch_qo_lens,
 )
 
@@ -101,7 +100,7 @@ def run_msa_sparse_decode(
     page tables come from the metadata's pre-built `msa_plans`. Returns
     `[num_tokens, num_q_heads * head_dim]`.
     """
-    from .decode_wrapper.dispatch import M3DecodeGeometry, get_decode_driver
+    from .decode_wrapper.dispatch import M3DecodeGeometry, resolve_decode_driver
 
     msa_plans = getattr(m3_meta, "msa_plans", None)
     if msa_plans is None:
@@ -113,19 +112,13 @@ def run_msa_sparse_decode(
     page_size = int(k_paged.shape[2])
     seq_lens = m3_meta.seq_lens.to(torch.int32)
     batch = int(q.shape[0])
-    geometry = M3DecodeGeometry(
-        num_q_heads=config.num_q_heads,
-        num_kv_heads=config.num_kv_heads,
-        num_index_heads=config.num_index_heads,
-        head_dim=config.head_dim,
-        page_size=page_size,
-        topk=config.topk,
-        init_blocks=config.init_blocks,
-        local_blocks=config.local_blocks,
+    geometry = M3DecodeGeometry.from_config(
+        config,
         max_batch=int(msa_plans.get("max_batch") or 0) or max(64, 1 << (batch - 1).bit_length()),
         max_kv_len=int(msa_plans.get("max_kv_len") or 0) or int(m3_meta.req_to_token.shape[1]),
+        page_size=page_size,
     )
-    driver = get_decode_driver(geometry, q.device)
+    driver = resolve_decode_driver(m3_meta, geometry, q.device)
     out = driver.sparse_attention(
         q,
         k_paged,
@@ -171,31 +164,58 @@ def get_minimax_m3_msa_attention_backend_cls():
             self._m3_static_buffers: Optional[dict] = None
             self._msa_kv_indices_buf = None
             self._msa_kv_page_indptr_buf = None
+            # Persistent decode driver holding the CUDA-graph-stable kernel
+            # buffers. This metadata persists across steps and graph replays
+            # for its batch-size bucket, so owning the driver here keeps
+            # those buffers' data_ptr() stable across replays.
+            self._decode_driver = None
 
         # lifecycle
 
         def prepare(self) -> None:
             super().prepare()
             self.minimax_m3 = None
-            # The per-rank geometry is registered process-wide by the MSA
-            # attention layer's constructor, before any forward or CUDA
-            # graph capture, so every metadata instance (including the
-            # separate clones the graph runner creates) reads it here.
+            # The per-rank config (geometry) is registered process-wide by
+            # the attention layer's constructor, before any CUDA graph
+            # capture, so every metadata instance reads it here. The builder
+            # allocates and owns all graph-stable buffers on this metadata.
             geometry = get_global_msa_geometry()
-            cache_device = m3_cache_device(self)
-            static_buffers = maybe_build_static_buffers_placeholder(self, cache_device)
-            (
-                attachment,
-                self._msa_kv_indices_buf,
-                self._msa_kv_page_indptr_buf,
-            ) = build_m3_sparse_metadata_and_plans(
-                self,
-                static_buffers=static_buffers,
-                kv_indices_buf=self._msa_kv_indices_buf,
-                kv_page_indptr_buf=self._msa_kv_page_indptr_buf,
-                geometry=geometry,
-            )
+            attachment = build_m3_sparse_metadata_and_plans(self, geometry=geometry)
             self.minimax_m3 = attachment
+            self._attach_decode_driver(attachment, geometry, m3_cache_device(self))
+
+        def _attach_decode_driver(self, attachment, config, cache_device) -> None:
+            """Build once and attach the persistent decode driver.
+
+            Runs inside prepare(), outside any CUDA graph capture, so the
+            driver's buffers are allocated before capture and reused across
+            replays. It is keyed by the decode geometry and rebuilt only
+            when that changes, which does not happen once a bucket's static
+            buffers are allocated.
+            """
+            if attachment is None or config is None:
+                return
+            msa_plans = attachment.get("msa_plans")
+            if msa_plans is None:
+                return
+            m3_meta = attachment["metadata"]
+            # Only the pure-decode path uses the driver; prefill / mixed
+            # batches run the eager fmha_sm100 path. Skip the build (and its
+            # persistent-buffer allocation) for prefill steps.
+            if m3_meta.is_prefill:
+                return
+            from .decode_wrapper.dispatch import M3DecodeGeometry, M3DecodeKernelDriver
+
+            decode_geometry = M3DecodeGeometry.from_config(
+                config,
+                max_batch=int(msa_plans["max_batch"]),
+                max_kv_len=int(msa_plans["max_kv_len"]),
+            )
+            driver = self._decode_driver
+            if driver is None or driver.geom != decode_geometry or driver.device != cache_device:
+                driver = M3DecodeKernelDriver(decode_geometry, cache_device)
+                self._decode_driver = driver
+            m3_meta.decode_driver = driver
 
         # internal accessors
 
@@ -290,24 +310,14 @@ def get_minimax_m3_msa_attention_backend_cls():
                 )
 
         def _register_global_geometry(self) -> None:
-            # Register the per-rank sparse geometry process-wide at
+            # Register the per-rank sparse config process-wide at
             # construction, before any forward or CUDA graph capture, so
             # every metadata instance's prepare() can pre-build the MSA
-            # plans.
-            from .metadata import MsaGeometry, set_global_msa_geometry
+            # plans. The config is the single geometry source of truth; the
+            # decode driver derives its own alloc-time key from it.
+            from .metadata import set_global_msa_geometry
 
-            set_global_msa_geometry(
-                MsaGeometry(
-                    num_q_heads=int(self.m3_config.num_q_heads),
-                    num_kv_heads=int(self.m3_config.num_kv_heads),
-                    num_index_heads=int(self.m3_config.num_index_heads),
-                    head_dim=int(self.m3_config.head_dim),
-                    block_size=int(self.m3_config.block_size),
-                    topk=int(self.m3_config.topk),
-                    init_blocks=int(self.m3_config.init_blocks),
-                    local_blocks=int(self.m3_config.local_blocks),
-                )
-            )
+            set_global_msa_geometry(self.m3_config)
 
         @classmethod
         def support_fused_rope(cls) -> bool:

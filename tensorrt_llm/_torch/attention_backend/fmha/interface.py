@@ -29,11 +29,7 @@ if TYPE_CHECKING:
 
 
 class Fmha(ABC):
-    """Common runtime contract for TRT-LLM attention FMHA libraries.
-
-    Each FMHA backend is owned by a `TrtllmAttention` layer and is driven
-    by `TrtllmAttention.forward`.
-    """
+    """Common runtime contract for TRT-LLM attention FMHA libraries."""
 
     def __init__(self, attn: "TrtllmAttention"):
         self._attn_ref: weakref.ReferenceType["TrtllmAttention"] = weakref.ref(attn)
@@ -46,7 +42,7 @@ class Fmha(ABC):
         return attn
 
     @classmethod
-    def is_available(cls, attn: Optional["TrtllmAttention"] = None) -> bool:
+    def is_available(cls, attn: "TrtllmAttention") -> bool:
         return True
 
     def is_supported(

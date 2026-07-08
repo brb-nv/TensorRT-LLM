@@ -33,50 +33,31 @@ from ..params import SparseParams
 # MSA per-rank geometry and CUDA-graph-stable paged-KV table staging
 # ---------------------------------------------------------------------------
 
+# The per-rank sparse geometry needed to stage the MSA plans is the
+# layer-invariant `MiniMaxM3SparseConfig`. There is no separate geometry
+# struct: the config is the single source of truth, and the decode driver
+# derives its own alloc-time key (`M3DecodeGeometry`) from it.
 
-@dataclass
-class MsaGeometry:
-    """Per-rank M3 model geometry needed to stage the MSA plans.
-
-    Populated by the MSA backend at construction. All sparse layers share
-    the same geometry, so the value written by the first layer is
-    authoritative for the rest.
-    """
-
-    num_q_heads: int
-    num_kv_heads: int
-    num_index_heads: int
-    head_dim: int
-    block_size: int
-    topk: int
-    init_blocks: int
-    local_blocks: int
+_GLOBAL_MSA_GEOMETRY: Optional["MiniMaxM3SparseConfig"] = None
 
 
-_GLOBAL_MSA_GEOMETRY: Optional[MsaGeometry] = None
+def set_global_msa_geometry(geometry: "MiniMaxM3SparseConfig") -> None:
+    """Register the per-rank M3 sparse config process-wide.
 
+    Called from the attention layer's constructor, before any forward and
+    so before any CUDA graph capture. Every metadata instance's prepare()
+    reads this to pre-build the MSA plans; registering at construction
+    ensures graph-capture metadata has a config and does not fall back to
+    in-forward planning that would freeze host values into each replay.
 
-def set_global_msa_geometry(geometry: MsaGeometry) -> None:
-    """Register the per-rank M3 sparse geometry process-wide.
-
-    Called from the MSA attention layer's constructor, before any forward
-    and therefore before any CUDA graph capture. The M3 metadata's
-    prepare() reads this so the kv-indices staging runs for every metadata
-    instance, including the separate instances the CUDA graph runner
-    creates. Registering here (rather than from the first sparse forward)
-    ensures graph-capture metadata has a geometry, so its prepare()
-    pre-builds the plan instead of falling back to in-forward planning
-    that would freeze capture-time host values into every replay.
-
-    All sparse layers on a rank share one geometry; the first writer wins
-    and later identical writes are no-ops.
+    All sparse layers on a rank share one config; the first writer wins.
     """
     global _GLOBAL_MSA_GEOMETRY
     if _GLOBAL_MSA_GEOMETRY is None:
         _GLOBAL_MSA_GEOMETRY = geometry
 
 
-def get_global_msa_geometry() -> Optional[MsaGeometry]:
+def get_global_msa_geometry() -> Optional["MiniMaxM3SparseConfig"]:
     return _GLOBAL_MSA_GEOMETRY
 
 
@@ -954,7 +935,7 @@ def build_runtime_metadata_from_kv_manager(
 def _build_msa_plans_for_metadata(
     *,
     m3_meta: "MiniMaxM3SparseAttentionMetadata",
-    geometry: MsaGeometry,
+    geometry: "MiniMaxM3SparseConfig",
     cache_device: torch.device,
     max_batch: int,
     kv_indices_buf: Optional[torch.Tensor],
@@ -1016,7 +997,6 @@ def _build_msa_plans_for_metadata(
         "qo_lens_cpu": qo_lens_cpu,
         "kv_lens_cpu": seq_lens_cpu,
         "qo_offset_cpu": qo_offset_cpu,
-        "geometry": geometry,
         # Capacity constants for the in-tree decode driver (stable
         # across steps so the driver cache key stays constant).
         "max_batch": int(max_batch),
@@ -1028,39 +1008,43 @@ def _build_msa_plans_for_metadata(
 def build_m3_sparse_metadata_and_plans(
     meta,
     *,
-    static_buffers: Optional[dict],
-    kv_indices_buf: Optional[torch.Tensor],
-    kv_page_indptr_buf: Optional[torch.Tensor],
-    geometry: Optional[MsaGeometry],
-) -> Tuple[Optional[dict], Optional[torch.Tensor], Optional[torch.Tensor]]:
+    geometry: Optional["MiniMaxM3SparseConfig"],
+) -> Optional[dict]:
     """Build the per-step MiniMax-M3 sparse attachment and MSA plans.
 
     Backend-neutral so both the Triton and MSA metadata classes produce
     the identical attachment without duplicating the logic. `meta` must
-    expose the standard attention-metadata attributes; `static_buffers`
-    and the `kv_indices_buf` / `kv_page_indptr_buf` staging buffers are
-    the caller-owned CUDA-graph-stable buffers (passed through so their
-    `data_ptr()` stays constant across replays); `geometry` is the MSA
-    plan geometry.
+    expose the standard attention-metadata attributes; `geometry` is the
+    layer-invariant `MiniMaxM3SparseConfig`.
 
-    Returns `(attachment_or_None, kv_indices_buf, kv_page_indptr_buf)`,
-    where `attachment` is the `{"metadata", "out_cache_loc"[,
-    "msa_plans"]}` dict, or None when the manager is not an M3 sparse
-    cache or the batch is empty.
+    All CUDA-graph-stable buffers are owned by `meta` (the static per-graph
+    buffers and the MSA paged-KV staging buffers). This function reads them
+    off `meta` and writes any newly allocated buffers back, so their
+    `data_ptr()` stays constant across replays.
+
+    Returns the `{"metadata", "out_cache_loc"[, "msa_plans"]}` attachment
+    dict, or None when the manager is not an M3 sparse cache or the batch
+    is empty.
     """
     kv_cache_manager = meta.kv_cache_manager
     if kv_cache_manager is None or not hasattr(kv_cache_manager, "get_index_k_buffer"):
-        return None, kv_indices_buf, kv_page_indptr_buf
+        return None
     request_ids = meta.request_ids
     seq_lens = meta.seq_lens
     if request_ids is None or seq_lens is None:
-        return None, kv_indices_buf, kv_page_indptr_buf
+        return None
     num_contexts = int(meta.num_contexts or 0)
     batch_size = int(seq_lens.shape[0])
     if batch_size == 0:
-        return None, kv_indices_buf, kv_page_indptr_buf
+        return None
 
     cache_device = m3_cache_device(meta)
+    # All graph-stable buffers live on the metadata; pull the current
+    # ones (allocated lazily on first use) so the builder can refresh
+    # them in place.
+    static_buffers = maybe_build_static_buffers_placeholder(meta, cache_device)
+    kv_indices_buf = getattr(meta, "_msa_kv_indices_buf", None)
+    kv_page_indptr_buf = getattr(meta, "_msa_kv_page_indptr_buf", None)
 
     # `seq_lens_cpu` is a `TrtllmAttentionMetadata` field (the MSA metadata
     # path) but not part of the base `AttentionMetadata` (the Triton path),
@@ -1138,7 +1122,11 @@ def build_m3_sparse_metadata_and_plans(
         if msa_plans is not None:
             attachment["msa_plans"] = msa_plans
             m3_meta.msa_plans = msa_plans
-    return attachment, kv_indices_buf, kv_page_indptr_buf
+        # Persist the (possibly first-allocated) staging buffers back onto
+        # the metadata so the next step reuses the same data_ptr().
+        meta._msa_kv_indices_buf = kv_indices_buf
+        meta._msa_kv_page_indptr_buf = kv_page_indptr_buf
+    return attachment
 
 
 @functools.lru_cache(maxsize=1)
@@ -1206,23 +1194,13 @@ def get_minimax_m3_attention_metadata_cls():
             self.minimax_m3 = None
 
             # The per-rank geometry is registered process-wide by the MSA
-            # attention layer's constructor, before any forward or CUDA
-            # graph capture, so every metadata instance reads it here.
-            geometry = get_global_msa_geometry()
-            cache_device = m3_cache_device(self)
-            static_buffers = maybe_build_static_buffers_placeholder(self, cache_device)
-            (
-                attachment,
-                self._msa_kv_indices_buf,
-                self._msa_kv_page_indptr_buf,
-            ) = build_m3_sparse_metadata_and_plans(
+            # attention layer's constructor, before any CUDA graph capture,
+            # so every metadata instance reads it here. The builder
+            # allocates and owns all graph-stable buffers on this metadata.
+            self.minimax_m3 = build_m3_sparse_metadata_and_plans(
                 self,
-                static_buffers=static_buffers,
-                kv_indices_buf=self._msa_kv_indices_buf,
-                kv_page_indptr_buf=self._msa_kv_page_indptr_buf,
-                geometry=geometry,
+                geometry=get_global_msa_geometry(),
             )
-            self.minimax_m3 = attachment
 
     return MiniMaxM3AttentionMetadata
 
@@ -1230,7 +1208,6 @@ def get_minimax_m3_attention_metadata_cls():
 __all__ = [
     "MiniMaxM3SparseConfig",
     "MiniMaxM3SparseAttentionMetadata",
-    "MsaGeometry",
     "allocate_minimax_m3_static_buffers",
     "build_m3_sparse_metadata_and_plans",
     "build_runtime_metadata_from_kv_manager",
