@@ -118,8 +118,8 @@ class MsaIndexer:
     """Predictor submodule: proxy MQA and top-k block selection.
 
     Owned by `MiniMaxM3MSATrtllmAttention`. Stateless: the decode path's
-    CUDA-graph-stable persistent buffers live on the attention metadata's
-    decode driver (`m3_meta.decode_driver`), built once in the metadata's
+    CUDA-graph-stable persistent buffers live in the attention metadata's
+    decode state (`m3_meta.decode_state`), built once in the metadata's
     `prepare()` outside any capture.
     """
 
@@ -196,24 +196,28 @@ class MsaIndexer:
         top-k with persistent buffers, so this path is CUDA-graph
         capturable.
         """
-        from .decode_wrapper.dispatch import M3DecodeGeometry, resolve_decode_driver
+        from .decode_wrapper.dispatch import (
+            M3DecodeGeometry,
+            decode_proxy_max_score,
+            decode_select_blocks,
+            resolve_decode_state,
+        )
 
         config = self.config
         idx_k_paged = cache_view_to_msa_paged(idx_k_cache)
         batch = int(idx_q.shape[0])
         seq_lens = metadata.seq_lens.to(torch.int32)
 
-        msa_plans = getattr(metadata, "msa_plans", None)
-        if msa_plans is not None:
-            kv_indices = msa_plans["kv_indices"]
-            kv_page_indptr = msa_plans["kv_page_indptr"]
-            max_batch = int(msa_plans.get("max_batch") or 0)
-            max_kv_len = int(msa_plans.get("max_kv_len") or 0)
+        kv_indices = getattr(metadata, "msa_kv_indices", None)
+        if kv_indices is not None:
+            kv_page_indptr = metadata.msa_kv_page_indptr
+            max_batch = int(getattr(metadata, "msa_max_batch", 0) or 0)
+            max_kv_len = int(getattr(metadata, "msa_max_kv_len", 0) or 0)
         else:
             if torch.cuda.is_current_stream_capturing():
                 raise RuntimeError(
                     "MiniMax-M3 MSA decode reached the eager fallback during CUDA graph "
-                    "capture: metadata.msa_plans was not pre-staged by prepare()."
+                    "capture: metadata plan values were not pre-staged by prepare()."
                 )
             kv_indices, _ = build_kv_indices_and_lens(metadata, page_size)
             num_pages_cpu = (metadata.seq_lens_cpu.to(torch.long) + page_size - 1) // page_size
@@ -234,8 +238,9 @@ class MsaIndexer:
             max_kv_len=max_kv_len,
             page_size=page_size,
         )
-        driver = resolve_decode_driver(metadata, geometry, idx_q.device)
-        max_score = driver.proxy_max_score(
+        state = resolve_decode_state(metadata, geometry, idx_q.device)
+        max_score = decode_proxy_max_score(
+            state,
             idx_q,
             idx_k_paged,
             seq_lens=seq_lens,
@@ -243,7 +248,7 @@ class MsaIndexer:
             kv_indices=kv_indices,
             sm_scale=idx_sm_scale,
         )
-        return driver.select_blocks(max_score, seq_lens=seq_lens)
+        return decode_select_blocks(state, max_score, seq_lens=seq_lens)
 
 
 __all__ = ["MsaIndexer"]

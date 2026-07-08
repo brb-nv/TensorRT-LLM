@@ -410,6 +410,16 @@ class MiniMaxM3SparseAttentionMetadata:
     q_positions: Optional[torch.Tensor] = None
     max_seqlen_q: int = field(default=1)
     max_seqlen_k: int = field(default=1)
+    # MSA per-step plan values, written by `_build_msa_plans_for_metadata`
+    # when the KV cache manager has `use_msa=True` (None on the Triton
+    # path). The MSA decode kernels read them directly off this metadata.
+    msa_kv_indices: Optional[torch.Tensor] = None
+    msa_kv_page_indptr: Optional[torch.Tensor] = None
+    msa_qo_lens_cpu: Optional[torch.Tensor] = None
+    msa_kv_lens_cpu: Optional[torch.Tensor] = None
+    msa_qo_offset_cpu: Optional[torch.Tensor] = None
+    msa_max_batch: int = 0
+    msa_max_kv_len: int = 0
 
     def prepare(self) -> None:
         """Compute CUDA-graph-safe scalar max lengths from CPU tensors.
@@ -940,17 +950,14 @@ def _build_msa_plans_for_metadata(
     max_batch: int,
     kv_indices_buf: Optional[torch.Tensor],
     kv_page_indptr_buf: Optional[torch.Tensor],
-) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[dict]]:
+) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
     """Refresh the persistent paged-KV staging for one scheduler step.
 
-    Returns `(kv_indices_buf, kv_page_indptr_buf, msa_plans_dict)`. The
-    two buffers hold the persistent `kv_indices` / `kv_page_indptr`
-    staging (stable `data_ptr()` across CUDA graph replays) and are owned
-    by the M3 attention metadata; they are threaded back so the caller
-    can retain them for the next step. `msa_plans_dict` is the payload
-    attached to `self.minimax_m3["msa_plans"]` so the forward path can
-    read the staged tables plus the per-request CPU lens/offsets the
-    prefill path consumes.
+    Returns the persistent `(kv_indices_buf, kv_page_indptr_buf)` staging
+    buffers (stable `data_ptr()` across CUDA graph replays) so the caller
+    can retain them for the next step. The per-step plan values (the staged
+    page-table views plus the per-request CPU lens/offsets the forward path
+    consumes) are written directly onto `m3_meta`'s `msa_*` attributes.
     """
     # 1) Derive per-request CPU tensors via the shared helper (same values
     #    the eager forward fallback in `msa_backend._whole_batch_lens`
@@ -960,7 +967,7 @@ def _build_msa_plans_for_metadata(
         # Prefill metadata is incomplete; skip staging. The sparse
         # forward's eager fallback builds the page table in-forward
         # (safe when outside capture).
-        return kv_indices_buf, kv_page_indptr_buf, None
+        return kv_indices_buf, kv_page_indptr_buf
     qo_lens_cpu, seq_lens_cpu, qo_offset_cpu = lens
 
     # 2) Allocate the staging buffers lazily on the first call. Sizes
@@ -991,18 +998,17 @@ def _build_msa_plans_for_metadata(
         kv_page_indptr_dst=kv_page_indptr_buf,
     )
 
-    msa_plans = {
-        "kv_indices": kv_indices,
-        "kv_page_indptr": kv_page_indptr,
-        "qo_lens_cpu": qo_lens_cpu,
-        "kv_lens_cpu": seq_lens_cpu,
-        "qo_offset_cpu": qo_offset_cpu,
-        # Capacity constants for the in-tree decode driver (stable
-        # across steps so the driver cache key stays constant).
-        "max_batch": int(max_batch),
-        "max_kv_len": int(m3_meta.req_to_token.shape[1]),
-    }
-    return kv_indices_buf, kv_page_indptr_buf, msa_plans
+    # Write the per-step plan values directly onto the sparse attention
+    # metadata. The decode capacity constants stay stable across steps so
+    # the decode state's geometry key is constant.
+    m3_meta.msa_kv_indices = kv_indices
+    m3_meta.msa_kv_page_indptr = kv_page_indptr
+    m3_meta.msa_qo_lens_cpu = qo_lens_cpu
+    m3_meta.msa_kv_lens_cpu = seq_lens_cpu
+    m3_meta.msa_qo_offset_cpu = qo_offset_cpu
+    m3_meta.msa_max_batch = int(max_batch)
+    m3_meta.msa_max_kv_len = int(m3_meta.req_to_token.shape[1])
+    return kv_indices_buf, kv_page_indptr_buf
 
 
 def build_m3_sparse_metadata_and_plans(
@@ -1022,9 +1028,10 @@ def build_m3_sparse_metadata_and_plans(
     off `meta` and writes any newly allocated buffers back, so their
     `data_ptr()` stays constant across replays.
 
-    Returns the `{"metadata", "out_cache_loc"[, "msa_plans"]}` attachment
-    dict, or None when the manager is not an M3 sparse cache or the batch
-    is empty.
+    Publishes the built per-forward sparse metadata as `meta.m3_sparse_metadata`
+    and the per-new-token slot ids as `meta.m3_out_cache_loc`, and returns the
+    sparse metadata (or None when the manager is not an M3 sparse cache or
+    the batch is empty).
     """
     kv_cache_manager = meta.kv_cache_manager
     if kv_cache_manager is None or not hasattr(kv_cache_manager, "get_index_k_buffer"):
@@ -1107,11 +1114,17 @@ def build_m3_sparse_metadata_and_plans(
             static_buffers=static_buffers,
         )
 
-    attachment = {"metadata": m3_meta, "out_cache_loc": out_cache_loc}
+    # Publish the built sparse metadata and per-new-token slot ids as
+    # direct attributes on the attention metadata.
+    meta.m3_sparse_metadata = m3_meta
+    meta.m3_out_cache_loc = out_cache_loc
 
     if use_msa and geometry is not None:
         max_batch = int(meta.max_num_sequences or meta.max_num_requests)
-        kv_indices_buf, kv_page_indptr_buf, msa_plans = _build_msa_plans_for_metadata(
+        # Persist the (possibly first-allocated) staging buffers back onto
+        # the metadata so the next step reuses the same data_ptr(). The
+        # per-step plan values are written onto `m3_meta` by the helper.
+        meta._msa_kv_indices_buf, meta._msa_kv_page_indptr_buf = _build_msa_plans_for_metadata(
             m3_meta=m3_meta,
             geometry=geometry,
             cache_device=cache_device,
@@ -1119,14 +1132,7 @@ def build_m3_sparse_metadata_and_plans(
             kv_indices_buf=kv_indices_buf,
             kv_page_indptr_buf=kv_page_indptr_buf,
         )
-        if msa_plans is not None:
-            attachment["msa_plans"] = msa_plans
-            m3_meta.msa_plans = msa_plans
-        # Persist the (possibly first-allocated) staging buffers back onto
-        # the metadata so the next step reuses the same data_ptr().
-        meta._msa_kv_indices_buf = kv_indices_buf
-        meta._msa_kv_page_indptr_buf = kv_page_indptr_buf
-    return attachment
+    return m3_meta
 
 
 @functools.lru_cache(maxsize=1)
@@ -1150,19 +1156,20 @@ def get_minimax_m3_attention_metadata_cls():
 
         Overrides :meth:`prepare` so the M3-sparse
         :class:`MiniMaxM3SparseAttentionMetadata` and the per-new-token
-        ``out_cache_loc`` are built **once per scheduler step**, on the
-        cache device, before the model forward runs.  The result is
-        stored as ``self.minimax_m3 = {"metadata": m3_meta,
-        "out_cache_loc": out_cache_loc}`` so the model layer's
-        ``_dense_forward`` and ``_sparse_forward`` can read it without
-        any device migration.
+        `out_cache_loc` are built once per scheduler step, on the cache
+        device, before the model forward runs. They are published as
+        `self.m3_sparse_metadata` and `self.m3_out_cache_loc` so the model
+        layer's `_dense_forward` and `_sparse_forward` can read them
+        without any device migration.
 
         Test paths that build their own metadata can short-circuit by
-        attaching ``attn_metadata.minimax_m3`` directly before calling
-        the forward; those paths do not go through :meth:`prepare`.
+        setting `attn_metadata.m3_sparse_metadata` /
+        `attn_metadata.m3_out_cache_loc` directly before calling the
+        forward; those paths do not go through :meth:`prepare`.
         """
 
-        minimax_m3: Optional[dict] = None
+        m3_sparse_metadata: Optional["MiniMaxM3SparseAttentionMetadata"] = None
+        m3_out_cache_loc: Optional[torch.Tensor] = None
         # Lazily allocated dict of persistent device buffers used to keep
         # ``MiniMaxM3SparseAttentionMetadata`` tensor addresses stable
         # across CUDA-graph capture/replay. None until the first
@@ -1191,16 +1198,15 @@ def get_minimax_m3_attention_metadata_cls():
             # over ``req_to_token``/``slot_ids`` reads from freed warmup
             # memory and either produces wrong tokens or fires
             # ``Indexing.cu:1515`` ``srcIndex < srcSelectDimSize``.
-            self.minimax_m3 = None
+            self.m3_sparse_metadata = None
+            self.m3_out_cache_loc = None
 
             # The per-rank geometry is registered process-wide by the MSA
             # attention layer's constructor, before any CUDA graph capture,
             # so every metadata instance reads it here. The builder
-            # allocates and owns all graph-stable buffers on this metadata.
-            self.minimax_m3 = build_m3_sparse_metadata_and_plans(
-                self,
-                geometry=get_global_msa_geometry(),
-            )
+            # allocates and owns all graph-stable buffers on this metadata
+            # and publishes m3_sparse_metadata / m3_out_cache_loc.
+            build_m3_sparse_metadata_and_plans(self, geometry=get_global_msa_geometry())
 
     return MiniMaxM3AttentionMetadata
 

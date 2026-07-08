@@ -63,17 +63,17 @@ def _whole_batch_lens(
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
     """Whole-batch `(qo_lens_cpu, kv_lens_cpu, qo_offset_cpu, kv_indices)`.
 
-    Prefers the pre-staged `msa_plans` (CUDA-graph-stable buffers) and
-    falls back to an eager rebuild for focused tests and the first eager
-    warmup pass.
+    Prefers the pre-staged plan values on the metadata (CUDA-graph-stable
+    buffers) and falls back to an eager rebuild for focused tests and the
+    first eager warmup pass.
     """
-    msa_plans = getattr(m3_meta, "msa_plans", None)
-    if msa_plans is not None:
+    kv_indices = getattr(m3_meta, "msa_kv_indices", None)
+    if kv_indices is not None:
         return (
-            msa_plans["qo_lens_cpu"],
-            msa_plans["kv_lens_cpu"],
-            msa_plans["qo_offset_cpu"],
-            msa_plans["kv_indices"],
+            m3_meta.msa_qo_lens_cpu,
+            m3_meta.msa_kv_lens_cpu,
+            m3_meta.msa_qo_offset_cpu,
+            kv_indices,
         )
     lens = whole_batch_qo_lens(m3_meta)
     if lens is None:
@@ -97,36 +97,43 @@ def run_msa_sparse_decode(
     Decode is CUDA-graph captured, so it must not go through the eager
     `fmha_sm100_plan` host driver, which uses unpinned H2D staging,
     per-call device allocations, and a device-side cost sweep. The staged
-    page tables come from the metadata's pre-built `msa_plans`. Returns
+    page tables come from the metadata's pre-built plan values. Returns
     `[num_tokens, num_q_heads * head_dim]`.
     """
-    from .decode_wrapper.dispatch import M3DecodeGeometry, resolve_decode_driver
+    from .decode_wrapper.dispatch import (
+        M3DecodeGeometry,
+        decode_sparse_attention,
+        resolve_decode_state,
+    )
 
-    msa_plans = getattr(m3_meta, "msa_plans", None)
-    if msa_plans is None:
+    kv_indices = getattr(m3_meta, "msa_kv_indices", None)
+    if kv_indices is None:
         raise RuntimeError(
-            "MiniMax-M3 MSA decode requires pre-staged msa_plans; "
+            "MiniMax-M3 MSA decode requires pre-staged plan values; "
             "prepare() did not build them (missing geometry / use_msa)."
         )
+    kv_page_indptr = m3_meta.msa_kv_page_indptr
     k_paged, v_paged = msa_paged_kv(kv_cache_manager, layer_idx)
     page_size = int(k_paged.shape[2])
     seq_lens = m3_meta.seq_lens.to(torch.int32)
     batch = int(q.shape[0])
     geometry = M3DecodeGeometry.from_config(
         config,
-        max_batch=int(msa_plans.get("max_batch") or 0) or max(64, 1 << (batch - 1).bit_length()),
-        max_kv_len=int(msa_plans.get("max_kv_len") or 0) or int(m3_meta.req_to_token.shape[1]),
+        max_batch=int(getattr(m3_meta, "msa_max_batch", 0))
+        or max(64, 1 << (batch - 1).bit_length()),
+        max_kv_len=int(getattr(m3_meta, "msa_max_kv_len", 0)) or int(m3_meta.req_to_token.shape[1]),
         page_size=page_size,
     )
-    driver = resolve_decode_driver(m3_meta, geometry, q.device)
-    out = driver.sparse_attention(
+    state = resolve_decode_state(m3_meta, geometry, q.device)
+    out = decode_sparse_attention(
+        state,
         q,
         k_paged,
         v_paged,
         kv_block_indexes,
         seq_lens=seq_lens,
-        kv_page_indptr=msa_plans["kv_page_indptr"],
-        kv_indices=msa_plans["kv_indices"],
+        kv_page_indptr=kv_page_indptr,
+        kv_indices=kv_indices,
         sm_scale=sm_scale,
     )
     return out.reshape(batch, config.num_q_heads * config.head_dim)
@@ -155,85 +162,74 @@ def get_minimax_m3_msa_attention_backend_cls():
         lengths, index-K writes) on top of the standard metadata. The
         whole-batch paged K/V views and sparse GQA dispatch live in
         `MsaSparseGqaFmha`; this class only owns the CUDA-graph-stable
-        buffers and the built attachment.
+        buffers and the built sparse metadata.
         """
 
         def __init__(self, *args, **kwargs):
             super().__init__(*args, **kwargs)
-            self.minimax_m3: Optional[dict] = None
+            self.m3_sparse_metadata = None
+            self.m3_out_cache_loc = None
             self._m3_static_buffers: Optional[dict] = None
             self._msa_kv_indices_buf = None
             self._msa_kv_page_indptr_buf = None
-            # Persistent decode driver holding the CUDA-graph-stable kernel
+            # Persistent decode state holding the CUDA-graph-stable kernel
             # buffers. This metadata persists across steps and graph replays
-            # for its batch-size bucket, so owning the driver here keeps
+            # for its batch-size bucket, so owning the state here keeps
             # those buffers' data_ptr() stable across replays.
-            self._decode_driver = None
+            self._m3_decode_state = None
 
         # lifecycle
 
         def prepare(self) -> None:
             super().prepare()
-            self.minimax_m3 = None
+            self.m3_sparse_metadata = None
+            self.m3_out_cache_loc = None
             # The per-rank config (geometry) is registered process-wide by
             # the attention layer's constructor, before any CUDA graph
             # capture, so every metadata instance reads it here. The builder
-            # allocates and owns all graph-stable buffers on this metadata.
+            # allocates and owns all graph-stable buffers on this metadata
+            # and publishes m3_sparse_metadata / m3_out_cache_loc.
             geometry = get_global_msa_geometry()
-            attachment = build_m3_sparse_metadata_and_plans(self, geometry=geometry)
-            self.minimax_m3 = attachment
-            self._attach_decode_driver(attachment, geometry, m3_cache_device(self))
+            m3_meta = build_m3_sparse_metadata_and_plans(self, geometry=geometry)
+            self._attach_decode_state(m3_meta, geometry, m3_cache_device(self))
 
-        def _attach_decode_driver(self, attachment, config, cache_device) -> None:
-            """Build once and attach the persistent decode driver.
+        def _attach_decode_state(self, m3_meta, config, cache_device) -> None:
+            """Build once and attach the persistent decode state.
 
             Runs inside prepare(), outside any CUDA graph capture, so the
-            driver's buffers are allocated before capture and reused across
+            decode buffers are allocated before capture and reused across
             replays. It is keyed by the decode geometry and rebuilt only
             when that changes, which does not happen once a bucket's static
-            buffers are allocated.
+            buffers are allocated. Only the pure-decode path uses it;
+            prefill / mixed batches run the eager fmha_sm100 path.
             """
-            if attachment is None or config is None:
+            if m3_meta is None or config is None:
                 return
-            msa_plans = attachment.get("msa_plans")
-            if msa_plans is None:
+            if getattr(m3_meta, "msa_kv_indices", None) is None or m3_meta.is_prefill:
                 return
-            m3_meta = attachment["metadata"]
-            # Only the pure-decode path uses the driver; prefill / mixed
-            # batches run the eager fmha_sm100 path. Skip the build (and its
-            # persistent-buffer allocation) for prefill steps.
-            if m3_meta.is_prefill:
-                return
-            from .decode_wrapper.dispatch import M3DecodeGeometry, M3DecodeKernelDriver
+            from .decode_wrapper.dispatch import M3DecodeGeometry, build_m3_decode_state
 
             decode_geometry = M3DecodeGeometry.from_config(
                 config,
-                max_batch=int(msa_plans["max_batch"]),
-                max_kv_len=int(msa_plans["max_kv_len"]),
+                max_batch=int(m3_meta.msa_max_batch),
+                max_kv_len=int(m3_meta.msa_max_kv_len),
             )
-            driver = self._decode_driver
-            if driver is None or driver.geom != decode_geometry or driver.device != cache_device:
-                driver = M3DecodeKernelDriver(decode_geometry, cache_device)
-                self._decode_driver = driver
-            m3_meta.decode_driver = driver
+            state = self._m3_decode_state
+            if state is None or state.geom != decode_geometry or state.device != cache_device:
+                state = build_m3_decode_state(decode_geometry, cache_device)
+                self._m3_decode_state = state
+            m3_meta.decode_state = state
 
         # internal accessors
 
-        def _require_attachment(self) -> dict:
-            if self.minimax_m3 is None:
-                raise RuntimeError(
-                    "MiniMaxM3MSATrtllmAttentionMetadata.minimax_m3 is not built; "
-                    "prepare() must run before the sparse forward."
-                )
-            return self.minimax_m3
-
         @property
         def m3_meta(self) -> "MiniMaxM3SparseAttentionMetadata":
-            return self._require_attachment()["metadata"]
-
-        @property
-        def m3_out_cache_loc(self) -> torch.Tensor:
-            return self._require_attachment()["out_cache_loc"]
+            if self.m3_sparse_metadata is None:
+                raise RuntimeError(
+                    "MiniMaxM3MSATrtllmAttentionMetadata.m3_sparse_metadata is not built; "
+                    "prepare() must run before the sparse forward."
+                )
+            return self.m3_sparse_metadata
 
         # Index-K cache access + write (consumed by the MsaIndexer via
         # run_indexer). The main-KV paged views and sparse GQA dispatch

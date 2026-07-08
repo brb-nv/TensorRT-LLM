@@ -1,11 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Validation: in-tree decode driver vs MSA api path, bit-exact.
+"""Validation: in-tree decode kernels vs MSA api path, bit-exact.
 
 Runs the same JIT-compiled SM100 kernel binaries through (a) MSA's
-host-centric `fmha_sm100_plan` / `fmha_sm100` driver and (b) the in-tree
-graph-safe `dispatch.M3DecodeKernelDriver`, on identical inputs, and
-asserts bit-equality:
+host-centric `fmha_sm100_plan` / `fmha_sm100` launch and (b) the in-tree
+graph-safe `dispatch.decode_*` functions over an `M3DecodeState`, on
+identical inputs, and asserts bit-equality:
 
 * proxy MQA max-score pass: uniform and heterogeneous KV lens;
 * top-k block selection: bit-diff vs `sparse_topk_select` on uniform lens
@@ -210,16 +210,21 @@ def _msa_sparse(inp, kv_block_indexes, causal=False):
 # ---------------------------------------------------------------------------
 
 
-def _driver(max_batch):
+def _decode_state(max_batch):
     from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.decode_wrapper.dispatch import (  # noqa: E501
-        M3DecodeKernelDriver,
+        build_m3_decode_state,
     )
 
-    return M3DecodeKernelDriver(_geometry(max_batch), torch.device("cuda"))
+    return build_m3_decode_state(_geometry(max_batch), torch.device("cuda"))
 
 
-def _intree_proxy(driver, inp):
-    return driver.proxy_max_score(
+def _intree_proxy(state, inp):
+    from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.decode_wrapper.dispatch import (  # noqa: E501
+        decode_proxy_max_score,
+    )
+
+    return decode_proxy_max_score(
+        state,
         inp["idx_q"],
         inp["idx_k_paged"],
         seq_lens=inp["seq_lens_dev"],
@@ -229,8 +234,21 @@ def _intree_proxy(driver, inp):
     )
 
 
-def _intree_sparse(driver, inp, kv_block_indexes):
-    return driver.sparse_attention(
+def _intree_select(state, max_score, seq_lens):
+    from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.decode_wrapper.dispatch import (  # noqa: E501
+        decode_select_blocks,
+    )
+
+    return decode_select_blocks(state, max_score, seq_lens=seq_lens)
+
+
+def _intree_sparse(state, inp, kv_block_indexes):
+    from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.decode_wrapper.dispatch import (  # noqa: E501
+        decode_sparse_attention,
+    )
+
+    return decode_sparse_attention(
+        state,
         inp["q"],
         inp["k_paged"],
         inp["v_paged"],
@@ -280,10 +298,10 @@ HETERO_LENS = [1, 130, 257, 128, 511, 1024, 33, 900]
 def test_proxy_max_score_bitdiff(kv_lens):
     _require_env()
     inp = _make_inputs(kv_lens)
-    driver = _driver(max_batch=len(kv_lens))
+    state = _decode_state(max_batch=len(kv_lens))
 
     ms_ref = _msa_proxy_max_score(inp)
-    ms_new = _intree_proxy(driver, inp)
+    ms_new = _intree_proxy(state, inp)
     torch.cuda.synchronize()
 
     assert ms_ref.shape == ms_new.shape, f"{ms_ref.shape} vs {ms_new.shape}"
@@ -296,11 +314,11 @@ def test_proxy_max_score_bitdiff(kv_lens):
 def test_topk_bitdiff_uniform():
     _require_env()
     inp = _make_inputs(UNIFORM_LENS)
-    driver = _driver(max_batch=len(UNIFORM_LENS))
+    state = _decode_state(max_batch=len(UNIFORM_LENS))
 
     ms = _msa_proxy_max_score(inp)
     blocks_ref = _msa_topk(ms, inp["kv_lens_cpu"])
-    blocks_new = driver.select_blocks(ms, seq_lens=inp["seq_lens_dev"])
+    blocks_new = _intree_select(state, ms, inp["seq_lens_dev"])
     torch.cuda.synchronize()
 
     assert torch.equal(blocks_ref, blocks_new), (
@@ -311,10 +329,10 @@ def test_topk_bitdiff_uniform():
 def test_topk_reference_hetero():
     _require_env()
     inp = _make_inputs(HETERO_LENS)
-    driver = _driver(max_batch=len(HETERO_LENS))
+    state = _decode_state(max_batch=len(HETERO_LENS))
 
-    ms = _intree_proxy(driver, inp)
-    blocks_new = driver.select_blocks(ms, seq_lens=inp["seq_lens_dev"]).cpu()
+    ms = _intree_proxy(state, inp)
+    blocks_new = _intree_select(state, ms, inp["seq_lens_dev"]).cpu()
     torch.cuda.synchronize()
     blocks_ref = _reference_topk(ms, HETERO_LENS)
 
@@ -332,7 +350,7 @@ def test_topk_reference_hetero():
 def test_sparse_gqa_bitdiff(kv_lens):
     _require_env()
     inp = _make_inputs(kv_lens)
-    driver = _driver(max_batch=len(kv_lens))
+    state = _decode_state(max_batch=len(kv_lens))
 
     # Use MSA's own block selection for both sides to isolate the
     # sparse kernel and driver comparison. Heterogeneous batches need
@@ -347,7 +365,7 @@ def test_sparse_gqa_bitdiff(kv_lens):
     # partially filled last page).
     needs_exact_ref = len(set(kv_lens)) > 1 or any(kv_len % PAGE_SIZE for kv_len in kv_lens)
     out_ref = _msa_sparse(inp, blocks, causal=needs_exact_ref)
-    out_new = _intree_sparse(driver, inp, blocks)
+    out_new = _intree_sparse(state, inp, blocks)
     torch.cuda.synchronize()
 
     assert out_ref.shape == out_new.shape
@@ -360,15 +378,15 @@ def test_sparse_gqa_bitdiff(kv_lens):
 def test_full_pipeline_bitdiff_uniform():
     _require_env()
     inp = _make_inputs(UNIFORM_LENS)
-    driver = _driver(max_batch=len(UNIFORM_LENS))
+    state = _decode_state(max_batch=len(UNIFORM_LENS))
 
     ms_ref = _msa_proxy_max_score(inp)
     blocks_ref = _msa_topk(ms_ref, inp["kv_lens_cpu"])
     out_ref = _msa_sparse(inp, blocks_ref)
 
-    ms_new = _intree_proxy(driver, inp)
-    blocks_new = driver.select_blocks(ms_new, seq_lens=inp["seq_lens_dev"])
-    out_new = _intree_sparse(driver, inp, blocks_new)
+    ms_new = _intree_proxy(state, inp)
+    blocks_new = _intree_select(state, ms_new, inp["seq_lens_dev"])
+    out_new = _intree_sparse(state, inp, blocks_new)
     torch.cuda.synchronize()
 
     assert torch.equal(blocks_ref, blocks_new)
@@ -384,7 +402,7 @@ def test_cuda_graph_replay_tracks_device_state():
     """
     _require_env()
     batch = 8
-    driver = _driver(max_batch=batch)
+    state = _decode_state(max_batch=batch)
 
     # Persistent input buffers the graph will read.
     pool_pages = batch * (MAX_KV_LEN // PAGE_SIZE)
@@ -403,7 +421,14 @@ def test_cuda_graph_replay_tracks_device_state():
     idx_k_paged = inp0["idx_k_paged"].clone()
 
     def run_pipeline():
-        ms = driver.proxy_max_score(
+        from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.decode_wrapper.dispatch import (  # noqa: E501
+            decode_proxy_max_score,
+            decode_select_blocks,
+            decode_sparse_attention,
+        )
+
+        ms = decode_proxy_max_score(
+            state,
             idx_q,
             idx_k_paged,
             seq_lens=seq_lens,
@@ -411,8 +436,9 @@ def test_cuda_graph_replay_tracks_device_state():
             kv_indices=kv_indices_buf,
             sm_scale=IDX_SM_SCALE,
         )
-        blocks = driver.select_blocks(ms, seq_lens=seq_lens)
-        return driver.sparse_attention(
+        blocks = decode_select_blocks(state, ms, seq_lens=seq_lens)
+        return decode_sparse_attention(
+            state,
             q,
             k_paged,
             v_paged,

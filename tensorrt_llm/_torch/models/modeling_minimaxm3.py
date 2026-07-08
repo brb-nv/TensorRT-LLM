@@ -894,8 +894,8 @@ class MiniMaxM3Attention(Attention):
           3. Apply partial RoPE.
           4. Pull the paged main K/V cache from the M3 cache manager.
           5. Read the pre-built :class:`MiniMaxM3SparseAttentionMetadata`
-             from ``attn_metadata.minimax_m3``. Production code paths
-             build this attachment in
+             from `attn_metadata.m3_sparse_metadata`. Production code paths
+             build this in
              :meth:`MiniMaxM3AttentionMetadata.prepare` (called by the
              pyexecutor outside any CUDA-graph capture window); test
              code paths attach it directly. The forward path **never**
@@ -977,17 +977,16 @@ class MiniMaxM3Attention(Attention):
         # 5. Read the pre-built M3 metadata. Building is the
         # responsibility of ``MiniMaxM3AttentionMetadata.prepare`` (or
         # the test path), so the forward stays CUDA-graph-capture safe.
-        m3_attachment = getattr(attn_metadata, "minimax_m3", None)
-        if m3_attachment is None:
+        m3_meta = getattr(attn_metadata, "m3_sparse_metadata", None)
+        if m3_meta is None:
             raise RuntimeError(
                 f"MiniMax-M3 dense forward (layer {self.layer_idx}) requires "
-                "attn_metadata.minimax_m3 to be pre-built by "
+                "attn_metadata.m3_sparse_metadata to be pre-built by "
                 "MiniMaxM3AttentionMetadata.prepare(); the model_engine "
                 "configures the M3 backend's Metadata class so this happens "
-                "automatically. Test callers must attach minimax_m3 manually."
+                "automatically. Test callers must set m3_sparse_metadata manually."
             )
-        m3_meta = m3_attachment["metadata"]
-        out_cache_loc = m3_attachment["out_cache_loc"]
+        out_cache_loc = attn_metadata.m3_out_cache_loc
 
         # 6. Write the new tokens' K/V to the pool. All inputs come
         # from prepare() which lands them on the cache device, so the
@@ -1184,12 +1183,13 @@ class MiniMaxM3Attention(Attention):
 
         Production callers (the LLM API path) drive
         :meth:`MiniMaxM3AttentionMetadata.prepare` outside any
-        CUDA-graph capture window; that method attaches a pre-built
-        :class:`MiniMaxM3SparseAttentionMetadata` and an
-        ``out_cache_loc`` tensor as ``attn_metadata.minimax_m3``. Test
-        callers attach the same dict manually.  This forward path
-        always reads the pre-built attachment and never builds metadata
-        itself — both would trigger
+        CUDA-graph capture window; that method publishes a pre-built
+        :class:`MiniMaxM3SparseAttentionMetadata` as
+        `attn_metadata.m3_sparse_metadata` and the per-new-token
+        `out_cache_loc` as `attn_metadata.m3_out_cache_loc`. Test callers
+        set the same attributes manually. This forward path always reads
+        the pre-built metadata and never builds it itself; both would
+        trigger
         ``cudaErrorStreamCaptureUnsupported`` for the
         ``cuda_graph=True`` hard path because the build does
         CPU->GPU copies.
@@ -1343,17 +1343,16 @@ class MiniMaxM3Attention(Attention):
         # 5. Read the pre-built M3 metadata. Building is the
         # responsibility of ``MiniMaxM3AttentionMetadata.prepare`` (or
         # the test path), so the forward stays CUDA-graph-capture safe.
-        m3_attachment = getattr(attn_metadata, "minimax_m3", None)
-        if m3_attachment is None:
+        m3_meta = getattr(attn_metadata, "m3_sparse_metadata", None)
+        if m3_meta is None:
             raise RuntimeError(
                 f"MiniMax-M3 sparse forward (layer {self.layer_idx}) requires "
-                "attn_metadata.minimax_m3 to be pre-built by "
+                "attn_metadata.m3_sparse_metadata to be pre-built by "
                 "MiniMaxM3AttentionMetadata.prepare(); the model_engine "
                 "configures the M3 backend's Metadata class so this happens "
-                "automatically. Test callers must attach minimax_m3 manually."
+                "automatically. Test callers must set m3_sparse_metadata manually."
             )
-        m3_meta = m3_attachment["metadata"]
-        out_cache_loc = m3_attachment["out_cache_loc"]
+        out_cache_loc = attn_metadata.m3_out_cache_loc
 
         if not self.disable_index_value and idx_v_cache is not None:
             # The shared idx_v_proj is not part of the M3 checkpoint
