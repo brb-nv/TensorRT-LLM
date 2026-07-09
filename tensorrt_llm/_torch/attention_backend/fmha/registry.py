@@ -19,10 +19,12 @@ from typing import TypeAlias
 from .fallback import FallbackFmha
 from .flashinfer_trtllm_gen import FlashInferTrtllmGenFmha
 from .interface import Fmha
+from .msa_sparse_gqa import MsaSparseGqaFmha
 
 FmhaCls: TypeAlias = type[Fmha]
 
 FMHA_LIBS: dict[str, FmhaCls] = {
+    "msa_sparse_gqa": MsaSparseGqaFmha,
     "flashinfer_trtllm_gen": FlashInferTrtllmGenFmha,
     "fallback": FallbackFmha,
 }

@@ -382,6 +382,13 @@ def create_py_executor(
     if llm_args.attn_backend == "VANILLA":
         tokens_per_block = max_num_tokens
 
+    # The MSA kernels require a page size of 128; the Triton reference uses TRT-LLM's default
+    # of 32.
+    m3_sparse_config = llm_args.sparse_attention_config
+    if getattr(m3_sparse_config, "algorithm", None) == "minimax_m3":
+        tokens_per_block = 128 if m3_sparse_config.sparse_use_msa else 32
+        kv_cache_config.tokens_per_block = tokens_per_block
+
     if llm_args.attn_backend in ["FLASHINFER", "FLASHINFER_STAR_ATTENTION"]:
         # Workaround for flashinfer and star attention
         if kv_cache_config.enable_block_reuse:
