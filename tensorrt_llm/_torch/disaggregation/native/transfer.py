@@ -1785,6 +1785,10 @@ class Receiver(ReceiverBase):
         return list(dict.fromkeys(rank for overlap in overlaps for rank in overlap.ranks))
 
     @staticmethod
+    def _iter_pool_pairs(pool_mapping):
+        return pool_mapping.items() if hasattr(pool_mapping, "items") else pool_mapping
+
+    @staticmethod
     def _legacy_fanin_pools_uniform(pool_mapping: dict, page_table) -> bool:
         """Return whether every mapped pool contributes bytes from every fan-in writer.
 
@@ -1795,7 +1799,7 @@ class Receiver(ReceiverBase):
         return not any(
             page_table.layer_groups[layer_group].pool_views[pool].mapper_kind
             == MapperKind.REPLICATED
-            for layer_group, pool in pool_mapping
+            for (layer_group, pool), _peer_pool_key in Receiver._iter_pool_pairs(pool_mapping)
         )
 
     @staticmethod
@@ -1807,7 +1811,7 @@ class Receiver(ReceiverBase):
         but a view backed by another physical pool contributes bytes outside the
         reservation and must use structured split routing or the direct path.
         """
-        for layer_group, pool in pool_mapping:
+        for (layer_group, pool), _peer_pool_key in Receiver._iter_pool_pairs(pool_mapping):
             views = page_table.layer_groups[layer_group].pool_views
             if views[pool].pool_idx != 0:
                 return False
@@ -1827,7 +1831,7 @@ class Receiver(ReceiverBase):
         templates: dict[tuple[int, int], "NHDScatterTemplate"] = {}
         unstructured_capacity = 0
         pool_mapping = self._registrar.get_pool_mapping(peer_ri)
-        for (self_lg, self_pi), peer_pool_key in pool_mapping.items():
+        for (self_lg, self_pi), peer_pool_key in self._iter_pool_pairs(pool_mapping):
             mapper = self._registrar.get_kv_map(peer_ri, (self_lg, self_pi), peer_pool_key)
             block_ids = task._kv_slice.block_ids_per_layer_groups[self_lg]
             region = self._registrar.self_extractor.extract(

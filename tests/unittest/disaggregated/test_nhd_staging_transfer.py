@@ -450,7 +450,7 @@ def test_legacy_fanin_rejects_replicated_owner_pool():
         views = [SimpleNamespace(mapper_kind=kind) for kind in kinds]
         return SimpleNamespace(layer_groups=[SimpleNamespace(pool_views=views)])
 
-    mapping = {(0, 0): (0, 0), (0, 1): (0, 1)}
+    mapping = [((0, 0), (0, 0)), ((0, 1), (0, 1))]
     uniform = page_table(MapperKind.NHD, MapperKind.NHD)
     mixed = page_table(MapperKind.NHD, MapperKind.REPLICATED)
     assert tfr.Receiver._legacy_fanin_pools_uniform(mapping, uniform) is True
@@ -460,7 +460,7 @@ def test_legacy_fanin_rejects_replicated_owner_pool():
 def test_legacy_bounce_layout_requires_all_views_in_sized_physical_pool():
     tfr = pytest.importorskip("tensorrt_llm._torch.disaggregation.native.transfer")
     complete = tfr.Receiver._legacy_bounce_layout_complete
-    mapping = {(0, 0): (0, 0), (0, 1): (0, 1)}
+    mapping = [((0, 0), (0, 0)), ((0, 1), (0, 1))]
 
     def page_table(*physical_pool_ids):
         views = [SimpleNamespace(pool_idx=pool_id) for pool_id in physical_pool_ids]
@@ -995,9 +995,11 @@ class _FakeRegistrar:
         return self._peer_ext
 
     def get_pool_mapping(self, peer_ri):
-        return {key: key for key in self._mappers}
+        return [(key, key) for key in self._mappers]
 
-    def should_send_pool(self, targets, peer_ri, layer_group_id, pool_idx):
+    def should_send_pool(
+        self, targets, peer_ri, layer_group_id, pool_idx, peer_layer_group_id, peer_pool_idx
+    ):
         return True
 
     def get_kv_map(self, peer_ri, self_key, peer_key):
@@ -1101,6 +1103,109 @@ def test_fanin_mixed_pool_split_routing(monkeypatch):
     )
     per_writer = tfr.Receiver._structured_section_bytes({(0, 0): template})
     assert per_writer == section.spec.total_bytes == 2 * 4 * 32
+
+
+def test_v2_pool_buffer_mapper_builds_structured_section(monkeypatch):
+    """V2 MiniMax-style buffer metadata must engage structured staging too.
+
+    The production M3 page table uses non-empty buffer_entries plus per-buffer
+    mapper kinds, which makes PeerRegistrar return PoolBufferMapper instead of
+    the legacy NHDHeadMismatchMapper. This pins that transfer.py consumes the
+    PoolBufferMapper structured-staging interface directly.
+    """
+    tfr = pytest.importorskip("tensorrt_llm._torch.disaggregation.native.transfer")
+    from test_peer import make_page_table, make_rankinfo
+
+    from tensorrt_llm._torch.disaggregation.native.mixers.attention.peer import PoolBufferMapper
+    from tensorrt_llm._torch.disaggregation.native.peer import PeerRegistrar
+    from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
+    from tensorrt_llm._torch.disaggregation.resource.page import BUFFER_ENTRY_DTYPE, MapperKind
+
+    monkeypatch.setattr(
+        tfr.MambaPolicy, "collect_frags", staticmethod(lambda **kwargs: ([], [], []))
+    )
+
+    self_pt = make_page_table(pool_ptrs=[0x100000], block_bytes=[32], global_layer_ids=[0])
+    peer_pt = make_page_table(pool_ptrs=[0x900000], block_bytes=[16], global_layer_ids=[0])
+    self_pt.tokens_per_block = peer_pt.tokens_per_block = 2
+    self_entries = np.array([(0, 0, 16), (0, 16, 16)], dtype=BUFFER_ENTRY_DTYPE)
+    peer_entries = np.array([(0, 0, 8), (0, 8, 8)], dtype=BUFFER_ENTRY_DTYPE)
+    for page_table, entries in ((self_pt, self_entries), (peer_pt, peer_entries)):
+        pool_view = page_table.layer_groups[0].pool_views[0]
+        pool_view.buffer_entries = entries
+        pool_view.pool_role = frozenset({"key", "value"})
+        pool_view.mapper_kind = MapperKind.NHD
+        pool_view.buffer_roles = ("key", "value")
+        pool_view.buffer_mapper_kinds = (MapperKind.NHD, MapperKind.NHD)
+
+    self_ri = make_rankinfo(
+        instance_name="ctx",
+        tp_size=2,
+        kv_heads_per_rank=2,
+        tokens_per_block=2,
+        dims_per_head=2,
+        element_bytes=2,
+        page_table=self_pt,
+        layer_num_per_pp=[1],
+    )
+    peer_ri = make_rankinfo(
+        instance_name="gen",
+        instance_rank=0,
+        tp_size=1,
+        kv_heads_per_rank=1,
+        tokens_per_block=2,
+        dims_per_head=2,
+        element_bytes=2,
+        page_table=peer_pt,
+        layer_num_per_pp=[1],
+    )
+    registrar = PeerRegistrar(self_ri, KVRegionExtractorV1(self_pt))
+    registrar.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
+    mapper = registrar.get_kv_map(peer_ri, (0, 0), (0, 0))
+    assert isinstance(mapper, PoolBufferMapper)
+    assert mapper.supports_structured_staging is True
+
+    sender = object.__new__(tfr.Sender)
+    sender._registrar = registrar
+    sender._bounce = SimpleNamespace(structured_nhd=True)
+    task = SimpleNamespace(
+        _slice=SimpleNamespace(
+            block_ids_per_layer_groups=[np.array([3, 4], dtype=np.int64)],
+            token_range=SimpleNamespace(end=4),
+            is_last_slice=True,
+            mamba_state_index=None,
+        ),
+        _perf_timer=None,
+        _beam_width=1,
+        _prompt_len=4,
+        _unique_rid=42,
+        slice_id=0,
+    )
+    req_info = tfr.RecvReqInfo(
+        sender_req_id=1,
+        instance_name=peer_ri.instance_name,
+        instance_rank=peer_ri.instance_rank,
+        block_ids_per_layer_groups=[np.array([7, 8], dtype=np.int64)],
+        unique_rid=42,
+        bounce_dst_base=0x8000,
+        structured_nhd=True,
+        structured_only=False,
+    )
+
+    wm = tfr.Sender._build_kv_write_meta(sender, task, req_info)
+
+    assert wm.nhd_sections is not None and len(wm.nhd_sections) == 1
+    (section,) = wm.nhd_sections
+    assert section.mapper is mapper
+    assert section.spec.total_bytes == 2 * 2 * 2 * 4
+    assert section.spec.frag_bytes == 4
+    assert section.spec.flat_offsets.tolist() == [0, 8, 16, 24]
+    assert np.array_equal(
+        section.spec.block_ptrs,
+        0x100000 + np.array([3, 4], dtype=np.int64) * 32,
+    )
+    assert wm.dst_ptrs.size == 0
+    assert wm.sizes.size == 0
 
 
 def test_single_writer_coalesces_bounded_remainder(monkeypatch):

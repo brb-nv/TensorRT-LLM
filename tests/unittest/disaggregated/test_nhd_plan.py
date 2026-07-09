@@ -37,7 +37,10 @@ from tensorrt_llm._torch.disaggregation.native.mixers.attention.peer import (
     HeadMismatchMapper,
     IdentityMapper,
     NHDHeadMismatchMapper,
+    PoolBufferMapper,
+    PoolBufferMapping,
 )
+from tensorrt_llm._torch.disaggregation.resource.page import MapperKind
 
 # The bounce package init pulls CUDA-binding modules; skip gracefully when those are
 # absent (CPU-only env without cuda-python). Catch only ImportError so a genuine bug in
@@ -360,6 +363,63 @@ class TestMapperAccessors:
         spec = geo.mapper.src_gather_spec(geo.src_block_ptrs.astype(np.uint64))
         assert spec.block_ptrs.dtype == np.int64
         assert np.array_equal(spec.block_ptrs, geo.src_block_ptrs)
+
+    def test_pool_buffer_mapper_v2_nhd_specs_match_map(self):
+        self_ri = make_rankinfo(
+            instance_name="local",
+            tp_size=2,
+            kv_heads_per_rank=2,
+            tokens_per_block=2,
+            dims_per_head=2,
+            element_bytes=2,
+        )
+        peer_ri = make_rankinfo(
+            instance_name="peer",
+            tp_size=1,
+            kv_heads_per_rank=1,
+            tokens_per_block=2,
+            dims_per_head=2,
+            element_bytes=2,
+        )
+        mapper = PoolBufferMapper(
+            mappings=[
+                PoolBufferMapping(0, 0, 16, 8, MapperKind.NHD),
+                PoolBufferMapping(16, 8, 16, 8, MapperKind.NHD),
+            ],
+            self_ri=self_ri,
+            peer_ri=peer_ri,
+            self_region_bytes=32,
+            peer_region_bytes=16,
+            full_region_identity=False,
+            include_sharded=True,
+            include_replicated=True,
+        )
+        src_block_ptrs = np.array([1000, 2000], dtype=np.int64)
+        dst_block_ptrs = np.array([5000, 6000], dtype=np.int64)
+
+        pair = mapper.map(
+            SpecRegion(memory=MemRegionGroup(ptrs=src_block_ptrs, bytes_per_region=32)),
+            SpecRegion(memory=MemRegionGroup(ptrs=dst_block_ptrs, bytes_per_region=16)),
+        )[0]
+        src_spec = mapper.src_gather_spec(src_block_ptrs)
+        dst_spec = mapper.dst_scatter_spec(dst_block_ptrs)
+
+        paged, _, sizes = expand_specs(0, [src_spec])
+        assert mapper.supports_structured_staging is True
+        assert np.array_equal(paged, pair.src.memory.ptrs)
+        assert np.array_equal(sizes, np.full(pair.src.memory.ptrs.size, 4, dtype=np.int64))
+        paged, _, sizes = expand_specs(0, [dst_spec])
+        assert np.array_equal(paged, pair.dst.memory.ptrs)
+        assert np.array_equal(sizes, np.full(pair.dst.memory.ptrs.size, 4, dtype=np.int64))
+
+        template = mapper.recv_scatter_template(src_block_ptrs)
+        assert template.frag_bytes == 4
+        assert template.writer_head_stride == 4
+        assert np.array_equal(template.spec_for(0, 0, 2).flat_offsets, src_spec.flat_offsets)
+        assert np.array_equal(
+            template.spec_for(1, 0, 2).flat_offsets,
+            src_spec.flat_offsets + template.writer_head_stride,
+        )
 
 
 # --------------------------------------------------------------------------- #
