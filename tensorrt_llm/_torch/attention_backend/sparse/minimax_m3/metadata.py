@@ -43,6 +43,18 @@ class MiniMaxM3SparseParams(SparseParams):
     local_blocks: int = 1
     score_type: str = "max"
     disable_index_value: bool = True
+    # Select the MSA (fmha_sm100) kernels instead of the Triton reference.
+    # Requires an SM100 GPU and the fmha_sm100 package.
+    use_msa: bool = False
+
+    @property
+    def indices_block_size(self) -> int:
+        """Block granularity of the selected sparse indices.
+
+        Read by the shared TrtllmAttention forward when publishing the
+        sparse prediction. It equals the per-block scoring size.
+        """
+        return self.block_size
 
 
 @dataclass(frozen=True)

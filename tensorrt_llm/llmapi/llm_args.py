@@ -416,8 +416,7 @@ class EncodeCudaGraphConfig(BaseCudaGraphConfig):
     @staticmethod
     def _generate_cuda_graph_seq_lens(max_seq_len: int,
                                       enable_padding: bool) -> List[int]:
-        """
-        Generate a list of max per-request sequence lengths for encoder CUDA graphs.
+        """Generate a list of max per-request sequence lengths for encoder CUDA graphs.
 
         Args:
             max_seq_len: Maximum per-request sequence length to generate up to.
@@ -674,6 +673,12 @@ class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
         default=True,
         description="If True, skip the index V branch (M3 checkpoint default).",
     )
+    sparse_use_msa: bool = Field(
+        default=False,
+        description=
+        "If True, run the MSA (fmha_sm100) sparse attention kernels instead of "
+        "the Triton reference. Requires an SM100 GPU and the fmha_sm100 package.",
+    )
 
     def supports_backend(self, backend: str) -> bool:
         return backend == "pytorch"
@@ -694,6 +699,7 @@ class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
             local_blocks=self.sparse_local_blocks,
             score_type=self.sparse_score_type,
             disable_index_value=self.sparse_disable_index_value,
+            use_msa=self.sparse_use_msa,
         )
 
 

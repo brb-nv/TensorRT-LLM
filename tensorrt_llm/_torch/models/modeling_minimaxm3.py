@@ -1199,6 +1199,14 @@ class MiniMaxM3Attention(Attention):
         output: torch.Tensor,
     ) -> torch.Tensor:
         """Run sparse cache updates and attention into ``output``."""
+        # The MSA (fmha_sm100) backend rides the standard TrtllmAttention
+        # forward and manages its own cache writes, so it uses a dedicated
+        # DSA-style path rather than the Triton cache-update path below.
+        from ..attention_backend.sparse.minimax_m3 import get_minimax_m3_msa_attention_backend_cls
+
+        if isinstance(self.attn, get_minimax_m3_msa_attention_backend_cls()):
+            return self._sparse_attention_core_msa(q, k, v, idx_q, idx_k, attn_metadata, output)
+
         kv_cache_manager = getattr(attn_metadata, "kv_cache_manager", None)
         if kv_cache_manager is None:
             raise RuntimeError(
@@ -1296,6 +1304,30 @@ class MiniMaxM3Attention(Attention):
             out_cache_loc=out_cache_loc,
             m3_metadata=m3_meta,
         )
+
+    def _sparse_attention_core_msa(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        idx_q: torch.Tensor,
+        idx_k: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run the MSA sparse path: indexer selection then sparse GQA.
+
+        Mirrors DSA: select the KV blocks with the indexer, publish them
+        through forward_args.topk_indices, and let the inherited
+        TrtllmAttention forward dispatch the sparse GQA into output. The
+        backend writes the main and index caches itself.
+        """
+        from ..attention_backend.interface import AttentionForwardArgs
+
+        kv_block_indexes = self.attn.run_indexer(idx_q, idx_k, attn_metadata)
+        forward_args = AttentionForwardArgs(output=output, topk_indices=kv_block_indexes)
+        self.attn.forward(q, k, v, attn_metadata, forward_args=forward_args)
+        return output
 
 
 class MiniMaxM3DecoderLayer(DecoderLayer):

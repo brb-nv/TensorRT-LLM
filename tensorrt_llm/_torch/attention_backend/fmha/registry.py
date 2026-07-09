@@ -19,10 +19,15 @@ from typing import TypeAlias
 from .fallback import FallbackFmha
 from .flashinfer_trtllm_gen import FlashInferTrtllmGenFmha
 from .interface import Fmha
+from .msa_sparse_gqa import MsaSparseGqaFmha
 
 FmhaCls: TypeAlias = type[Fmha]
 
+# MsaSparseGqaFmha is listed first so that, for a MiniMax-M3 MSA layer, it is
+# tried before the dense libraries. Its is_available filters on the owning
+# attention type, so it is only added to that layer.
 FMHA_LIBS: dict[str, FmhaCls] = {
+    "msa_sparse_gqa": MsaSparseGqaFmha,
     "flashinfer_trtllm_gen": FlashInferTrtllmGenFmha,
     "fallback": FallbackFmha,
 }

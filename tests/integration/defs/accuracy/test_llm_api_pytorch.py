@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import asyncio
+import importlib.util
 import json
 import os
 import sys
@@ -7614,11 +7615,18 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device(4)
     @pytest.mark.skip_less_device_memory(140000)
-    @parametrize_with_ids("tp_size,ep_size", [(4, 4)])
-    def test_mxfp8(self, tp_size, ep_size):
+    @parametrize_with_ids("use_msa", [False, True])
+    def test_mxfp8(self, use_msa):
         # MXFP8 checkpoint: weights are MXFP8 (e4m3 + UE8M0 1x32 block
         # scales) with MXFP8 dynamic activations; the KV cache stays in
         # BF16 and the sparse attention path is unchanged from BF16.
+        # use_msa selects the MSA (fmha_sm100) kernels over the Triton
+        # reference.
+        if use_msa and importlib.util.find_spec("fmha_sm100") is None:
+            pytest.skip(
+                "MiniMax-M3 MSA sparse attention requires the fmha_sm100 package"
+            )
+        tp_size = ep_size = 4
         model_name = "MiniMaxAI/MiniMax-M3-MXFP8"
         model_path = f"{llm_models_root()}/MiniMax-M3-MXFP8"
         # Halving TP from the BF16 reference (TP=8) doubles per-rank
@@ -7627,7 +7635,8 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
         # under the PyTorch cap.
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4,
                                         enable_block_reuse=False)
-        sparse_attention_config = MiniMaxM3SparseAttentionConfig()
+        sparse_attention_config = MiniMaxM3SparseAttentionConfig(
+            sparse_use_msa=use_msa)
         with LLM(model_path,
                  tensor_parallel_size=tp_size,
                  moe_expert_parallel_size=ep_size,
@@ -7678,16 +7687,23 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device(4)
     @pytest.mark.skip_less_device_memory(140000)
-    @parametrize_with_ids("tp_size,ep_size", [(4, 4)])
-    def test_nvfp4(self, tp_size, ep_size):
+    @parametrize_with_ids("use_msa", [False, True])
+    def test_nvfp4(self, use_msa):
         # NVFP4 checkpoint: MXFP8 base layers with NVFP4 routed experts
         # (MIXED_PRECISION checkpoint); the KV cache stays in BF16 and the
-        # sparse attention path is unchanged from BF16.
+        # sparse attention path is unchanged from BF16. use_msa selects the
+        # MSA (fmha_sm100) kernels over the Triton reference.
+        if use_msa and importlib.util.find_spec("fmha_sm100") is None:
+            pytest.skip(
+                "MiniMax-M3 MSA sparse attention requires the fmha_sm100 package"
+            )
+        tp_size = ep_size = 4
         model_name = "nvidia/MiniMax-M3-NVFP4"
         model_path = f"{llm_models_root()}/MiniMax-M3-NVFP4"
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6,
                                         enable_block_reuse=False)
-        sparse_attention_config = MiniMaxM3SparseAttentionConfig()
+        sparse_attention_config = MiniMaxM3SparseAttentionConfig(
+            sparse_use_msa=use_msa)
         moe_config = MoeConfig(backend="CUTLASS")
         with LLM(model_path,
                  tensor_parallel_size=tp_size,

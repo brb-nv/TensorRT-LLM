@@ -159,6 +159,10 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
 
         if sparse_index_dim is None:
             sparse_index_dim = int(getattr(sparse_attn_config, "sparse_index_dim", 0) or 0) or 128
+        # Whether the MSA (fmha_sm100) kernels drive this model. The cache
+        # layout is shared with the Triton reference; this flag lets the
+        # forward path pick the MSA kernels when set.
+        self.use_msa = bool(getattr(sparse_attn_config, "sparse_use_msa", False))
         if sparse_layer_ids is None:
             if num_layers is not None:
                 sparse_layer_ids = list(range(3, int(num_layers)))
