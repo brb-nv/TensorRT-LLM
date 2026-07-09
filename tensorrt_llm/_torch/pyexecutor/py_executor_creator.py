@@ -384,8 +384,8 @@ def create_py_executor(
 
     # MiniMax-M3 fixes the KV cache block size to the sparse block size so the
     # paged cache page maps one-to-one onto a sparse block. The MSA kernels
-    # require a page size of 128; the Triton reference uses 32. Propagate the
-    # value back to kv_cache_config so downstream consumers agree on it.
+    # require a page size of 128; the Triton reference uses TRT-LLM's default
+    # of 32.
     m3_sparse_config = llm_args.sparse_attention_config
     if getattr(m3_sparse_config, "algorithm", None) == "minimax_m3":
         tokens_per_block = 128 if m3_sparse_config.sparse_use_msa else 32

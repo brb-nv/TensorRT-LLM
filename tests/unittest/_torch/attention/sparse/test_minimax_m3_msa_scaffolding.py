@@ -7,10 +7,9 @@ lowering into MiniMaxM3SparseParams, and the backend resolver's gating. They
 do not launch kernels and run without an SM100 GPU.
 """
 
-import pytest
-
 from tensorrt_llm._torch.attention_backend.sparse.minimax_m3 import (
     get_minimax_m3_attention_backend_cls,
+    get_minimax_m3_msa_attention_backend_cls,
 )
 from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.metadata import MiniMaxM3SparseParams
 from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_availability import (
@@ -40,12 +39,12 @@ def test_resolver_returns_triton_backend_when_msa_disabled():
 
 def test_resolver_does_not_fall_back_to_triton_when_msa_requested():
     params = MiniMaxM3SparseAttentionConfig(sparse_use_msa=True).to_sparse_params()
-    # A request for MSA must either resolve to the MSA backend or fail loudly;
-    # it must never silently return the Triton reference. On a non-SM100 host
-    # the availability gate raises RuntimeError; on SM100 the backend is not
-    # implemented at this stage and raises NotImplementedError.
-    with pytest.raises((RuntimeError, NotImplementedError)):
-        _resolve_minimax_m3_backend_cls(params)
+    try:
+        resolved = _resolve_minimax_m3_backend_cls(params)
+    except RuntimeError:
+        return
+    assert resolved is get_minimax_m3_msa_attention_backend_cls()
+    assert resolved is not get_minimax_m3_attention_backend_cls()
 
 
 def test_is_msa_available_returns_bool():
