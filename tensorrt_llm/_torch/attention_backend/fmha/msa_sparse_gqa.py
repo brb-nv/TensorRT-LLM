@@ -114,6 +114,38 @@ def run_msa_sparse_gqa(
     return out
 
 
+def run_msa_sparse_gqa_decode(
+    q: torch.Tensor,
+    k_paged: torch.Tensor,
+    v_paged: torch.Tensor,
+    kv_block_indexes: torch.Tensor,
+    *,
+    gqa_plan: tuple,
+    kv_indices: torch.Tensor,
+    out: torch.Tensor,
+    sm_scale: float,
+) -> None:
+    """CUDA-graph-safe decode variant of run_msa_sparse_gqa.
+
+    Runs fmha_sm100 from a prebuilt plan into the preallocated output buffer.
+    All inputs are stable device tensors built in prepare(), so there is no
+    fmha_sm100_plan call and no host sync inside the captured region.
+    """
+    import fmha_sm100
+
+    fmha_sm100.fmha_sm100(
+        q,
+        k_paged,
+        v_paged,
+        gqa_plan,
+        kv_indices=kv_indices,
+        kv_block_indexes=kv_block_indexes,
+        out=out,
+        sm_scale=sm_scale,
+        output_maxscore=False,
+    )
+
+
 class MsaSparseGqaFmha(Fmha):
     """SM100 block-sparse GQA FMHA powered by MSA's fmha_sm100 kernel.
 
@@ -203,6 +235,21 @@ class MsaSparseGqaFmha(Fmha):
         out_view = output.view(num_tokens, attn.num_heads, self.HEAD_DIM)
 
         k_paged, v_paged = msa_paged_kv(kv_cache_manager, layer_idx)
+
+        # Decode runs from the prebuilt graph-safe plan; prefill plans eagerly.
+        if metadata.msa_decode_gqa_plan is not None:
+            run_msa_sparse_gqa_decode(
+                q3,
+                k_paged,
+                v_paged,
+                kv_block_indexes,
+                gqa_plan=metadata.msa_decode_gqa_plan,
+                kv_indices=metadata._msa_kv_indices_buf,
+                out=out_view,
+                sm_scale=self._sm_scale(),
+            )
+            return
+
         out = run_msa_sparse_gqa(
             q3,
             k_paged,
@@ -219,4 +266,4 @@ class MsaSparseGqaFmha(Fmha):
         out_view.copy_(out.view_as(out_view))
 
 
-__all__ = ["MsaSparseGqaFmha", "run_msa_sparse_gqa"]
+__all__ = ["MsaSparseGqaFmha", "run_msa_sparse_gqa", "run_msa_sparse_gqa_decode"]

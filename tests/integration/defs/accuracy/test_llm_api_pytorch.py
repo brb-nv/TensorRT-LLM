@@ -7712,6 +7712,7 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
                  sparse_attention_config=sparse_attention_config,
                  moe_config=moe_config,
                  max_seq_len=4096,
+                 cuda_graph_config=None,
                  trust_remote_code=True) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.MIXED_PRECISION
             task = MMLU(model_name)

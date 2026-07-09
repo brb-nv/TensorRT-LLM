@@ -163,5 +163,47 @@ class MsaIndexer:
             local_blocks=config.local_blocks,
         )
 
+    def select_blocks_decode(
+        self,
+        idx_q: torch.Tensor,
+        idx_k_cache: torch.Tensor,
+        *,
+        proxy_plan: tuple,
+        kv_indices: torch.Tensor,
+        max_score: torch.Tensor,
+        n_valid_blocks: torch.Tensor,
+        idx_sm_scale: float,
+    ) -> torch.Tensor:
+        """CUDA-graph-safe decode variant of :meth:`select_blocks`.
+
+        Runs the proxy MQA pass from a prebuilt plan into a preallocated
+        max_score buffer, then selects the top-k blocks. Every input is a stable
+        device tensor built in prepare(): there is no fmha_sm100_plan call and no
+        host sync, so the whole path is capturable. ``n_valid_blocks`` is the
+        precomputed per-query valid-block count.
+        """
+        fmha_sm100 = require_msa_module()
+        config = self.config
+        idx_k_paged = cache_view_to_msa_paged(idx_k_cache)
+        _, ms = fmha_sm100.fmha_sm100(
+            idx_q,
+            idx_k_paged,
+            idx_k_paged,
+            proxy_plan,
+            kv_indices=kv_indices,
+            output_o=False,
+            output_maxscore=True,
+            max_score=max_score,
+            sm_scale=idx_sm_scale,
+        )
+        max_score_kv = _group_max_reduce(ms, config)
+        return select_blocks_from_maxscore(
+            max_score_kv,
+            topk=MSA_REQUIRED_TOPK,
+            n_valid_blocks=n_valid_blocks,
+            init_blocks=config.init_blocks,
+            local_blocks=config.local_blocks,
+        )
+
 
 __all__ = ["MsaIndexer"]

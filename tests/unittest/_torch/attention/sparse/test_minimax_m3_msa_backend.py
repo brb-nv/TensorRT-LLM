@@ -19,15 +19,11 @@ from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttention, Trtllm
 from tensorrt_llm.llmapi.llm_args import MiniMaxM3SparseAttentionConfig
 
 _MSA_METADATA_FIELDS = (
-    "msa_is_prefill",
-    "msa_req_to_token",
-    "msa_slot_ids",
-    "msa_kv_lens_dev",
+    "msa_out_cache_loc",
+    "msa_kv_indices",
     "msa_kv_lens_cpu",
     "msa_qo_lens_cpu",
     "msa_qo_offset_cpu",
-    "msa_kv_indices",
-    "msa_out_cache_loc",
 )
 
 
@@ -67,6 +63,29 @@ def test_msa_metadata_declares_flat_fields():
         annotations.update(getattr(klass, "__annotations__", {}))
     for field in _MSA_METADATA_FIELDS:
         assert field in annotations, f"{field} must be a declared field"
+
+
+def test_msa_metadata_drops_redundant_intermediate_fields():
+    # These were per-forward intermediates that no forward path reads; the
+    # graph-safe metadata computes them locally and does not store them.
+    metadata_cls = get_minimax_m3_msa_attention_backend_cls().Metadata
+    annotations = {}
+    for klass in metadata_cls.__mro__:
+        annotations.update(getattr(klass, "__annotations__", {}))
+    for field in ("msa_is_prefill", "msa_req_to_token", "msa_slot_ids", "msa_kv_lens_dev"):
+        assert field not in annotations, f"{field} should no longer be stored"
+
+
+def test_msa_metadata_allocates_graph_stable_buffers():
+    # The buffers are declared and allocated in a DSA-style __post_init__ hook,
+    # not cached per batch size on a bespoke driver.
+    metadata_cls = get_minimax_m3_msa_attention_backend_cls().Metadata
+    assert callable(getattr(metadata_cls, "_create_msa_buffers", None))
+    annotations = {}
+    for klass in metadata_cls.__mro__:
+        annotations.update(getattr(klass, "__annotations__", {}))
+    for buf in ("_msa_out_cache_loc_buf", "_msa_kv_indices_buf"):
+        assert buf in annotations, f"{buf} must be a declared backing buffer"
 
 
 def test_msa_backend_defines_dsa_style_hooks():
