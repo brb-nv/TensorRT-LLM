@@ -125,11 +125,11 @@ class MsaIndexer:
     ) -> torch.Tensor:
         """Return [total_q, num_kv_heads, topk] selected block indices.
 
-        Plan/run split, mirroring the sparse GQA. When ``proxy_plan`` is None
+        Plan/run split, mirroring the sparse GQA. When `proxy_plan` is None
         (prefill and focused tests) the proxy plan is built inline and the
         per-query valid-block count is derived here; when provided (CUDA-graph
         decode) the proxy runs from the prebuilt plan into the preallocated
-        ``max_score`` buffer with a precomputed ``n_valid_blocks``, so there is
+        `max_score` buffer with a precomputed `n_valid_blocks`, so there is
         no host sync inside the captured region. The same top-k selection serves
         both, and generation is the one-query-token-per-request special case.
         """

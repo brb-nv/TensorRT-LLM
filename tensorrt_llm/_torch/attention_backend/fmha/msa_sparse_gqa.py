@@ -48,7 +48,7 @@ def run_msa_sparse_gqa(
     q: torch.Tensor,
     k_paged: torch.Tensor,
     v_paged: torch.Tensor,
-    kv_block_indexes: torch.Tensor,
+    kv_block_indexes: Optional[torch.Tensor] = None,
     *,
     kv_indices: torch.Tensor,
     sm_scale: float,
@@ -60,13 +60,19 @@ def run_msa_sparse_gqa(
     plan: Optional[tuple] = None,
     out: Optional[torch.Tensor] = None,
 ) -> Optional[torch.Tensor]:
-    """Run fmha_sm100 block-sparse paged GQA (plan/run split, FlashInfer style).
+    """Run fmha_sm100 paged GQA (plan/run split, FlashInfer style).
 
-    ``plan`` is the fmha_sm100 execution plan. When None (prefill and focused
+    `kv_block_indexes` selects the mode: when provided it is the per-query
+    top-k block table and the kernel runs block-sparse GQA (MiniMax-M3 sparse
+    layers); when None the kernel runs dense paged GQA over the full page table
+    in `kv_indices` (MiniMax-M3 dense layers 0-2). The dense mode has no
+    per-block-count restriction because no kv_block_num is planned.
+
+    `plan` is the fmha_sm100 execution plan. When None (prefill and focused
     tests) it is built inline from qo_lens_cpu/kv_lens_cpu/qo_offset_cpu; when
     provided (CUDA-graph decode) it is a prebuilt graph-safe plan and the
     per-request length tensors are ignored, so there is no host sync inside the
-    captured region. ``out``, when provided, receives the result in place;
+    captured region. `out`, when provided, receives the result in place;
     otherwise a fresh output tensor is allocated and returned.
     """
     import fmha_sm100
@@ -91,6 +97,9 @@ def run_msa_sparse_gqa(
         )
 
     if plan is None:
+        # kv_block_num is planned only for the sparse (block-indexed) path;
+        # dense paged GQA leaves it unset and attends the full page table.
+        kv_block_num = int(kv_block_indexes.shape[-1]) if kv_block_indexes is not None else -1
         plan = fmha_sm100.fmha_sm100_plan(
             qo_lens_cpu,
             kv_lens_cpu,
@@ -98,7 +107,7 @@ def run_msa_sparse_gqa(
             num_kv_heads=int(k_paged.shape[1]),
             qo_offset=qo_offset_cpu,
             page_size=int(k_paged.shape[2]),
-            kv_block_num=int(kv_block_indexes.shape[-1]),
+            kv_block_num=kv_block_num,
             causal=causal,
             num_kv_splits=1,
         )

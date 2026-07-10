@@ -911,6 +911,14 @@ class MiniMaxM3Attention(Attention):
         output: torch.Tensor,
     ) -> torch.Tensor:
         """Run dense cache updates and attention into ``output``."""
+        # The MSA (fmha_sm100) backend runs dense layers through the same paged
+        # GQA kernel as the sparse layers, so it takes a dedicated path rather
+        # than the SDPA-gather oracle below (which serves the Triton reference).
+        from ..attention_backend.sparse.minimax_m3 import get_minimax_m3_msa_attention_backend_cls
+
+        if isinstance(self.attn, get_minimax_m3_msa_attention_backend_cls()):
+            return self._dense_attention_core_msa(q, k, v, attn_metadata, output)
+
         from ..attention_backend.sparse.minimax_m3 import (
             _gather_paged_batched,
             _write_main_kv_slots_to_pool,
@@ -1081,6 +1089,59 @@ class MiniMaxM3Attention(Attention):
             # which the per-batch loop already laid out correctly.
             output.view(batch, self.num_heads, self.head_dim).copy_(out_b.squeeze(2))
 
+        return output
+
+    def _dense_attention_core_msa(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run dense attention through the MSA fmha_sm100 paged GQA kernel.
+
+        Dense layers share the main K/V cache geometry with the sparse layers,
+        so they reuse the plan/run split with kv_block_indexes left unset: the
+        kernel then attends the full page table instead of top-k blocks. The
+        graph-safe dense plan comes from the sparse layer's build_decode_plans
+        (None for prefill, which plans inline). Mirrors MsaSparseGqaFmha.forward
+        minus the block selection.
+        """
+        from ..attention_backend.fmha.msa_sparse_gqa import run_msa_sparse_gqa
+        from ..attention_backend.sparse.minimax_m3.common import msa_paged_kv, write_msa_main_kv
+
+        kv_cache_manager = getattr(attn_metadata, "kv_cache_manager", None)
+        if kv_cache_manager is None:
+            raise RuntimeError(
+                f"MiniMax-M3 dense forward (layer {self.layer_idx}) requires "
+                "attn_metadata.kv_cache_manager to be a MiniMaxM3KVCacheManagerV2."
+            )
+
+        # fmha_sm100 reads the paged cache directly, so the new-token K/V must
+        # be resident before the GQA runs.
+        write_msa_main_kv(kv_cache_manager, self.layer_idx, attn_metadata.msa_out_cache_loc, k, v)
+
+        num_tokens = int(q.shape[0])
+        q3 = q.view(num_tokens, self.num_heads, self.head_dim)
+        out_view = output.view(num_tokens, self.num_heads, self.head_dim)
+        k_paged, v_paged = msa_paged_kv(kv_cache_manager, self.layer_idx)
+        sm_scale = (self.head_dim**-0.5) / float(self.attn.q_scaling)
+
+        run_msa_sparse_gqa(
+            q3,
+            k_paged,
+            v_paged,
+            kv_indices=attn_metadata._msa_kv_indices_buf,
+            sm_scale=sm_scale,
+            qo_lens_cpu=attn_metadata.msa_qo_lens_cpu,
+            kv_lens_cpu=attn_metadata.msa_kv_lens_cpu,
+            qo_offset_cpu=attn_metadata.msa_qo_offset_cpu,
+            causal=True,
+            head_dim=self.head_dim,
+            plan=attn_metadata.msa_decode_dense_plan,
+            out=out_view,
+        )
         return output
 
     def _forward_attention_core(

@@ -61,7 +61,7 @@ def _cache_device(meta) -> torch.device:
 # Per-step fmha_sm100 plan tensors that must live in CUDA-graph-stable buffers.
 # At num_kv_splits=1 the plan carries no split-KV workspaces, and
 # cute_workspace_buffer is the vendor's cached scratch (kept by reference, not
-# copied). Validated by scripts_local/msa_2b_probe.py on SM100.
+# copied).
 _MSA_PLAN_STABLE_KEYS = (
     "packed_work_range",
     "packed_work_info",
@@ -190,10 +190,11 @@ def get_minimax_m3_msa_attention_backend_cls():
         """TrtllmAttentionMetadata for MiniMax-M3 MSA sparse layers.
 
         Only the tensors the sparse GQA and cache write actually consume are
-        stored: the per-new-token cache slots (msa_out_cache_loc), the paged
-        page table (msa_kv_indices), and the per-request lengths and causal
-        offset that fmha_sm100_plan reads (msa_kv_lens_cpu, msa_qo_lens_cpu,
-        msa_qo_offset_cpu).
+        stored: the per-new-token cache slots (msa_out_cache_loc) and the
+        per-request lengths and causal offset that fmha_sm100_plan reads
+        (msa_kv_lens_cpu, msa_qo_lens_cpu, msa_qo_offset_cpu). The paged page
+        table lives in the backing buffer _msa_kv_indices_buf, which the
+        forward and indexer read directly.
 
         Buffers are allocated once in __post_init__ and populated in prepare()
         via copy_, so their addresses stay stable across CUDA-graph replays.
@@ -202,23 +203,18 @@ def get_minimax_m3_msa_attention_backend_cls():
         """
 
         msa_out_cache_loc: Optional[torch.Tensor] = None
-        msa_kv_indices: Optional[torch.Tensor] = None
         msa_kv_lens_cpu: Optional[torch.Tensor] = None
         msa_qo_lens_cpu: Optional[torch.Tensor] = None
         msa_qo_offset_cpu: Optional[torch.Tensor] = None
 
-        # Dense layers (0-2) of MiniMax-M3 run the shared dense oracle path in
-        # the model, which reads this attachment (metadata + per-new-token
-        # cache slots). It is the same contract the Triton reference builds; the
-        # sparse layers ignore it and use the msa_* fields above.
-        minimax_m3: Optional[dict] = None
-
         # Prebuilt graph-safe decode plans (set by the sparse layer's
         # build_decode_plans during prepare(); None for prefill/mixed batches,
         # which run eagerly). The forward reads these instead of planning inside
-        # the captured region.
+        # the captured region. msa_decode_dense_plan drives the dense layers
+        # (0-2), which attend the full page table (no block selection).
         msa_decode_proxy_plan: Optional[tuple] = None
         msa_decode_gqa_plan: Optional[tuple] = None
+        msa_decode_dense_plan: Optional[tuple] = None
         msa_max_score: Optional[torch.Tensor] = None
         msa_n_valid_blocks: Optional[torch.Tensor] = None
 
@@ -234,14 +230,9 @@ def get_minimax_m3_msa_attention_backend_cls():
         # geometry not visible here), then reused across steps.
         _msa_proxy_plan: Optional["_MsaGraphSafePlan"] = None
         _msa_gqa_plan: Optional["_MsaGraphSafePlan"] = None
+        _msa_dense_plan: Optional["_MsaGraphSafePlan"] = None
         _msa_max_score_buf: Optional[torch.Tensor] = None
         _msa_n_valid_blocks_buf: Optional[torch.Tensor] = None
-        # Persistent staging buffers for the dense oracle attachment (m3_meta +
-        # out_cache_loc). Under CUDA graph these keep the dense path's tensor
-        # addresses stable across replays, matching the Triton reference. One
-        # dict per metadata clone (create_cuda_graph_metadata clones per batch
-        # size); it is not keyed by batch size.
-        _m3_static_buffers: Optional[dict] = None
 
         def __post_init__(self) -> None:
             super().__post_init__()
@@ -307,6 +298,7 @@ def get_minimax_m3_msa_attention_backend_cls():
             """
             self.msa_decode_proxy_plan = None
             self.msa_decode_gqa_plan = None
+            self.msa_decode_dense_plan = None
             self.msa_max_score = None
             self.msa_n_valid_blocks = None
             if self.msa_qo_lens_cpu is None:
@@ -326,34 +318,6 @@ def get_minimax_m3_msa_attention_backend_cls():
                 return
             layer.build_decode_plans(self)
 
-        def _maybe_get_m3_static_buffers(self, cache_device) -> Optional[dict]:
-            """Return persistent staging buffers for the dense oracle attachment.
-
-            Used only to keep the dense path's m3_meta / out_cache_loc addresses
-            stable under CUDA graph. Returns None in eager mode (fresh per-call
-            tensors are fine there). The first graph-mode call installs a
-            placeholder dict; build_runtime_metadata_from_kv_manager allocates
-            the persistent tensors lazily on first use and refreshes them in
-            place afterwards.
-            """
-            need_static = bool(self.is_cuda_graph) or self._m3_static_buffers is not None
-            if not need_static:
-                return None
-            if self._m3_static_buffers is not None and (
-                self._m3_static_buffers.get("device") == cache_device
-            ):
-                return self._m3_static_buffers
-            max_num_sequences = int(
-                getattr(self, "max_num_sequences", None) or self.max_num_requests
-            )
-            max_num_tokens = int(getattr(self, "max_num_tokens", None) or max_num_sequences)
-            self._m3_static_buffers = {
-                "device": cache_device,
-                "max_num_sequences_hint": max_num_sequences,
-                "max_num_tokens_hint": max_num_tokens,
-            }
-            return self._m3_static_buffers
-
         def _build_msa_fields(self) -> None:
             """Populate the MSA buffers for this step and expose sliced views.
 
@@ -363,11 +327,9 @@ def get_minimax_m3_msa_attention_backend_cls():
             public msa_* fields; the transient builder result is discarded.
             """
             self.msa_out_cache_loc = None
-            self.msa_kv_indices = None
             self.msa_kv_lens_cpu = None
             self.msa_qo_lens_cpu = None
             self.msa_qo_offset_cpu = None
-            self.minimax_m3 = None
             if not self._msa_buffers_ready:
                 return
             request_ids = self.request_ids
@@ -407,13 +369,11 @@ def get_minimax_m3_msa_attention_backend_cls():
                     "decoding or use the non-MSA MiniMax-M3 backend."
                 )
 
-            # Under CUDA graph the dense oracle attachment (m3_meta +
-            # out_cache_loc) must keep stable tensor addresses across replays,
-            # so build it into persistent staging buffers, matching the Triton
-            # reference. The sparse path copies what it needs into its own
-            # buffers below, so this only affects the dense attachment.
-            static_buffers = self._maybe_get_m3_static_buffers(cache_device)
-
+            # The builder runs only in prepare() (outside CUDA-graph capture),
+            # so its fresh per-call tensors are fine: the sparse and dense
+            # forwards read only the persistent msa_* buffers copied into below,
+            # never the transient m3_meta. That is why no static staging buffer
+            # is needed here.
             if is_prefill:
                 prefix_lens_list = [int(num_cached[b]) for b in range(batch_size)]
                 qo_lens_list = [kv_lens_list[b] - prefix_lens_list[b] for b in range(batch_size)]
@@ -427,7 +387,6 @@ def get_minimax_m3_msa_attention_backend_cls():
                     prefix_lens=prefix_lens,
                     extend_seq_lens_cpu=qo_lens_list,
                     device=cache_device,
-                    static_buffers=static_buffers,
                 )
             else:
                 qo_lens_list = [1] * batch_size
@@ -438,7 +397,6 @@ def get_minimax_m3_msa_attention_backend_cls():
                     seq_lens_cpu=kv_lens_cpu,
                     is_prefill=False,
                     device=cache_device,
-                    static_buffers=static_buffers,
                 )
 
             qo_lens_cpu = torch.tensor(qo_lens_list, dtype=torch.int32)
@@ -446,10 +404,6 @@ def get_minimax_m3_msa_attention_backend_cls():
             kv_indices = build_kv_page_indices(
                 m3_meta.req_to_token, m3_meta.slot_ids, kv_lens_cpu, page_size
             )
-
-            # Dense layers reuse the shared dense oracle path, which reads the
-            # freshly built metadata and cache slots off this attachment.
-            self.minimax_m3 = {"metadata": m3_meta, "out_cache_loc": out_cache_loc}
 
             total_new_tokens = int(out_cache_loc.shape[0])
             total_pages = int(kv_indices.shape[0])
@@ -471,7 +425,6 @@ def get_minimax_m3_msa_attention_backend_cls():
             self._msa_qo_offset_cpu_buf[:batch_size].copy_(qo_offset_cpu)
 
             self.msa_out_cache_loc = self._msa_out_cache_loc_buf[:total_new_tokens]
-            self.msa_kv_indices = self._msa_kv_indices_buf[:total_pages]
             self.msa_kv_lens_cpu = self._msa_kv_lens_cpu_buf[:batch_size]
             self.msa_qo_lens_cpu = self._msa_qo_lens_cpu_buf[:batch_size]
             self.msa_qo_offset_cpu = self._msa_qo_offset_cpu_buf[:batch_size]
@@ -556,11 +509,12 @@ def get_minimax_m3_msa_attention_backend_cls():
             """Build the graph-safe decode plans and buffers on the metadata.
 
             Invoked from MsaMinimaxM3AttentionMetadata.prepare() (outside CUDA
-            graph capture) by the first sparse layer, since the plan is
+            graph capture) by the first sparse layer, since the plans are
             layer-invariant. Uses this layer's geometry plus the metadata's
-            per-request lengths to build the proxy max-score plan and the sparse
-            GQA plan, mirror them into CUDA-graph-stable buffers, and precompute
-            the per-query valid-block count. Mimics FlashInfer's plan() split.
+            per-request lengths to build the proxy max-score plan, the sparse
+            GQA plan, and the dense GQA plan (shared by the dense layers 0-2),
+            mirror them into CUDA-graph-stable buffers, and precompute the
+            per-query valid-block count. Mimics FlashInfer's plan() split.
             """
             fmha_sm100 = require_msa_module()
             config = self.m3_config
@@ -597,6 +551,19 @@ def get_minimax_m3_msa_attention_backend_cls():
                 num_kv_splits=1,
                 causal=True,
             )
+            # Dense plan: same GQA geometry as the sparse main path but with no
+            # kv_block_num, so it attends the full page table. The dense layers
+            # share the main geometry, so one plan serves all of them.
+            dense_plan = fmha_sm100.fmha_sm100_plan(
+                qo_lens_cpu,
+                kv_lens_cpu,
+                config.num_q_heads,
+                num_kv_heads=config.num_kv_heads,
+                qo_offset=qo_offset_cpu,
+                page_size=page_size,
+                num_kv_splits=1,
+                causal=True,
+            )
 
             if metadata._msa_proxy_plan is None:
                 num_ctas = torch.cuda.get_device_properties(device).multi_processor_count
@@ -610,6 +577,13 @@ def get_minimax_m3_msa_attention_backend_cls():
                 metadata._msa_gqa_plan = _MsaGraphSafePlan(
                     metadata,
                     "msa_gqa_plan",
+                    max_batch=max_batch,
+                    num_ctas=num_ctas,
+                    capture_graph=capture_graph,
+                )
+                metadata._msa_dense_plan = _MsaGraphSafePlan(
+                    metadata,
+                    "msa_dense_plan",
                     max_batch=max_batch,
                     num_ctas=num_ctas,
                     capture_graph=capture_graph,
@@ -634,6 +608,7 @@ def get_minimax_m3_msa_attention_backend_cls():
 
             metadata.msa_decode_proxy_plan = metadata._msa_proxy_plan.refresh(proxy_plan)
             metadata.msa_decode_gqa_plan = metadata._msa_gqa_plan.refresh(gqa_plan)
+            metadata.msa_decode_dense_plan = metadata._msa_dense_plan.refresh(dense_plan)
             metadata.msa_max_score = metadata._msa_max_score_buf[:, :, :batch]
 
             n_valid = per_token_valid_blocks(
