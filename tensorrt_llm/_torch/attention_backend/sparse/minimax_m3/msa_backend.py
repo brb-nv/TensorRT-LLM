@@ -671,24 +671,20 @@ def get_minimax_m3_msa_attention_backend_cls():
             metadata.msa_write_idx_k(self.layer_idx, idx_k_view)
             idx_k_cache = metadata.msa_idx_k_cache(self.layer_idx)
 
-            if metadata.msa_decode_proxy_plan is not None:
-                return self.indexer.select_blocks_decode(
-                    idx_q_view,
-                    idx_k_cache,
-                    proxy_plan=metadata.msa_decode_proxy_plan,
-                    kv_indices=metadata._msa_kv_indices_buf,
-                    max_score=metadata.msa_max_score,
-                    n_valid_blocks=metadata.msa_n_valid_blocks,
-                    idx_sm_scale=idx_sm_scale,
-                )
+            # One selection path: decode passes the prebuilt graph-safe proxy
+            # plan plus preallocated max_score / n_valid_blocks; prefill leaves
+            # them None and the proxy plan is built inline.
             return self.indexer.select_blocks(
                 idx_q_view,
                 idx_k_cache,
                 idx_sm_scale=idx_sm_scale,
+                kv_indices=metadata._msa_kv_indices_buf,
                 qo_lens_cpu=metadata.msa_qo_lens_cpu,
                 kv_lens_cpu=metadata.msa_kv_lens_cpu,
                 qo_offset_cpu=metadata.msa_qo_offset_cpu,
-                kv_indices=metadata.msa_kv_indices,
+                proxy_plan=metadata.msa_decode_proxy_plan,
+                max_score=metadata.msa_max_score,
+                n_valid_blocks=metadata.msa_n_valid_blocks,
             )
 
         def sparse_attn_predict(

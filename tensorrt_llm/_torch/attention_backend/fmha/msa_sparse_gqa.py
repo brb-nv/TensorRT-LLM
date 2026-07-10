@@ -50,20 +50,24 @@ def run_msa_sparse_gqa(
     v_paged: torch.Tensor,
     kv_block_indexes: torch.Tensor,
     *,
-    qo_lens_cpu: torch.Tensor,
-    kv_lens_cpu: torch.Tensor,
-    qo_offset_cpu: Optional[torch.Tensor],
     kv_indices: torch.Tensor,
     sm_scale: float,
-    causal: bool,
+    qo_lens_cpu: Optional[torch.Tensor] = None,
+    kv_lens_cpu: Optional[torch.Tensor] = None,
+    qo_offset_cpu: Optional[torch.Tensor] = None,
+    causal: bool = True,
     head_dim: int = 128,
-) -> torch.Tensor:
-    """Run fmha_sm100 block-sparse paged GQA.
+    plan: Optional[tuple] = None,
+    out: Optional[torch.Tensor] = None,
+) -> Optional[torch.Tensor]:
+    """Run fmha_sm100 block-sparse paged GQA (plan/run split, FlashInfer style).
 
-    Follows MSA's two-call pattern: fmha_sm100_plan builds the per-shape
-    sparse plan with kv_block_num from kv_block_indexes, then fmha_sm100 runs
-    the kernel with the block indices threaded through. Returns [total_q,
-    num_qo_heads, head_dim] bfloat16.
+    ``plan`` is the fmha_sm100 execution plan. When None (prefill and focused
+    tests) it is built inline from qo_lens_cpu/kv_lens_cpu/qo_offset_cpu; when
+    provided (CUDA-graph decode) it is a prebuilt graph-safe plan and the
+    per-request length tensors are ignored, so there is no host sync inside the
+    captured region. ``out``, when provided, receives the result in place;
+    otherwise a fresh output tensor is allocated and returned.
     """
     import fmha_sm100
 
@@ -86,64 +90,30 @@ def run_msa_sparse_gqa(
             f"got k={tuple(k_paged.shape)}, v={tuple(v_paged.shape)}."
         )
 
-    num_qo_heads = int(q.shape[1])
-    num_kv_heads = int(k_paged.shape[1])
-    page_size = int(k_paged.shape[2])
-
-    sparse_plan = fmha_sm100.fmha_sm100_plan(
-        qo_lens_cpu,
-        kv_lens_cpu,
-        num_qo_heads,
-        num_kv_heads=num_kv_heads,
-        qo_offset=qo_offset_cpu,
-        page_size=page_size,
-        kv_block_num=int(kv_block_indexes.shape[-1]),
-        causal=causal,
-        num_kv_splits=1,
-    )
-    out, _ = fmha_sm100.fmha_sm100(
+    if plan is None:
+        plan = fmha_sm100.fmha_sm100_plan(
+            qo_lens_cpu,
+            kv_lens_cpu,
+            int(q.shape[1]),
+            num_kv_heads=int(k_paged.shape[1]),
+            qo_offset=qo_offset_cpu,
+            page_size=int(k_paged.shape[2]),
+            kv_block_num=int(kv_block_indexes.shape[-1]),
+            causal=causal,
+            num_kv_splits=1,
+        )
+    out_result, _ = fmha_sm100.fmha_sm100(
         q,
         k_paged,
         v_paged,
-        sparse_plan,
-        kv_indices=kv_indices,
-        kv_block_indexes=kv_block_indexes,
-        sm_scale=sm_scale,
-        output_maxscore=False,
-    )
-    return out
-
-
-def run_msa_sparse_gqa_decode(
-    q: torch.Tensor,
-    k_paged: torch.Tensor,
-    v_paged: torch.Tensor,
-    kv_block_indexes: torch.Tensor,
-    *,
-    gqa_plan: tuple,
-    kv_indices: torch.Tensor,
-    out: torch.Tensor,
-    sm_scale: float,
-) -> None:
-    """CUDA-graph-safe decode variant of run_msa_sparse_gqa.
-
-    Runs fmha_sm100 from a prebuilt plan into the preallocated output buffer.
-    All inputs are stable device tensors built in prepare(), so there is no
-    fmha_sm100_plan call and no host sync inside the captured region.
-    """
-    import fmha_sm100
-
-    fmha_sm100.fmha_sm100(
-        q,
-        k_paged,
-        v_paged,
-        gqa_plan,
+        plan,
         kv_indices=kv_indices,
         kv_block_indexes=kv_block_indexes,
         out=out,
         sm_scale=sm_scale,
         output_maxscore=False,
     )
+    return out_result
 
 
 class MsaSparseGqaFmha(Fmha):
@@ -236,34 +206,25 @@ class MsaSparseGqaFmha(Fmha):
 
         k_paged, v_paged = msa_paged_kv(kv_cache_manager, layer_idx)
 
-        # Decode runs from the prebuilt graph-safe plan; prefill plans eagerly.
-        if metadata.msa_decode_gqa_plan is not None:
-            run_msa_sparse_gqa_decode(
-                q3,
-                k_paged,
-                v_paged,
-                kv_block_indexes,
-                gqa_plan=metadata.msa_decode_gqa_plan,
-                kv_indices=metadata._msa_kv_indices_buf,
-                out=out_view,
-                sm_scale=self._sm_scale(),
-            )
-            return
-
-        out = run_msa_sparse_gqa(
+        # One run path (FlashInfer style): decode passes the prebuilt graph-safe
+        # plan; prefill leaves plan=None and it is built inline. The full
+        # kv_indices buffer is bounded by the plan's page indptr, and the result
+        # is written in place into the model's output buffer.
+        run_msa_sparse_gqa(
             q3,
             k_paged,
             v_paged,
             kv_block_indexes,
+            kv_indices=metadata._msa_kv_indices_buf,
+            sm_scale=self._sm_scale(),
             qo_lens_cpu=metadata.msa_qo_lens_cpu,
             kv_lens_cpu=metadata.msa_kv_lens_cpu,
             qo_offset_cpu=metadata.msa_qo_offset_cpu,
-            kv_indices=metadata.msa_kv_indices,
-            sm_scale=self._sm_scale(),
             causal=True,
             head_dim=self.HEAD_DIM,
+            plan=metadata.msa_decode_gqa_plan,
+            out=out_view,
         )
-        out_view.copy_(out.view_as(out_view))
 
 
-__all__ = ["MsaSparseGqaFmha", "run_msa_sparse_gqa", "run_msa_sparse_gqa_decode"]
+__all__ = ["MsaSparseGqaFmha", "run_msa_sparse_gqa"]
