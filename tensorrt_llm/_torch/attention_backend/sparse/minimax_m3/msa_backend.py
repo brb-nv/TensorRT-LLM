@@ -236,6 +236,12 @@ def get_minimax_m3_msa_attention_backend_cls():
         _msa_gqa_plan: Optional["_MsaGraphSafePlan"] = None
         _msa_max_score_buf: Optional[torch.Tensor] = None
         _msa_n_valid_blocks_buf: Optional[torch.Tensor] = None
+        # Persistent staging buffers for the dense oracle attachment (m3_meta +
+        # out_cache_loc). Under CUDA graph these keep the dense path's tensor
+        # addresses stable across replays, matching the Triton reference. One
+        # dict per metadata clone (create_cuda_graph_metadata clones per batch
+        # size); it is not keyed by batch size.
+        _m3_static_buffers: Optional[dict] = None
 
         def __post_init__(self) -> None:
             super().__post_init__()
@@ -320,6 +326,34 @@ def get_minimax_m3_msa_attention_backend_cls():
                 return
             layer.build_decode_plans(self)
 
+        def _maybe_get_m3_static_buffers(self, cache_device) -> Optional[dict]:
+            """Return persistent staging buffers for the dense oracle attachment.
+
+            Used only to keep the dense path's m3_meta / out_cache_loc addresses
+            stable under CUDA graph. Returns None in eager mode (fresh per-call
+            tensors are fine there). The first graph-mode call installs a
+            placeholder dict; build_runtime_metadata_from_kv_manager allocates
+            the persistent tensors lazily on first use and refreshes them in
+            place afterwards.
+            """
+            need_static = bool(self.is_cuda_graph) or self._m3_static_buffers is not None
+            if not need_static:
+                return None
+            if self._m3_static_buffers is not None and (
+                self._m3_static_buffers.get("device") == cache_device
+            ):
+                return self._m3_static_buffers
+            max_num_sequences = int(
+                getattr(self, "max_num_sequences", None) or self.max_num_requests
+            )
+            max_num_tokens = int(getattr(self, "max_num_tokens", None) or max_num_sequences)
+            self._m3_static_buffers = {
+                "device": cache_device,
+                "max_num_sequences_hint": max_num_sequences,
+                "max_num_tokens_hint": max_num_tokens,
+            }
+            return self._m3_static_buffers
+
         def _build_msa_fields(self) -> None:
             """Populate the MSA buffers for this step and expose sliced views.
 
@@ -373,6 +407,13 @@ def get_minimax_m3_msa_attention_backend_cls():
                     "decoding or use the non-MSA MiniMax-M3 backend."
                 )
 
+            # Under CUDA graph the dense oracle attachment (m3_meta +
+            # out_cache_loc) must keep stable tensor addresses across replays,
+            # so build it into persistent staging buffers, matching the Triton
+            # reference. The sparse path copies what it needs into its own
+            # buffers below, so this only affects the dense attachment.
+            static_buffers = self._maybe_get_m3_static_buffers(cache_device)
+
             if is_prefill:
                 prefix_lens_list = [int(num_cached[b]) for b in range(batch_size)]
                 qo_lens_list = [kv_lens_list[b] - prefix_lens_list[b] for b in range(batch_size)]
@@ -386,6 +427,7 @@ def get_minimax_m3_msa_attention_backend_cls():
                     prefix_lens=prefix_lens,
                     extend_seq_lens_cpu=qo_lens_list,
                     device=cache_device,
+                    static_buffers=static_buffers,
                 )
             else:
                 qo_lens_list = [1] * batch_size
@@ -396,6 +438,7 @@ def get_minimax_m3_msa_attention_backend_cls():
                     seq_lens_cpu=kv_lens_cpu,
                     is_prefill=False,
                     device=cache_device,
+                    static_buffers=static_buffers,
                 )
 
             qo_lens_cpu = torch.tensor(qo_lens_list, dtype=torch.int32)
