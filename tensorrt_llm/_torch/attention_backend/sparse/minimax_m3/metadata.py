@@ -747,15 +747,20 @@ def build_runtime_metadata_from_kv_manager(
             # needs more.
             max_num_tokens_hint = int(static_buffers.get("max_num_tokens_hint", max_num_sequences))
             max_num_tokens = max(max_num_sequences, max_num_tokens_hint)
-            # Grow ``max_kv_len`` to the current call's actual width plus
-            # one extra block of headroom so any decode-step growth (one
-            # newly-allocated block per generated token) does not force
-            # a reallocation. The captured graph references the
-            # ``data_ptr()`` we pick here, so we cannot grow this buffer
-            # after capture.
-            max_kv_len_alloc = max(
-                max_kv_len + tokens_per_block, max_num_sequences_hint * tokens_per_block
-            )
+            # The captured graph references the ``data_ptr()`` we pick
+            # here, so the buffer cannot grow after capture: size the
+            # width for the largest kv any request can ever reach - the
+            # manager-level max_seq_len (includes the spec-dec margins) -
+            # plus one block of headroom. The previous floor
+            # (max_num_sequences * tokens_per_block) allocated GiB-scale
+            # buffers per graph bucket for no benefit.
+            engine_bound = int(getattr(kv_cache_manager, "max_seq_len", 0) or 0)
+            if engine_bound > 0:
+                max_kv_len_alloc = max(max_kv_len, engine_bound) + tokens_per_block
+            else:
+                max_kv_len_alloc = max(
+                    max_kv_len + tokens_per_block, max_num_sequences_hint * tokens_per_block
+                )
 
             allocated = allocate_minimax_m3_static_buffers(
                 max_num_sequences=max_num_sequences,
