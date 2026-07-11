@@ -12,10 +12,9 @@ Contains:
     the :class:`AttentionMetadata` subclass the pyexecutor wires into
     the M3 sparse layer's forward path.
 
-The layer-invariant config bundles (:class:`MiniMaxM3SparseParams`,
-:class:`MiniMaxM3SparseConfig`) and the runtime builder
-:func:`build_runtime_metadata_from_kv_manager` are shared with the MSA path;
-the MSA backend imports the builder from here to derive its page table.
+The layer-invariant config bundles (MiniMaxM3SparseParams,
+MiniMaxM3SparseConfig) live in common, alongside the backend-neutral paged-cache
+slot mapping (build_paged_kv_slot_mapping) shared with the MSA path.
 """
 
 from __future__ import annotations
@@ -297,6 +296,84 @@ def allocate_minimax_m3_static_buffers(
     }
 
 
+def _build_runtime_metadata_fresh(
+    *,
+    kv_cache_manager,
+    request_ids,
+    seq_lens: torch.Tensor,
+    seq_lens_cpu: torch.Tensor,
+    is_prefill: bool,
+    prefix_lens: Optional[torch.Tensor],
+    extend_seq_lens_cpu: Optional[List[int]],
+    device: torch.device,
+) -> Tuple[MiniMaxM3TritonSparseAttentionMetadata, torch.Tensor]:
+    """Fresh-allocation build of the Triton reference metadata.
+
+    Delegates the backend-neutral req_to_token, slot_ids and out_cache_loc
+    derivation to common.build_paged_kv_slot_mapping and adds the Triton-only
+    fields: cu_seqlens_q, prefix_lens on device, and the scalar max_seqlen
+    values and per-query-token tensors that prepare() computes. Used when no
+    graph-stable static_buffers are supplied; the static_buffers path in
+    build_runtime_metadata_from_kv_manager keeps its own in-place buffer writes.
+    """
+    from .common import build_paged_kv_slot_mapping
+
+    batch = int(seq_lens.shape[0])
+    seq_lens_dev = seq_lens.to(device) if seq_lens.device != device else seq_lens
+
+    if is_prefill:
+        if extend_seq_lens_cpu is None:
+            raise ValueError("prefill metadata requires extend_seq_lens_cpu")
+        if prefix_lens is None:
+            raise ValueError("prefill metadata requires prefix_lens")
+        prefix_lens_dev = prefix_lens.to(device) if prefix_lens.device != device else prefix_lens
+        qo_lens_cpu = torch.tensor([int(x) for x in extend_seq_lens_cpu], dtype=torch.int32)
+        qo_offset_cpu = prefix_lens.detach().to(device="cpu", dtype=torch.int32)
+        req_to_token, slot_ids, out_cache_loc = build_paged_kv_slot_mapping(
+            kv_cache_manager=kv_cache_manager,
+            request_ids=request_ids,
+            qo_lens_cpu=qo_lens_cpu,
+            qo_offset_cpu=qo_offset_cpu,
+            device=device,
+        )
+        cu_q: List[int] = [0]
+        for ext in extend_seq_lens_cpu:
+            cu_q.append(cu_q[-1] + int(ext))
+        cu_seqlens_q = torch.tensor(cu_q, dtype=torch.int32, device=device)
+        meta = MiniMaxM3TritonSparseAttentionMetadata(
+            is_prefill=True,
+            req_to_token=req_to_token,
+            slot_ids=slot_ids,
+            seq_lens=seq_lens_dev,
+            seq_lens_cpu=seq_lens_cpu,
+            prefix_lens=prefix_lens_dev,
+            cu_seqlens_q=cu_seqlens_q,
+            extend_seq_lens_cpu=list(extend_seq_lens_cpu),
+            q_batch_row=None,
+            q_positions=None,
+        )
+    else:
+        # Decode: the new token sits at position seq_lens[b] - 1.
+        qo_lens_cpu = torch.ones(batch, dtype=torch.int32)
+        qo_offset_cpu = seq_lens_cpu.detach().to(device="cpu", dtype=torch.int32) - 1
+        req_to_token, slot_ids, out_cache_loc = build_paged_kv_slot_mapping(
+            kv_cache_manager=kv_cache_manager,
+            request_ids=request_ids,
+            qo_lens_cpu=qo_lens_cpu,
+            qo_offset_cpu=qo_offset_cpu,
+            device=device,
+        )
+        meta = MiniMaxM3TritonSparseAttentionMetadata(
+            is_prefill=False,
+            req_to_token=req_to_token,
+            slot_ids=slot_ids,
+            seq_lens=seq_lens_dev,
+            seq_lens_cpu=seq_lens_cpu,
+        )
+    meta.prepare()
+    return meta, out_cache_loc
+
+
 def build_runtime_metadata_from_kv_manager(
     *,
     kv_cache_manager,
@@ -344,6 +421,21 @@ def build_runtime_metadata_from_kv_manager(
     the end-to-end runtime path without going through the full LLM
     forward.
     """
+    if device is None:
+        device = seq_lens.device
+
+    if static_buffers is None:
+        return _build_runtime_metadata_fresh(
+            kv_cache_manager=kv_cache_manager,
+            request_ids=request_ids,
+            seq_lens=seq_lens,
+            seq_lens_cpu=seq_lens_cpu,
+            is_prefill=is_prefill,
+            prefix_lens=prefix_lens,
+            extend_seq_lens_cpu=extend_seq_lens_cpu,
+            device=device,
+        )
+
     tokens_per_block = int(kv_cache_manager.tokens_per_block)
     # block_ids_per_seq is a [batch_size, max_blocks_per_seq] tensor; row b
     # holds the block ids assigned to request_ids[b] in order.
@@ -351,8 +443,6 @@ def build_runtime_metadata_from_kv_manager(
     batch = int(seq_lens.shape[0])
     max_blocks = int(block_ids.shape[1])
     max_kv_len = max_blocks * tokens_per_block
-    if device is None:
-        device = seq_lens.device
 
     if static_buffers is not None:
         if static_buffers.get("device") != device:

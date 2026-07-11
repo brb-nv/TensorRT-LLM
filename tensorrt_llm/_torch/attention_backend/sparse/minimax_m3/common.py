@@ -6,13 +6,14 @@ Both the Triton reference and the MSA (fmha_sm100) path share these
 backend-neutral pieces: the lowered parameter and per-rank kernel config
 bundles, the lazy fmha_sm100 import guard, kernel precondition constants,
 block-priority sentinels, paged cache layout adapters, KV-slot writers,
-per-query valid-block counting, and torch top-k block selection.
+the paged-cache slot mapping builder, per-query valid-block counting, and
+torch top-k block selection.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Literal, Optional, Tuple
+from typing import List, Literal, Optional, Tuple
 
 import torch
 
@@ -222,6 +223,61 @@ def write_msa_main_kv(
     write_kv_slots(v_view, out_cache_loc, v.reshape(num_tokens, num_kv_heads, head_dim))
 
 
+def build_paged_kv_slot_mapping(
+    *,
+    kv_cache_manager,
+    request_ids,
+    qo_lens_cpu: torch.Tensor,
+    qo_offset_cpu: torch.Tensor,
+    device: torch.device,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build the backend-neutral paged-cache slot mapping.
+
+    Returns (req_to_token, slot_ids, out_cache_loc), derived only from the paged
+    KV cache manager and the per-request query geometry, with no dependency on
+    any backend-specific metadata.
+
+    req_to_token is the [batch, max_kv_len] int32 map from (request, position)
+    to a global slot id, expanded from get_block_ids_per_seq with
+    tokens_per_block as block_id * tokens_per_block + offset_within_block.
+    slot_ids is the [batch] identity row index into req_to_token. out_cache_loc
+    lists the per-new-token slot ids in flattened query order: request b
+    contributes positions qo_offset[b] through qo_offset[b] + qo_lens[b] - 1.
+    That one formula covers prefill (qo_offset is the prefix length) and decode
+    (qo_offset is kv_len - 1 with qo_len 1).
+
+    The req_to_token reads that build out_cache_loc sync the host, so call this
+    only from prepare(), never from the forward path.
+    """
+    tokens_per_block = int(kv_cache_manager.tokens_per_block)
+    # block_ids_per_seq is a [batch, max_blocks_per_seq] tensor; row b holds the
+    # block ids assigned to request_ids[b] in order.
+    block_ids = kv_cache_manager.get_block_ids_per_seq(list(request_ids))
+    batch = int(qo_lens_cpu.shape[0])
+    max_blocks = int(block_ids.shape[1])
+    max_kv_len = max_blocks * tokens_per_block
+
+    # Expand block ids -> per-token slot ids.
+    block_ids_dev = block_ids.to(device).to(torch.int64)
+    within_block = torch.arange(tokens_per_block, device=device, dtype=torch.int64)
+    # Outer product per batch entry: [batch, max_blocks, tokens_per_block]
+    slot_grid = block_ids_dev.unsqueeze(-1) * tokens_per_block + within_block
+    req_to_token = slot_grid.reshape(batch, max_kv_len).to(torch.int32)
+    slot_ids = torch.arange(batch, device=device, dtype=torch.int32)
+
+    # out_cache_loc: per-new-token slot ids, in flattened query-token order.
+    req_to_token_cpu = req_to_token.to("cpu")
+    qo_lens_list = qo_lens_cpu.to(torch.long).tolist()
+    qo_offset_list = qo_offset_cpu.to(torch.long).tolist()
+    out_cache_loc_list: List[int] = []
+    for b in range(batch):
+        start = int(qo_offset_list[b])
+        for offset in range(int(qo_lens_list[b])):
+            out_cache_loc_list.append(int(req_to_token_cpu[b, start + offset].item()))
+    out_cache_loc = torch.tensor(out_cache_loc_list, dtype=torch.int32, device=device)
+    return req_to_token, slot_ids, out_cache_loc
+
+
 def build_kv_page_indices(
     req_to_token: torch.Tensor,
     slot_ids: torch.Tensor,
@@ -342,6 +398,7 @@ __all__ = [
     "MiniMaxM3SparseConfig",
     "MiniMaxM3SparseParams",
     "build_kv_page_indices",
+    "build_paged_kv_slot_mapping",
     "cache_view_to_msa_paged",
     "msa_paged_kv",
     "per_token_valid_blocks",

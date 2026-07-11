@@ -37,12 +37,12 @@ from .common import (
     MSA_REQUIRED_TOPK,
     MiniMaxM3SparseConfig,
     build_kv_page_indices,
+    build_paged_kv_slot_mapping,
     per_token_valid_blocks,
     require_msa_module,
     write_kv_slots,
 )
 from .msa_indexer import MsaIndexer
-from .triton_metadata import build_runtime_metadata_from_kv_manager
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention_backend.interface import AttentionForwardArgs
@@ -323,7 +323,7 @@ def get_minimax_m3_msa_attention_backend_cls():
             """Populate the MSA buffers for this step and expose sliced views.
 
             The page table and per-new-token cache slots are derived via the
-            tested build_runtime_metadata_from_kv_manager path, then copied into
+            backend-neutral build_paged_kv_slot_mapping helper, then copied into
             the persistent buffers. Only the sliced views are exposed as the
             public msa_* fields; the transient builder result is discarded.
             """
@@ -360,7 +360,6 @@ def get_minimax_m3_msa_attention_backend_cls():
                 int(num_cached[b]) + int(seq_lens_cpu[b].item()) for b in range(batch_size)
             ]
             kv_lens_cpu = torch.tensor(kv_lens_list, dtype=torch.int32)
-            kv_lens_dev = kv_lens_cpu.to(device=cache_device, non_blocking=True)
 
             is_prefill = num_contexts > 0
             if not is_prefill and int(seq_lens_cpu[:batch_size].max().item()) > 1:
@@ -370,41 +369,29 @@ def get_minimax_m3_msa_attention_backend_cls():
                     "decoding or use the non-MSA MiniMax-M3 backend."
                 )
 
-            # The builder runs only in prepare() (outside CUDA-graph capture),
-            # so its fresh per-call tensors are fine: the sparse and dense
-            # forwards read only the persistent msa_* buffers copied into below,
-            # never the transient m3_meta. That is why no static staging buffer
-            # is needed here.
+            # Per-request query geometry. For prefill the new chunk starts at the
+            # prefix (num_cached) and spans the remaining kv_len; for decode the
+            # single new token sits at kv_len - 1. Both collapse to the same
+            # qo_offset/qo_len pair build_paged_kv_slot_mapping consumes.
             if is_prefill:
                 prefix_lens_list = [int(num_cached[b]) for b in range(batch_size)]
                 qo_lens_list = [kv_lens_list[b] - prefix_lens_list[b] for b in range(batch_size)]
-                prefix_lens = torch.tensor(prefix_lens_list, dtype=torch.int32, device=cache_device)
-                m3_meta, out_cache_loc = build_runtime_metadata_from_kv_manager(
-                    kv_cache_manager=kv_cache_manager,
-                    request_ids=request_ids,
-                    seq_lens=kv_lens_dev,
-                    seq_lens_cpu=kv_lens_cpu,
-                    is_prefill=True,
-                    prefix_lens=prefix_lens,
-                    extend_seq_lens_cpu=qo_lens_list,
-                    device=cache_device,
-                )
             else:
                 qo_lens_list = [1] * batch_size
-                m3_meta, out_cache_loc = build_runtime_metadata_from_kv_manager(
-                    kv_cache_manager=kv_cache_manager,
-                    request_ids=request_ids,
-                    seq_lens=kv_lens_dev,
-                    seq_lens_cpu=kv_lens_cpu,
-                    is_prefill=False,
-                    device=cache_device,
-                )
-
             qo_lens_cpu = torch.tensor(qo_lens_list, dtype=torch.int32)
             qo_offset_cpu = kv_lens_cpu - qo_lens_cpu
-            kv_indices = build_kv_page_indices(
-                m3_meta.req_to_token, m3_meta.slot_ids, kv_lens_cpu, page_size
+
+            # The mapping is built in prepare(), outside CUDA-graph capture, so
+            # its fresh per-call tensors are fine: the forwards read only the
+            # persistent msa_* buffers filled below, not these transients.
+            req_to_token, slot_ids, out_cache_loc = build_paged_kv_slot_mapping(
+                kv_cache_manager=kv_cache_manager,
+                request_ids=request_ids,
+                qo_lens_cpu=qo_lens_cpu,
+                qo_offset_cpu=qo_offset_cpu,
+                device=cache_device,
             )
+            kv_indices = build_kv_page_indices(req_to_token, slot_ids, kv_lens_cpu, page_size)
 
             total_new_tokens = int(out_cache_loc.shape[0])
             total_pages = int(kv_indices.shape[0])

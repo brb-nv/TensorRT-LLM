@@ -4,17 +4,18 @@
 
 Layered as:
 
-  * :mod:`.metadata`        -- ``MiniMaxM3SparseConfig`` /
-                                ``MiniMaxM3TritonSparseAttentionMetadata``
-                                dataclasses, CUDA-graph-stable buffer
+  * :mod:`.triton_metadata` -- ``MiniMaxM3TritonSparseAttentionMetadata``
+                                dataclass, CUDA-graph-stable buffer
                                 allocator + builder, and the
                                 :class:`AttentionMetadata` subclass
-                                factory. Shared by both backends.
+                                factory for the Triton reference path.
   * :mod:`.cache_manager`   -- standalone side index cache used by tests
                                 and the :class:`KVCacheManagerV2`
                                 subclass factory. Shared by both backends.
-  * :mod:`.common`          -- backend-neutral paged-cache and top-k
-                                primitives shared by both backends.
+  * :mod:`.common`          -- backend-neutral config bundles, paged-cache
+                                primitives (slot mapping, page indices,
+                                KV-slot writers), and top-k selection
+                                shared by both backends.
   * :mod:`.triton_kernels`  -- OpenAI Triton kernels (per-block max
                                 score, masked softmax for sparse GQA).
   * :mod:`.triton_backend`  -- the Triton reference algorithm (vectorized
