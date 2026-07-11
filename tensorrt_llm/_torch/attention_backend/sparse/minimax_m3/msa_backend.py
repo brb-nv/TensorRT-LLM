@@ -4,14 +4,14 @@
 
 Mimics DSATrtllmAttention:
 
-  * MsaMinimaxM3Attention subclasses TrtllmAttention and reuses its
+  * MiniMaxM3MsaSparseAttention subclasses TrtllmAttention and reuses its
     inherited forward, overriding only the sparse hooks and owning an
     MsaIndexer.
   * The main sparse GQA runs through the registered MsaSparseGqaFmha.
   * The indexer calls fmha_sm100 directly to produce the per-query selected
     block indices, which the model layer threads through
     forward_args.topk_indices.
-  * MsaMinimaxM3AttentionMetadata subclasses TrtllmAttentionMetadata and
+  * MiniMaxM3MsaSparseAttentionMetadata subclasses TrtllmAttentionMetadata and
     stores its per-forward MSA tensors in CUDA-graph-stable buffers.
     Following DSAtrtllmAttentionMetadata, the buffers are allocated once in
     __post_init__ via get_empty(capture_graph=...), and prepare() copies the
@@ -35,13 +35,14 @@ from tensorrt_llm._utils import prefer_pinned
 from .common import (
     MSA_REQUIRED_HEAD_DIM,
     MSA_REQUIRED_TOPK,
+    MiniMaxM3SparseConfig,
     build_kv_page_indices,
     per_token_valid_blocks,
     require_msa_module,
     write_kv_slots,
 )
-from .indexer import MsaIndexer
-from .metadata import MiniMaxM3SparseConfig, build_runtime_metadata_from_kv_manager
+from .msa_indexer import MsaIndexer
+from .triton_metadata import build_runtime_metadata_from_kv_manager
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention_backend.interface import AttentionForwardArgs
@@ -152,7 +153,7 @@ class _MsaGraphSafePlan:
 def _lookup_msa_attention_layer(layer_idx: int):
     """Resolve the MSA sparse backend for a layer via the model layer registry.
 
-    Returns the MsaMinimaxM3Attention backend (which owns the geometry) or None
+    Returns the MiniMaxM3MsaSparseAttention backend (which owns the geometry) or None
     when the registry is unavailable, e.g. focused tests that build metadata
     without running the model. Reuses the same per-layer registry the attention
     custom op uses; it is not a separate geometry singleton.
@@ -177,7 +178,7 @@ def _lookup_msa_attention_layer(layer_idx: int):
 
 @functools.lru_cache(maxsize=1)
 def get_minimax_m3_msa_attention_backend_cls():
-    """Return MsaMinimaxM3Attention (the MSA backend selection entry point)."""
+    """Return MiniMaxM3MsaSparseAttention (the MSA backend selection entry point)."""
     from dataclasses import dataclass
 
     from tensorrt_llm._torch.attention_backend.trtllm import (
@@ -186,7 +187,7 @@ def get_minimax_m3_msa_attention_backend_cls():
     )
 
     @dataclass(init=False)
-    class MsaMinimaxM3AttentionMetadata(TrtllmAttentionMetadata):
+    class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         """TrtllmAttentionMetadata for MiniMax-M3 MSA sparse layers.
 
         Only the tensors the sparse GQA and cache write actually consume are
@@ -442,10 +443,10 @@ def get_minimax_m3_msa_attention_backend_cls():
                 cache, self.msa_out_cache_loc, idx_k.reshape(num_tokens, 1, sparse_index_dim)
             )
 
-    class MsaMinimaxM3Attention(TrtllmAttention):
+    class MiniMaxM3MsaSparseAttention(TrtllmAttention):
         """MSA-backed MiniMax-M3 sparse attention (mimics DSATrtllmAttention)."""
 
-        Metadata = MsaMinimaxM3AttentionMetadata
+        Metadata = MiniMaxM3MsaSparseAttentionMetadata
 
         def __init__(
             self,
@@ -508,7 +509,7 @@ def get_minimax_m3_msa_attention_backend_cls():
         def build_decode_plans(self, metadata) -> None:
             """Build the graph-safe decode plans and buffers on the metadata.
 
-            Invoked from MsaMinimaxM3AttentionMetadata.prepare() (outside CUDA
+            Invoked from MiniMaxM3MsaSparseAttentionMetadata.prepare() (outside CUDA
             graph capture) by the first sparse layer, since the plans are
             layer-invariant. Uses this layer's geometry plus the metadata's
             per-request lengths to build the proxy max-score plan, the sparse
@@ -662,6 +663,83 @@ def get_minimax_m3_msa_attention_backend_cls():
                 n_valid_blocks=metadata.msa_n_valid_blocks,
             )
 
+        def run_sparse_attention(
+            self,
+            q: torch.Tensor,
+            k: torch.Tensor,
+            v: torch.Tensor,
+            idx_q: torch.Tensor,
+            idx_k: torch.Tensor,
+            metadata,
+            output: torch.Tensor,
+        ) -> torch.Tensor:
+            """Select the KV blocks, then run the sparse GQA into output.
+
+            Mirrors DSA: pick blocks with the indexer, publish them through
+            forward_args.topk_indices, and let the inherited TrtllmAttention
+            forward dispatch the sparse GQA. This backend writes the main and
+            index caches itself.
+            """
+            from tensorrt_llm._torch.attention_backend.interface import AttentionForwardArgs
+
+            kv_block_indexes = self.run_indexer(idx_q, idx_k, metadata)
+            forward_args = AttentionForwardArgs(output=output, topk_indices=kv_block_indexes)
+            self.forward(q, k, v, metadata, forward_args=forward_args)
+            return output
+
+        def run_dense_attention(
+            self,
+            q: torch.Tensor,
+            k: torch.Tensor,
+            v: torch.Tensor,
+            metadata,
+            output: torch.Tensor,
+        ) -> torch.Tensor:
+            """Run dense paged GQA through fmha_sm100 into output.
+
+            The dense MiniMax-M3 layers share the main K/V cache geometry with
+            the sparse layers, so they reuse the plan/run split with
+            kv_block_indexes left unset: the kernel then attends the full page
+            table instead of top-k blocks. The graph-safe dense plan is built in
+            build_decode_plans; prefill leaves it None and plans inline.
+            """
+            from tensorrt_llm._torch.attention_backend.fmha.msa_sparse_gqa import run_msa_sparse_gqa
+
+            from .common import msa_paged_kv, write_msa_main_kv
+
+            kv_cache_manager = metadata.kv_cache_manager
+            if kv_cache_manager is None:
+                raise RuntimeError(
+                    f"MiniMax-M3 dense forward (layer {self.layer_idx}) requires "
+                    "attn_metadata.kv_cache_manager to be a MiniMaxM3KVCacheManagerV2."
+                )
+
+            # fmha_sm100 reads the paged cache directly, so the new-token K/V
+            # must be resident before the GQA runs.
+            write_msa_main_kv(kv_cache_manager, self.layer_idx, metadata.msa_out_cache_loc, k, v)
+
+            num_tokens = int(q.shape[0])
+            q3 = q.view(num_tokens, self.num_heads, self.head_dim)
+            out_view = output.view(num_tokens, self.num_heads, self.head_dim)
+            k_paged, v_paged = msa_paged_kv(kv_cache_manager, self.layer_idx)
+            sm_scale = (self.head_dim**-0.5) / float(self.q_scaling)
+
+            run_msa_sparse_gqa(
+                q3,
+                k_paged,
+                v_paged,
+                kv_indices=metadata._msa_kv_indices_buf,
+                sm_scale=sm_scale,
+                qo_lens_cpu=metadata.msa_qo_lens_cpu,
+                kv_lens_cpu=metadata.msa_kv_lens_cpu,
+                qo_offset_cpu=metadata.msa_qo_offset_cpu,
+                causal=True,
+                head_dim=self.head_dim,
+                plan=metadata.msa_decode_dense_plan,
+                out=out_view,
+            )
+            return output
+
         def sparse_attn_predict(
             self,
             q: torch.Tensor,
@@ -683,7 +761,7 @@ def get_minimax_m3_msa_attention_backend_cls():
         ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
             return None, None
 
-    return MsaMinimaxM3Attention
+    return MiniMaxM3MsaSparseAttention
 
 
 __all__ = ["get_minimax_m3_msa_attention_backend_cls"]

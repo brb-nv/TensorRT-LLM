@@ -1,19 +1,22 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Shared low-level helpers for the MiniMax-M3 sparse attention backends.
+"""Shared building blocks for the MiniMax-M3 sparse attention backends.
 
-Hosts pure primitives with no backend-specific dependencies so both the
-Triton reference and the MSA (fmha_sm100) path can share them: the lazy
-fmha_sm100 import guard, kernel precondition constants, block-priority
-sentinels, paged cache layout adapters, KV-slot writers, per-query
-valid-block counting, and torch top-k block selection.
+Both the Triton reference and the MSA (fmha_sm100) path share these
+backend-neutral pieces: the lowered parameter and per-rank kernel config
+bundles, the lazy fmha_sm100 import guard, kernel precondition constants,
+block-priority sentinels, paged cache layout adapters, KV-slot writers,
+per-query valid-block counting, and torch top-k block selection.
 """
 
 from __future__ import annotations
 
-from typing import Optional, Tuple
+from dataclasses import dataclass, field
+from typing import Literal, Optional, Tuple
 
 import torch
+
+from ..params import SparseParams
 
 # fmha_sm100 ships only head_dim 128 variants and the MiniMax-M3 checkpoint
 # selects topk 16. Callers enforce these early so a misconfiguration fails
@@ -25,6 +28,112 @@ MSA_REQUIRED_HEAD_DIM = 128
 # of their computed score. Init outranks local.
 _INIT_SCORE = 1e30
 _LOCAL_SCORE = 1e29
+
+
+@dataclass(frozen=True)
+class MiniMaxM3SparseParams(SparseParams):
+    """Lowered runtime parameters for the MiniMax-M3 sparse backend."""
+
+    algorithm: Literal["minimax_m3"] = field(init=False, default="minimax_m3")
+    num_index_heads: int = 4
+    sparse_index_dim: int = 128
+    block_size: int = 128
+    topk: int = 16
+    init_blocks: int = 0
+    local_blocks: int = 1
+    score_type: str = "max"
+    disable_index_value: bool = True
+    # Select the MSA (fmha_sm100) kernels instead of the Triton reference.
+    # Requires an SM100 GPU and the fmha_sm100 package.
+    use_msa: bool = False
+
+    @property
+    def indices_block_size(self) -> int:
+        """Block granularity of the selected sparse indices.
+
+        Read by the shared TrtllmAttention forward when publishing the
+        sparse prediction. It equals the per-block scoring size.
+        """
+        return self.block_size
+
+
+@dataclass(frozen=True)
+class MiniMaxM3SparseConfig:
+    """Per-rank kernel parameter bundle for MiniMax-M3 sparse attention.
+
+    This is **not** a user-facing config (use
+    :class:`tensorrt_llm.llmapi.llm_args.MiniMaxM3SparseAttentionConfig`
+    for that). It is the layer-invariant, post-TP-shard parameter bundle
+    that backend kernels and reference helpers consume. The user knobs
+    come from :class:`MiniMaxM3SparseParams`; ``num_q_heads`` /
+    ``num_kv_heads`` / ``head_dim`` come from the per-rank model
+    geometry and must be supplied by the caller (typically via
+    :meth:`from_sparse_params`).
+    """
+
+    num_q_heads: int
+    num_kv_heads: int
+    head_dim: int
+    num_index_heads: int
+    sparse_index_dim: int
+    block_size: int
+    topk: int
+    init_blocks: int = 0
+    local_blocks: int = 1
+    score_type: str = "max"
+
+    def __post_init__(self) -> None:
+        if self.num_q_heads % self.num_kv_heads != 0:
+            raise ValueError(
+                f"num_q_heads ({self.num_q_heads}) must be divisible by "
+                f"num_kv_heads ({self.num_kv_heads})"
+            )
+        if self.num_index_heads % self.num_kv_heads != 0:
+            raise ValueError(
+                f"num_index_heads ({self.num_index_heads}) must be divisible "
+                f"by num_kv_heads ({self.num_kv_heads})"
+            )
+        if self.block_size <= 0:
+            raise ValueError(f"block_size must be > 0, got {self.block_size}")
+        if self.topk <= 0:
+            raise ValueError(f"topk must be > 0, got {self.topk}")
+        if self.init_blocks < 0:
+            raise ValueError(f"init_blocks must be >= 0, got {self.init_blocks}")
+        if self.local_blocks < 0:
+            raise ValueError(f"local_blocks must be >= 0, got {self.local_blocks}")
+        if self.score_type != "max":
+            # SGLang exposes only "max" today and that is what the MiniMax-M3
+            # checkpoint config specifies. Reject anything else explicitly so
+            # a config drift surfaces immediately.
+            raise ValueError(
+                f"score_type={self.score_type!r} is not supported "
+                "(only 'max' matches the SGLang reference)"
+            )
+
+    @classmethod
+    def from_sparse_params(
+        cls,
+        sparse_params: "MiniMaxM3SparseParams",
+        *,
+        num_q_heads: int,
+        num_kv_heads: int,
+        head_dim: int,
+    ) -> "MiniMaxM3SparseConfig":
+        """Build a kernel param bundle from lowered ``MiniMaxM3SparseParams``
+        and the per-rank model geometry.
+        """
+        return cls(
+            num_q_heads=int(num_q_heads),
+            num_kv_heads=int(num_kv_heads),
+            head_dim=int(head_dim),
+            num_index_heads=int(sparse_params.num_index_heads),
+            sparse_index_dim=int(sparse_params.sparse_index_dim),
+            block_size=int(sparse_params.block_size),
+            topk=int(sparse_params.topk),
+            init_blocks=int(sparse_params.init_blocks),
+            local_blocks=int(sparse_params.local_blocks),
+            score_type=str(sparse_params.score_type),
+        )
 
 
 def require_msa_module():
@@ -230,6 +339,8 @@ def select_blocks_from_maxscore(
 __all__ = [
     "MSA_REQUIRED_HEAD_DIM",
     "MSA_REQUIRED_TOPK",
+    "MiniMaxM3SparseConfig",
+    "MiniMaxM3SparseParams",
     "build_kv_page_indices",
     "cache_view_to_msa_paged",
     "msa_paged_kv",

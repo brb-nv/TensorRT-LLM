@@ -13,14 +13,13 @@ from tensorrt_llm._torch.attention_backend.fmha.registry import DEFAULT_FMHA_LIB
 from tensorrt_llm._torch.attention_backend.sparse.minimax_m3 import (
     get_minimax_m3_msa_attention_backend_cls,
 )
-from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.metadata import MiniMaxM3SparseParams
+from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.common import MiniMaxM3SparseParams
 from tensorrt_llm._torch.attention_backend.sparse.utils import _resolve_minimax_m3_backend_cls
 from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttention, TrtllmAttentionMetadata
 from tensorrt_llm.llmapi.llm_args import MiniMaxM3SparseAttentionConfig
 
 _MSA_METADATA_FIELDS = (
     "msa_out_cache_loc",
-    "msa_kv_indices",
     "msa_kv_lens_cpu",
     "msa_qo_lens_cpu",
     "msa_qo_offset_cpu",
@@ -72,7 +71,13 @@ def test_msa_metadata_drops_redundant_intermediate_fields():
     annotations = {}
     for klass in metadata_cls.__mro__:
         annotations.update(getattr(klass, "__annotations__", {}))
-    for field in ("msa_is_prefill", "msa_req_to_token", "msa_slot_ids", "msa_kv_lens_dev"):
+    for field in (
+        "msa_is_prefill",
+        "msa_req_to_token",
+        "msa_slot_ids",
+        "msa_kv_lens_dev",
+        "msa_kv_indices",
+    ):
         assert field not in annotations, f"{field} should no longer be stored"
 
 

@@ -50,13 +50,13 @@ def _resolve_minimax_m3_backend_cls(
     (fmha_sm100) backend is used instead, gated on SM100 availability so an
     unsupported system fails early rather than at kernel launch.
     """
-    from .minimax_m3 import get_minimax_m3_attention_backend_cls
+    from .minimax_m3 import get_minimax_m3_triton_attention_backend_cls
     if getattr(sparse_params, "use_msa", False):
         from .minimax_m3 import get_minimax_m3_msa_attention_backend_cls
         from .minimax_m3.msa_availability import ensure_msa_available
         ensure_msa_available()
         return get_minimax_m3_msa_attention_backend_cls()
-    return get_minimax_m3_attention_backend_cls()
+    return get_minimax_m3_triton_attention_backend_cls()
 
 
 def get_vanilla_sparse_attn_attention_backend(

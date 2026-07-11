@@ -1,21 +1,21 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""MiniMax-M3 sparse attention configuration + per-forward metadata.
+"""MiniMax-M3 Triton reference per-forward metadata.
 
 Contains:
 
-  * :class:`MiniMaxM3SparseConfig`            -- post-TP-shard kernel
-                                                 parameter bundle.
-  * :class:`MiniMaxM3SparseAttentionMetadata` -- per-forward metadata
-                                                 dataclass with a
-                                                 CUDA-graph-safe
-                                                 :meth:`prepare`.
+  * :class:`MiniMaxM3TritonSparseAttentionMetadata` -- per-forward metadata
+    dataclass with a CUDA-graph-safe :meth:`prepare`.
   * Helpers to migrate metadata across devices, build it from a real
-    :class:`KVCacheManagerV2`, and pre-allocate CUDA-graph-stable
-    buffers.
+    :class:`KVCacheManagerV2`, and pre-allocate CUDA-graph-stable buffers.
   * :func:`get_minimax_m3_attention_metadata_cls` -- lazy factory for
     the :class:`AttentionMetadata` subclass the pyexecutor wires into
     the M3 sparse layer's forward path.
+
+The layer-invariant config bundles (:class:`MiniMaxM3SparseParams`,
+:class:`MiniMaxM3SparseConfig`) and the runtime builder
+:func:`build_runtime_metadata_from_kv_manager` are shared with the MSA path;
+the MSA backend imports the builder from here to derive its page table.
 """
 
 from __future__ import annotations
@@ -23,121 +23,13 @@ from __future__ import annotations
 import dataclasses
 import functools
 from dataclasses import dataclass, field
-from typing import List, Literal, Optional, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 
-from ..params import SparseParams
-
-
-@dataclass(frozen=True)
-class MiniMaxM3SparseParams(SparseParams):
-    """Lowered runtime parameters for the MiniMax-M3 sparse backend."""
-
-    algorithm: Literal["minimax_m3"] = field(init=False, default="minimax_m3")
-    num_index_heads: int = 4
-    sparse_index_dim: int = 128
-    block_size: int = 128
-    topk: int = 16
-    init_blocks: int = 0
-    local_blocks: int = 1
-    score_type: str = "max"
-    disable_index_value: bool = True
-    # Select the MSA (fmha_sm100) kernels instead of the Triton reference.
-    # Requires an SM100 GPU and the fmha_sm100 package.
-    use_msa: bool = False
-
-    @property
-    def indices_block_size(self) -> int:
-        """Block granularity of the selected sparse indices.
-
-        Read by the shared TrtllmAttention forward when publishing the
-        sparse prediction. It equals the per-block scoring size.
-        """
-        return self.block_size
-
-
-@dataclass(frozen=True)
-class MiniMaxM3SparseConfig:
-    """Per-rank kernel parameter bundle for MiniMax-M3 sparse attention.
-
-    This is **not** a user-facing config (use
-    :class:`tensorrt_llm.llmapi.llm_args.MiniMaxM3SparseAttentionConfig`
-    for that). It is the layer-invariant, post-TP-shard parameter bundle
-    that backend kernels and reference helpers consume. The user knobs
-    come from :class:`MiniMaxM3SparseParams`; ``num_q_heads`` /
-    ``num_kv_heads`` / ``head_dim`` come from the per-rank model
-    geometry and must be supplied by the caller (typically via
-    :meth:`from_sparse_params`).
-    """
-
-    num_q_heads: int
-    num_kv_heads: int
-    head_dim: int
-    num_index_heads: int
-    sparse_index_dim: int
-    block_size: int
-    topk: int
-    init_blocks: int = 0
-    local_blocks: int = 1
-    score_type: str = "max"
-
-    def __post_init__(self) -> None:
-        if self.num_q_heads % self.num_kv_heads != 0:
-            raise ValueError(
-                f"num_q_heads ({self.num_q_heads}) must be divisible by "
-                f"num_kv_heads ({self.num_kv_heads})"
-            )
-        if self.num_index_heads % self.num_kv_heads != 0:
-            raise ValueError(
-                f"num_index_heads ({self.num_index_heads}) must be divisible "
-                f"by num_kv_heads ({self.num_kv_heads})"
-            )
-        if self.block_size <= 0:
-            raise ValueError(f"block_size must be > 0, got {self.block_size}")
-        if self.topk <= 0:
-            raise ValueError(f"topk must be > 0, got {self.topk}")
-        if self.init_blocks < 0:
-            raise ValueError(f"init_blocks must be >= 0, got {self.init_blocks}")
-        if self.local_blocks < 0:
-            raise ValueError(f"local_blocks must be >= 0, got {self.local_blocks}")
-        if self.score_type != "max":
-            # SGLang exposes only "max" today and that is what the MiniMax-M3
-            # checkpoint config specifies. Reject anything else explicitly so
-            # a config drift surfaces immediately.
-            raise ValueError(
-                f"score_type={self.score_type!r} is not supported "
-                "(only 'max' matches the SGLang reference)"
-            )
-
-    @classmethod
-    def from_sparse_params(
-        cls,
-        sparse_params: "MiniMaxM3SparseParams",
-        *,
-        num_q_heads: int,
-        num_kv_heads: int,
-        head_dim: int,
-    ) -> "MiniMaxM3SparseConfig":
-        """Build a kernel param bundle from lowered ``MiniMaxM3SparseParams``
-        and the per-rank model geometry.
-        """
-        return cls(
-            num_q_heads=int(num_q_heads),
-            num_kv_heads=int(num_kv_heads),
-            head_dim=int(head_dim),
-            num_index_heads=int(sparse_params.num_index_heads),
-            sparse_index_dim=int(sparse_params.sparse_index_dim),
-            block_size=int(sparse_params.block_size),
-            topk=int(sparse_params.topk),
-            init_blocks=int(sparse_params.init_blocks),
-            local_blocks=int(sparse_params.local_blocks),
-            score_type=str(sparse_params.score_type),
-        )
-
 
 @dataclass
-class MiniMaxM3SparseAttentionMetadata:
+class MiniMaxM3TritonSparseAttentionMetadata:
     """Per-forward metadata for MiniMax-M3 sparse attention.
 
     Mirrors the shape of SGLang's
@@ -281,12 +173,12 @@ class MiniMaxM3SparseAttentionMetadata:
 
 
 def ensure_metadata_on_device(
-    metadata: "MiniMaxM3SparseAttentionMetadata",
+    metadata: "MiniMaxM3TritonSparseAttentionMetadata",
     device: torch.device,
-) -> "MiniMaxM3SparseAttentionMetadata":
+) -> "MiniMaxM3TritonSparseAttentionMetadata":
     """Return ``metadata`` with every GPU-consumed tensor on ``device``.
 
-    Constructs a new :class:`MiniMaxM3SparseAttentionMetadata` whose
+    Constructs a new :class:`MiniMaxM3TritonSparseAttentionMetadata` whose
     tensor fields are migrated to ``device`` when they live elsewhere.
     The CPU-side mirror ``seq_lens_cpu`` is preserved because the
     algorithm reads it only when explicitly noted (e.g. for
@@ -316,18 +208,6 @@ def ensure_metadata_on_device(
         q_batch_row=_move(metadata.q_batch_row),
         q_positions=_move(metadata.q_positions),
     )
-
-
-def replace_metadata(
-    metadata: MiniMaxM3SparseAttentionMetadata,
-    **changes,
-) -> MiniMaxM3SparseAttentionMetadata:
-    """Helper around :func:`dataclasses.replace` for ``metadata``.
-
-    Provided so callers can build a decode metadata from a prefill
-    metadata without manually re-typing every field.
-    """
-    return dataclasses.replace(metadata, **changes)
 
 
 def allocate_minimax_m3_static_buffers(
@@ -428,8 +308,8 @@ def build_runtime_metadata_from_kv_manager(
     extend_seq_lens_cpu: Optional[List[int]] = None,
     device: Optional[torch.device] = None,
     static_buffers: Optional[dict] = None,
-) -> Tuple[MiniMaxM3SparseAttentionMetadata, torch.Tensor]:
-    """Build a :class:`MiniMaxM3SparseAttentionMetadata` from a real
+) -> Tuple[MiniMaxM3TritonSparseAttentionMetadata, torch.Tensor]:
+    """Build a :class:`MiniMaxM3TritonSparseAttentionMetadata` from a real
     :class:`MiniMaxM3KVCacheManagerV2`.
 
     Returns the populated metadata plus an ``out_cache_loc`` tensor
@@ -643,7 +523,7 @@ def build_runtime_metadata_from_kv_manager(
             cu_seqlens_q = torch.tensor(cu_q, dtype=torch.int32, device=device)
             q_batch_row = None
             q_positions = None
-        meta = MiniMaxM3SparseAttentionMetadata(
+        meta = MiniMaxM3TritonSparseAttentionMetadata(
             is_prefill=True,
             req_to_token=req_to_token,
             slot_ids=slot_ids,
@@ -675,7 +555,7 @@ def build_runtime_metadata_from_kv_manager(
             out_cache_loc = out_cache_loc_buf[:batch]
         else:
             out_cache_loc = torch.tensor(out_cache_loc_list, dtype=torch.int32, device=device)
-        meta = MiniMaxM3SparseAttentionMetadata(
+        meta = MiniMaxM3TritonSparseAttentionMetadata(
             is_prefill=False,
             req_to_token=req_to_token,
             slot_ids=slot_ids,
@@ -706,7 +586,7 @@ def get_minimax_m3_attention_metadata_cls():
         """:class:`AttentionMetadata` that pre-builds MiniMax-M3 metadata.
 
         Overrides :meth:`prepare` so the M3-sparse
-        :class:`MiniMaxM3SparseAttentionMetadata` and the per-new-token
+        :class:`MiniMaxM3TritonSparseAttentionMetadata` and the per-new-token
         ``out_cache_loc`` are built **once per scheduler step**, on the
         cache device, before the model forward runs.  The result is
         stored as ``self.minimax_m3 = {"metadata": m3_meta,
@@ -721,7 +601,7 @@ def get_minimax_m3_attention_metadata_cls():
 
         minimax_m3: Optional[dict] = None
         # Lazily allocated dict of persistent device buffers used to keep
-        # ``MiniMaxM3SparseAttentionMetadata`` tensor addresses stable
+        # ``MiniMaxM3TritonSparseAttentionMetadata`` tensor addresses stable
         # across CUDA-graph capture/replay. None until the first
         # ``prepare()`` call decides to use them (``is_cuda_graph`` /
         # graph-stable mode).
@@ -917,11 +797,9 @@ def get_minimax_m3_attention_metadata_cls():
 
 
 __all__ = [
-    "MiniMaxM3SparseConfig",
-    "MiniMaxM3SparseAttentionMetadata",
+    "MiniMaxM3TritonSparseAttentionMetadata",
     "allocate_minimax_m3_static_buffers",
     "build_runtime_metadata_from_kv_manager",
     "ensure_metadata_on_device",
     "get_minimax_m3_attention_metadata_cls",
-    "replace_metadata",
 ]

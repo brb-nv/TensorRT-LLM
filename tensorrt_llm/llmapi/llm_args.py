@@ -631,7 +631,7 @@ class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
       2. A sparse GQA attention runs only over the selected blocks.
 
     The selected backend at runtime uses
-    :class:`tensorrt_llm._torch.attention_backend.sparse.minimax_m3.MiniMaxM3SparseAttention`
+    :class:`tensorrt_llm._torch.attention_backend.sparse.minimax_m3.triton_backend.MiniMaxM3TritonSparseAttention`
     on top of a :class:`MiniMaxM3KVCacheManagerV2` that allocates a
     paged side index-K cache (``[num_slots, 1, sparse_index_dim]``)
     parallel to the main K/V cache. The M3 checkpoint sets
@@ -687,7 +687,7 @@ class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
         return self.sparse_block_size
 
     def to_sparse_params(self, **kwargs):
-        from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.metadata import \
+        from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.common import \
             MiniMaxM3SparseParams
 
         return MiniMaxM3SparseParams(

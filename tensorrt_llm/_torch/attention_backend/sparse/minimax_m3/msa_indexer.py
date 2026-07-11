@@ -26,7 +26,7 @@ from .common import (
 )
 
 if TYPE_CHECKING:
-    from .metadata import MiniMaxM3SparseConfig
+    from .common import MiniMaxM3SparseConfig
 
 
 def _proxy_max_score(

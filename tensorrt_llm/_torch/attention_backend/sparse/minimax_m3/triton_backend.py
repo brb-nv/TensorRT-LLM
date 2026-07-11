@@ -46,7 +46,7 @@ CUDA-graph safety
 -----------------
 
 All scalar max lengths (``max_seqlen_q``, ``max_seqlen_k``) are
-pre-computed CPU-side in :meth:`MiniMaxM3SparseAttentionMetadata.prepare`
+pre-computed CPU-side in :meth:`MiniMaxM3TritonSparseAttentionMetadata.prepare`
 and stored as plain Python ints. The hot path uses only batched
 tensor ops with static shapes derived from those CPU-side scalars;
 no ``.item()`` or other GPU-CPU sync runs inside the forward
@@ -63,18 +63,17 @@ from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
 
-from .common import _INIT_SCORE, _LOCAL_SCORE, write_kv_slots
-from .kernels import triton_block_max_score, triton_sparse_softmax
-from .metadata import (
-    MiniMaxM3SparseAttentionMetadata,
-    MiniMaxM3SparseConfig,
+from .common import _INIT_SCORE, _LOCAL_SCORE, MiniMaxM3SparseConfig, write_kv_slots
+from .triton_kernels import triton_block_max_score, triton_sparse_softmax
+from .triton_metadata import (
+    MiniMaxM3TritonSparseAttentionMetadata,
     ensure_metadata_on_device,
     get_minimax_m3_attention_metadata_cls,
 )
 
 if TYPE_CHECKING:
     from .cache_manager import MiniMaxM3SparseIndexCache
-    from .metadata import MiniMaxM3SparseParams
+    from .common import MiniMaxM3SparseParams
 
 
 # ---------------------------------------------------------------------------
@@ -594,7 +593,7 @@ def minimax_m3_sparse_decode(
     v_cache: torch.Tensor,
     idx_k_cache: torch.Tensor,
     idx_v_cache: Optional[torch.Tensor],
-    metadata: MiniMaxM3SparseAttentionMetadata,
+    metadata: MiniMaxM3TritonSparseAttentionMetadata,
     config: MiniMaxM3SparseConfig,
     *,
     disable_index_value: bool,
@@ -689,7 +688,7 @@ def minimax_m3_sparse_prefill(
     idx_q: torch.Tensor,
     idx_k_cache: torch.Tensor,
     idx_v_cache: Optional[torch.Tensor],
-    metadata: MiniMaxM3SparseAttentionMetadata,
+    metadata: MiniMaxM3TritonSparseAttentionMetadata,
     config: MiniMaxM3SparseConfig,
     *,
     disable_index_value: bool,
@@ -796,7 +795,7 @@ def _import_index_cache_cls():
 
 
 @dataclass
-class MiniMaxM3SparseAttention:
+class MiniMaxM3TritonSparseAttention:
     """Thin orchestrator for :func:`minimax_m3_sparse_prefill` and
     :func:`minimax_m3_sparse_decode`.
 
@@ -804,7 +803,7 @@ class MiniMaxM3SparseAttention:
     :class:`MiniMaxM3SparseIndexCache`. The caller is responsible for
     routing the projected Q, K, V, ``idx_q``, ``idx_k`` (and optional
     ``idx_v``) tensors plus the populated
-    :class:`MiniMaxM3SparseAttentionMetadata`.
+    :class:`MiniMaxM3TritonSparseAttentionMetadata`.
     """
 
     config: MiniMaxM3SparseConfig
@@ -841,7 +840,7 @@ class MiniMaxM3SparseAttention:
         idx_q: torch.Tensor,
         k_cache: torch.Tensor,
         v_cache: torch.Tensor,
-        metadata: MiniMaxM3SparseAttentionMetadata,
+        metadata: MiniMaxM3TritonSparseAttentionMetadata,
         *,
         disable_index_value: bool,
         sm_scale: Optional[float] = None,
@@ -897,7 +896,7 @@ class MiniMaxM3SparseAttention:
 
 
 @functools.lru_cache(maxsize=1)
-def get_minimax_m3_attention_backend_cls():
+def get_minimax_m3_triton_attention_backend_cls():
     """Return :class:`MiniMaxM3SparseRuntimeBackend` (lazy import).
 
     Deferring the :class:`AttentionBackend` import keeps the algorithm
@@ -990,7 +989,7 @@ def get_minimax_m3_attention_backend_cls():
             idx_k_cache: torch.Tensor,
             idx_v_cache: Optional[torch.Tensor],
             out_cache_loc: torch.Tensor,
-            m3_metadata: "MiniMaxM3SparseAttentionMetadata",
+            m3_metadata: "MiniMaxM3TritonSparseAttentionMetadata",
             sm_scale: Optional[float] = None,
             idx_sm_scale: Optional[float] = None,
             output: Optional[torch.Tensor] = None,
@@ -1014,7 +1013,7 @@ def get_minimax_m3_attention_backend_cls():
                                           indices to write the new
                                           token's K/V/idx_K to.
                 ``m3_metadata``         : populated
-                                          :class:`MiniMaxM3SparseAttentionMetadata`.
+                                          :class:`MiniMaxM3TritonSparseAttentionMetadata`.
                 ``output``              : optional preallocated final output,
                                           ``[num_tokens, num_q_heads * head_dim]``.
 
@@ -1137,7 +1136,7 @@ def get_minimax_m3_attention_backend_cls():
             idx_k_cache: Optional[torch.Tensor] = None,
             idx_v_cache: Optional[torch.Tensor] = None,
             out_cache_loc: Optional[torch.Tensor] = None,
-            m3_metadata: Optional["MiniMaxM3SparseAttentionMetadata"] = None,
+            m3_metadata: Optional["MiniMaxM3TritonSparseAttentionMetadata"] = None,
             sm_scale: Optional[float] = None,
             idx_sm_scale: Optional[float] = None,
             **kwargs,
@@ -1210,8 +1209,8 @@ def get_minimax_m3_attention_backend_cls():
 
 
 __all__ = [
-    "MiniMaxM3SparseAttention",
-    "get_minimax_m3_attention_backend_cls",
+    "MiniMaxM3TritonSparseAttention",
+    "get_minimax_m3_triton_attention_backend_cls",
     "minimax_m3_sparse_decode",
     "minimax_m3_sparse_prefill",
 ]

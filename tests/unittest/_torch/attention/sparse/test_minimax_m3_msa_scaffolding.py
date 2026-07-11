@@ -8,10 +8,10 @@ do not launch kernels and run without an SM100 GPU.
 """
 
 from tensorrt_llm._torch.attention_backend.sparse.minimax_m3 import (
-    get_minimax_m3_attention_backend_cls,
     get_minimax_m3_msa_attention_backend_cls,
+    get_minimax_m3_triton_attention_backend_cls,
 )
-from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.metadata import MiniMaxM3SparseParams
+from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.common import MiniMaxM3SparseParams
 from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_availability import (
     is_msa_available,
 )
@@ -34,7 +34,9 @@ def test_use_msa_lowers_into_params():
 
 def test_resolver_returns_triton_backend_when_msa_disabled():
     params = MiniMaxM3SparseAttentionConfig().to_sparse_params()
-    assert _resolve_minimax_m3_backend_cls(params) is (get_minimax_m3_attention_backend_cls())
+    assert _resolve_minimax_m3_backend_cls(params) is (
+        get_minimax_m3_triton_attention_backend_cls()
+    )
 
 
 def test_resolver_does_not_fall_back_to_triton_when_msa_requested():
@@ -44,7 +46,7 @@ def test_resolver_does_not_fall_back_to_triton_when_msa_requested():
     except RuntimeError:
         return
     assert resolved is get_minimax_m3_msa_attention_backend_cls()
-    assert resolved is not get_minimax_m3_attention_backend_cls()
+    assert resolved is not get_minimax_m3_triton_attention_backend_cls()
 
 
 def test_is_msa_available_returns_bool():
