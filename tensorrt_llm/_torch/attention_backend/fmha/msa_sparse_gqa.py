@@ -123,12 +123,67 @@ def run_msa_sparse_gqa(
     return out_result
 
 
-class MsaSparseGqaFmha(Fmha):
-    """SM100 block-sparse GQA FMHA powered by MSA's fmha_sm100 kernel.
+def run_msa_paged_gqa(
+    attn: "TrtllmAttention",
+    q: torch.Tensor,
+    k: Optional[torch.Tensor],
+    v: Optional[torch.Tensor],
+    metadata: "TrtllmAttentionMetadata",
+    output: torch.Tensor,
+    *,
+    kv_block_indexes: Optional[torch.Tensor],
+    plan: Optional[tuple],
+) -> None:
+    """Write the new-token main K/V, then run paged GQA into output in place.
 
-    Consumes the indexer's selected KV block indices on
-    forward_args.sparse_prediction.sparse_attn_indices and runs paged GQA
-    over them; is_supported claims only MiniMax-M3 MSA sparse requests.
+    Shared by the sparse layers (kv_block_indexes is the per-query top-k table,
+    with the sparse plan) and the dense layers (kv_block_indexes None, with the
+    dense plan, attending the full page table). fmha_sm100 reads the paged cache
+    directly, so the new-token K/V must be resident before the run.
+    """
+    from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.common import (
+        msa_paged_kv,
+        write_msa_main_kv,
+    )
+
+    layer_idx = attn.layer_idx
+    head_dim = attn.head_dim
+    kv_cache_manager = metadata.kv_cache_manager
+    num_tokens = int(q.shape[0])
+    if k is not None and v is not None:
+        write_msa_main_kv(
+            kv_cache_manager, layer_idx, metadata.msa_out_cache_loc[:num_tokens], k, v
+        )
+
+    q_view = q.view(num_tokens, attn.num_heads, head_dim)
+    out_view = output.view(num_tokens, attn.num_heads, head_dim)
+    k_paged, v_paged = msa_paged_kv(kv_cache_manager, layer_idx)
+    sm_scale = (head_dim**-0.5) / float(attn.q_scaling)
+
+    run_msa_sparse_gqa(
+        q_view,
+        k_paged,
+        v_paged,
+        kv_block_indexes,
+        kv_indices=metadata.msa_kv_indices,
+        sm_scale=sm_scale,
+        qo_lens_cpu=metadata.msa_qo_lens_cpu,
+        kv_lens_cpu=metadata.msa_kv_lens_cpu,
+        qo_offset_cpu=metadata.msa_qo_offset_cpu,
+        causal=True,
+        head_dim=head_dim,
+        plan=plan,
+        out=out_view,
+    )
+
+
+class MsaSparseGqaFmha(Fmha):
+    """SM100 paged GQA FMHA powered by MSA's fmha_sm100 kernel.
+
+    Handles every MiniMax-M3 MSA layer. Sparse layers pass the indexer's
+    selected KV block indices on forward_args.sparse_prediction.sparse_attn_indices
+    and attend those blocks; dense layers leave the indices None and attend the
+    full page table.
 
         Inherits Fmha rather than PhasedFmha: fmha_sm100 takes a single plan and
         the selected block indices span the whole batch, so it handles a mixed
@@ -167,12 +222,10 @@ class MsaSparseGqaFmha(Fmha):
         metadata: "TrtllmAttentionMetadata",
         forward_args: "AttentionForwardArgs",
     ) -> bool:
-        if forward_args.sparse_prediction.sparse_attn_indices is None:
-            return False
+        # Claims every MiniMax-M3 MSA forward. Sparse layers carry the per-query
+        # top-k table in sparse_attn_indices; dense layers leave it None and
+        # attend the full page table. Both run fmha_sm100 through this lib.
         return isinstance(metadata, _msa_metadata_cls())
-
-    def _sm_scale(self) -> float:
-        return (self.HEAD_DIM**-0.5) / float(self.attn.q_scaling)
 
     def forward(
         self,
@@ -182,58 +235,30 @@ class MsaSparseGqaFmha(Fmha):
         metadata: "TrtllmAttentionMetadata",
         forward_args: "AttentionForwardArgs",
     ) -> None:
-        from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.common import (
-            msa_paged_kv,
-            write_msa_main_kv,
-        )
-
-        attn = self.attn
-        layer_idx = attn.layer_idx
-        kv_cache_manager = metadata.kv_cache_manager
         output = forward_args.output
         if output is None:
             raise RuntimeError(f"{type(self).__name__} requires an output buffer.")
 
+        # Sparse layers attend the per-query top-k blocks with the sparse plan;
+        # dense layers leave the indices None and attend the full page table
+        # with the dense plan. The shared helper writes the main K/V cache and
+        # runs the paged GQA either way.
         kv_block_indexes = forward_args.sparse_prediction.sparse_attn_indices
-        if kv_block_indexes is None:
-            raise RuntimeError(
-                "MsaSparseGqaFmha invoked without sparse_attn_indices; the MSA "
-                "attention layer's sparse_attn_predict must populate them."
-            )
-
-        num_tokens = int(q.shape[0])
-        # fmha_sm100 reads the paged K/V cache directly, so the new-token K/V
-        # must be written into the cache before the sparse GQA runs. The
-        # index-K write is done by the indexer.
-        if k is not None and v is not None:
-            write_msa_main_kv(
-                kv_cache_manager, layer_idx, metadata.msa_out_cache_loc[:num_tokens], k, v
-            )
-
-        q_view = q.view(num_tokens, attn.num_heads, self.HEAD_DIM)
-        out_view = output.view(num_tokens, attn.num_heads, self.HEAD_DIM)
-
-        k_paged, v_paged = msa_paged_kv(kv_cache_manager, layer_idx)
-
-        # One run path (FlashInfer style): decode passes the prebuilt graph-safe
-        # plan; prefill leaves plan=None and it is built inline. The full
-        # kv_indices buffer is bounded by the plan's page indptr, and the result
-        # is written in place into the model's output buffer.
-        run_msa_sparse_gqa(
-            q_view,
-            k_paged,
-            v_paged,
-            kv_block_indexes,
-            kv_indices=metadata.msa_kv_indices,
-            sm_scale=self._sm_scale(),
-            qo_lens_cpu=metadata.msa_qo_lens_cpu,
-            kv_lens_cpu=metadata.msa_kv_lens_cpu,
-            qo_offset_cpu=metadata.msa_qo_offset_cpu,
-            causal=True,
-            head_dim=self.HEAD_DIM,
-            plan=metadata.msa_decode_gqa_plan,
-            out=out_view,
+        plan = (
+            metadata.msa_decode_gqa_plan
+            if kv_block_indexes is not None
+            else metadata.msa_decode_dense_plan
+        )
+        run_msa_paged_gqa(
+            self.attn,
+            q,
+            k,
+            v,
+            metadata,
+            output,
+            kv_block_indexes=kv_block_indexes,
+            plan=plan,
         )
 
 
-__all__ = ["MsaSparseGqaFmha", "run_msa_sparse_gqa"]
+__all__ = ["MsaSparseGqaFmha", "run_msa_paged_gqa", "run_msa_sparse_gqa"]

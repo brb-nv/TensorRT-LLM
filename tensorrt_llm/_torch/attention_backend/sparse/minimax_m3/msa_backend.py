@@ -40,11 +40,9 @@ from .common import (
     MiniMaxM3SparseConfig,
     build_kv_page_indices,
     build_paged_kv_slot_mapping,
-    msa_paged_kv,
     per_token_valid_blocks,
     require_msa_module,
     write_kv_slots,
-    write_msa_main_kv,
 )
 from .msa_indexer import MsaIndexer
 
@@ -694,52 +692,16 @@ def get_minimax_m3_msa_attention_backend_cls():
             metadata,
             output: torch.Tensor,
         ) -> torch.Tensor:
-            """Run dense paged GQA through fmha_sm100 into output.
+            """Run dense paged GQA through the inherited forward into output.
 
-            The dense MiniMax-M3 layers share the main K/V cache geometry with
-            the sparse layers, so they reuse the plan/run split with
-            kv_block_indexes left unset: the kernel then attends the full page
-            table instead of top-k blocks. The graph-safe dense plan is built in
-            build_decode_plans; prefill leaves it None and plans inline.
+            The dense MiniMax-M3 layers share the sparse layers' K/V geometry, so
+            they route through the same MsaSparseGqaFmha as run_sparse_attention,
+            just without an indexer pass. With no top-k selection published, the
+            FMHA attends the full page table using the dense plan built in
+            build_decode_plans.
             """
-            # fmha.msa_sparse_gqa is imported lazily: it is registered in the
-            # fmha library and imports back into this package, so a top-level
-            # import here would cycle.
-            from tensorrt_llm._torch.attention_backend.fmha.msa_sparse_gqa import run_msa_sparse_gqa
-
-            kv_cache_manager = metadata.kv_cache_manager
-            if kv_cache_manager is None:
-                raise RuntimeError(
-                    f"MiniMax-M3 dense forward (layer {self.layer_idx}) requires "
-                    "attn_metadata.kv_cache_manager to be a MiniMaxM3KVCacheManagerV2."
-                )
-
-            num_tokens = int(q.shape[0])
-            # fmha_sm100 reads the paged cache directly, so the new-token K/V
-            # must be resident before the GQA runs.
-            write_msa_main_kv(
-                kv_cache_manager, self.layer_idx, metadata.msa_out_cache_loc[:num_tokens], k, v
-            )
-
-            q_view = q.view(num_tokens, self.num_heads, self.head_dim)
-            out_view = output.view(num_tokens, self.num_heads, self.head_dim)
-            k_paged, v_paged = msa_paged_kv(kv_cache_manager, self.layer_idx)
-            sm_scale = (self.head_dim**-0.5) / float(self.q_scaling)
-
-            run_msa_sparse_gqa(
-                q_view,
-                k_paged,
-                v_paged,
-                kv_indices=metadata.msa_kv_indices,
-                sm_scale=sm_scale,
-                qo_lens_cpu=metadata.msa_qo_lens_cpu,
-                kv_lens_cpu=metadata.msa_kv_lens_cpu,
-                qo_offset_cpu=metadata.msa_qo_offset_cpu,
-                causal=True,
-                head_dim=self.head_dim,
-                plan=metadata.msa_decode_dense_plan,
-                out=out_view,
-            )
+            forward_args = AttentionForwardArgs(output=output)
+            self.forward(q, k, v, metadata, forward_args=forward_args)
             return output
 
         def sparse_attn_predict(
