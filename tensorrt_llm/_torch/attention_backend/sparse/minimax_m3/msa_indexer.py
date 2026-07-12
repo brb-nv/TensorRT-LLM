@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from .common import (
+from .msa_utils import (
     MSA_REQUIRED_TOPK,
     cache_view_to_msa_paged,
     per_token_valid_blocks,

@@ -34,17 +34,15 @@ import torch
 from tensorrt_llm._torch.attention_backend.interface import AttentionForwardArgs
 from tensorrt_llm._torch.utils import get_model_extra_attrs
 
-from .common import (
+from .common import MiniMaxM3SparseConfig, build_paged_kv_slot_mapping, write_kv_slots
+from .msa_indexer import MsaIndexer
+from .msa_utils import (
     MSA_REQUIRED_HEAD_DIM,
     MSA_REQUIRED_TOPK,
-    MiniMaxM3SparseConfig,
     build_kv_page_indices,
-    build_paged_kv_slot_mapping,
     per_token_valid_blocks,
     require_msa_module,
-    write_kv_slots,
 )
-from .msa_indexer import MsaIndexer
 
 
 def _cache_device(meta) -> torch.device:

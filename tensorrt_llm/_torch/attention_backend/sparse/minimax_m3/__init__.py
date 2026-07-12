@@ -12,10 +12,14 @@ Layered as:
   * :mod:`.cache_manager`   -- standalone side index cache used by tests
                                 and the :class:`KVCacheManagerV2`
                                 subclass factory. Shared by both backends.
-  * :mod:`.common`          -- backend-neutral config bundles, paged-cache
-                                primitives (slot mapping, page indices,
-                                KV-slot writers), and top-k selection
-                                shared by both backends.
+  * :mod:`.common`          -- backend-neutral config bundles, the paged
+                                KV-slot writer, block-priority sentinels, and
+                                the paged-cache slot mapping builder shared by
+                                both backends.
+  * :mod:`.msa_utils`       -- MSA-only (fmha_sm100) helpers: import guard,
+                                kernel precondition constants, HND paged-cache
+                                adapters, main-KV writer, page-table builder,
+                                valid-block counting, and top-k selection.
   * :mod:`.triton_kernels`  -- OpenAI Triton kernels (per-block max
                                 score, masked softmax for sparse GQA).
   * :mod:`.triton_backend`  -- the Triton reference algorithm (vectorized

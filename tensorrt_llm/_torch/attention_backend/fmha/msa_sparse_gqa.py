@@ -58,20 +58,11 @@ def run_msa_sparse_gqa(
 ) -> Optional[torch.Tensor]:
     """Run fmha_sm100 paged GQA (plan/run split).
 
-    `kv_block_indexes` selects the mode. When provided, it is the per-query
-    top-k block table and the kernel attends only those blocks (MiniMax-M3
-    sparse layers); the plan is built with a fixed `kv_block_num=topk`. When
-    None, the kernel attends every page listed in `kv_indices` for each
-    request (MiniMax-M3 dense layers); the plan omits `kv_block_num`, so
-    each request may use a different number of KV pages with no top-k limit.
-
-    `plan` is the fmha_sm100 execution plan. When None, the plan is built
-    inline from qo_lens_cpu/kv_lens_cpu/qo_offset_cpu; this is used for prefill
-    and focused tests, which run eagerly rather than inside CUDA graph capture.
-    CUDA-graph decode passes a plan prebuilt in metadata.prepare(), so planning
-    stays outside capture and the captured region only runs the kernel. `out`,
-    when provided, receives the result in place; otherwise a fresh output
-    tensor is allocated and returned.
+    `kv_block_indexes`: if set, sparse top-k mode (fixed `kv_block_num=topk`);
+    if None, dense mode attending all pages in `kv_indices`.
+    `plan`: prebuilt execution plan; if None, built inline from the CPU length
+    tensors (eager prefill/tests vs. CUDA-graph decode).
+    `out`: written in place if provided, else a new tensor is returned.
     """
     import fmha_sm100
 
@@ -141,7 +132,7 @@ def run_msa_paged_gqa(
     dense plan, attending the full page table). fmha_sm100 reads the paged cache
     directly, so the new-token K/V must be resident before the run.
     """
-    from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.common import (
+    from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_utils import (
         msa_paged_kv,
         write_msa_main_kv,
     )
@@ -241,8 +232,7 @@ class MsaSparseGqaFmha(Fmha):
 
         # Sparse layers attend the per-query top-k blocks with the sparse plan;
         # dense layers leave the indices None and attend the full page table
-        # with the dense plan. The shared helper writes the main K/V cache and
-        # runs the paged GQA either way.
+        # with the dense plan.
         kv_block_indexes = forward_args.sparse_prediction.sparse_attn_indices
         plan = (
             metadata.msa_decode_gqa_plan
@@ -261,4 +251,4 @@ class MsaSparseGqaFmha(Fmha):
         )
 
 
-__all__ = ["MsaSparseGqaFmha", "run_msa_paged_gqa", "run_msa_sparse_gqa"]
+__all__ = ["MsaSparseGqaFmha"]
