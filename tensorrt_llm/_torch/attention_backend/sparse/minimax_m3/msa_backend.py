@@ -2,8 +2,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """MSA-backed MiniMax-M3 sparse attention on the TrtllmAttention stack.
 
-Mimics DSATrtllmAttention:
-
   * MiniMaxM3MsaSparseAttention subclasses TrtllmAttention and reuses its
     inherited forward, overriding only the sparse hooks and owning an
     MsaIndexer.
@@ -13,11 +11,11 @@ Mimics DSATrtllmAttention:
     forward_args.topk_indices.
   * MiniMaxM3MsaSparseAttentionMetadata subclasses TrtllmAttentionMetadata and
     stores its per-forward MSA tensors in CUDA-graph-stable buffers.
-    Following DSAtrtllmAttentionMetadata, the buffers are allocated once in
-    __post_init__ via get_empty(capture_graph=...), and prepare() copies the
-    per-step values into them. The standard CUDAGraphRunner clones one
-    metadata per graph batch size (create_cuda_graph_metadata), so no
-    per-batch-size cache is needed here.
+    The buffers are allocated once in __post_init__ via
+    get_empty(capture_graph=...), and prepare() copies the per-step values
+    into them. The standard CUDAGraphRunner clones one metadata per graph
+    batch size (create_cuda_graph_metadata), so no per-batch-size cache is
+    needed here.
 
 The classes are defined inside get_minimax_m3_msa_attention_backend_cls with
 a deferred trtllm import, avoiding an import cycle at package init.
@@ -159,7 +157,7 @@ class _MsaGraphSafePlan:
         return self._plan
 
 
-def _lookup_msa_attention_layer(layer_idx: int):
+def _resolve_msa_backend(layer_idx: int):
     """Resolve the MSA sparse backend for a layer via the model layer registry.
 
     Returns the MiniMaxM3MsaSparseAttention backend (which owns the geometry) or None
@@ -197,24 +195,18 @@ def get_minimax_m3_msa_attention_backend_cls():
     class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         """TrtllmAttentionMetadata for MiniMax-M3 MSA sparse layers.
 
-        Two device tensors are owned as CUDA-graph-stable buffers: the
-        per-new-token cache slots (msa_out_cache_loc) and the flat paged page
-        table (msa_kv_indices), which the forward and indexer read directly.
-        Both are allocated once in __post_init__ and refreshed in prepare() via
-        copy_, so their addresses stay stable across replays.
+        Tensors read inside the captured forward are CUDA-graph-stable: the
+        cache slots (msa_out_cache_loc), page table (msa_kv_indices), and proxy
+        scratch (msa_max_score, msa_n_valid_blocks) are allocated once and
+        refreshed via copy_. The decode plans' device worklists are likewise
+        pinned on the _MsaGraphSafePlan owners, surfaced via msa_decode_*_plan.
 
-        The per-request lengths fmha_sm100_plan reads (msa_qo_lens_cpu,
-        msa_kv_lens_cpu, msa_qo_offset_cpu) are properties derived from the base
-        seq_lens and kv_lens. They are read only while building plans in
-        prepare(), outside capture, so they need no graph-stable storage.
-        MiniMax-M3 MSA has no cache compression or speculative decode, so the
-        base lengths apply directly.
-
-        The decode plans and their proxy scratch (msa_max_score,
-        msa_n_valid_blocks) are built by the sparse layer's build_decode_plans
-        during prepare(), and are absent for prefill or mixed batches, which run
-        eagerly. The plan tuples live on the _MsaGraphSafePlan owners and are
-        surfaced through the msa_decode_*_plan properties.
+        The length inputs to fmha_sm100_plan (msa_qo_lens_cpu, msa_kv_lens_cpu,
+        msa_qo_offset_cpu) are host properties of the base seq_lens/kv_lens,
+        read only while building plans in prepare() (outside capture), so they
+        need no graph-stable storage. Plans are built by build_decode_plans and
+        are absent for prefill/mixed batches, which run eagerly. (MiniMax-M3 MSA
+        has no cache compression or speculative decode, so base lengths apply.)
         """
 
         # Graph-stable buffers; consumers slice to the live count at the call
@@ -287,8 +279,7 @@ def get_minimax_m3_msa_attention_backend_cls():
             return plan.plan if plan is not None else None
 
         def _create_msa_buffers(self) -> None:
-            """Allocate the CUDA-graph-stable MSA device buffers (mirrors DSA's
-            create_buffers_for_indexer).
+            """Allocate the CUDA-graph-stable MSA device buffers.
 
             Buffers come from the shared graph buffer pool so they are reserved
             under capture. Sizing follows the worst-case graph geometry:
@@ -333,7 +324,7 @@ def get_minimax_m3_msa_attention_backend_cls():
             The plan is layer-invariant for MiniMax-M3, so it is built once per
             step by the first sparse layer (which owns the geometry) and shared
             by every layer. Prefill/mixed batches leave the plans cleared and run
-            eagerly. Mirrors DSA's Indexer.prepare(metadata=self).
+            eagerly.
             """
             # Drop any plan tuples from the previous step; the msa_decode_*_plan
             # properties then report None until build_decode_plans refreshes them.
@@ -352,17 +343,17 @@ def get_minimax_m3_msa_attention_backend_cls():
             sparse_layer_ids = getattr(kv_cache_manager, "sparse_layer_ids", None)
             if not sparse_layer_ids:
                 return
-            layer = _lookup_msa_attention_layer(int(sparse_layer_ids[0]))
-            if layer is None:
+            backend = _resolve_msa_backend(int(sparse_layer_ids[0]))
+            if backend is None:
                 return
-            layer.build_decode_plans(self)
+            backend.build_decode_plans(self)
 
         def _build_msa_fields(self) -> None:
             """Populate the MSA cache-write buffers for this step.
 
             The page table and per-new-token cache slots are derived via the
-            backend-neutral build_paged_kv_slot_mapping helper, then copied into
-            the persistent buffers. The transient builder tensors are discarded.
+            build_paged_kv_slot_mapping helper, then copied into the persistent
+            buffers. The transient builder tensors are discarded.
             """
             self._msa_fields_ready = False
             if not self._msa_buffers_ready:
@@ -389,11 +380,10 @@ def get_minimax_m3_msa_attention_backend_cls():
                     "decoding or use the non-MSA MiniMax-M3 backend."
                 )
 
-            # The mapping is built in prepare(), outside CUDA-graph capture, so
-            # its fresh per-call tensors are fine: the forwards read only the
-            # persistent buffers filled below, not these transients. qo_offset is
-            # the per-request prefix length, so one build covers prefill (offset
-            # = num_cached) and decode (offset = kv_len - 1 with qo_len 1).
+            # Built in prepare() (outside capture), so these transients are
+            # fine: forwards read only the persistent buffers filled below.
+            # qo_offset is the prefix length, so one build covers prefill
+            # (num_cached) and decode (kv_len - 1 with qo_len 1).
             req_to_token, slot_ids, out_cache_loc = build_paged_kv_slot_mapping(
                 kv_cache_manager=kv_cache_manager,
                 request_ids=request_ids,
@@ -436,7 +426,7 @@ def get_minimax_m3_msa_attention_backend_cls():
             )
 
     class MiniMaxM3MsaSparseAttention(TrtllmAttention):
-        """MSA-backed MiniMax-M3 sparse attention (mimics DSATrtllmAttention)."""
+        """MSA-backed MiniMax-M3 sparse attention."""
 
         Metadata = MiniMaxM3MsaSparseAttentionMetadata
 
@@ -522,6 +512,8 @@ def get_minimax_m3_msa_attention_backend_cls():
             capture_graph = metadata.is_cuda_graph
             max_batch = int(metadata.max_num_sequences)
 
+            # Proxy plan: MQA (num_kv_heads=1) max-score pass over the index
+            # branch; output_maxscore feeds the indexer's top-k block selection.
             proxy_plan = fmha_sm100.fmha_sm100_plan(
                 qo_lens_cpu,
                 kv_lens_cpu,
@@ -533,6 +525,7 @@ def get_minimax_m3_msa_attention_backend_cls():
                 num_kv_splits=1,
                 causal=True,
             )
+            # Sparse-layer plan: kv_block_num=topk limits attention to top-k blocks.
             gqa_plan = fmha_sm100.fmha_sm100_plan(
                 qo_lens_cpu,
                 kv_lens_cpu,
@@ -544,9 +537,7 @@ def get_minimax_m3_msa_attention_backend_cls():
                 num_kv_splits=1,
                 causal=True,
             )
-            # Dense plan: same GQA geometry as the sparse main path but with no
-            # kv_block_num, so it attends the full page table. The dense layers
-            # share the main geometry, so one plan serves all of them.
+            # Dense-layer plan: no kv_block_num, so it attends the full page table.
             dense_plan = fmha_sm100.fmha_sm100_plan(
                 qo_lens_cpu,
                 kv_lens_cpu,
@@ -558,6 +549,8 @@ def get_minimax_m3_msa_attention_backend_cls():
                 causal=True,
             )
 
+            # Allocate the graph-stable buffers once per metadata; later steps
+            # only refresh their contents below.
             if metadata._msa_proxy_plan is None:
                 num_ctas = torch.cuda.get_device_properties(device).multi_processor_count
                 metadata._msa_proxy_plan = _MsaGraphSafePlan(
@@ -620,8 +613,7 @@ def get_minimax_m3_msa_attention_backend_cls():
         ) -> torch.Tensor:
             """Write the index-K cache and return the selected block indices.
 
-            Mirrors DSA's indexer entry point: the model layer runs this
-            before forward and threads the result through
+            The model layer runs this before forward and threads the result through
             forward_args.topk_indices. Returns [total_q, num_kv_heads, topk].
             Decode uses the prebuilt graph-safe proxy plan; prefill plans
             eagerly.
@@ -672,7 +664,7 @@ def get_minimax_m3_msa_attention_backend_cls():
         ) -> torch.Tensor:
             """Select the KV blocks, then run the sparse GQA into output.
 
-            Mirrors DSA: pick blocks with the indexer, publish them through
+            Pick blocks with the indexer, publish them through
             forward_args.topk_indices, and let the inherited TrtllmAttention
             forward dispatch the sparse GQA. This backend writes the main and
             index caches itself.
