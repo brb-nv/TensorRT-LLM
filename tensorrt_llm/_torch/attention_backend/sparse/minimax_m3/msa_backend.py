@@ -26,10 +26,13 @@ a deferred trtllm import, avoiding an import cycle at package init.
 from __future__ import annotations
 
 import functools
-from typing import TYPE_CHECKING, Optional, Tuple
+from dataclasses import dataclass
+from typing import Optional, Tuple
 
 import torch
 
+from tensorrt_llm._torch.attention_backend.interface import AttentionForwardArgs
+from tensorrt_llm._torch.utils import get_model_extra_attrs
 from tensorrt_llm._utils import prefer_pinned
 
 from .common import (
@@ -38,14 +41,13 @@ from .common import (
     MiniMaxM3SparseConfig,
     build_kv_page_indices,
     build_paged_kv_slot_mapping,
+    msa_paged_kv,
     per_token_valid_blocks,
     require_msa_module,
     write_kv_slots,
+    write_msa_main_kv,
 )
 from .msa_indexer import MsaIndexer
-
-if TYPE_CHECKING:
-    from tensorrt_llm._torch.attention_backend.interface import AttentionForwardArgs
 
 
 def _cache_device(meta) -> torch.device:
@@ -158,8 +160,6 @@ def _lookup_msa_attention_layer(layer_idx: int):
     without running the model. Reuses the same per-layer registry the attention
     custom op uses; it is not a separate geometry singleton.
     """
-    from tensorrt_llm._torch.utils import get_model_extra_attrs
-
     extra_attrs = get_model_extra_attrs()
     if not extra_attrs:
         return None
@@ -179,8 +179,8 @@ def _lookup_msa_attention_layer(layer_idx: int):
 @functools.lru_cache(maxsize=1)
 def get_minimax_m3_msa_attention_backend_cls():
     """Return MiniMaxM3MsaSparseAttention (the MSA backend selection entry point)."""
-    from dataclasses import dataclass
-
+    # trtllm is imported lazily: it pulls the fmha registry, which imports this
+    # package's MsaSparseGqaFmha, so a top-level import here would cycle.
     from tensorrt_llm._torch.attention_backend.trtllm import (
         TrtllmAttention,
         TrtllmAttentionMetadata,
@@ -667,8 +667,6 @@ def get_minimax_m3_msa_attention_backend_cls():
             forward dispatch the sparse GQA. This backend writes the main and
             index caches itself.
             """
-            from tensorrt_llm._torch.attention_backend.interface import AttentionForwardArgs
-
             kv_block_indexes = self.run_indexer(idx_q, idx_k, metadata)
             forward_args = AttentionForwardArgs(output=output, topk_indices=kv_block_indexes)
             self.forward(q, k, v, metadata, forward_args=forward_args)
@@ -690,9 +688,10 @@ def get_minimax_m3_msa_attention_backend_cls():
             table instead of top-k blocks. The graph-safe dense plan is built in
             build_decode_plans; prefill leaves it None and plans inline.
             """
+            # fmha.msa_sparse_gqa is imported lazily: it is registered in the
+            # fmha library and imports back into this package, so a top-level
+            # import here would cycle.
             from tensorrt_llm._torch.attention_backend.fmha.msa_sparse_gqa import run_msa_sparse_gqa
-
-            from .common import msa_paged_kv, write_msa_main_kv
 
             kv_cache_manager = metadata.kv_cache_manager
             if kv_cache_manager is None:

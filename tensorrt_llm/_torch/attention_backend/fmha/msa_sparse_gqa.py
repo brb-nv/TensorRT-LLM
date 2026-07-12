@@ -8,10 +8,6 @@ owning MiniMax-M3 MSA attention layer runs an MsaIndexer to select the
 per-query KV blocks and publishes them on forward_args.sparse_prediction;
 this class attends over them.
 
-The kernel is SM100 only and fmha_sm100 is an optional dependency, so
-is_available returns False when it or an SM100 device is missing.
-run_msa_sparse_gqa is importable for focused tests that drive the kernel
-directly.
 """
 
 from __future__ import annotations
@@ -60,20 +56,22 @@ def run_msa_sparse_gqa(
     plan: Optional[tuple] = None,
     out: Optional[torch.Tensor] = None,
 ) -> Optional[torch.Tensor]:
-    """Run fmha_sm100 paged GQA (plan/run split, FlashInfer style).
+    """Run fmha_sm100 paged GQA (plan/run split).
 
-    `kv_block_indexes` selects the mode: when provided it is the per-query
-    top-k block table and the kernel runs block-sparse GQA (MiniMax-M3 sparse
-    layers); when None the kernel runs dense paged GQA over the full page table
-    in `kv_indices` (MiniMax-M3 dense layers 0-2). The dense mode has no
-    per-block-count restriction because no kv_block_num is planned.
+    `kv_block_indexes` selects the mode. When provided, it is the per-query
+    top-k block table and the kernel attends only those blocks (MiniMax-M3
+    sparse layers); the plan is built with a fixed `kv_block_num=topk`. When
+    None, the kernel attends every page listed in `kv_indices` for each
+    request (MiniMax-M3 dense layers); the plan omits `kv_block_num`, so
+    each request may use a different number of KV pages with no top-k limit.
 
-    `plan` is the fmha_sm100 execution plan. When None (prefill and focused
-    tests) it is built inline from qo_lens_cpu/kv_lens_cpu/qo_offset_cpu; when
-    provided (CUDA-graph decode) it is a prebuilt graph-safe plan and the
-    per-request length tensors are ignored, so there is no host sync inside the
-    captured region. `out`, when provided, receives the result in place;
-    otherwise a fresh output tensor is allocated and returned.
+    `plan` is the fmha_sm100 execution plan. When None, the plan is built
+    inline from qo_lens_cpu/kv_lens_cpu/qo_offset_cpu; this is used for prefill
+    and focused tests, which run eagerly rather than inside CUDA graph capture.
+    CUDA-graph decode passes a plan prebuilt in metadata.prepare(), so planning
+    stays outside capture and the captured region only runs the kernel. `out`,
+    when provided, receives the result in place; otherwise a fresh output
+    tensor is allocated and returned.
     """
     import fmha_sm100
 
@@ -103,7 +101,7 @@ def run_msa_sparse_gqa(
         plan = fmha_sm100.fmha_sm100_plan(
             qo_lens_cpu,
             kv_lens_cpu,
-            int(q.shape[1]),
+            int(q.shape[1]),  # num query heads.
             num_kv_heads=int(k_paged.shape[1]),
             qo_offset=qo_offset_cpu,
             page_size=int(k_paged.shape[2]),
@@ -210,7 +208,7 @@ class MsaSparseGqaFmha(Fmha):
             write_msa_main_kv(kv_cache_manager, layer_idx, metadata.msa_out_cache_loc, k, v)
 
         num_tokens = int(q.shape[0])
-        q3 = q.view(num_tokens, attn.num_heads, self.HEAD_DIM)
+        q_view = q.view(num_tokens, attn.num_heads, self.HEAD_DIM)
         out_view = output.view(num_tokens, attn.num_heads, self.HEAD_DIM)
 
         k_paged, v_paged = msa_paged_kv(kv_cache_manager, layer_idx)
@@ -220,7 +218,7 @@ class MsaSparseGqaFmha(Fmha):
         # kv_indices buffer is bounded by the plan's page indptr, and the result
         # is written in place into the model's output buffer.
         run_msa_sparse_gqa(
-            q3,
+            q_view,
             k_paged,
             v_paged,
             kv_block_indexes,

@@ -63,6 +63,12 @@ from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
 
+from ...interface import (
+    AttentionBackend,
+    AttentionForwardArgs,
+    AttentionMetadata,
+    merge_attention_forward_args,
+)
 from .common import _INIT_SCORE, _LOCAL_SCORE, MiniMaxM3SparseConfig, write_kv_slots
 from .triton_kernels import triton_block_max_score, triton_sparse_softmax
 from .triton_metadata import (
@@ -784,16 +790,6 @@ def minimax_m3_sparse_prefill(
 # ---------------------------------------------------------------------------
 
 
-# Lazy import alias to avoid a circular import at module load — the side
-# cache class lives in ``cache_manager`` which imports from this module
-# is fine (no cycle), but keeping the indirection explicit makes the
-# dependency direction in this file clearer.
-def _import_index_cache_cls():
-    from .cache_manager import MiniMaxM3SparseIndexCache
-
-    return MiniMaxM3SparseIndexCache
-
-
 @dataclass
 class MiniMaxM3TritonSparseAttention:
     """Thin orchestrator for :func:`minimax_m3_sparse_prefill` and
@@ -897,18 +893,10 @@ class MiniMaxM3TritonSparseAttention:
 
 @functools.lru_cache(maxsize=1)
 def get_minimax_m3_triton_attention_backend_cls():
-    """Return :class:`MiniMaxM3SparseRuntimeBackend` (lazy import).
+    """Return :class:`MiniMaxM3SparseRuntimeBackend`.
 
-    Deferring the :class:`AttentionBackend` import keeps the algorithm
-    module usable from test paths that do not need the runtime backend.
+    Cached so the runtime backend class is built once.
     """
-    from ...interface import (
-        AttentionBackend,
-        AttentionForwardArgs,
-        AttentionMetadata,
-        merge_attention_forward_args,
-    )
-
     metadata_cls = get_minimax_m3_attention_metadata_cls()
 
     class MiniMaxM3SparseRuntimeBackend(AttentionBackend[AttentionMetadata]):

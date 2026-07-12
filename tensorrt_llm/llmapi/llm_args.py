@@ -630,9 +630,10 @@ class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
          forced at the tail).
       2. A sparse GQA attention runs only over the selected blocks.
 
-    The selected backend at runtime uses
-    :class:`tensorrt_llm._torch.attention_backend.sparse.minimax_m3.triton_backend.MiniMaxM3TritonSparseAttention`
-    on top of a :class:`MiniMaxM3KVCacheManagerV2` that allocates a
+    At runtime one of the MiniMax-M3 sparse attention backends under
+    :mod:`tensorrt_llm._torch.attention_backend.sparse.minimax_m3` is
+    selected. The chosen backend runs on top of a
+    :class:`MiniMaxM3KVCacheManagerV2` that allocates a
     paged side index-K cache (``[num_slots, 1, sparse_index_dim]``)
     parallel to the main K/V cache. The M3 checkpoint sets
     ``disable_index_value=True`` on every sparse layer so no index V

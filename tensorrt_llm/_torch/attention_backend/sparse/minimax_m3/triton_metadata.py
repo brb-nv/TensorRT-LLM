@@ -11,10 +11,6 @@ Contains:
   * :func:`get_minimax_m3_attention_metadata_cls` -- lazy factory for
     the :class:`AttentionMetadata` subclass the pyexecutor wires into
     the M3 sparse layer's forward path.
-
-The layer-invariant config bundles (MiniMaxM3SparseParams,
-MiniMaxM3SparseConfig) live in common, alongside the backend-neutral paged-cache
-slot mapping (build_paged_kv_slot_mapping) shared with the MSA path.
 """
 
 from __future__ import annotations
@@ -25,6 +21,9 @@ from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
 import torch
+
+from ...interface import AttentionMetadata
+from .common import build_paged_kv_slot_mapping
 
 
 @dataclass
@@ -316,8 +315,6 @@ def _build_runtime_metadata_fresh(
     graph-stable static_buffers are supplied; the static_buffers path in
     build_runtime_metadata_from_kv_manager keeps its own in-place buffer writes.
     """
-    from .common import build_paged_kv_slot_mapping
-
     batch = int(seq_lens.shape[0])
     seq_lens_dev = seq_lens.to(device) if seq_lens.device != device else seq_lens
 
@@ -670,7 +667,6 @@ def get_minimax_m3_attention_metadata_cls():
     CUDA-graph capture safety (``cudaErrorStreamCaptureUnsupported``
     fires for CPU->GPU ``memcpyAsync`` calls inside a captured stream).
     """
-    from ...interface import AttentionMetadata
 
     class MiniMaxM3AttentionMetadata(AttentionMetadata):
         """:class:`AttentionMetadata` that pre-builds MiniMax-M3 metadata.
