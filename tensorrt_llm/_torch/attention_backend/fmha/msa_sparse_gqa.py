@@ -201,13 +201,15 @@ class MsaSparseGqaFmha(Fmha):
                 "attention layer's sparse_attn_predict must populate them."
             )
 
+        num_tokens = int(q.shape[0])
         # fmha_sm100 reads the paged K/V cache directly, so the new-token K/V
         # must be written into the cache before the sparse GQA runs. The
         # index-K write is done by the indexer.
         if k is not None and v is not None:
-            write_msa_main_kv(kv_cache_manager, layer_idx, metadata.msa_out_cache_loc, k, v)
+            write_msa_main_kv(
+                kv_cache_manager, layer_idx, metadata.msa_out_cache_loc[:num_tokens], k, v
+            )
 
-        num_tokens = int(q.shape[0])
         q_view = q.view(num_tokens, attn.num_heads, self.HEAD_DIM)
         out_view = output.view(num_tokens, attn.num_heads, self.HEAD_DIM)
 
@@ -222,7 +224,7 @@ class MsaSparseGqaFmha(Fmha):
             k_paged,
             v_paged,
             kv_block_indexes,
-            kv_indices=metadata._msa_kv_indices_buf,
+            kv_indices=metadata.msa_kv_indices,
             sm_scale=self._sm_scale(),
             qo_lens_cpu=metadata.msa_qo_lens_cpu,
             kv_lens_cpu=metadata.msa_kv_lens_cpu,

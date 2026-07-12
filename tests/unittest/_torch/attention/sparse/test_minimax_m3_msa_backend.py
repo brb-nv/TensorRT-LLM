@@ -18,11 +18,23 @@ from tensorrt_llm._torch.attention_backend.sparse.utils import _resolve_minimax_
 from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttention, TrtllmAttentionMetadata
 from tensorrt_llm.llmapi.llm_args import MiniMaxM3SparseAttentionConfig
 
+# CUDA-graph-stable buffers owned by the metadata as declared fields.
 _MSA_METADATA_FIELDS = (
     "msa_out_cache_loc",
-    "msa_kv_lens_cpu",
+    "msa_kv_indices",
+    "msa_max_score",
+    "msa_n_valid_blocks",
+)
+
+# Per-request lengths and decode-plan tuples are derived on access from the
+# base metadata / plan owners, so they are properties rather than stored fields.
+_MSA_METADATA_PROPERTIES = (
     "msa_qo_lens_cpu",
+    "msa_kv_lens_cpu",
     "msa_qo_offset_cpu",
+    "msa_decode_proxy_plan",
+    "msa_decode_gqa_plan",
+    "msa_decode_dense_plan",
 )
 
 
@@ -76,20 +88,32 @@ def test_msa_metadata_drops_redundant_intermediate_fields():
         "msa_req_to_token",
         "msa_slot_ids",
         "msa_kv_lens_dev",
-        "msa_kv_indices",
     ):
         assert field not in annotations, f"{field} should no longer be stored"
 
 
+def test_msa_metadata_lengths_and_plans_are_derived_properties():
+    metadata_cls = get_minimax_m3_msa_attention_backend_cls().Metadata
+    annotations = {}
+    for klass in metadata_cls.__mro__:
+        annotations.update(getattr(klass, "__annotations__", {}))
+    for name in _MSA_METADATA_PROPERTIES:
+        assert name not in annotations, f"{name} should be derived, not stored"
+        assert isinstance(getattr(metadata_cls, name, None), property), (
+            f"{name} must be exposed as a property"
+        )
+
+
 def test_msa_metadata_allocates_graph_stable_buffers():
     # The buffers are declared and allocated in a DSA-style __post_init__ hook,
-    # not cached per batch size on a bespoke driver.
+    # not cached per batch size on a bespoke driver. Each graph-stable tensor is
+    # a single declared field.
     metadata_cls = get_minimax_m3_msa_attention_backend_cls().Metadata
     assert callable(getattr(metadata_cls, "_create_msa_buffers", None))
     annotations = {}
     for klass in metadata_cls.__mro__:
         annotations.update(getattr(klass, "__annotations__", {}))
-    for buf in ("_msa_out_cache_loc_buf", "_msa_kv_indices_buf"):
+    for buf in ("msa_out_cache_loc", "msa_kv_indices"):
         assert buf in annotations, f"{buf} must be a declared backing buffer"
 
 
