@@ -328,9 +328,6 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         # A decode batch is pure generation (no context requests).
         if int(self.num_contexts or 0) > 0:
             return
-        # Planning does host->device work and cannot run under capture.
-        if torch.cuda.is_current_stream_capturing():
-            return
         kv_cache_manager = self.kv_cache_manager
         sparse_layer_ids = getattr(kv_cache_manager, "sparse_layer_ids", None)
         if not sparse_layer_ids:
