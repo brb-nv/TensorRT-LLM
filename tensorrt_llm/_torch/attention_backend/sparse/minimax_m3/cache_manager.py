@@ -30,6 +30,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2._common import BAD_PAGE_INDEX
 from tensorrt_llm.runtime.kv_cache_manager_v2._utils import typed_range
 
 from ....pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2, Role
+from .common import MiniMaxM3SparseConfig
 
 
 class MiniMaxM3SparseIndexCache:
@@ -176,6 +177,11 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
 
         super().__init__(*args, **kwargs)
 
+        # Shared sparse geometry, built once so the attention metadata can
+        # construct its decode plans without resolving a per-layer attention
+        # instance.
+        self.m3_config = self._build_m3_config(kwargs)
+
         # Optional plain-tensor index-V cache for non-disabled sparse
         # layers (test-only; production has disable_index_value=True
         # on every sparse layer).
@@ -192,6 +198,38 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
                     dtype=torch_dtype,
                     device=device,
                 )
+
+    def _build_m3_config(self, manager_kwargs) -> Optional[MiniMaxM3SparseConfig]:
+        """Build the layer-invariant MiniMax-M3 sparse geometry.
+
+        Head counts follow the tensor-parallel sharding the model applies
+        (num_index_heads is replicated, not sharded), matching the geometry
+        the attention backend derives. Sourced from the pretrained config
+        (head counts and head_dim) and the sparse attention config (index and
+        top-k params). Returns None when either is unavailable.
+        """
+        pretrained_config = manager_kwargs.get("pretrained_config")
+        sparse_attention_config = manager_kwargs.get(
+            "sparse_attention_config"
+        ) or manager_kwargs.get("sparse_attn_config")
+        if pretrained_config is None or sparse_attention_config is None:
+            return None
+        to_sparse_params = getattr(sparse_attention_config, "to_sparse_params", None)
+        if to_sparse_params is None:
+            return None
+
+        tp_size = 1 if self.mapping.enable_attention_dp else self.mapping.tp_size
+        num_attention_heads = int(pretrained_config.num_attention_heads)
+        num_kv_heads = int(getattr(pretrained_config, "num_key_value_heads", num_attention_heads))
+        head_dim = getattr(pretrained_config, "head_dim", None)
+        if not isinstance(head_dim, int):
+            head_dim = pretrained_config.hidden_size // num_attention_heads
+        return MiniMaxM3SparseConfig.from_sparse_params(
+            to_sparse_params(),
+            num_q_heads=(num_attention_heads + tp_size - 1) // tp_size,
+            num_kv_heads=(num_kv_heads + tp_size - 1) // tp_size,
+            head_dim=int(head_dim),
+        )
 
     def _extra_buffers_per_layer(self, *, tokens_per_block):
         """Register a per-sparse-layer ``Role.INDEX_KEY`` :class:`BufferConfig`.
