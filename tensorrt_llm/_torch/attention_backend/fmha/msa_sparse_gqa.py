@@ -29,15 +29,16 @@ if TYPE_CHECKING:
 def _msa_metadata_cls() -> type:
     """The concrete metadata class that drives MsaSparseGqaFmha.
 
-    Resolved lazily because the class is built inside a factory with a
-    deferred trtllm import, which would otherwise form an import cycle at
-    attention-backend package init.
+    Resolved lazily: this module is imported by the fmha registry while trtllm
+    is still importing (trtllm -> fmha -> registry), and msa_backend imports
+    the trtllm base classes at module scope, so a top-level import here would
+    form an import cycle.
     """
     from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_backend import (
-        get_minimax_m3_msa_attention_backend_cls,
+        MiniMaxM3MsaSparseAttention,
     )
 
-    return get_minimax_m3_msa_attention_backend_cls().Metadata
+    return MiniMaxM3MsaSparseAttention.Metadata
 
 
 def run_msa_sparse_gqa(
@@ -200,10 +201,10 @@ class MsaSparseGqaFmha(Fmha):
         # of the fmha_sm100 package and an SM100 device is gated earlier, when
         # the MSA backend is selected.
         from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_backend import (
-            get_minimax_m3_msa_attention_backend_cls,
+            MiniMaxM3MsaSparseAttention,
         )
 
-        return isinstance(attn, get_minimax_m3_msa_attention_backend_cls())
+        return isinstance(attn, MiniMaxM3MsaSparseAttention)
 
     def is_supported(
         self,

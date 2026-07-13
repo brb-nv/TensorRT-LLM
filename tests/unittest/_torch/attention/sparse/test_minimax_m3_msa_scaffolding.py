@@ -8,7 +8,7 @@ do not launch kernels and run without an SM100 GPU.
 """
 
 from tensorrt_llm._torch.attention_backend.sparse.minimax_m3 import (
-    get_minimax_m3_msa_attention_backend_cls,
+    MiniMaxM3MsaSparseAttention,
     get_minimax_m3_triton_attention_backend_cls,
 )
 from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.common import MiniMaxM3SparseParams
@@ -45,7 +45,7 @@ def test_resolver_does_not_fall_back_to_triton_when_msa_requested():
         resolved = _resolve_minimax_m3_backend_cls(params)
     except RuntimeError:
         return
-    assert resolved is get_minimax_m3_msa_attention_backend_cls()
+    assert resolved is MiniMaxM3MsaSparseAttention
     assert resolved is not get_minimax_m3_triton_attention_backend_cls()
 
 

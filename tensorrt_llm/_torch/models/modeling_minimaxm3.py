@@ -37,9 +37,9 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
 from ..attention_backend.sparse.minimax_m3 import (
+    MiniMaxM3MsaSparseAttention,
     _gather_paged_batched,
     _write_main_kv_slots_to_pool,
-    get_minimax_m3_msa_attention_backend_cls,
     get_minimax_m3_triton_attention_backend_cls,
 )
 from ..distributed import AllReduce, AllReduceParams, MiniMaxAllReduceRMS
@@ -1120,7 +1120,7 @@ class MiniMaxM3Attention(Attention):
     ) -> torch.Tensor:
         # The MSA backend owns attention execution (indexer + sparse GQA, or
         # dense paged GQA); the model layer only supplies the projections.
-        if isinstance(self.attn, get_minimax_m3_msa_attention_backend_cls()):
+        if isinstance(self.attn, MiniMaxM3MsaSparseAttention):
             if self.is_sparse_attention_layer:
                 assert idx_q is not None and idx_k is not None
                 return self.attn.run_sparse_attention(q, k, v, idx_q, idx_k, attn_metadata, output)

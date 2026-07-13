@@ -47,7 +47,7 @@ working unchanged.
 # part of __all__. Every other backend/metadata/config symbol is imported
 # directly from its defining submodule by the code that needs it.
 from .cache_manager import MiniMaxM3KVCacheManagerV2
-from .msa_backend import get_minimax_m3_msa_attention_backend_cls
+from .msa_backend import MiniMaxM3MsaSparseAttention
 from .triton_backend import (  # noqa: F401
     _gather_paged_batched,
     _write_main_kv_slots_to_pool,
@@ -56,6 +56,6 @@ from .triton_backend import (  # noqa: F401
 
 __all__ = [
     "MiniMaxM3KVCacheManagerV2",
-    "get_minimax_m3_msa_attention_backend_cls",
+    "MiniMaxM3MsaSparseAttention",
     "get_minimax_m3_triton_attention_backend_cls",
 ]

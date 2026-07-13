@@ -52,10 +52,10 @@ def _resolve_minimax_m3_backend_cls(
     """
     from .minimax_m3 import get_minimax_m3_triton_attention_backend_cls
     if getattr(sparse_params, "use_msa", False):
-        from .minimax_m3 import get_minimax_m3_msa_attention_backend_cls
+        from .minimax_m3 import MiniMaxM3MsaSparseAttention
         from .minimax_m3.msa_availability import ensure_msa_available
         ensure_msa_available()
-        return get_minimax_m3_msa_attention_backend_cls()
+        return MiniMaxM3MsaSparseAttention
     return get_minimax_m3_triton_attention_backend_cls()
 
 

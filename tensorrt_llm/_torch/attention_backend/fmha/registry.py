@@ -19,15 +19,31 @@ from typing import TypeAlias
 from .fallback import FallbackFmha
 from .flashinfer_trtllm_gen import FlashInferTrtllmGenFmha
 from .interface import Fmha
-from .msa_sparse_gqa import MsaSparseGqaFmha
 
 FmhaCls: TypeAlias = type[Fmha]
 
-FMHA_LIBS: dict[str, FmhaCls] = {
-    "msa_sparse_gqa": MsaSparseGqaFmha,
-    "flashinfer_trtllm_gen": FlashInferTrtllmGenFmha,
-    "fallback": FallbackFmha,
-}
+
+def init_fmha_libs() -> dict[str, "FmhaCls"]:
+    """Build the ordered FMHA library registry.
+
+    ``MsaSparseGqaFmha`` is imported here rather than at module scope so the
+    registry does not pull it in while ``trtllm`` is still importing this module
+    (``trtllm`` -> ``fmha`` -> ``registry``). Keeping the concrete-backend
+    imports inside this factory lets a backend module (e.g.
+    ``minimax_m3.msa_backend``) import ``TrtllmAttention`` /
+    ``TrtllmAttentionMetadata`` at top level without forming an import cycle,
+    and keeps that door open for future backends registered here.
+    """
+    from .msa_sparse_gqa import MsaSparseGqaFmha
+
+    return {
+        "msa_sparse_gqa": MsaSparseGqaFmha,
+        "flashinfer_trtllm_gen": FlashInferTrtllmGenFmha,
+        "fallback": FallbackFmha,
+    }
+
+
+FMHA_LIBS: dict[str, FmhaCls] = init_fmha_libs()
 DEFAULT_FMHA_LIBS: tuple[str, ...] = tuple(FMHA_LIBS)
 
 
@@ -80,4 +96,5 @@ __all__ = [
     "FMHA_LIBS",
     "FmhaCls",
     "get_enabled_fmha_lib_classes",
+    "init_fmha_libs",
 ]

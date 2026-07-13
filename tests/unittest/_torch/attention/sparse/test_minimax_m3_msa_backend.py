@@ -10,9 +10,7 @@ SM100 integration accuracy test.
 
 from tensorrt_llm._torch.attention_backend.fmha import MsaSparseGqaFmha
 from tensorrt_llm._torch.attention_backend.fmha.registry import DEFAULT_FMHA_LIBS, FMHA_LIBS
-from tensorrt_llm._torch.attention_backend.sparse.minimax_m3 import (
-    get_minimax_m3_msa_attention_backend_cls,
-)
+from tensorrt_llm._torch.attention_backend.sparse.minimax_m3 import MiniMaxM3MsaSparseAttention
 from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.common import MiniMaxM3SparseParams
 from tensorrt_llm._torch.attention_backend.sparse.utils import _resolve_minimax_m3_backend_cls
 from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttention, TrtllmAttentionMetadata
@@ -52,7 +50,7 @@ def test_msa_fmha_is_available_filters_on_owning_attention():
 
 
 def test_msa_backend_does_not_override_create_fmha_libs():
-    cls = get_minimax_m3_msa_attention_backend_cls()
+    cls = MiniMaxM3MsaSparseAttention
     assert cls.create_fmha_libs is TrtllmAttention.create_fmha_libs
 
 
@@ -62,13 +60,13 @@ def test_indices_block_size_matches_block_size():
 
 
 def test_msa_backend_subclasses_trtllm_attention():
-    cls = get_minimax_m3_msa_attention_backend_cls()
+    cls = MiniMaxM3MsaSparseAttention
     assert issubclass(cls, TrtllmAttention)
     assert issubclass(cls.Metadata, TrtllmAttentionMetadata)
 
 
 def test_msa_metadata_declares_flat_fields():
-    metadata_cls = get_minimax_m3_msa_attention_backend_cls().Metadata
+    metadata_cls = MiniMaxM3MsaSparseAttention.Metadata
     annotations = {}
     for klass in metadata_cls.__mro__:
         annotations.update(getattr(klass, "__annotations__", {}))
@@ -79,7 +77,7 @@ def test_msa_metadata_declares_flat_fields():
 def test_msa_metadata_drops_redundant_intermediate_fields():
     # These were per-forward intermediates that no forward path reads; the
     # graph-safe metadata computes them locally and does not store them.
-    metadata_cls = get_minimax_m3_msa_attention_backend_cls().Metadata
+    metadata_cls = MiniMaxM3MsaSparseAttention.Metadata
     annotations = {}
     for klass in metadata_cls.__mro__:
         annotations.update(getattr(klass, "__annotations__", {}))
@@ -93,7 +91,7 @@ def test_msa_metadata_drops_redundant_intermediate_fields():
 
 
 def test_msa_metadata_lengths_and_plans_are_derived_properties():
-    metadata_cls = get_minimax_m3_msa_attention_backend_cls().Metadata
+    metadata_cls = MiniMaxM3MsaSparseAttention.Metadata
     annotations = {}
     for klass in metadata_cls.__mro__:
         annotations.update(getattr(klass, "__annotations__", {}))
@@ -108,7 +106,7 @@ def test_msa_metadata_allocates_graph_stable_buffers():
     # The buffers are declared and allocated in a DSA-style __post_init__ hook,
     # not cached per batch size on a bespoke driver. Each graph-stable tensor is
     # a single declared field.
-    metadata_cls = get_minimax_m3_msa_attention_backend_cls().Metadata
+    metadata_cls = MiniMaxM3MsaSparseAttention.Metadata
     assert callable(getattr(metadata_cls, "_create_msa_buffers", None))
     annotations = {}
     for klass in metadata_cls.__mro__:
@@ -118,7 +116,7 @@ def test_msa_metadata_allocates_graph_stable_buffers():
 
 
 def test_msa_backend_defines_dsa_style_hooks():
-    cls = get_minimax_m3_msa_attention_backend_cls()
+    cls = MiniMaxM3MsaSparseAttention
     for name in ("run_indexer", "sparse_attn_predict", "sparse_kv_predict"):
         assert callable(getattr(cls, name, None)), f"missing {name}"
     assert cls.support_fused_rope() is False
@@ -129,7 +127,7 @@ def test_resolver_selects_msa_backend_when_available(monkeypatch):
 
     monkeypatch.setattr(avail, "ensure_msa_available", lambda: None)
     params = MiniMaxM3SparseAttentionConfig(sparse_use_msa=True).to_sparse_params()
-    assert _resolve_minimax_m3_backend_cls(params) is (get_minimax_m3_msa_attention_backend_cls())
+    assert _resolve_minimax_m3_backend_cls(params) is MiniMaxM3MsaSparseAttention
 
 
 def test_msa_params_reject_bad_topk_at_construction():
