@@ -29,10 +29,9 @@ if TYPE_CHECKING:
 def _msa_metadata_cls() -> type:
     """The concrete metadata class that drives MsaSparseGqaFmha.
 
-    Resolved lazily: this module is imported by the fmha registry while trtllm
-    is still importing (trtllm -> fmha -> registry), and msa_backend imports
-    the trtllm base classes at module scope, so a top-level import here would
-    form an import cycle.
+    Imported lazily: this module is pulled in while trtllm is still importing,
+    and msa_backend imports the trtllm attention classes at module scope, so a
+    module-scope import here would create a cycle.
     """
     from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_backend import (
         MiniMaxM3MsaSparseAttention,
@@ -195,29 +194,13 @@ class MsaSparseGqaFmha(Fmha):
 
     @classmethod
     def is_available(cls, attn: Optional["TrtllmAttention"] = None) -> bool:
-        # Only the MiniMax-M3 MSA attention layer uses this library. Filtering
-        # on the owning type lets the base create_fmha_libs add it to that
-        # layer alone, so no create_fmha_libs override is needed. Availability
-        # of the fmha_sm100 package and an SM100 device is gated earlier, when
-        # the MSA backend is selected.
-        from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_backend import (
-            MiniMaxM3MsaSparseAttention,
-        )
-
-        return isinstance(attn, MiniMaxM3MsaSparseAttention)
-
-    def is_supported(
-        self,
-        q: torch.Tensor,
-        k: Optional[torch.Tensor],
-        v: Optional[torch.Tensor],
-        metadata: "TrtllmAttentionMetadata",
-        forward_args: "AttentionForwardArgs",
-    ) -> bool:
-        # Claims every MiniMax-M3 MSA forward. Sparse layers carry the per-query
-        # top-k table in sparse_attn_indices; dense layers leave it None and
-        # attend the full page table. Both run fmha_sm100 through this lib.
-        return isinstance(metadata, _msa_metadata_cls())
+        # Only the MiniMax-M3 MSA attention layer uses this library. Matching on
+        # the lowered sparse algorithm lets the base create_fmha_libs add it to
+        # that layer alone, so no create_fmha_libs override is needed.
+        # Availability of the fmha_sm100 package and an SM100 device is gated
+        # earlier, when the MSA backend is selected.
+        sparse_params = getattr(attn, "sparse_params", None)
+        return getattr(sparse_params, "algorithm", None) == "minimax_m3"
 
     def forward(
         self,

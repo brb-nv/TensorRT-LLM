@@ -17,11 +17,10 @@
     batch size (create_cuda_graph_metadata), so no per-batch-size cache is
     needed here.
 
-The classes subclass TrtllmAttention / TrtllmAttentionMetadata, imported at
-top level. The fmha registry defers its MsaSparseGqaFmha import into
-init_fmha_libs (see fmha/registry.py), so the trtllm -> fmha -> registry
-import chain never reaches this module; that lets the trtllm base classes be
-imported here at module scope without an import cycle.
+The classes subclass TrtllmAttention and TrtllmAttentionMetadata, imported at
+module scope. This is cycle-free because the fmha registry defers its
+MsaSparseGqaFmha import (see fmha/registry.py), so trtllm's import chain does
+not reach this module.
 """
 
 from __future__ import annotations
