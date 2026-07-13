@@ -41,13 +41,6 @@ def _is_supported_device(capability: tuple[int, int] | None) -> bool:
     return is_sm_100f(major * 10 + minor)
 
 
-def is_msa_available() -> bool:
-    """Return True when the fmha_sm100 package and a supported GPU are present."""
-    if not _has_msa_package():
-        return False
-    return _is_supported_device(_current_compute_capability())
-
-
 def ensure_msa_available() -> None:
     """Raise RuntimeError if the MSA sparse attention path cannot run here."""
     if not _has_msa_package():
@@ -72,5 +65,4 @@ def ensure_msa_available() -> None:
 __all__ = [
     "MSA_PACKAGE",
     "ensure_msa_available",
-    "is_msa_available",
 ]

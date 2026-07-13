@@ -12,9 +12,6 @@ from tensorrt_llm._torch.attention_backend.sparse.minimax_m3 import (
     get_minimax_m3_triton_attention_backend_cls,
 )
 from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.common import MiniMaxM3SparseParams
-from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_availability import (
-    is_msa_available,
-)
 from tensorrt_llm._torch.attention_backend.sparse.utils import _resolve_minimax_m3_backend_cls
 from tensorrt_llm.llmapi.llm_args import MiniMaxM3SparseAttentionConfig
 
@@ -47,7 +44,3 @@ def test_resolver_does_not_fall_back_to_triton_when_msa_requested():
         return
     assert resolved is MiniMaxM3MsaSparseAttention
     assert resolved is not get_minimax_m3_triton_attention_backend_cls()
-
-
-def test_is_msa_available_returns_bool():
-    assert isinstance(is_msa_available(), bool)
