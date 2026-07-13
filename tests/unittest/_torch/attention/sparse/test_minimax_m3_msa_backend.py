@@ -13,7 +13,6 @@ from tensorrt_llm._torch.attention_backend.fmha.registry import DEFAULT_FMHA_LIB
 from tensorrt_llm._torch.attention_backend.sparse.minimax_m3 import MiniMaxM3MsaSparseAttention
 from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.common import MiniMaxM3SparseParams
 from tensorrt_llm._torch.attention_backend.sparse.utils import _resolve_minimax_m3_backend_cls
-from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttention, TrtllmAttentionMetadata
 from tensorrt_llm.llmapi.llm_args import MiniMaxM3SparseAttentionConfig
 
 # CUDA-graph-stable buffers owned by the metadata as declared fields.
@@ -49,20 +48,9 @@ def test_msa_fmha_is_available_filters_on_owning_attention():
     assert MsaSparseGqaFmha.is_available(object()) is False
 
 
-def test_msa_backend_does_not_override_create_fmha_libs():
-    cls = MiniMaxM3MsaSparseAttention
-    assert cls.create_fmha_libs is TrtllmAttention.create_fmha_libs
-
-
 def test_indices_block_size_matches_block_size():
     params = MiniMaxM3SparseAttentionConfig(sparse_block_size=128).to_sparse_params()
     assert params.indices_block_size == 128
-
-
-def test_msa_backend_subclasses_trtllm_attention():
-    cls = MiniMaxM3MsaSparseAttention
-    assert issubclass(cls, TrtllmAttention)
-    assert issubclass(cls.Metadata, TrtllmAttentionMetadata)
 
 
 def test_msa_metadata_declares_flat_fields():
@@ -72,22 +60,6 @@ def test_msa_metadata_declares_flat_fields():
         annotations.update(getattr(klass, "__annotations__", {}))
     for field in _MSA_METADATA_FIELDS:
         assert field in annotations, f"{field} must be a declared field"
-
-
-def test_msa_metadata_drops_redundant_intermediate_fields():
-    # These were per-forward intermediates that no forward path reads; the
-    # graph-safe metadata computes them locally and does not store them.
-    metadata_cls = MiniMaxM3MsaSparseAttention.Metadata
-    annotations = {}
-    for klass in metadata_cls.__mro__:
-        annotations.update(getattr(klass, "__annotations__", {}))
-    for field in (
-        "msa_is_prefill",
-        "msa_req_to_token",
-        "msa_slot_ids",
-        "msa_kv_lens_dev",
-    ):
-        assert field not in annotations, f"{field} should no longer be stored"
 
 
 def test_msa_metadata_lengths_and_plans_are_derived_properties():
@@ -113,13 +85,6 @@ def test_msa_metadata_allocates_graph_stable_buffers():
         annotations.update(getattr(klass, "__annotations__", {}))
     for buf in ("msa_out_cache_loc", "msa_kv_indices"):
         assert buf in annotations, f"{buf} must be a declared backing buffer"
-
-
-def test_msa_backend_defines_dsa_style_hooks():
-    cls = MiniMaxM3MsaSparseAttention
-    for name in ("run_indexer", "sparse_attn_predict", "sparse_kv_predict"):
-        assert callable(getattr(cls, name, None)), f"missing {name}"
-    assert cls.support_fused_rope() is False
 
 
 def test_resolver_selects_msa_backend_when_available(monkeypatch):

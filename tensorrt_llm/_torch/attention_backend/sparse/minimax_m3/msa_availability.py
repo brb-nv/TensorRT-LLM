@@ -2,9 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Availability checks for the MiniMax-M3 MSA sparse attention kernels.
 
-The MSA path depends on the external fmha_sm100 package and runs only on
-SM100 GPUs. These helpers gate backend selection so a request for the MSA
-path fails early with a clear message on unsupported systems.
+The MSA path depends on the external fmha_sm100 package and runs only on the
+SM100 architecture family (SM100 and SM103). These helpers gate backend
+selection so a request for the MSA path fails early with a clear message on
+unsupported systems.
 """
 
 from __future__ import annotations
@@ -13,8 +14,10 @@ import importlib.util
 
 import torch
 
-# fmha_sm100 targets the SM100 architecture (compute capability 10.x).
-MSA_MIN_COMPUTE_CAPABILITY = (10, 0)
+from tensorrt_llm._utils import is_sm_100f
+
+# fmha_sm100 runs on the SM100 architecture family (SM100 and SM103). Other
+# architectures, including SM120, are not supported.
 MSA_PACKAGE = "fmha_sm100"
 
 
@@ -31,12 +34,18 @@ def _current_compute_capability() -> tuple[int, int] | None:
         return None
 
 
+def _is_supported_device(capability: tuple[int, int] | None) -> bool:
+    if capability is None:
+        return False
+    major, minor = capability
+    return is_sm_100f(major * 10 + minor)
+
+
 def is_msa_available() -> bool:
-    """Return True when the fmha_sm100 package and an SM100 GPU are present."""
+    """Return True when the fmha_sm100 package and a supported GPU are present."""
     if not _has_msa_package():
         return False
-    capability = _current_compute_capability()
-    return capability is not None and capability >= MSA_MIN_COMPUTE_CAPABILITY
+    return _is_supported_device(_current_compute_capability())
 
 
 def ensure_msa_available() -> None:
@@ -52,17 +61,15 @@ def ensure_msa_available() -> None:
             "MiniMax-M3 MSA sparse attention requires a CUDA device and could not "
             "query the compute capability."
         )
-    if capability < MSA_MIN_COMPUTE_CAPABILITY:
+    if not _is_supported_device(capability):
         major, minor = capability
         raise RuntimeError(
-            "MiniMax-M3 MSA sparse attention requires compute capability "
-            f"{MSA_MIN_COMPUTE_CAPABILITY[0]}.{MSA_MIN_COMPUTE_CAPABILITY[1]} or "
-            f"higher, but the current device is {major}.{minor}."
+            "MiniMax-M3 MSA sparse attention requires an SM100 or SM103 device, "
+            f"but the current device is compute capability {major}.{minor}."
         )
 
 
 __all__ = [
-    "MSA_MIN_COMPUTE_CAPABILITY",
     "MSA_PACKAGE",
     "ensure_msa_available",
     "is_msa_available",
