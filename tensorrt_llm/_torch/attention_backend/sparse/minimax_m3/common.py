@@ -15,7 +15,7 @@ import Triton-backend internals:
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional, Tuple
+from typing import TYPE_CHECKING, Literal, Optional, Tuple
 
 import torch
 
@@ -68,30 +68,44 @@ def write_main_kv_slots(
     cache: torch.Tensor,
     out_cache_loc: torch.Tensor,
     values: torch.Tensor,
+    *,
+    layout: Literal["NHD", "HND"] = "NHD",
 ) -> None:
     """Layout-aware writer for K (or V / index-K) caches.
 
-    Supports two layouts:
+    Supports two cache ranks, and for the paged case two axis orders via
+    ``layout``:
 
       * 3-D flat-slot `[num_slots, num_heads, channel]`: index_copy_
         writes propagate because the tensor is the storage (unit tests).
-      * 4-D paged `[num_pages, tokens_per_block, num_heads, channel]`: a
-        view of `kv_pool[:, 0]` / `kv_pool[:, 1]` (or the paged index-K
+      * 4-D paged: ``layout="NHD"`` is
+        `[num_pages, tokens_per_block, num_heads, channel]`, ``layout="HND"``
+        is `[num_pages, num_heads, tokens_per_block, channel]`. Either way it
+        is a view of `kv_pool[:, 0]` / `kv_pool[:, 1]` (or the paged index-K
         view). The view is non-contiguous, so index_copy_ would silently
         fork a copy and lose the write; instead decompose the flat slot id
         into (page, within) and use multi-dim fancy assignment so the
         write propagates to the pool.
+
+    ``values`` is always `[num_tokens, num_heads, channel]`.
     """
     # KV-cache writes never need autograd; wrap in no_grad so callers with
     # an active grad context (unit tests without inference_mode) do not
     # trip the in-place autograd guard on the cache view chain.
     with torch.no_grad():
         if cache.ndim >= 4:
-            tokens_per_block = int(cache.shape[1])
+            token_axis = 2 if layout == "HND" else 1
+            tokens_per_block = int(cache.shape[token_axis])
             out_long = out_cache_loc.to(torch.long)
             page = out_long // tokens_per_block
             within = out_long % tokens_per_block
-            cache[page, within] = values.to(cache.dtype)
+            if layout == "HND":
+                # Advanced indices on dims 0 and 2 broadcast to [num_tokens]
+                # and move front, giving a [num_tokens, num_heads, channel]
+                # target that matches `values`.
+                cache[page, :, within, :] = values.to(cache.dtype)
+            else:
+                cache[page, within] = values.to(cache.dtype)
         else:
             cache.index_copy_(0, out_cache_loc.to(torch.long), values.to(cache.dtype))
 
@@ -130,13 +144,16 @@ def cache_view_to_msa_paged(cache_view: torch.Tensor) -> torch.Tensor:
 
 
 def msa_paged_kv(kv_cache_manager, layer_idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Per-layer paged K/V in `fmha_sm100` HND layout.
+    """Per-layer paged K/V in `fmha_sm100` HND layout, zero-copy.
 
-    Reads the coalesced K+V slot view from the KV cache manager and
-    converts each half to `[num_pages, num_kv_heads, page_size, head_dim]`.
+    The cache is stored head-major (see `write_msa_main_kv`), so the "HND"
+    buffer view is already the `[num_slots, num_kv_heads, page_size, head_dim]`
+    layout `fmha_sm100` expects. The kernel reads the page and head strides at
+    runtime and needs only each page's `[page_size, head_dim]` block to be
+    contiguous, which this view satisfies, so no copy is required.
     """
-    buffers = kv_cache_manager.get_buffers(layer_idx)
-    return cache_view_to_msa_paged(buffers[:, 0]), cache_view_to_msa_paged(buffers[:, 1])
+    buffers = kv_cache_manager.get_buffers(layer_idx, kv_layout="HND")
+    return buffers[:, 0], buffers[:, 1]
 
 
 def write_msa_main_kv(
@@ -150,15 +167,20 @@ def write_msa_main_kv(
 
     `fmha_sm100` reads the paged cache directly, so (unlike the standard
     C++ FMHA path) the new-token K/V must be written into the cache before
-    the sparse GQA runs.
+    the sparse GQA runs. The write uses the head-major HND view so
+    `msa_paged_kv` can return a zero-copy view.
     """
-    buffers = kv_cache_manager.get_buffers(layer_idx)
+    buffers = kv_cache_manager.get_buffers(layer_idx, kv_layout="HND")
     k_view, v_view = buffers[:, 0], buffers[:, 1]
-    num_kv_heads = int(k_view.shape[2])
+    num_kv_heads = int(k_view.shape[1])
     head_dim = int(k_view.shape[3])
     num_tokens = int(k.shape[0])
-    write_main_kv_slots(k_view, out_cache_loc, k.reshape(num_tokens, num_kv_heads, head_dim))
-    write_main_kv_slots(v_view, out_cache_loc, v.reshape(num_tokens, num_kv_heads, head_dim))
+    write_main_kv_slots(
+        k_view, out_cache_loc, k.reshape(num_tokens, num_kv_heads, head_dim), layout="HND"
+    )
+    write_main_kv_slots(
+        v_view, out_cache_loc, v.reshape(num_tokens, num_kv_heads, head_dim), layout="HND"
+    )
 
 
 def build_kv_indices_and_lens(
