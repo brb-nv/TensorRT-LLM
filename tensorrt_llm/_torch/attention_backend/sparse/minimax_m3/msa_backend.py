@@ -315,21 +315,38 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
                     kv_cache_manager=kv_cache_manager,
                     max_batch=max_num_sequences,
                 )
-                self.msa_max_score = self.get_empty(
-                    buffers,
-                    (config.num_index_heads, max_k_tiles, max_num_sequences),
-                    cache_name="msa_max_score",
-                    dtype=torch.float32,
-                    capture_graph=capture_graph,
-                )
-                self.msa_n_valid_blocks = self.get_empty(
-                    buffers,
-                    (max_num_sequences,),
-                    cache_name="msa_n_valid_blocks",
-                    dtype=torch.int32,
+                self._alloc_msa_proxy_scratch(
+                    config=config,
+                    max_batch=max_num_sequences,
+                    max_k_tiles=max_k_tiles,
                     capture_graph=capture_graph,
                 )
         self._msa_buffers_ready = True
+
+    def _alloc_msa_proxy_scratch(
+        self,
+        *,
+        config: MiniMaxM3SparseConfig,
+        max_batch: int,
+        max_k_tiles: int,
+        capture_graph: bool,
+    ) -> None:
+        """Allocate the proxy max-score and valid-block scratch buffers."""
+        buffers = self.cuda_graph_buffers
+        self.msa_max_score = self.get_empty(
+            buffers,
+            (config.num_index_heads, max_k_tiles, max_batch),
+            cache_name="msa_max_score",
+            dtype=torch.float32,
+            capture_graph=capture_graph,
+        )
+        self.msa_n_valid_blocks = self.get_empty(
+            buffers,
+            (max_batch,),
+            cache_name="msa_n_valid_blocks",
+            dtype=torch.int32,
+            capture_graph=capture_graph,
+        )
 
     def _ensure_msa_decode_scratch_buffers(
         self,
@@ -365,19 +382,10 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
                 f"Worst-case max_k_tiles ({max_k_tiles}) is less than the "
                 f"decode plan ({required_max_k_tiles})."
             )
-        buffers = self.cuda_graph_buffers
-        self.msa_max_score = self.get_empty(
-            buffers,
-            (config.num_index_heads, max_k_tiles, max_batch),
-            cache_name="msa_max_score",
-            dtype=torch.float32,
-            capture_graph=capture_graph,
-        )
-        self.msa_n_valid_blocks = self.get_empty(
-            buffers,
-            (max_batch,),
-            cache_name="msa_n_valid_blocks",
-            dtype=torch.int32,
+        self._alloc_msa_proxy_scratch(
+            config=config,
+            max_batch=max_batch,
+            max_k_tiles=max_k_tiles,
             capture_graph=capture_graph,
         )
 

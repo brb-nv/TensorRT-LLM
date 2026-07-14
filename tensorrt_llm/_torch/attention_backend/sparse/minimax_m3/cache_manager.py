@@ -202,11 +202,9 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
     def _build_m3_config(self, manager_kwargs) -> Optional[MiniMaxM3SparseConfig]:
         """Build the layer-invariant MiniMax-M3 sparse geometry.
 
-        Head counts follow the tensor-parallel sharding the model applies
-        (num_index_heads is replicated, not sharded), matching the geometry
-        the attention backend derives. Sourced from the pretrained config
-        (head counts and head_dim) and the sparse attention config (index and
-        top-k params). Returns None when either is unavailable.
+        Q/KV head counts follow the model's tensor-parallel sharding; index
+        heads stay replicated. Returns None if the pretrained or sparse
+        attention config is unavailable.
         """
         pretrained_config = manager_kwargs.get("pretrained_config")
         sparse_attention_config = manager_kwargs.get(

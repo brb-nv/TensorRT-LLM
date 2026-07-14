@@ -26,11 +26,9 @@ FmhaCls: TypeAlias = type[Fmha]
 def init_fmha_libs() -> dict[str, "FmhaCls"]:
     """Build the ordered FMHA library registry.
 
-    MsaSparseGqaFmha is imported inside this factory rather than at module
-    scope. trtllm imports this registry during its own import, so localizing
-    the backend imports here keeps that import light and lets backend modules
-    such as minimax_m3.msa_backend import TrtllmAttention and
-    TrtllmAttentionMetadata at module scope without an import cycle.
+    Backend classes are imported inside this factory rather than at module
+    scope, so backends can import trtllm attention classes at module scope
+    without an import cycle.
     """
     from .msa_sparse_gqa import MsaSparseGqaFmha
 
