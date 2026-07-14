@@ -55,6 +55,33 @@ def _cache_device(meta) -> torch.device:
     return torch.device(f"cuda:{torch.cuda.current_device()}")
 
 
+def _worst_case_proxy_max_k_tiles(
+    fmha_sm100,
+    *,
+    config: MiniMaxM3SparseConfig,
+    kv_cache_manager,
+    max_batch: int,
+) -> int:
+    """Return max_k_tiles for a proxy plan at the manager's max KV length."""
+    page_size = int(kv_cache_manager.tokens_per_block)
+    max_kv_len = int(kv_cache_manager.max_blocks_per_seq) * page_size
+    qo_lens = torch.ones(max_batch, dtype=torch.int32)
+    kv_lens = torch.full((max_batch,), max_kv_len, dtype=torch.int32)
+    qo_offset = kv_lens - qo_lens
+    proxy_plan = fmha_sm100.fmha_sm100_plan(
+        qo_lens,
+        kv_lens,
+        config.num_index_heads,
+        num_kv_heads=1,
+        qo_offset=qo_offset,
+        page_size=page_size,
+        output_maxscore=True,
+        num_kv_splits=1,
+        causal=True,
+    )
+    return int(proxy_plan[3]["max_k_tiles"])
+
+
 # Per-step fmha_sm100 plan tensors that must live in CUDA-graph-stable buffers.
 # At num_kv_splits=1 the plan carries no split-KV workspaces, and
 # cute_workspace_buffer is the vendor's cached scratch (kept by reference, not
@@ -164,24 +191,21 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
 
     Tensors read inside the captured forward are CUDA-graph-stable: the
     cache slots (msa_out_cache_loc), page table (msa_kv_indices), and proxy
-    scratch (msa_max_score, msa_n_valid_blocks) are allocated once and
-    refreshed via copy_. The decode plans' device worklists are likewise
-    pinned on the _MsaGraphSafePlan owners, surfaced via msa_decode_*_plan.
+    scratch (msa_max_score, msa_n_valid_blocks) are allocated once from the
+    manager's worst-case geometry and refreshed via copy_. Decode-plan
+    worklists live on _MsaGraphSafePlan owners, surfaced via msa_decode_*_plan.
 
-    The length inputs to fmha_sm100_plan (msa_qo_lens_cpu, msa_kv_lens_cpu,
+    Length inputs to fmha_sm100_plan (msa_qo_lens_cpu, msa_kv_lens_cpu,
     msa_qo_offset_cpu) are host properties of the base seq_lens/kv_lens,
     read only while building plans in prepare() (outside capture), so they
     need no graph-stable storage. Plans are built in _build_decode_plans and
-    are absent for prefill/mixed batches, which run eagerly. (MiniMax-M3 MSA
-    has no cache compression or speculative decode, so base lengths apply.)
+    are absent for prefill/mixed batches, which run eagerly.
     """
 
     # Graph-stable buffers; consumers slice to the live count at the call
     # site. Filled once the current step's cache write is prepared.
     msa_out_cache_loc: Optional[torch.Tensor] = None
     msa_kv_indices: Optional[torch.Tensor] = None
-    # Proxy-pass scratch, allocated lazily when the decode plans are first
-    # built. Absent until the first decode step.
     msa_max_score: Optional[torch.Tensor] = None
     msa_n_valid_blocks: Optional[torch.Tensor] = None
 
@@ -250,8 +274,8 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
 
         Buffers come from the shared graph buffer pool so they are reserved
         under capture. Sizing follows the worst-case graph geometry:
-        max_num_tokens new tokens for the cache slots, and up to
-        max_num_sequences * max_blocks_per_seq pages for the page table.
+        max_num_tokens for cache slots, max_num_sequences * max_blocks_per_seq
+        for the page table, and worst-case max_k_tiles for proxy scratch.
         """
         kv_cache_manager = self.kv_cache_manager
         self._msa_buffers_ready = False
@@ -278,7 +302,84 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
             dtype=torch.int32,
             capture_graph=capture_graph,
         )
+        config = getattr(kv_cache_manager, "m3_config", None)
+        if config is not None:
+            try:
+                fmha_sm100 = require_msa_module()
+            except RuntimeError:
+                fmha_sm100 = None
+            if fmha_sm100 is not None:
+                max_k_tiles = _worst_case_proxy_max_k_tiles(
+                    fmha_sm100,
+                    config=config,
+                    kv_cache_manager=kv_cache_manager,
+                    max_batch=max_num_sequences,
+                )
+                self.msa_max_score = self.get_empty(
+                    buffers,
+                    (config.num_index_heads, max_k_tiles, max_num_sequences),
+                    cache_name="msa_max_score",
+                    dtype=torch.float32,
+                    capture_graph=capture_graph,
+                )
+                self.msa_n_valid_blocks = self.get_empty(
+                    buffers,
+                    (max_num_sequences,),
+                    cache_name="msa_n_valid_blocks",
+                    dtype=torch.int32,
+                    capture_graph=capture_graph,
+                )
         self._msa_buffers_ready = True
+
+    def _ensure_msa_decode_scratch_buffers(
+        self,
+        *,
+        config: MiniMaxM3SparseConfig,
+        max_batch: int,
+        capture_graph: bool,
+        required_max_k_tiles: int,
+    ) -> None:
+        """Ensure proxy scratch buffers exist and cover the current plan."""
+        if self.msa_max_score is not None:
+            allocated_max_k_tiles = int(self.msa_max_score.shape[1])
+            if allocated_max_k_tiles < required_max_k_tiles:
+                raise ValueError(
+                    f"msa_max_score has {allocated_max_k_tiles} k-tiles but the "
+                    f"decode plan needs {required_max_k_tiles}."
+                )
+            return
+
+        kv_cache_manager = self.kv_cache_manager
+        if kv_cache_manager is None:
+            return
+
+        fmha_sm100 = require_msa_module()
+        max_k_tiles = _worst_case_proxy_max_k_tiles(
+            fmha_sm100,
+            config=config,
+            kv_cache_manager=kv_cache_manager,
+            max_batch=max_batch,
+        )
+        if max_k_tiles < required_max_k_tiles:
+            raise ValueError(
+                f"Worst-case max_k_tiles ({max_k_tiles}) is less than the "
+                f"decode plan ({required_max_k_tiles})."
+            )
+        buffers = self.cuda_graph_buffers
+        self.msa_max_score = self.get_empty(
+            buffers,
+            (config.num_index_heads, max_k_tiles, max_batch),
+            cache_name="msa_max_score",
+            dtype=torch.float32,
+            capture_graph=capture_graph,
+        )
+        self.msa_n_valid_blocks = self.get_empty(
+            buffers,
+            (max_batch,),
+            cache_name="msa_n_valid_blocks",
+            dtype=torch.int32,
+            capture_graph=capture_graph,
+        )
 
     def prepare(self) -> None:
         super().prepare()
@@ -359,7 +460,15 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
             causal=True,
         )
 
-        # Allocate the graph-stable buffers once per metadata; later steps
+        required_max_k_tiles = int(proxy_plan[3]["max_k_tiles"])
+        self._ensure_msa_decode_scratch_buffers(
+            config=config,
+            max_batch=max_batch,
+            capture_graph=capture_graph,
+            required_max_k_tiles=required_max_k_tiles,
+        )
+
+        # Allocate the graph-safe plan owners once per metadata; later steps
         # only refresh their contents below.
         if self._msa_proxy_plan is None:
             num_ctas = torch.cuda.get_device_properties(device).multi_processor_count
@@ -382,23 +491,6 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
                 "msa_dense_plan",
                 max_batch=max_batch,
                 num_ctas=num_ctas,
-                capture_graph=capture_graph,
-            )
-            # max_k_tiles is constant over the decode kv-length range, so the
-            # proxy max_score buffer keeps a stable shape across replays.
-            max_k_tiles = int(proxy_plan[3]["max_k_tiles"])
-            self.msa_max_score = self.get_empty(
-                self.cuda_graph_buffers,
-                (config.num_index_heads, max_k_tiles, max_batch),
-                cache_name="msa_max_score",
-                dtype=torch.float32,
-                capture_graph=capture_graph,
-            )
-            self.msa_n_valid_blocks = self.get_empty(
-                self.cuda_graph_buffers,
-                (max_batch,),
-                cache_name="msa_n_valid_blocks",
-                dtype=torch.int32,
                 capture_graph=capture_graph,
             )
 
