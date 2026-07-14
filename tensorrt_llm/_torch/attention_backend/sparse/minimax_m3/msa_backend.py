@@ -302,25 +302,25 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
             dtype=torch.int32,
             capture_graph=capture_graph,
         )
+        # The proxy scratch needs the fmha_sm100 plan geometry. This metadata
+        # exists only for the MSA backend, whose selection already required the
+        # kernels, so a failed import here is a hard error rather than a reason
+        # to skip allocation.
         config = getattr(kv_cache_manager, "m3_config", None)
         if config is not None:
-            try:
-                fmha_sm100 = require_msa_module()
-            except RuntimeError:
-                fmha_sm100 = None
-            if fmha_sm100 is not None:
-                max_k_tiles = _worst_case_proxy_max_k_tiles(
-                    fmha_sm100,
-                    config=config,
-                    kv_cache_manager=kv_cache_manager,
-                    max_batch=max_num_sequences,
-                )
-                self._alloc_msa_proxy_scratch(
-                    config=config,
-                    max_batch=max_num_sequences,
-                    max_k_tiles=max_k_tiles,
-                    capture_graph=capture_graph,
-                )
+            fmha_sm100 = require_msa_module()
+            max_k_tiles = _worst_case_proxy_max_k_tiles(
+                fmha_sm100,
+                config=config,
+                kv_cache_manager=kv_cache_manager,
+                max_batch=max_num_sequences,
+            )
+            self._alloc_msa_proxy_scratch(
+                config=config,
+                max_batch=max_num_sequences,
+                max_k_tiles=max_k_tiles,
+                capture_graph=capture_graph,
+            )
         self._msa_buffers_ready = True
 
     def _alloc_msa_proxy_scratch(

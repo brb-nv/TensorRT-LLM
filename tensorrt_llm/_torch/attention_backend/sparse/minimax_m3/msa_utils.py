@@ -4,6 +4,9 @@
 
 from __future__ import annotations
 
+import importlib.util
+import sys
+from pathlib import Path
 from typing import Optional, Tuple
 
 import torch
@@ -16,20 +19,53 @@ from .common import _INIT_SCORE, _LOCAL_SCORE, write_kv_slots
 MSA_REQUIRED_TOPK = 16
 MSA_REQUIRED_HEAD_DIM = 128
 
+# Path of the vendored fmha_sm100 package relative to the repository root
+# (see 3rdparty/MSA/LICENSE and 3rdparty/MSA/NOTICE for provenance).
+_VENDORED_MSA_RELPATH = Path("3rdparty") / "MSA" / "python"
+
+
+def _find_vendored_msa_python_dir() -> Optional[Path]:
+    """Locate the vendored fmha_sm100 package dir by walking up from this file.
+
+    Returns None in installed layouts where the 3rdparty tree is not shipped.
+    Walking up avoids hardcoding this module's depth below the repository root.
+    """
+    for parent in Path(__file__).resolve().parents:
+        candidate = parent / _VENDORED_MSA_RELPATH
+        if candidate.is_dir():
+            return candidate
+    return None
+
+
+def _ensure_msa_on_path() -> None:
+    """Prepend the vendored fmha_sm100 package directory to sys.path if present."""
+    vendored = _find_vendored_msa_python_dir()
+    if vendored is not None and str(vendored) not in sys.path:
+        sys.path.insert(0, str(vendored))
+
+
+def msa_package_available() -> bool:
+    """True if fmha_sm100 can be imported (source-integrated or installed)."""
+    _ensure_msa_on_path()
+    return importlib.util.find_spec("fmha_sm100") is not None
+
 
 def require_msa_module():
-    """Import fmha_sm100 and raise a clear error when it is missing.
+    """Import the source-integrated fmha_sm100 package or raise a clear error.
 
     The import is deferred to first kernel use so the MSA backend can be
-    advertised in the config schema on systems where fmha_sm100 is absent.
+    advertised in the config schema on systems where the kernels cannot load.
+    The vendored 3rdparty/MSA/python directory is added to sys.path first, so a
+    source checkout resolves without a separate install. A missing package is a
+    hard error, never a silent fallback to another backend.
     """
+    _ensure_msa_on_path()
     try:
         import fmha_sm100
     except ImportError as exc:
         raise RuntimeError(
-            "MiniMax-M3 MSA attention requires the external fmha_sm100 package "
-            "(https://github.com/MiniMax-AI/MSA). Install it, or unset "
-            "sparse_use_msa to use the Triton reference path."
+            "MiniMax-M3 MSA attention requires the source-integrated fmha_sm100 "
+            "kernels vendored under 3rdparty/MSA, which could not be imported."
         ) from exc
     return fmha_sm100
 
@@ -210,6 +246,7 @@ __all__ = [
     "MSA_REQUIRED_TOPK",
     "build_kv_page_indices",
     "cache_view_to_msa_paged",
+    "msa_package_available",
     "msa_paged_kv",
     "per_token_valid_blocks",
     "require_msa_module",
