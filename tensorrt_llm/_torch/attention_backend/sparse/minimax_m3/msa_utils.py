@@ -53,9 +53,16 @@ def cache_view_to_msa_paged(cache_view: torch.Tensor) -> torch.Tensor:
 
 
 def msa_paged_kv(kv_cache_manager, layer_idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Return per-layer paged K and V in fmha_sm100 HND layout."""
-    buffers = kv_cache_manager.get_buffers(layer_idx)
-    return cache_view_to_msa_paged(buffers[:, 0]), cache_view_to_msa_paged(buffers[:, 1])
+    """Return per-layer paged K and V in fmha_sm100 HND layout, zero-copy.
+
+    The cache is stored head-major (see `write_msa_main_kv`), so the "HND"
+    buffer view is already the [num_slots, num_kv_heads, page_size, head_dim]
+    layout fmha_sm100 expects. The kernel reads the page and head strides at
+    runtime and needs only each page's [page_size, head_dim] block to be
+    contiguous, which this view satisfies, so no copy is required.
+    """
+    buffers = kv_cache_manager.get_buffers(layer_idx, kv_layout="HND")
+    return buffers[:, 0], buffers[:, 1]
 
 
 def write_msa_main_kv(
@@ -67,16 +74,21 @@ def write_msa_main_kv(
 ) -> None:
     """Write new-token K and V into the paged main cache at out_cache_loc.
 
-    fmha_sm100 reads the paged cache directly, so the new-token K and V must
-    be resident before the sparse GQA runs.
+    fmha_sm100 reads the paged cache directly, so the new-token K and V must be
+    resident before the sparse GQA runs. The write uses the head-major HND view
+    so `msa_paged_kv` can return a zero-copy view.
     """
-    buffers = kv_cache_manager.get_buffers(layer_idx)
+    buffers = kv_cache_manager.get_buffers(layer_idx, kv_layout="HND")
     k_view, v_view = buffers[:, 0], buffers[:, 1]
-    num_kv_heads = int(k_view.shape[2])
+    num_kv_heads = int(k_view.shape[1])
     head_dim = int(k_view.shape[3])
     num_tokens = int(k.shape[0])
-    write_kv_slots(k_view, out_cache_loc, k.reshape(num_tokens, num_kv_heads, head_dim))
-    write_kv_slots(v_view, out_cache_loc, v.reshape(num_tokens, num_kv_heads, head_dim))
+    write_kv_slots(
+        k_view, out_cache_loc, k.reshape(num_tokens, num_kv_heads, head_dim), layout="HND"
+    )
+    write_kv_slots(
+        v_view, out_cache_loc, v.reshape(num_tokens, num_kv_heads, head_dim), layout="HND"
+    )
 
 
 def build_kv_page_indices(
