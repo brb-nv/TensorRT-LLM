@@ -36,6 +36,12 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
+from ..attention_backend.sparse.minimax_m3 import (
+    MiniMaxM3MsaSparseAttention,
+    _gather_paged_batched,
+    _write_main_kv_slots_to_pool,
+    get_minimax_m3_triton_attention_backend_cls,
+)
 from ..distributed import AllReduce, AllReduceParams, MiniMaxAllReduceRMS
 from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
@@ -911,11 +917,6 @@ class MiniMaxM3Attention(Attention):
         output: torch.Tensor,
     ) -> torch.Tensor:
         """Run dense cache updates and attention into ``output``."""
-        from ..attention_backend.sparse.minimax_m3 import (
-            _gather_paged_batched,
-            _write_main_kv_slots_to_pool,
-        )
-
         kv_cache_manager = getattr(attn_metadata, "kv_cache_manager", None)
         if kv_cache_manager is None:
             raise RuntimeError(
@@ -1117,11 +1118,20 @@ class MiniMaxM3Attention(Attention):
         attn_metadata: AttentionMetadata,
         output: torch.Tensor,
     ) -> torch.Tensor:
-        if self.is_sparse_attention_layer:
-            assert idx_q is not None and idx_k is not None
-            return self._sparse_attention_core(q, k, v, idx_q, idx_k, attn_metadata, output)
-        assert idx_q is None and idx_k is None
-        return self._dense_attention_core(q, k, v, attn_metadata, output)
+        # The MSA backend owns attention execution (indexer + sparse GQA, or
+        # dense paged GQA); the model layer only supplies the projections.
+        if isinstance(self.attn, MiniMaxM3MsaSparseAttention):
+            if self.is_sparse_attention_layer:
+                assert idx_q is not None and idx_k is not None
+                return self.attn.run_sparse_attention(q, k, v, idx_q, idx_k, attn_metadata, output)
+            assert idx_q is None and idx_k is None
+            return self.attn.run_dense_attention(q, k, v, attn_metadata, output)
+        else:
+            if self.is_sparse_attention_layer:
+                assert idx_q is not None and idx_k is not None
+                return self._sparse_attention_core(q, k, v, idx_q, idx_k, attn_metadata, output)
+            assert idx_q is None and idx_k is None
+            return self._dense_attention_core(q, k, v, attn_metadata, output)
 
     def _sparse_forward(
         self,
@@ -1141,7 +1151,7 @@ class MiniMaxM3Attention(Attention):
           4. Pull paged main K/V cache (reshaped to flat-slot view) and
              paged side index-K cache from the
              :class:`MiniMaxM3KVCacheManagerV2`.
-          5. Build a :class:`MiniMaxM3SparseAttentionMetadata` from the
+          5. Build a :class:`MiniMaxM3TritonSparseAttentionMetadata` from the
              standard :class:`AttentionMetadata` (using ``request_ids``
              + ``seq_lens`` + ``num_cached_tokens_per_seq``).
           6. Write the new token's K/V/idx_K to the slots named by the
@@ -1154,7 +1164,7 @@ class MiniMaxM3Attention(Attention):
         Production callers (the LLM API path) drive
         :meth:`MiniMaxM3AttentionMetadata.prepare` outside any
         CUDA-graph capture window; that method attaches a pre-built
-        :class:`MiniMaxM3SparseAttentionMetadata` and an
+        :class:`MiniMaxM3TritonSparseAttentionMetadata` and an
         ``out_cache_loc`` tensor as ``attn_metadata.minimax_m3``. Test
         callers attach the same dict manually.  This forward path
         always reads the pre-built attachment and never builds metadata
@@ -1198,7 +1208,7 @@ class MiniMaxM3Attention(Attention):
         attn_metadata: AttentionMetadata,
         output: torch.Tensor,
     ) -> torch.Tensor:
-        """Run sparse cache updates and attention into ``output``."""
+        """Run sparse cache updates and attention into ``output`` (Triton path)."""
         kv_cache_manager = getattr(attn_metadata, "kv_cache_manager", None)
         if kv_cache_manager is None:
             raise RuntimeError(
@@ -1268,9 +1278,7 @@ class MiniMaxM3Attention(Attention):
         # registers :class:`MiniMaxM3SparseRuntimeBackend` as
         # ``self.attn``; any other backend on a sparse layer is a
         # configuration error.
-        from ..attention_backend.sparse.minimax_m3 import get_minimax_m3_attention_backend_cls
-
-        m3_backend_cls = get_minimax_m3_attention_backend_cls()
+        m3_backend_cls = get_minimax_m3_triton_attention_backend_cls()
         if not isinstance(self.attn, m3_backend_cls):
             raise RuntimeError(
                 f"MiniMax-M3 sparse forward (layer {self.layer_idx}) requires "

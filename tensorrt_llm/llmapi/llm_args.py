@@ -412,8 +412,7 @@ class EncodeCudaGraphConfig(BaseCudaGraphConfig):
     @staticmethod
     def _generate_cuda_graph_seq_lens(max_seq_len: int,
                                       enable_padding: bool) -> List[int]:
-        """
-        Generate a list of max per-request sequence lengths for encoder CUDA graphs.
+        """Generate a list of max per-request sequence lengths for encoder CUDA graphs.
 
         Args:
             max_seq_len: Maximum per-request sequence length to generate up to.
@@ -620,20 +619,18 @@ class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
 
     Drives the two-step sparse attention used by MiniMax-M3 layers 3..N:
 
-      1. An index attention branch projects a per-head Q vector and a
-         **single replicated** K vector, scores main K/V cache blocks,
-         and selects the top-``topk`` blocks per ``(num_kv_heads, q_token)``
-         pair (with ``init_blocks`` forced at the head and ``local_blocks``
-         forced at the tail).
+      1. An index attention branch projects a per-head Q vector and a single
+         replicated K vector, scores main K/V cache blocks, and selects the
+         top-k blocks per (num_kv_heads, q_token) pair, with init_blocks forced
+         at the head and local_blocks forced at the tail.
       2. A sparse GQA attention runs only over the selected blocks.
 
-    The selected backend at runtime uses
-    :class:`tensorrt_llm._torch.attention_backend.sparse.minimax_m3.MiniMaxM3SparseAttention`
-    on top of a :class:`MiniMaxM3KVCacheManagerV2` that allocates a
-    paged side index-K cache (``[num_slots, 1, sparse_index_dim]``)
-    parallel to the main K/V cache. The M3 checkpoint sets
-    ``disable_index_value=True`` on every sparse layer so no index V
-    cache is allocated for the bring-up.
+    At runtime one of the MiniMax-M3 sparse attention backends under
+    tensorrt_llm._torch.attention_backend.sparse.minimax_m3 is selected. The
+    chosen backend runs on top of a MiniMaxM3KVCacheManagerV2 that allocates a
+    paged side index-K cache of shape [num_slots, 1, sparse_index_dim] parallel
+    to the main K/V cache. The M3 checkpoint sets disable_index_value=True on
+    every sparse layer, so no index V cache is allocated.
     """
 
     algorithm: Literal["minimax_m3"] = "minimax_m3"
@@ -670,6 +667,22 @@ class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
         default=True,
         description="If True, skip the index V branch (M3 checkpoint default).",
     )
+    implementation: Literal["triton", "msa"] = Field(
+        default="triton",
+        description=
+        "Sparse attention implementation: 'triton' reference (default) or 'msa' "
+        "(fmha_sm100 kernels). The 'msa' implementation requires an SM100 GPU, "
+        "the fmha_sm100 package, and sparse_block_size == 128.",
+        status="prototype",
+    )
+
+    @model_validator(mode="after")
+    def _validate_msa_block_size(self):
+        if self.implementation == "msa" and self.sparse_block_size != 128:
+            raise ValueError(
+                "MiniMax-M3 'msa' implementation requires sparse_block_size == "
+                f"128, got {self.sparse_block_size}.")
+        return self
 
     def supports_backend(self, backend: str) -> bool:
         return backend == "pytorch"
@@ -678,7 +691,7 @@ class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
         return self.sparse_block_size
 
     def to_sparse_params(self, **kwargs):
-        from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.metadata import \
+        from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.common import \
             MiniMaxM3SparseParams
 
         return MiniMaxM3SparseParams(
@@ -690,6 +703,32 @@ class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
             local_blocks=self.sparse_local_blocks,
             score_type=self.sparse_score_type,
             disable_index_value=self.sparse_disable_index_value,
+            implementation=self.implementation,
+        )
+
+    def to_sparse_metadata_params(self, **kwargs):
+        """Lower into MiniMaxM3SparseMetadataParams for the attention metadata.
+
+        The global head counts come from pretrained_config; the metadata shards
+        them with its mapping to build the decode plans. Returns None when
+        pretrained_config is unavailable, such as focused tests that construct
+        metadata directly.
+        """
+        from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.common import \
+            MiniMaxM3SparseMetadataParams
+
+        pretrained_config = kwargs.get("pretrained_config", None)
+        if pretrained_config is None:
+            return None
+        num_attention_heads = int(pretrained_config.num_attention_heads)
+        num_kv_heads = int(
+            getattr(pretrained_config, "num_key_value_heads",
+                    num_attention_heads))
+        return MiniMaxM3SparseMetadataParams(
+            global_num_q_heads=num_attention_heads,
+            global_num_kv_heads=num_kv_heads,
+            num_index_heads=self.sparse_num_index_heads,
+            topk=self.sparse_topk_blocks,
         )
 
 

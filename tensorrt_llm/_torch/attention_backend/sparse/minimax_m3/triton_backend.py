@@ -46,7 +46,7 @@ CUDA-graph safety
 -----------------
 
 All scalar max lengths (``max_seqlen_q``, ``max_seqlen_k``) are
-pre-computed CPU-side in :meth:`MiniMaxM3SparseAttentionMetadata.prepare`
+pre-computed CPU-side in :meth:`MiniMaxM3TritonSparseAttentionMetadata.prepare`
 and stored as plain Python ints. The hot path uses only batched
 tensor ops with static shapes derived from those CPU-side scalars;
 no ``.item()`` or other GPU-CPU sync runs inside the forward
@@ -63,22 +63,23 @@ from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
 
-from .kernels import triton_block_max_score, triton_sparse_softmax
-from .metadata import (
-    MiniMaxM3SparseAttentionMetadata,
-    MiniMaxM3SparseConfig,
+from ...interface import (
+    AttentionBackend,
+    AttentionForwardArgs,
+    AttentionMetadata,
+    merge_attention_forward_args,
+)
+from .common import _INIT_SCORE, _LOCAL_SCORE, MiniMaxM3SparseConfig, write_kv_slots
+from .triton_kernels import triton_block_max_score, triton_sparse_softmax
+from .triton_metadata import (
+    MiniMaxM3TritonSparseAttentionMetadata,
     ensure_metadata_on_device,
     get_minimax_m3_attention_metadata_cls,
 )
 
 if TYPE_CHECKING:
     from .cache_manager import MiniMaxM3SparseIndexCache
-    from .metadata import MiniMaxM3SparseParams
-
-# Sentinel block score for blocks that init / local priority forces into
-# the top-k regardless of their numerical score.
-_INIT_SCORE = 1e30
-_LOCAL_SCORE = 1e29
+    from .common import MiniMaxM3SparseParams
 
 
 # ---------------------------------------------------------------------------
@@ -143,53 +144,6 @@ def _gather_paged_batched(
     return flat.view(batch, max_k, *cache.shape[1:])
 
 
-def _assert_paged_write_in_bounds(
-    name: str,
-    cache: torch.Tensor,
-    page: torch.Tensor,
-    within: torch.Tensor,
-) -> None:
-    """Optional CPU-side bounds check for paged-cache writes.
-
-    The runtime computes per-token slot ids from
-    ``KVCacheManagerV2``'s block ids; if the runtime ever produces a
-    block id that does not fit the per-layer view's dim-0 the write
-    falls into another layer's coalesced memory and corrupts the
-    cache, or fires the CUDA ``IndexKernel.cu`` device-side assert
-    during fancy indexing. Both are far enough away from the root
-    cause to be hard to triage.
-
-    When ``TRTLLM_MINIMAX_M3_DEBUG_BOUNDS`` is set this check runs a
-    CPU-side max/min comparison against the cache's dim-0 and dim-2
-    bounds, surfacing the misindex with the exact tensor names and
-    values instead of a device-side assert spam. It is opt-in
-    because the comparison forces a CPU sync.
-    """
-    if not os.environ.get("TRTLLM_MINIMAX_M3_DEBUG_BOUNDS"):
-        return
-    num_pages = int(cache.shape[0])
-    tokens_per_block = int(cache.shape[1]) if cache.ndim == 4 else int(cache.shape[2])
-    page_max = int(page.max().item()) if page.numel() else -1
-    page_min = int(page.min().item()) if page.numel() else 0
-    within_max = int(within.max().item()) if within.numel() else -1
-    within_min = int(within.min().item()) if within.numel() else 0
-    assert 0 <= page_min and page_max < num_pages, (
-        f"{name}: page index out of bounds — page.min={page_min} "
-        f"page.max={page_max} but cache.shape[0]={num_pages} "
-        f"(shape={tuple(cache.shape)}). This usually means the "
-        f"runtime's get_block_ids_per_seq produced a block id wider "
-        f"than the per-layer paged view's dim-0; check that the M3 "
-        f"override path returns slot ids in [0, num_slots)."
-    )
-    assert 0 <= within_min and within_max < tokens_per_block, (
-        f"{name}: within-page offset out of bounds — within.min="
-        f"{within_min} within.max={within_max} but tokens_per_block="
-        f"{tokens_per_block} (shape={tuple(cache.shape)}). This "
-        f"usually means out_cache_loc was computed with a different "
-        f"tokens_per_block than the cache was allocated with."
-    )
-
-
 def _write_main_kv_slots_to_pool(
     pool: torch.Tensor,
     kv_index: int,
@@ -201,40 +155,12 @@ def _write_main_kv_slots_to_pool(
     ``pool`` is the 5-D main K/V pool returned by
     :meth:`KVCacheManagerV2.get_buffers` with the NHD layout
     ``[num_pages, kv_factor, tokens_per_block, num_kv_heads, head_dim]``.
-    ``values`` has shape ``[num_new_tokens, num_kv_heads, head_dim]``
-    and ``out_cache_loc`` is the 1-D ``[num_new_tokens]`` int tensor of
-    flat slot ids the caller wants to update.
-
-    The write decomposes each flat slot id into
-    ``(page = s // tokens_per_block, within = s % tokens_per_block)``
-    and uses multi-dim fancy-index assignment so the writes propagate
-    to the underlying pool storage. The previously used pattern
-    ``pool[:, kv_index].reshape(-1, num_kv_heads, head_dim)
-    .index_copy_(0, ...)`` instead wrote into a silent copy (see
-    :func:`_gather_paged_batched`), so the next forward call read
-    zeros for the prefilled positions.
-
-    The optional CPU-side bounds assertion (enabled when the
-    ``TRTLLM_MINIMAX_M3_DEBUG_BOUNDS`` env var is set) catches
-    block_ids overflowing the pool's dim-0 before the device-side
-    ``IndexKernel.cu`` assert fires deep inside the kernel. The
-    assertion is a CPU sync, so the env var keeps it opt-in for
-    production runs that need a clean fast path.
+    ``values`` has shape ``[num_new_tokens, num_kv_heads, head_dim]`` and
+    ``out_cache_loc`` is the 1-D ``[num_new_tokens]`` int tensor of flat slot
+    ids to update. ``pool[:, kv_index]`` is a storage-sharing view, so the
+    shared :func:`common.write_kv_slots` propagates the write to the pool.
     """
-    tokens_per_block = int(pool.shape[2])
-    out_long = out_cache_loc.to(torch.long)
-    page = out_long // tokens_per_block
-    within = out_long % tokens_per_block
-    _assert_paged_write_in_bounds("pool", pool, page, within)
-    # KV-cache writes never need to participate in autograd. Wrap the
-    # fancy-index assignment in ``torch.no_grad()`` so callers that
-    # enter this path with an active grad context (e.g. unit tests
-    # exercising :class:`MiniMaxM3Attention` without ``inference_mode``)
-    # do not trip the "leaf Variable that requires grad is being used
-    # in an in-place operation" autograd guard on the view chain.
-    with torch.no_grad():
-        # Multi-dim fancy assignment writes into the underlying pool buffer.
-        pool[page, kv_index, within] = values.to(pool.dtype)
+    write_kv_slots(pool[:, kv_index], out_cache_loc, values)
 
 
 def _write_main_kv_slots(
@@ -242,39 +168,13 @@ def _write_main_kv_slots(
     out_cache_loc: torch.Tensor,
     values: torch.Tensor,
 ) -> None:
-    """Layout-aware writer for K (or V) caches used by the M3 backend.
+    """Write per-new-token K or V into a cache view via the shared writer.
 
-    Supports two layouts, mirroring :func:`_gather_paged_batched`:
-
-      * **3-D flat-slot** ``[num_slots, num_kv_heads, head_dim]``: used
-        by focused unit tests that allocate the cache as a contiguous
-        flat-slot tensor. ``index_copy_(0, ...)`` writes propagate
-        because the tensor IS the storage.
-      * **4-D multi-dim paged** ``[num_pages, tokens_per_block,
-        num_kv_heads, head_dim]``: used when the cache is a view of
-        ``kv_pool[:, 0]`` / ``kv_pool[:, 1]``. The view is
-        non-contiguous (its dim-0 stride is 2× the contiguous stride
-        because dim 1 separates K from V in the pool), so
-        ``index_copy_(0, ...)`` would silently fork a copy and the
-        write would be lost. Decompose the flat slot id into
-        ``(page, within)`` and use multi-dim fancy assignment so the
-        write propagates through the view to the underlying pool.
+    Delegates to :func:`common.write_kv_slots`, which handles both the 3-D
+    flat-slot layout used by focused unit tests and the 4-D paged view of
+    ``kv_pool[:, 0]`` / ``kv_pool[:, 1]``.
     """
-    # KV-cache writes never need to participate in autograd. Wrap both
-    # branches in ``torch.no_grad()`` so callers that enter this path
-    # with an active grad context (e.g. unit tests exercising
-    # :class:`MiniMaxM3Attention` without ``inference_mode``) do not
-    # trip the autograd in-place guard on the cache view chain.
-    with torch.no_grad():
-        if cache.ndim >= 4:
-            tokens_per_block = int(cache.shape[1])
-            out_long = out_cache_loc.to(torch.long)
-            page = out_long // tokens_per_block
-            within = out_long % tokens_per_block
-            _assert_paged_write_in_bounds("cache", cache, page, within)
-            cache[page, within] = values.to(cache.dtype)
-        else:
-            cache.index_copy_(0, out_cache_loc.to(torch.long), values.to(cache.dtype))
+    write_kv_slots(cache, out_cache_loc, values)
 
 
 def _scatter_topk_to_block_mask(
@@ -699,7 +599,7 @@ def minimax_m3_sparse_decode(
     v_cache: torch.Tensor,
     idx_k_cache: torch.Tensor,
     idx_v_cache: Optional[torch.Tensor],
-    metadata: MiniMaxM3SparseAttentionMetadata,
+    metadata: MiniMaxM3TritonSparseAttentionMetadata,
     config: MiniMaxM3SparseConfig,
     *,
     disable_index_value: bool,
@@ -794,7 +694,7 @@ def minimax_m3_sparse_prefill(
     idx_q: torch.Tensor,
     idx_k_cache: torch.Tensor,
     idx_v_cache: Optional[torch.Tensor],
-    metadata: MiniMaxM3SparseAttentionMetadata,
+    metadata: MiniMaxM3TritonSparseAttentionMetadata,
     config: MiniMaxM3SparseConfig,
     *,
     disable_index_value: bool,
@@ -890,18 +790,8 @@ def minimax_m3_sparse_prefill(
 # ---------------------------------------------------------------------------
 
 
-# Lazy import alias to avoid a circular import at module load — the side
-# cache class lives in ``cache_manager`` which imports from this module
-# is fine (no cycle), but keeping the indirection explicit makes the
-# dependency direction in this file clearer.
-def _import_index_cache_cls():
-    from .cache_manager import MiniMaxM3SparseIndexCache
-
-    return MiniMaxM3SparseIndexCache
-
-
 @dataclass
-class MiniMaxM3SparseAttention:
+class MiniMaxM3TritonSparseAttention:
     """Thin orchestrator for :func:`minimax_m3_sparse_prefill` and
     :func:`minimax_m3_sparse_decode`.
 
@@ -909,7 +799,7 @@ class MiniMaxM3SparseAttention:
     :class:`MiniMaxM3SparseIndexCache`. The caller is responsible for
     routing the projected Q, K, V, ``idx_q``, ``idx_k`` (and optional
     ``idx_v``) tensors plus the populated
-    :class:`MiniMaxM3SparseAttentionMetadata`.
+    :class:`MiniMaxM3TritonSparseAttentionMetadata`.
     """
 
     config: MiniMaxM3SparseConfig
@@ -946,7 +836,7 @@ class MiniMaxM3SparseAttention:
         idx_q: torch.Tensor,
         k_cache: torch.Tensor,
         v_cache: torch.Tensor,
-        metadata: MiniMaxM3SparseAttentionMetadata,
+        metadata: MiniMaxM3TritonSparseAttentionMetadata,
         *,
         disable_index_value: bool,
         sm_scale: Optional[float] = None,
@@ -1002,19 +892,11 @@ class MiniMaxM3SparseAttention:
 
 
 @functools.lru_cache(maxsize=1)
-def get_minimax_m3_attention_backend_cls():
-    """Return :class:`MiniMaxM3SparseRuntimeBackend` (lazy import).
+def get_minimax_m3_triton_attention_backend_cls():
+    """Return :class:`MiniMaxM3SparseRuntimeBackend`.
 
-    Deferring the :class:`AttentionBackend` import keeps the algorithm
-    module usable from test paths that do not need the runtime backend.
+    Cached so the runtime backend class is built once.
     """
-    from ...interface import (
-        AttentionBackend,
-        AttentionForwardArgs,
-        AttentionMetadata,
-        merge_attention_forward_args,
-    )
-
     metadata_cls = get_minimax_m3_attention_metadata_cls()
 
     class MiniMaxM3SparseRuntimeBackend(AttentionBackend[AttentionMetadata]):
@@ -1095,7 +977,7 @@ def get_minimax_m3_attention_backend_cls():
             idx_k_cache: torch.Tensor,
             idx_v_cache: Optional[torch.Tensor],
             out_cache_loc: torch.Tensor,
-            m3_metadata: "MiniMaxM3SparseAttentionMetadata",
+            m3_metadata: "MiniMaxM3TritonSparseAttentionMetadata",
             sm_scale: Optional[float] = None,
             idx_sm_scale: Optional[float] = None,
             output: Optional[torch.Tensor] = None,
@@ -1119,7 +1001,7 @@ def get_minimax_m3_attention_backend_cls():
                                           indices to write the new
                                           token's K/V/idx_K to.
                 ``m3_metadata``         : populated
-                                          :class:`MiniMaxM3SparseAttentionMetadata`.
+                                          :class:`MiniMaxM3TritonSparseAttentionMetadata`.
                 ``output``              : optional preallocated final output,
                                           ``[num_tokens, num_q_heads * head_dim]``.
 
@@ -1242,7 +1124,7 @@ def get_minimax_m3_attention_backend_cls():
             idx_k_cache: Optional[torch.Tensor] = None,
             idx_v_cache: Optional[torch.Tensor] = None,
             out_cache_loc: Optional[torch.Tensor] = None,
-            m3_metadata: Optional["MiniMaxM3SparseAttentionMetadata"] = None,
+            m3_metadata: Optional["MiniMaxM3TritonSparseAttentionMetadata"] = None,
             sm_scale: Optional[float] = None,
             idx_sm_scale: Optional[float] = None,
             **kwargs,
@@ -1315,8 +1197,8 @@ def get_minimax_m3_attention_backend_cls():
 
 
 __all__ = [
-    "MiniMaxM3SparseAttention",
-    "get_minimax_m3_attention_backend_cls",
+    "MiniMaxM3TritonSparseAttention",
+    "get_minimax_m3_triton_attention_backend_cls",
     "minimax_m3_sparse_decode",
     "minimax_m3_sparse_prefill",
 ]
