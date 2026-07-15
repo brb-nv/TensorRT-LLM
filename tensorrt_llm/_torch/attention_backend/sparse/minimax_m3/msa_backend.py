@@ -213,8 +213,6 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
     # site. Filled once the current step's cache write is prepared.
     msa_out_cache_loc: Optional[torch.Tensor] = None
     msa_kv_indices: Optional[torch.Tensor] = None
-    # Flat worst-case backing store for the proxy max-score. See
-    # msa_proxy_max_score_view for the layout it must satisfy.
     msa_max_score: Optional[torch.Tensor] = None
     msa_n_valid_blocks: Optional[torch.Tensor] = None
 
@@ -222,9 +220,7 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
     # _msa_fields_ready marks that the current step's buffers are populated.
     _msa_buffers_ready: bool = False
     _msa_fields_ready: bool = False
-    # Sparse geometry the decode plans need, injected by the model engine and
-    # captured once in __post_init__. None when the params are absent, such as
-    # focused tests that build metadata directly.
+    # Sparse geometry the decode plans need.
     _msa_params: Optional[MiniMaxM3SparseMetadataParams] = None
     # Plan owners, created lazily when the decode plans are first built and
     # reused across steps. Each owns its graph-safe plan buffers and the

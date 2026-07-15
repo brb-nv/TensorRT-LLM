@@ -53,14 +53,7 @@ class MiniMaxM3SparseParams(SparseParams):
 
 @dataclass(frozen=True)
 class MiniMaxM3SparseMetadataParams(SparseMetadataParams):
-    """Metadata-facing MiniMax-M3 sparse geometry.
-
-    Lowered from MiniMaxM3SparseAttentionConfig by to_sparse_metadata_params
-    and injected into the attention metadata by the model engine, mirroring
-    DeepSeek-V4. Carries only what the metadata reads to build its decode
-    plans: the global, pre-shard head counts (sharded by the metadata with
-    its mapping), the replicated index-head count, and the top-k block count.
-    """
+    """Metadata-facing MiniMax-M3 sparse geometry."""
 
     global_num_q_heads: int = 0
     global_num_kv_heads: int = 0
