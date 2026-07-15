@@ -192,7 +192,9 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
     Tensors read inside the captured forward are CUDA-graph-stable: the
     cache slots (msa_out_cache_loc), page table (msa_kv_indices), and proxy
     scratch (msa_max_score, msa_n_valid_blocks) are allocated once from the
-    manager's worst-case geometry and refreshed via copy_. Decode-plan
+    manager's worst-case geometry. msa_out_cache_loc, msa_kv_indices, and
+    msa_n_valid_blocks are refreshed via copy_, while the fmha_sm100 proxy pass
+    writes msa_max_score directly (see msa_proxy_max_score_view). Decode-plan
     worklists live on _MsaGraphSafePlan owners, surfaced via msa_decode_*_plan.
 
     Length inputs to fmha_sm100_plan (msa_qo_lens_cpu, msa_kv_lens_cpu,
@@ -206,6 +208,8 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
     # site. Filled once the current step's cache write is prepared.
     msa_out_cache_loc: Optional[torch.Tensor] = None
     msa_kv_indices: Optional[torch.Tensor] = None
+    # Flat worst-case backing store for the proxy max-score. See
+    # msa_proxy_max_score_view for the layout it must satisfy.
     msa_max_score: Optional[torch.Tensor] = None
     msa_n_valid_blocks: Optional[torch.Tensor] = None
 
@@ -331,11 +335,16 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         max_k_tiles: int,
         capture_graph: bool,
     ) -> None:
-        """Allocate the proxy max-score and valid-block scratch buffers."""
+        """Allocate the flat proxy max-score store and the valid-block scratch.
+
+        The store is sized for the worst-case max_k_tiles so one allocation
+        serves every decode step. msa_proxy_max_score_view slices the per-step
+        shape out of it.
+        """
         buffers = self.cuda_graph_buffers
         self.msa_max_score = self.get_empty(
             buffers,
-            (config.num_index_heads, max_k_tiles, max_batch),
+            (config.num_index_heads * max_k_tiles * max_batch,),
             cache_name="msa_max_score",
             dtype=torch.float32,
             capture_graph=capture_graph,
@@ -357,12 +366,14 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         required_max_k_tiles: int,
     ) -> None:
         """Ensure proxy scratch buffers exist and cover the current plan."""
+        required_numel = config.num_index_heads * required_max_k_tiles * max_batch
         if self.msa_max_score is not None:
-            allocated_max_k_tiles = int(self.msa_max_score.shape[1])
-            if allocated_max_k_tiles < required_max_k_tiles:
+            if self.msa_max_score.numel() < required_numel:
                 raise ValueError(
-                    f"msa_max_score has {allocated_max_k_tiles} k-tiles but the "
-                    f"decode plan needs {required_max_k_tiles}."
+                    f"msa_max_score backing store ({self.msa_max_score.numel()} "
+                    f"elements) is smaller than the decode plan needs "
+                    f"({required_numel} = {config.num_index_heads} heads * "
+                    f"{required_max_k_tiles} k-tiles * {max_batch} batch)."
                 )
             return
 
@@ -590,6 +601,28 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
             idx_k.reshape(num_tokens, 1, sparse_index_dim),
         )
 
+    def msa_proxy_max_score_view(
+        self, num_index_heads: int, plan_max_k_tiles: int, num_tokens: int
+    ) -> torch.Tensor:
+        """Return a contiguous [num_index_heads, plan_max_k_tiles, num_tokens] view.
+
+        fmha_sm100 ignores the passed tensor's strides and writes a contiguous
+        [num_index_heads, plan_max_k_tiles, total_q] block sized by the current
+        decode plan, so it must receive a tensor contiguous in exactly that
+        shape. The view is taken from the flat store's prefix starting at offset
+        0, so its data_ptr is stable for CUDA graph replay. Capture builds the
+        decode plan at the worst-case max_k_tiles, so replays only shrink it.
+        """
+        store = self.msa_max_score
+        numel = num_index_heads * plan_max_k_tiles * num_tokens
+        if numel > store.numel():
+            raise ValueError(
+                f"msa_max_score backing store ({store.numel()} elements) is "
+                f"smaller than the proxy view needs ({numel} = {num_index_heads} "
+                f"heads * {plan_max_k_tiles} k-tiles * {num_tokens} tokens)."
+            )
+        return store[:numel].view(num_index_heads, plan_max_k_tiles, num_tokens)
+
 
 class MiniMaxM3MsaSparseAttention(TrtllmAttention):
     """MSA-backed MiniMax-M3 sparse attention."""
@@ -679,11 +712,16 @@ class MiniMaxM3MsaSparseAttention(TrtllmAttention):
         idx_k_cache = metadata.msa_idx_k_cache(self.layer_idx)
 
         # One selection path: decode passes the prebuilt graph-safe proxy
-        # plan plus the proxy scratch sliced to the live query count; prefill
+        # plan plus the proxy scratch shaped to the live query count; prefill
         # leaves them None and the proxy plan is built inline.
         proxy_plan = metadata.msa_decode_proxy_plan
         if proxy_plan is not None:
-            max_score = metadata.msa_max_score[:, :, :num_tokens]
+            # proxy_plan is (has_mixed, split, batch, decode_dict, prefill);
+            # decode_dict carries max_k_tiles for the contiguous score view.
+            plan_max_k_tiles = int(proxy_plan[3]["max_k_tiles"])
+            max_score = metadata.msa_proxy_max_score_view(
+                config.num_index_heads, plan_max_k_tiles, num_tokens
+            )
             n_valid_blocks = metadata.msa_n_valid_blocks[:num_tokens]
         else:
             max_score = None

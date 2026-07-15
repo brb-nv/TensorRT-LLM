@@ -20,7 +20,7 @@ def test_resolver_selects_msa_backend_when_available(monkeypatch):
     import tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_availability as avail
 
     monkeypatch.setattr(avail, "ensure_msa_available", lambda: None)
-    params = MiniMaxM3SparseAttentionConfig(sparse_use_msa=True).to_sparse_params()
+    params = MiniMaxM3SparseAttentionConfig(sparse_use_msa_kernels=True).to_sparse_params()
     assert _resolve_minimax_m3_backend_cls(params) is MiniMaxM3MsaSparseAttention
 
 
@@ -36,13 +36,39 @@ def test_msa_metadata_rejects_undersized_max_score_buffer():
         topk=16,
     )
     metadata = metadata_cls.__new__(metadata_cls)
-    metadata.msa_max_score = torch.zeros(4, 8, 2)
+    # Flat backing store sized for 4 heads * 8 k-tiles * 2 batch = 64 elements,
+    # too small for the plan's required 4 * 16 * 2 = 128.
+    metadata.msa_max_score = torch.zeros(4 * 8 * 2)
     metadata.kv_cache_manager = None
 
-    with pytest.raises(ValueError, match=r"msa_max_score has 8 k-tiles"):
+    with pytest.raises(ValueError, match=r"msa_max_score backing store"):
         metadata._ensure_msa_decode_scratch_buffers(
             config=config,
             max_batch=2,
             capture_graph=False,
             required_max_k_tiles=16,
         )
+
+
+def test_msa_proxy_max_score_view_is_contiguous_over_stable_store():
+    """The proxy view fed to fmha_sm100 must be contiguous in the exact
+    [num_index_heads, plan_max_k_tiles, num_tokens] shape the kernel writes,
+    backed by a stable store so its data_ptr survives CUDA graph replay.
+    """
+    metadata_cls = MiniMaxM3MsaSparseAttention.Metadata
+    metadata = metadata_cls.__new__(metadata_cls)
+    # Worst-case store: 4 heads * 16 k-tiles * 8 batch.
+    num_index_heads, worst_k, max_batch = 4, 16, 8
+    metadata.msa_max_score = torch.zeros(num_index_heads * worst_k * max_batch)
+    store_ptr = metadata.msa_max_score.data_ptr()
+
+    # A smaller live step still yields a contiguous view sized to that step,
+    # which is what the kernel's stride-agnostic write requires.
+    view = metadata.msa_proxy_max_score_view(num_index_heads, 5, 3)
+    assert view.shape == (num_index_heads, 5, 3)
+    assert view.is_contiguous()
+    assert view.data_ptr() == store_ptr
+
+    # Oversized requests are rejected rather than silently corrupting memory.
+    with pytest.raises(ValueError, match=r"msa_max_score backing store"):
+        metadata.msa_proxy_max_score_view(num_index_heads, worst_k, max_batch + 1)
