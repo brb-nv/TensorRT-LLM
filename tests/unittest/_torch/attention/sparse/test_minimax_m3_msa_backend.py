@@ -11,7 +11,6 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.attention_backend.sparse.minimax_m3 import MiniMaxM3MsaSparseAttention
-from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.common import MiniMaxM3SparseConfig
 from tensorrt_llm._torch.attention_backend.sparse.utils import _resolve_minimax_m3_backend_cls
 from tensorrt_llm.llmapi.llm_args import MiniMaxM3SparseAttentionConfig
 
@@ -26,15 +25,6 @@ def test_resolver_selects_msa_backend_when_available(monkeypatch):
 
 def test_msa_metadata_rejects_undersized_max_score_buffer():
     metadata_cls = MiniMaxM3MsaSparseAttention.Metadata
-    config = MiniMaxM3SparseConfig(
-        num_q_heads=8,
-        num_kv_heads=4,
-        head_dim=128,
-        num_index_heads=4,
-        sparse_index_dim=128,
-        block_size=128,
-        topk=16,
-    )
     metadata = metadata_cls.__new__(metadata_cls)
     # Flat backing store sized for 4 heads * 8 k-tiles * 2 batch = 64 elements,
     # too small for the plan's required 4 * 16 * 2 = 128.
@@ -43,7 +33,7 @@ def test_msa_metadata_rejects_undersized_max_score_buffer():
 
     with pytest.raises(ValueError, match=r"msa_max_score backing store"):
         metadata._ensure_msa_decode_scratch_buffers(
-            config=config,
+            num_index_heads=4,
             max_batch=2,
             capture_graph=False,
             required_max_k_tiles=16,

@@ -33,7 +33,12 @@ import torch
 from tensorrt_llm._torch.attention_backend.interface import AttentionForwardArgs
 from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttention, TrtllmAttentionMetadata
 
-from .common import MiniMaxM3SparseConfig, build_paged_kv_slot_mapping, write_kv_slots
+from .common import (
+    MiniMaxM3SparseConfig,
+    MiniMaxM3SparseMetadataParams,
+    build_paged_kv_slot_mapping,
+    write_kv_slots,
+)
 from .msa_indexer import MsaIndexer
 from .msa_utils import (
     MSA_REQUIRED_HEAD_DIM,
@@ -58,7 +63,7 @@ def _cache_device(meta) -> torch.device:
 def _worst_case_proxy_max_k_tiles(
     fmha_sm100,
     *,
-    config: MiniMaxM3SparseConfig,
+    num_index_heads: int,
     kv_cache_manager,
     max_batch: int,
 ) -> int:
@@ -71,7 +76,7 @@ def _worst_case_proxy_max_k_tiles(
     proxy_plan = fmha_sm100.fmha_sm100_plan(
         qo_lens,
         kv_lens,
-        config.num_index_heads,
+        num_index_heads,
         num_kv_heads=1,
         qo_offset=qo_offset,
         page_size=page_size,
@@ -217,6 +222,10 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
     # _msa_fields_ready marks that the current step's buffers are populated.
     _msa_buffers_ready: bool = False
     _msa_fields_ready: bool = False
+    # Sparse geometry the decode plans need, injected by the model engine and
+    # captured once in __post_init__. None when the params are absent, such as
+    # focused tests that build metadata directly.
+    _msa_params: Optional[MiniMaxM3SparseMetadataParams] = None
     # Plan owners, created lazily when the decode plans are first built and
     # reused across steps. Each owns its graph-safe plan buffers and the
     # current refreshed plan tuple.
@@ -226,6 +235,8 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
 
     def __post_init__(self) -> None:
         super().__post_init__()
+        params = self.sparse_metadata_params
+        self._msa_params = params if isinstance(params, MiniMaxM3SparseMetadataParams) else None
         self._create_msa_buffers()
 
     @property
@@ -310,17 +321,17 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         # exists only for the MSA backend, whose selection already required the
         # kernels, so a failed import here is a hard error rather than a reason
         # to skip allocation.
-        config = getattr(kv_cache_manager, "m3_config", None)
-        if config is not None:
+        params = self._msa_params
+        if params is not None:
             fmha_sm100 = require_msa_module()
             max_k_tiles = _worst_case_proxy_max_k_tiles(
                 fmha_sm100,
-                config=config,
+                num_index_heads=params.num_index_heads,
                 kv_cache_manager=kv_cache_manager,
                 max_batch=max_num_sequences,
             )
             self._alloc_msa_proxy_scratch(
-                config=config,
+                num_index_heads=params.num_index_heads,
                 max_batch=max_num_sequences,
                 max_k_tiles=max_k_tiles,
                 capture_graph=capture_graph,
@@ -330,7 +341,7 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
     def _alloc_msa_proxy_scratch(
         self,
         *,
-        config: MiniMaxM3SparseConfig,
+        num_index_heads: int,
         max_batch: int,
         max_k_tiles: int,
         capture_graph: bool,
@@ -344,7 +355,7 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         buffers = self.cuda_graph_buffers
         self.msa_max_score = self.get_empty(
             buffers,
-            (config.num_index_heads * max_k_tiles * max_batch,),
+            (num_index_heads * max_k_tiles * max_batch,),
             cache_name="msa_max_score",
             dtype=torch.float32,
             capture_graph=capture_graph,
@@ -360,19 +371,19 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
     def _ensure_msa_decode_scratch_buffers(
         self,
         *,
-        config: MiniMaxM3SparseConfig,
+        num_index_heads: int,
         max_batch: int,
         capture_graph: bool,
         required_max_k_tiles: int,
     ) -> None:
         """Ensure proxy scratch buffers exist and cover the current plan."""
-        required_numel = config.num_index_heads * required_max_k_tiles * max_batch
+        required_numel = num_index_heads * required_max_k_tiles * max_batch
         if self.msa_max_score is not None:
             if self.msa_max_score.numel() < required_numel:
                 raise ValueError(
                     f"msa_max_score backing store ({self.msa_max_score.numel()} "
                     f"elements) is smaller than the decode plan needs "
-                    f"({required_numel} = {config.num_index_heads} heads * "
+                    f"({required_numel} = {num_index_heads} heads * "
                     f"{required_max_k_tiles} k-tiles * {max_batch} batch)."
                 )
             return
@@ -384,7 +395,7 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         fmha_sm100 = require_msa_module()
         max_k_tiles = _worst_case_proxy_max_k_tiles(
             fmha_sm100,
-            config=config,
+            num_index_heads=num_index_heads,
             kv_cache_manager=kv_cache_manager,
             max_batch=max_batch,
         )
@@ -394,7 +405,7 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
                 f"decode plan ({required_max_k_tiles})."
             )
         self._alloc_msa_proxy_scratch(
-            config=config,
+            num_index_heads=num_index_heads,
             max_batch=max_batch,
             max_k_tiles=max_k_tiles,
             capture_graph=capture_graph,
@@ -424,11 +435,13 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         # A decode batch is pure generation (no context requests).
         if int(self.num_contexts or 0) > 0:
             return
-        # Geometry is built once on the KV cache manager. Absent when the
-        # manager cannot supply it, e.g. focused tests.
-        config = getattr(self.kv_cache_manager, "m3_config", None)
-        if config is None:
+        # Geometry is captured in __post_init__; skip when it is unavailable.
+        params = self._msa_params
+        if params is None:
             return
+        num_index_heads = params.num_index_heads
+        num_q_heads, num_kv_heads = params.sharded_head_counts(self.mapping)
+        topk = params.topk
 
         fmha_sm100 = require_msa_module()
         qo_lens_cpu = self.msa_qo_lens_cpu
@@ -447,7 +460,7 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         proxy_plan = fmha_sm100.fmha_sm100_plan(
             qo_lens_cpu,
             kv_lens_cpu,
-            config.num_index_heads,
+            num_index_heads,
             num_kv_heads=1,
             qo_offset=qo_offset_cpu,
             page_size=page_size,
@@ -459,11 +472,11 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         gqa_plan = fmha_sm100.fmha_sm100_plan(
             qo_lens_cpu,
             kv_lens_cpu,
-            config.num_q_heads,
-            num_kv_heads=config.num_kv_heads,
+            num_q_heads,
+            num_kv_heads=num_kv_heads,
             qo_offset=qo_offset_cpu,
             page_size=page_size,
-            kv_block_num=config.topk,
+            kv_block_num=topk,
             num_kv_splits=1,
             causal=True,
         )
@@ -471,8 +484,8 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         dense_plan = fmha_sm100.fmha_sm100_plan(
             qo_lens_cpu,
             kv_lens_cpu,
-            config.num_q_heads,
-            num_kv_heads=config.num_kv_heads,
+            num_q_heads,
+            num_kv_heads=num_kv_heads,
             qo_offset=qo_offset_cpu,
             page_size=page_size,
             num_kv_splits=1,
@@ -481,7 +494,7 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
 
         required_max_k_tiles = int(proxy_plan[3]["max_k_tiles"])
         self._ensure_msa_decode_scratch_buffers(
-            config=config,
+            num_index_heads=num_index_heads,
             max_batch=max_batch,
             capture_graph=capture_graph,
             required_max_k_tiles=required_max_k_tiles,

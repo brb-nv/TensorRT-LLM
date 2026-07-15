@@ -11,11 +11,14 @@ slot mapping builder. MSA-only helpers live in :mod:`.msa_utils`.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import List, Literal, Tuple
+from typing import TYPE_CHECKING, List, Literal, Optional, Tuple
 
 import torch
 
-from ..params import SparseParams
+from ..params import SparseMetadataParams, SparseParams
+
+if TYPE_CHECKING:
+    from tensorrt_llm.mapping import Mapping
 
 # Sentinel scores that force init and local blocks into the top-k regardless
 # of their computed score. Init outranks local.
@@ -46,6 +49,39 @@ class MiniMaxM3SparseParams(SparseParams):
         sparse prediction. It equals the per-block scoring size.
         """
         return self.block_size
+
+
+@dataclass(frozen=True)
+class MiniMaxM3SparseMetadataParams(SparseMetadataParams):
+    """Metadata-facing MiniMax-M3 sparse geometry.
+
+    Lowered from MiniMaxM3SparseAttentionConfig by to_sparse_metadata_params
+    and injected into the attention metadata by the model engine, mirroring
+    DeepSeek-V4. Carries only what the metadata reads to build its decode
+    plans: the global, pre-shard head counts (sharded by the metadata with
+    its mapping), the replicated index-head count, and the top-k block count.
+    """
+
+    global_num_q_heads: int = 0
+    global_num_kv_heads: int = 0
+    num_index_heads: int = 4
+    topk: int = 16
+
+    def sharded_head_counts(self, mapping: Optional["Mapping"] = None) -> Tuple[int, int]:
+        """Return per-rank (num_q_heads, num_kv_heads) for mapping.
+
+        Matches the model's attention sharding: no split under attention data
+        parallelism, otherwise split by tp_size.
+        """
+        if mapping is not None and not getattr(mapping, "enable_attention_dp", False):
+            tp_size = int(getattr(mapping, "tp_size", 1) or 1)
+        else:
+            tp_size = 1
+
+        def _shard(num_heads: int) -> int:
+            return (int(num_heads) + tp_size - 1) // tp_size
+
+        return _shard(self.global_num_q_heads), _shard(self.global_num_kv_heads)
 
 
 @dataclass(frozen=True)
@@ -216,6 +252,7 @@ def build_paged_kv_slot_mapping(
 
 __all__ = [
     "MiniMaxM3SparseConfig",
+    "MiniMaxM3SparseMetadataParams",
     "MiniMaxM3SparseParams",
     "build_paged_kv_slot_mapping",
     "write_kv_slots",

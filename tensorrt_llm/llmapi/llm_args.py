@@ -700,6 +700,31 @@ class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
             use_msa=self.sparse_use_msa_kernels,
         )
 
+    def to_sparse_metadata_params(self, **kwargs):
+        """Lower into MiniMaxM3SparseMetadataParams for the attention metadata.
+
+        The global head counts come from pretrained_config; the metadata shards
+        them with its mapping to build the decode plans. Returns None when
+        pretrained_config is unavailable, such as focused tests that construct
+        metadata directly.
+        """
+        from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.common import \
+            MiniMaxM3SparseMetadataParams
+
+        pretrained_config = kwargs.get("pretrained_config", None)
+        if pretrained_config is None:
+            return None
+        num_attention_heads = int(pretrained_config.num_attention_heads)
+        num_kv_heads = int(
+            getattr(pretrained_config, "num_key_value_heads",
+                    num_attention_heads))
+        return MiniMaxM3SparseMetadataParams(
+            global_num_q_heads=num_attention_heads,
+            global_num_kv_heads=num_kv_heads,
+            num_index_heads=self.sparse_num_index_heads,
+            topk=self.sparse_topk_blocks,
+        )
+
 
 class RocketSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
     """Configuration for RocketKV sparse attention."""
