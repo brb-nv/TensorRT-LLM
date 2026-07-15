@@ -7,6 +7,7 @@ participates in the standard TrtllmAttention.forward dispatch loop. The
 owning MiniMax-M3 MSA attention layer runs an MsaIndexer to select the
 per-query KV blocks and publishes them on forward_args.sparse_prediction;
 this class attends over them.
+
 """
 
 from __future__ import annotations
@@ -63,9 +64,7 @@ def run_msa_sparse_gqa(
     tensors (eager prefill/tests vs. CUDA-graph decode).
     `out`: written in place if provided, else a new tensor is returned.
     """
-    from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_utils import require_msa_module
-
-    fmha_sm100 = require_msa_module()
+    import fmha_sm100
 
     if q.dim() != 3:
         raise ValueError(
@@ -128,9 +127,10 @@ def run_msa_paged_gqa(
 ) -> None:
     """Write the new-token main K/V, then run paged GQA into output in place.
 
-    Shared by the sparse and dense layers; kv_block_indexes and plan encode
-    which mode applies. fmha_sm100 reads the paged cache directly, so the
-    new-token K/V must be resident before the run.
+    Shared by the sparse layers (kv_block_indexes is the per-query top-k table,
+    with the sparse plan) and the dense layers (kv_block_indexes None, with the
+    dense plan, attending the full page table). fmha_sm100 reads the paged cache
+    directly, so the new-token K/V must be resident before the run.
     """
     from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_utils import (
         msa_paged_kv,
@@ -176,10 +176,11 @@ class MsaSparseGqaFmha(Fmha):
     and attend those blocks; dense layers leave the indices None and attend the
     full page table.
 
-    Inherits Fmha rather than PhasedFmha: fmha_sm100 takes a single plan and the
-    selected block indices span the whole batch, so it handles a mixed context
-    and generation batch in one call and there is no context/generation split
-    from PhasedFmha to reuse. Requires head_dim 128 and 4-D HND paged K/V.
+        Inherits Fmha rather than PhasedFmha: fmha_sm100 takes a single plan and
+        the selected block indices span the whole batch, so it handles a mixed
+        context and generation batch in one call and there is no
+        context/generation split from PhasedFmha to reuse. Requires head_dim 128
+        and 4-D HND paged K/V.
     """
 
     HEAD_DIM = 128
@@ -193,6 +194,11 @@ class MsaSparseGqaFmha(Fmha):
 
     @classmethod
     def is_available(cls, attn: Optional["TrtllmAttention"] = None) -> bool:
+        # Only the MiniMax-M3 MSA attention layer uses this library. Matching on
+        # the lowered sparse algorithm lets the base create_fmha_libs add it to
+        # that layer alone, so no create_fmha_libs override is needed.
+        # Availability of the fmha_sm100 package and an SM100 device is gated
+        # earlier, when the MSA backend is selected.
         sparse_params = getattr(attn, "sparse_params", None)
         return getattr(sparse_params, "algorithm", None) == "minimax_m3"
 
@@ -208,7 +214,9 @@ class MsaSparseGqaFmha(Fmha):
         if output is None:
             raise RuntimeError(f"{type(self).__name__} requires an output buffer.")
 
-        # Sparse indices select the sparse plan; their absence selects the dense plan.
+        # Sparse layers attend the per-query top-k blocks with the sparse plan;
+        # dense layers leave the indices None and attend the full page table
+        # with the dense plan.
         kv_block_indexes = forward_args.sparse_prediction.sparse_attn_indices
         plan = (
             metadata.msa_decode_gqa_plan
