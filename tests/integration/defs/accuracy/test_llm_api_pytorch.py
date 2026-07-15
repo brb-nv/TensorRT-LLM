@@ -7639,12 +7639,14 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
     @parametrize_with_ids("use_msa", [False, True])
     def test_nvfp4(self, use_msa):
         # NVFP4 checkpoint: MXFP8 base layers with NVFP4 routed experts
-        # (MIXED_PRECISION checkpoint); the KV cache stays in BF16.
+        # (MIXED_PRECISION checkpoint). The MSA path runs an FP8 KV cache; the
+        # Triton path keeps the KV cache in BF16.
         tp_size = ep_size = 4
         model_name = "nvidia/MiniMax-M3-NVFP4"
         model_path = f"{llm_models_root()}/MiniMax-M3-NVFP4"
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6,
-                                        enable_block_reuse=False)
+                                        enable_block_reuse=False,
+                                        dtype="fp8" if use_msa else "auto")
         sparse_attention_config = MiniMaxM3SparseAttentionConfig(
             sparse_use_msa_kernels=use_msa)
         moe_config = MoeConfig(backend="CUTLASS")

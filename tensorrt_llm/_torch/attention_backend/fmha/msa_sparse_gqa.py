@@ -54,6 +54,7 @@ def run_msa_sparse_gqa(
     head_dim: int = 128,
     plan: Optional[tuple] = None,
     out: Optional[torch.Tensor] = None,
+    use_fp8: bool = False,
 ) -> Optional[torch.Tensor]:
     """Run fmha_sm100 paged GQA (plan/run split).
 
@@ -62,6 +63,9 @@ def run_msa_sparse_gqa(
     `plan`: prebuilt execution plan; if None, built inline from the CPU length
     tensors (eager prefill/tests vs. CUDA-graph decode).
     `out`: written in place if provided, else a new tensor is returned.
+    `use_fp8`: FP8 KV cache. The caller must pass FP8 `q` to match the FP8 paged
+    K/V, since the kernel variant shares one dtype across q/k/v. Also selects the
+    FP8 AOT kernels for an inline sparse-prefill plan; no-op for the decode planner.
     """
     from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_utils import require_msa_module
 
@@ -100,6 +104,7 @@ def run_msa_sparse_gqa(
             kv_block_num=kv_block_num,
             causal=causal,
             num_kv_splits=1,
+            use_fp8_kvcache=use_fp8,
         )
     out_result, _ = fmha_sm100.fmha_sm100(
         q,
@@ -152,6 +157,13 @@ def run_msa_paged_gqa(
     k_paged, v_paged = msa_paged_kv(kv_cache_manager, layer_idx)
     sm_scale = (head_dim**-0.5) / float(attn.q_scaling)
 
+    # The fmha_sm100 variant is chosen from q.dtype and shares one dtype across
+    # q/k/v, so q must be FP8 to match an FP8 paged K/V. MiniMax-M3 has no
+    # KV-cache scales, so the scale is 1.0 and this is a plain E4M3 cast.
+    use_fp8 = k_paged.dtype == torch.float8_e4m3fn
+    if use_fp8:
+        q_view = q_view.to(torch.float8_e4m3fn)
+
     run_msa_sparse_gqa(
         q_view,
         k_paged,
@@ -166,6 +178,7 @@ def run_msa_paged_gqa(
         head_dim=head_dim,
         plan=plan,
         out=out_view,
+        use_fp8=use_fp8,
     )
 
 
