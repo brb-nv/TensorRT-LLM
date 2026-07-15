@@ -54,7 +54,7 @@ from ..utils import (
     is_torch_compiling,
 )
 from .modeling_speculative import SpecDecOneEngineForCausalLM
-from .modeling_utils import DecoderModel, ModelConfig, register_auto_model
+from .modeling_utils import DecoderModel, ModelConfig, duplicate_kv_weight, register_auto_model
 
 # Dense layers use SDPA with non-contiguous Q/K/V and a bool attn_mask.
 # Limit backends to memory-efficient and math; cuDNN SDPA fails for this layout,
@@ -1571,6 +1571,58 @@ _M3_GATE_BIAS_RENAME_MAP = {
     r"^(.*\.block_sparse_moe)\.e_score_correction_bias$": (r"\1.gate.e_score_correction_bias"),
 }
 
+# The generic loader (``modeling_utils._load_weights_impl``) duplicates only
+# the ``weight``/``bias`` tensors of ``k_proj``/``v_proj`` when KV heads must
+# be replicated across TP ranks (``tp_size > num_key_value_heads``, e.g. TEP8
+# with M3's 4 KV heads). The MXFP8 1x32 block scales are 2-D
+# ``[out_features, in_features / 32]`` tensors sharing the KV-head
+# out_features dim, so they must be row-duplicated the same way; otherwise
+# the fused qkv_proj scale copy fails with a size mismatch (per-rank
+# 8q+1k+1v = 1280 scale rows expected vs flat 9216/8 = 1152 sliced).
+# ``weight_scale`` and ``weight_scale_inv`` name the same block scale
+# (``MXFP8LinearMethod._get_scale_name``); the M3 checkpoints use
+# ``weight_scale_inv``. Per-tensor scalar scales (``input_scale``,
+# ``weight_scale_2``) are TP-invariant and intentionally not listed. The
+# replicated ``index_{q,k}_proj`` scales do not match these suffixes.
+_M3_KV_BLOCK_SCALE_SUFFIXES = tuple(
+    f".self_attn.{proj}.{scale_name}"
+    for proj in ("k_proj", "v_proj")
+    for scale_name in ("weight_scale", "weight_scale_inv")
+)
+
+
+def _duplicate_kv_block_scales_for_tp(weights, num_kv_heads: int, tp_size: int):
+    """Row-duplicate K/V block scales when TP ranks exceed KV heads.
+
+    Uses ``duplicate_kv_weight``'s interleaved layout
+    (``[h0, h0, h1, h1, ...]``) so the per-rank COLUMN shard of the scale
+    picks the same KV head as the (already duplicated) weight shard and as
+    the sparse index-head pairing (``index_head_start = tp_rank // reps``).
+
+    Mutates ``weights`` in place (preserving ``ConsumableWeightsDict``
+    semantics) and returns it. No-op when ``tp_size <= num_kv_heads``,
+    keeping the validated tp<=4 loading untouched.
+    """
+    if tp_size <= num_kv_heads:
+        return weights
+    for key in list(weights.keys()):
+        if not key.endswith(_M3_KV_BLOCK_SCALE_SUFFIXES):
+            continue
+        scale = weights[key]
+        # Tensor or lazy safetensors slice (same duality as
+        # ``load_weight_shard``); check the shape before materializing.
+        shape = scale.get_shape() if hasattr(scale, "get_shape") else scale.shape
+        if len(shape) != 2:
+            # Only 2-D block scales shard on the KV-head dim; a scalar
+            # scale spelled ``weight_scale`` stays per-tensor.
+            continue
+        weights[key] = duplicate_kv_weight(
+            weight=scale[:],
+            num_kv_heads=num_kv_heads,
+            tensor_parallel_size=tp_size,
+        )
+    return weights
+
 
 @register_auto_model("MiniMaxM3SparseForCausalLM")
 class MiniMaxM3ForCausalLM(SpecDecOneEngineForCausalLM[MiniMaxM3Model, PretrainedConfig]):
@@ -1588,6 +1640,15 @@ class MiniMaxM3ForCausalLM(SpecDecOneEngineForCausalLM[MiniMaxM3Model, Pretraine
         # tooling that already passes one keep working.
         params_map = kwargs.pop("params_map", None) or {}
         merged = {**_M3_GATE_BIAS_RENAME_MAP, **params_map}
+        # Mirror the generic loader's KV-duplication settings
+        # (``modeling_utils._load_weights_impl``): attention DP keeps KV
+        # heads unsharded, so no duplication happens there either.
+        mapping = self.model_config.mapping
+        tp_size = 1 if mapping.enable_attention_dp else mapping.tp_size
+        num_kv_heads = getattr(self.config, "num_key_value_heads", None)
+        if num_kv_heads is None:
+            num_kv_heads = self.config.num_attention_heads
+        weights = _duplicate_kv_block_scales_for_tp(weights, num_kv_heads, tp_size)
         return super().load_weights(weights, *args, params_map=merged, **kwargs)
 
 
