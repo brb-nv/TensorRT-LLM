@@ -8,7 +8,8 @@ indices the main attention consumes. It calls fmha_sm100 directly in
 output_maxscore mode, reduces the per-index-head max score to KV-head
 granularity, and selects the top-k blocks per query.
 
-Results are [total_q, num_kv_heads, topk] int32, ascending with -1 padding.
+Results are [total_q, num_kv_heads, topk] int32 block ids with -1 padding.
+The top-k selection itself runs in a Triton kernel (see msa_topk).
 """
 
 from __future__ import annotations
