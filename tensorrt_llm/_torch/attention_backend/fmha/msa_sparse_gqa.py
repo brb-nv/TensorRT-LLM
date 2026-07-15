@@ -7,7 +7,6 @@ participates in the standard TrtllmAttention.forward dispatch loop. The
 owning MiniMax-M3 MSA attention layer runs an MsaIndexer to select the
 per-query KV blocks and publishes them on forward_args.sparse_prediction;
 this class attends over them.
-
 """
 
 from __future__ import annotations
@@ -64,7 +63,9 @@ def run_msa_sparse_gqa(
     tensors (eager prefill/tests vs. CUDA-graph decode).
     `out`: written in place if provided, else a new tensor is returned.
     """
-    import fmha_sm100
+    from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_utils import require_msa_module
+
+    fmha_sm100 = require_msa_module()
 
     if q.dim() != 3:
         raise ValueError(
