@@ -7585,7 +7585,7 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4,
                                         enable_block_reuse=False)
         sparse_attention_config = MiniMaxM3SparseAttentionConfig(
-            sparse_use_msa_kernels=use_msa)
+            implementation="msa" if use_msa else "triton")
         with LLM(model_path,
                  tensor_parallel_size=tp_size,
                  moe_expert_parallel_size=ep_size,
@@ -7648,7 +7648,7 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
                                         enable_block_reuse=False,
                                         dtype="fp8" if use_msa else "auto")
         sparse_attention_config = MiniMaxM3SparseAttentionConfig(
-            sparse_use_msa_kernels=use_msa)
+            implementation="msa" if use_msa else "triton")
         moe_config = MoeConfig(backend="CUTLASS")
         with LLM(model_path,
                  tensor_parallel_size=tp_size,

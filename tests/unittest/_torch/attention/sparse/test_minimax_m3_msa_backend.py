@@ -19,8 +19,20 @@ def test_resolver_selects_msa_backend_when_available(monkeypatch):
     import tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_availability as avail
 
     monkeypatch.setattr(avail, "ensure_msa_available", lambda: None)
-    params = MiniMaxM3SparseAttentionConfig(sparse_use_msa_kernels=True).to_sparse_params()
+    params = MiniMaxM3SparseAttentionConfig(implementation="msa").to_sparse_params()
     assert _resolve_minimax_m3_backend_cls(params) is MiniMaxM3MsaSparseAttention
+
+
+def test_msa_requires_block_size_128():
+    # The MSA implementation is fixed to a 128-token page size; a mismatched
+    # sparse_block_size must fail loudly at config construction rather than being
+    # silently overridden at runtime.
+    with pytest.raises(ValueError, match=r"sparse_block_size == 128"):
+        MiniMaxM3SparseAttentionConfig(implementation="msa", sparse_block_size=64)
+
+    # The Triton reference is unaffected by the constraint.
+    cfg = MiniMaxM3SparseAttentionConfig(implementation="triton", sparse_block_size=64)
+    assert cfg.sparse_block_size == 64
 
 
 def test_msa_metadata_rejects_undersized_max_score_buffer():

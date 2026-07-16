@@ -39,7 +39,7 @@ class MiniMaxM3SparseParams(SparseParams):
     local_blocks: int = 1
     score_type: str = "max"
     disable_index_value: bool = True
-    use_msa: bool = False
+    implementation: Literal["triton", "msa"] = "triton"
 
     @property
     def indices_block_size(self) -> int:

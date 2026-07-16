@@ -46,12 +46,12 @@ def _resolve_minimax_m3_backend_cls(
         sparse_params: "SparseParams") -> Type["AttentionBackend"]:
     """Select the MiniMax-M3 sparse backend from the lowered params.
 
-    The Triton reference is the default. When ``use_msa`` is set the MSA
+    The Triton reference is the default. When implementation is 'msa' the MSA
     (fmha_sm100) backend is used instead, gated on SM100 availability so an
     unsupported system fails early rather than at kernel launch.
     """
     from .minimax_m3 import get_minimax_m3_triton_attention_backend_cls
-    if getattr(sparse_params, "use_msa", False):
+    if getattr(sparse_params, "implementation", "triton") == "msa":
         from .minimax_m3 import MiniMaxM3MsaSparseAttention
         from .minimax_m3.msa_availability import ensure_msa_available
         ensure_msa_available()

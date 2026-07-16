@@ -415,7 +415,7 @@ def create_py_executor(
     # of 32.
     m3_sparse_config = llm_args.sparse_attention_config
     if is_minimax_m3(m3_sparse_config):
-        tokens_per_block = 128 if m3_sparse_config.sparse_use_msa_kernels else 32
+        tokens_per_block = 128 if m3_sparse_config.implementation == "msa" else 32
         kv_cache_config.tokens_per_block = tokens_per_block
 
     if llm_args.attn_backend in ["FLASHINFER", "FLASHINFER_STAR_ATTENTION"]:
