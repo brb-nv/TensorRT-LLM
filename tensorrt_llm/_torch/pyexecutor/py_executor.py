@@ -1012,6 +1012,7 @@ class PyExecutor:
             # can complete.
             self._enqueue_responses(responses)
 
+    @nvtx_range("_handle_kv_transfer_timeouts_synced")
     def _handle_kv_transfer_timeouts_synced(self):
         """ADP-safe drain of the KV-transfer-timeout consensus collective.
 
@@ -1029,6 +1030,7 @@ class PyExecutor:
                                 requests=timed_out,
                                 charge_budget=False)
 
+    @nvtx_range("_flush_iter_stats_synced")
     def _flush_iter_stats_synced(self):
         """ADP-safe drain of the TLLM_METRICS_ALL_RANKS dict-gather collective.
 
@@ -2008,6 +2010,7 @@ class PyExecutor:
                  host_step_time_ms, prev_device_step_time_ms, scheduler_mode,
                  gpu_forward_time_ms))
 
+    @nvtx_range("_process_iter_stats")
     def _process_iter_stats(
         self,
         finished_requests: list[LlmRequest],
@@ -3062,6 +3065,7 @@ class PyExecutor:
             self.kv_connector_manager.worker.start_load_kv(
                 torch.cuda.current_stream())
 
+    @nvtx_range("_kv_connector_terminate_requests")
     def _kv_connector_terminate_requests(self):
         if self.kv_connector_manager:
             reqs_to_terminate = self.kv_connector_manager.get_finished()
@@ -3643,6 +3647,7 @@ class PyExecutor:
             self.control_action_done.set()
             self.control_request_barrier.clear()
 
+    @nvtx_range("_wait_for_model_engine_input_copy")
     def _wait_for_model_engine_input_copy(self):
         wait_for_input_copy = getattr(self.model_engine, "wait_for_input_copy",
                                       None)
@@ -4025,6 +4030,7 @@ class PyExecutor:
 
         return result_tensors, num_accepted_tokens
 
+    @nvtx_range("_process_previous_batch")
     def _process_previous_batch(self):
         self._handle_canceled_requests()
         # Skip iter-1 emission when `_emit_first_token_responses` already
@@ -4330,6 +4336,7 @@ class PyExecutor:
         self.active_requests.extend(validated_requests)
         return validated_requests
 
+    @nvtx_range("_add_kv_cache_events")
     def _add_kv_cache_events(self):
         kv_cache_manager = self.resource_manager.resource_managers.get(
             ResourceManagerType.KV_CACHE_MANAGER)
@@ -5249,6 +5256,7 @@ class PyExecutor:
             self._handle_errors(error_msg)
             return None
 
+    @nvtx_range("_update_generation_requests_that_will_complete_next_iteration")
     def _update_generation_requests_that_will_complete_next_iteration(
             self, generation_requests: list[LlmRequest]):
         """ Update the generation requests that will complete next iteration.

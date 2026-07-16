@@ -2469,9 +2469,11 @@ class ResourceManager:
 
     @nvtx_range("prepare_resources")
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
-        for _, resource_manager in self.resource_managers.items():
+        for rtype, resource_manager in self.resource_managers.items():
             if hasattr(resource_manager, "prepare_resources"):
-                resource_manager.prepare_resources(scheduled_batch)
+                with nvtx_range(
+                        f"prepare_resources:{getattr(rtype, 'name', rtype)}"):
+                    resource_manager.prepare_resources(scheduled_batch)
 
     @nvtx_range("update_resources")
     def update_resources(
@@ -2480,14 +2482,16 @@ class ResourceManager:
         attn_metadata: Optional["AttentionMetadata"] = None,
         kv_cache_dtype_byte_size: Optional[float] = None,
     ):
-        for _, resource_manager in self.resource_managers.items():
+        for rtype, resource_manager in self.resource_managers.items():
             if hasattr(resource_manager, "update_resources"):
-                if isinstance(resource_manager, KVCacheManager):
-                    resource_manager.update_resources(scheduled_batch,
-                                                      attn_metadata,
-                                                      kv_cache_dtype_byte_size)
-                else:
-                    resource_manager.update_resources(scheduled_batch)
+                with nvtx_range(
+                        f"update_resources:{getattr(rtype, 'name', rtype)}"):
+                    if isinstance(resource_manager, KVCacheManager):
+                        resource_manager.update_resources(
+                            scheduled_batch, attn_metadata,
+                            kv_cache_dtype_byte_size)
+                    else:
+                        resource_manager.update_resources(scheduled_batch)
 
     def free_resources(self, request: LlmRequest):
         for resource_type, resource_manager in reversed(
