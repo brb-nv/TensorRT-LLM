@@ -72,6 +72,18 @@ def require_msa_module():
     return fmha_sm100
 
 
+def _msa_inner_block_contiguous(paged: torch.Tensor) -> bool:
+    """True if each page's inner [page_size, head_dim] block is packed.
+
+    fmha_sm100 reads the page stride (dim 0) and head stride (dim 1) at runtime
+    but assumes the innermost [page_size, head_dim] block is contiguous (token
+    stride == head_dim, element stride == 1). When that holds the permuted view
+    is a valid kernel input without a copy, regardless of the outer page/head
+    strides.
+    """
+    return paged.stride(-1) == 1 and paged.stride(-2) == paged.shape[-1]
+
+
 def cache_view_to_msa_paged(cache_view: torch.Tensor) -> torch.Tensor:
     """Convert a KV cache view to the fmha_sm100 HND paged layout.
 
@@ -79,15 +91,25 @@ def cache_view_to_msa_paged(cache_view: torch.Tensor) -> torch.Tensor:
     [num_pages, num_heads, page_size, head_dim]. A 3-D flat-slot cache
     [num_slots, num_heads, head_dim] is treated as one virtual page, giving
     [1, num_heads, num_slots, head_dim].
+
+    fmha_sm100 honours the page and head strides at runtime and only requires
+    each page's [page_size, head_dim] block to be contiguous. For the MQA
+    index-K cache (num_heads == 1) the permuted view already satisfies that,
+    even when the buffer is a coalesced-pool slice whose page stride spans the
+    shared K/V/index storage, so the view is returned zero-copy and the
+    per-forward full-cache copy is avoided. Layouts whose inner block is strided
+    (num_heads > 1 interleaved) fall back to a contiguous copy.
     """
     if cache_view.dim() == 4:
-        return cache_view.permute(0, 2, 1, 3).contiguous()
-    if cache_view.dim() == 3:
-        return cache_view.permute(1, 0, 2).unsqueeze(0).contiguous()
-    raise ValueError(
-        f"Unsupported cache view rank {cache_view.dim()} for MSA paged conversion; "
-        "expected 3 (flat-slot) or 4 (paged)."
-    )
+        paged = cache_view.permute(0, 2, 1, 3)
+    elif cache_view.dim() == 3:
+        paged = cache_view.permute(1, 0, 2).unsqueeze(0)
+    else:
+        raise ValueError(
+            f"Unsupported cache view rank {cache_view.dim()} for MSA paged conversion; "
+            "expected 3 (flat-slot) or 4 (paged)."
+        )
+    return paged if _msa_inner_block_contiguous(paged) else paged.contiguous()
 
 
 def msa_paged_kv(kv_cache_manager, layer_idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
