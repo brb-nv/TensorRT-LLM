@@ -1,0 +1,60 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# trtllm-bench --config (extra_llm_api_options) for the MiniMax-M3-NVFP4
+# ISL=8192 / OSL=1 steady-state nsys profiling workload (PyTorch backend).
+#
+# This file only carries the feature knobs that trtllm-bench does NOT own on
+# its CLI. Parallelism (tp/ep), max_seq_len, max_batch_size and max_num_tokens
+# are passed on the trtllm-bench command line by run_nsys.sh so a single
+# source of truth drives them (see run_nsys.sh).
+#
+# Defaults mirror the validated NVFP4 path in
+# tests/integration/defs/accuracy/test_llm_api_pytorch.py::TestMiniMaxM3.test_nvfp4
+# (tp=ep=4, MSA sparse attention with an fp8 KV cache, CUTLASS MoE).
+# Blackwell-only (SM100+); requires >=4 GPUs with >=140 GB each and
+# trust_remote_code (trtllm-bench forces trust_remote_code=True internally).
+
+# tp=ep=4 without attention-DP is the validated NVFP4 layout. Flip to true only
+# if you also bump the MPI world / tp on the CLI.
+enable_attention_dp: false
+
+moe_config:
+  # CUTLASS is the validated MoE backend for the NVFP4 checkpoint.
+  backend: CUTLASS
+
+kv_cache_config:
+  free_gpu_memory_fraction: 0.6
+  # Sparse-attention path does not support KV-cache block reuse.
+  enable_block_reuse: false
+  # MSA sparse-attention implementation runs an fp8 KV cache. If you switch
+  # sparse_attention_config.implementation to "triton", change this to "auto".
+  dtype: fp8
+
+sparse_attention_config:
+  algorithm: minimax_m3
+  # "msa" = fmha_sm100 kernels (SM100 + sparse_block_size==128). Use "triton"
+  # for the reference path (and set kv_cache_config.dtype: auto above).
+  implementation: msa
+
+cuda_graph_config:
+  enable_padding: true
+
+# Piecewise CUDA graph for the context/prefill step. torch.compile splits the
+# FX graph at attention (incl. MiniMax-M3 sparse attention, which is a
+# registered piecewise boundary op) and captures the non-attention pieces into
+# CUDA graphs. Captured at each `capture_num_tokens` bucket; a prefill with
+# <= bucket tokens is padded up to the nearest bucket and replayed.
+#
+# capture_num_tokens MUST cover the workload: 8192 for the ISL=8192 prefill
+# chunk (== max_num_tokens) and 1 for the single OSL=1 decode step. The engine
+# caps buckets at max_batch_size*(max_seq_len-1); with mbs=32 / max_seq_len=8320
+# that ceiling is far above 8192, so 8192 is captured (watch the log for a
+# "Skipping piecewise CUDA graph capture for num_tokens=[8192]" warning).
+torch_compile_config:
+  enable_piecewise_cuda_graph: true
+  capture_num_tokens: [1, 8192]
+  # The validated M3 piecewise reference uses max_num_streams: 3 for intra-piece
+  # overlap. Left at the default 1 here to isolate "is piecewise replaying?";
+  # bump to 3 once confirmed working.
+  # max_num_streams: 3
