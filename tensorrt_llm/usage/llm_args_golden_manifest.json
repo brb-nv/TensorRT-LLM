@@ -1451,6 +1451,20 @@
       "annotation": "Optional[int]",
       "converter": "",
       "kind": "value",
+      "path": "sparse_attention_config.num_attention_heads"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[int]",
+      "converter": "",
+      "kind": "value",
+      "path": "sparse_attention_config.num_key_value_heads"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[int]",
+      "converter": "",
+      "kind": "value",
       "path": "sparse_attention_config.page_size"
     },
     {
