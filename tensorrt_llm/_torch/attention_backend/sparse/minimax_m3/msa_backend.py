@@ -133,6 +133,10 @@ class _MsaGraphSafePlan:
         self._buf = {}
         # Set by refresh(), read through the plan property.
         self._plan: Optional[tuple] = None
+        # cute_workspace_buffer must keep a fixed address across steps for the
+        # captured graph to replay correctly. Pin it on first use and fail if
+        # it moves.
+        self._ws_ptr: Optional[int] = None
         for key in _MSA_PLAN_STABLE_KEYS:
             if key == "packed_work_range":
                 shape = (num_ctas,)
@@ -172,6 +176,15 @@ class _MsaGraphSafePlan:
                 raise RuntimeError(
                     f"MSA decode plan used split-KV workspace {key!r}; num_kv_splits=1 "
                     "is required for graph-safe decode."
+                )
+        ws = decode.get("cute_workspace_buffer")
+        if ws is not None:
+            if self._ws_ptr is None:
+                self._ws_ptr = ws.data_ptr()
+            elif ws.data_ptr() != self._ws_ptr:
+                raise RuntimeError(
+                    "cute_workspace_buffer moved across steps; the fmha_sm100 plan "
+                    "is not CUDA-graph safe."
                 )
         rebuilt = dict(decode)
         for key in _MSA_PLAN_STABLE_KEYS:

@@ -89,8 +89,18 @@ def _group_max_reduce(
     max_score: torch.Tensor,
     config: "MiniMaxM3SparseConfig",
 ) -> torch.Tensor:
-    """Reduce per-index-head max score to per-KV-head granularity by amax."""
-    group = config.num_index_heads // config.num_kv_heads
+    """Reduce per-index-head max score to per-KV-head granularity by amax.
+
+    Index heads are assumed to be grouped contiguously per KV head, so head h
+    maps to KV group h // group.
+    """
+    group, rem = divmod(config.num_index_heads, config.num_kv_heads)
+    if rem != 0:
+        raise ValueError(
+            "num_index_heads must be divisible by num_kv_heads for group max "
+            f"reduce; got num_index_heads={config.num_index_heads}, "
+            f"num_kv_heads={config.num_kv_heads}."
+        )
     if group > 1:
         return max_score.view(
             config.num_kv_heads, group, max_score.shape[1], max_score.shape[2]
