@@ -761,48 +761,6 @@ class MiniMaxM3MsaSparseAttention(TrtllmAttention):
             n_valid_blocks=n_valid_blocks,
         )
 
-    def run_sparse_attention(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        idx_q: torch.Tensor,
-        idx_k: torch.Tensor,
-        metadata,
-        output: torch.Tensor,
-    ) -> torch.Tensor:
-        """Select the KV blocks, then run the sparse GQA into output.
-
-        Pick blocks with the indexer, publish them through
-        forward_args.topk_indices, and let the inherited TrtllmAttention
-        forward dispatch the sparse GQA. This backend writes the main and
-        index caches itself.
-        """
-        kv_block_indexes = self.run_indexer(idx_q, idx_k, metadata)
-        forward_args = AttentionForwardArgs(output=output, topk_indices=kv_block_indexes)
-        self.forward(q, k, v, metadata, forward_args=forward_args)
-        return output
-
-    def run_dense_attention(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        metadata,
-        output: torch.Tensor,
-    ) -> torch.Tensor:
-        """Run dense paged GQA through the inherited forward into output.
-
-        The dense MiniMax-M3 layers share the sparse layers' K/V geometry, so
-        they route through the same MsaSparseGqaFmha as run_sparse_attention,
-        just without an indexer pass. With no top-k selection published, the
-        FMHA attends the full page table using the dense plan built in
-        the metadata's prepare().
-        """
-        forward_args = AttentionForwardArgs(output=output)
-        self.forward(q, k, v, metadata, forward_args=forward_args)
-        return output
-
     def sparse_attn_predict(
         self,
         q: torch.Tensor,

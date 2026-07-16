@@ -98,7 +98,7 @@ def is_mla(config):
 
 def is_minimax_m3(sparse_attention_config):
     """True when the sparse attention config selects the MiniMax-M3 algorithm."""
-    return getattr(sparse_attention_config, "algorithm", None) == "minimax_m3"
+    return sparse_attention_config.algorithm == "minimax_m3"
 
 
 def is_qwen3_next(config):

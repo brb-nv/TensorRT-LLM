@@ -15,6 +15,8 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from tensorrt_llm._utils import is_sm_100f
+
 from .interface import Fmha
 
 if TYPE_CHECKING:
@@ -23,20 +25,6 @@ if TYPE_CHECKING:
         TrtllmAttention,
         TrtllmAttentionMetadata,
     )
-
-
-def _msa_metadata_cls() -> type:
-    """The concrete metadata class that drives MsaSparseGqaFmha.
-
-    Imported lazily: this module is pulled in while trtllm is still importing,
-    and msa_backend imports the trtllm attention classes at module scope, so a
-    module-scope import here would create a cycle.
-    """
-    from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_backend import (
-        MiniMaxM3MsaSparseAttention,
-    )
-
-    return MiniMaxM3MsaSparseAttention.Metadata
 
 
 def run_msa_sparse_gqa(
@@ -55,14 +43,14 @@ def run_msa_sparse_gqa(
     plan: Optional[tuple] = None,
     out: Optional[torch.Tensor] = None,
     use_fp8: bool = False,
-) -> Optional[torch.Tensor]:
+) -> None:
     """Run fmha_sm100 paged GQA (plan/run split).
 
     `kv_block_indexes`: if set, sparse top-k mode (fixed `kv_block_num=topk`);
     if None, dense mode attending all pages in `kv_indices`.
     `plan`: prebuilt execution plan; if None, built inline from the CPU length
     tensors (eager prefill/tests vs. CUDA-graph decode).
-    `out`: written in place if provided, else a new tensor is returned.
+    `out`: destination buffer the kernel writes in place.
     `use_fp8`: FP8 KV cache. The caller must pass FP8 `q` to match the FP8 paged
     K/V, since the kernel variant shares one dtype across q/k/v. Also selects the
     FP8 AOT kernels for an inline sparse-prefill plan; no-op for the decode planner.
@@ -106,7 +94,7 @@ def run_msa_sparse_gqa(
             num_kv_splits=1,
             use_fp8_kvcache=use_fp8,
         )
-    out_result, _ = fmha_sm100.fmha_sm100(
+    fmha_sm100.fmha_sm100(
         q,
         k_paged,
         v_paged,
@@ -117,7 +105,6 @@ def run_msa_sparse_gqa(
         sm_scale=sm_scale,
         output_maxscore=False,
     )
-    return out_result
 
 
 def run_msa_paged_gqa(
@@ -197,24 +184,22 @@ class MsaSparseGqaFmha(Fmha):
         and 4-D HND paged K/V.
     """
 
-    HEAD_DIM = 128
-    REQUIRES_PAGED_KV = True
-
-    def __init__(self, attn: "TrtllmAttention"):
-        super().__init__(attn)
-        self.kv_factor = 2
-        self.generation_out_head_size = self.HEAD_DIM
-        self.context_out_head_size = self.HEAD_DIM
-
     @classmethod
     def is_available(cls, attn: Optional["TrtllmAttention"] = None) -> bool:
-        # Only the MiniMax-M3 MSA attention layer uses this library. Matching on
-        # the lowered sparse algorithm lets the base create_fmha_libs add it to
-        # that layer alone, so no create_fmha_libs override is needed.
-        # Availability of the fmha_sm100 package and an SM100 device is gated
-        # earlier, when the MSA backend is selected.
-        sparse_params = getattr(attn, "sparse_params", None)
-        return getattr(sparse_params, "algorithm", None) == "minimax_m3"
+        # fmha_sm100 runs only on the SM100 family and ships in the MSA git
+        # submodule, so it is unavailable off SM100 or without the package.
+        # Imported lazily because the minimax_m3 package init imports the trtllm
+        # attention classes, which a module-scope import here would cycle with.
+        from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_utils import (
+            msa_package_available,
+        )
+
+        if not is_sm_100f() or not msa_package_available():
+            return False
+        # Only the MiniMax-M3 MSA layer uses this library. Matching the lowered
+        # sparse algorithm lets the base create_fmha_libs add it to that layer
+        # alone, so no create_fmha_libs override is needed.
+        return attn.sparse_params.algorithm == "minimax_m3"
 
     def forward(
         self,

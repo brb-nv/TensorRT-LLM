@@ -49,13 +49,13 @@ working unchanged.
 from .cache_manager import MiniMaxM3KVCacheManagerV2
 from .msa_backend import MiniMaxM3MsaSparseAttention
 from .triton_backend import (  # noqa: F401
+    MiniMaxM3SparseRuntimeBackend,
     _gather_paged_batched,
     _write_main_kv_slots_to_pool,
-    get_minimax_m3_triton_attention_backend_cls,
 )
 
 __all__ = [
     "MiniMaxM3KVCacheManagerV2",
     "MiniMaxM3MsaSparseAttention",
-    "get_minimax_m3_triton_attention_backend_cls",
+    "MiniMaxM3SparseRuntimeBackend",
 ]
