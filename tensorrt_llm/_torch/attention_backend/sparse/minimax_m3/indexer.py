@@ -181,12 +181,17 @@ class MsaIndexer:
         *,
         idx_sm_scale: float,
         page_size: int,
+        sparse_kv_fp8: bool = False,
     ) -> torch.Tensor:
         """Return `kv_block_indexes` via the graph-safe decode driver.
 
         The driver runs the same `fmha_sm100` proxy binary and device-side
         top-k with persistent buffers, so this path is CUDA-graph
         capturable.
+
+        `sparse_kv_fp8` sizes the shared decode state's sparse-GQA variant
+        for an FP8 K/V cache. The proxy pass driven here is always bf16; the
+        flag is forwarded so an eager-fallback build matches the main pass.
         """
         from .decode_wrapper.dispatch import (
             M3DecodeGeometry,
@@ -232,7 +237,7 @@ class MsaIndexer:
             max_kv_len=max_kv_len,
             page_size=page_size,
         )
-        state = resolve_decode_state(metadata, geometry, idx_q.device)
+        state = resolve_decode_state(metadata, geometry, idx_q.device, sparse_kv_fp8=sparse_kv_fp8)
         max_score = decode_proxy_max_score(
             state,
             idx_q,

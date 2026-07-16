@@ -76,6 +76,19 @@ def _whole_batch_lens(
     return qo_lens_cpu, kv_lens_cpu, qo_offset_cpu, kv_indices
 
 
+def _msa_main_kv_is_fp8(kv_cache_manager) -> bool:
+    """True when the main K/V pool is FP8 (`KvCacheConfig(dtype="fp8")`).
+
+    Reads the actual buffer dtype; the pool dtype is uniform across
+    layers, so layer 0 is representative. An FP8 pool forces the FP8
+    sparse variant and an FP8 q cast.
+    """
+    if kv_cache_manager is None:
+        return False
+    k_paged, _ = msa_paged_kv(kv_cache_manager, 0)
+    return k_paged.dtype == torch.float8_e4m3fn
+
+
 def run_msa_sparse_decode(
     config: "MiniMaxM3SparseConfig",
     kv_cache_manager,
@@ -117,7 +130,9 @@ def run_msa_sparse_decode(
         max_kv_len=int(getattr(m3_meta, "msa_max_kv_len", 0)) or int(m3_meta.req_to_token.shape[1]),
         page_size=page_size,
     )
-    state = resolve_decode_state(m3_meta, geometry, q.device)
+    state = resolve_decode_state(
+        m3_meta, geometry, q.device, sparse_kv_fp8=k_paged.dtype == torch.float8_e4m3fn
+    )
     out = decode_sparse_attention(
         state,
         q,
@@ -244,9 +259,14 @@ def get_minimax_m3_msa_attention_backend_cls():
                 max_batch=int(m3_meta.msa_max_batch),
                 max_kv_len=int(m3_meta.msa_max_kv_len),
             )
+            # Build the decode state with the variant matching the
+            # KV-cache dtype, outside capture, so graph replays reuse it.
+            sparse_kv_fp8 = _msa_main_kv_is_fp8(self.kv_cache_manager)
             state = self._m3_decode_state
             if state is None or state.geom != decode_geometry or state.device != cache_device:
-                state = build_m3_decode_state(decode_geometry, cache_device)
+                state = build_m3_decode_state(
+                    decode_geometry, cache_device, sparse_kv_fp8=sparse_kv_fp8
+                )
                 self._m3_decode_state = state
             m3_meta.decode_state = state
 
@@ -406,6 +426,7 @@ def get_minimax_m3_msa_attention_backend_cls():
                 m3_meta,
                 idx_sm_scale=idx_sm_scale,
                 page_size=page_size,
+                sparse_kv_fp8=_msa_main_kv_is_fp8(metadata.kv_cache_manager),
             )
 
         # sparse hooks (consumed by inherited TrtllmAttention.forward)

@@ -144,6 +144,8 @@ class M3DecodeState:
     num_ctas: int
     proxy_module: object
     sparse_module: object
+    # Dtype of the compiled sparse-GQA variant; q is cast to it at launch.
+    sparse_q_dtype: torch.dtype
     workspace_buffer: torch.Tensor
     max_score_flat: torch.Tensor
     kv_block_indexes: torch.Tensor
@@ -157,11 +159,21 @@ class M3DecodeState:
     worklist_cache: dict = field(default_factory=dict)
 
 
-def build_m3_decode_state(geometry: M3DecodeGeometry, device: torch.device) -> M3DecodeState:
+def build_m3_decode_state(
+    geometry: M3DecodeGeometry,
+    device: torch.device,
+    *,
+    sparse_kv_fp8: bool = False,
+) -> M3DecodeState:
     """Allocate the persistent decode buffers and compile the kernels.
 
     Runs outside any CUDA graph capture (from the metadata's `prepare()`),
     using the same JIT-compiled SM100 binaries as the MSA api path.
+
+    `sparse_kv_fp8`: the main K/V cache is FP8. The variant is keyed on
+    `q.dtype` (one dtype for q/k/v), so the sparse-GQA pass uses the FP8
+    variant and casts q to FP8. The proxy pass stays bf16 because the
+    index-K cache is bf16. Output is bf16 either way.
     """
     import fmha_sm100  # noqa: F401  (hard dependency of the decode kernels)
     from fmha_sm100.jit import _dlpack_dtype_code, get_fmha_variant
@@ -173,6 +185,8 @@ def build_m3_decode_state(geometry: M3DecodeGeometry, device: torch.device) -> M
     pf_sparse = _compute_pack_factor(1, g.num_q_heads, g.num_kv_heads)
     max_k_tiles = _max_k_tiles_capacity(g.max_kv_len)
     bf16_code = _dlpack_dtype_code(torch.bfloat16)
+    sparse_q_dtype = torch.float8_e4m3fn if sparse_kv_fp8 else torch.bfloat16
+    sparse_dtype_code = _dlpack_dtype_code(sparse_q_dtype)
     return M3DecodeState(
         geom=g,
         device=device,
@@ -187,8 +201,9 @@ def build_m3_decode_state(geometry: M3DecodeGeometry, device: torch.device) -> M
             bf16_code, _QO_TILE_SIZE, True, 2, g.page_size, False, pf_proxy
         ),
         sparse_module=get_fmha_variant(
-            bf16_code, _QO_TILE_SIZE, True, 0, g.page_size, False, pf_sparse
+            sparse_dtype_code, _QO_TILE_SIZE, True, 0, g.page_size, False, pf_sparse
         ),
+        sparse_q_dtype=sparse_q_dtype,
         workspace_buffer=torch.empty(_WORKSPACE_BYTES, dtype=torch.uint8, device=device),
         max_score_flat=torch.empty(
             g.num_index_heads * max_k_tiles * g.max_batch, dtype=torch.float32, device=device
@@ -209,6 +224,8 @@ def resolve_decode_state(
     m3_meta,
     geometry: M3DecodeGeometry,
     device: torch.device,
+    *,
+    sparse_kv_fp8: bool = False,
 ) -> M3DecodeState:
     """Return the decode state owning the CUDA-graph-stable buffers.
 
@@ -217,6 +234,9 @@ def resolve_decode_state(
     `data_ptr()` across replays. The eager and test paths may reach here
     without one; there we build a per-call state and cache it on the
     metadata for reuse.
+
+    `sparse_kv_fp8` selects the FP8 sparse-GQA variant for an FP8 K/V
+    cache. It must match the flag `prepare()` used for the attached state.
     """
     state = getattr(m3_meta, "decode_state", None)
     if state is not None and state.geom == geometry and state.device == device:
@@ -228,7 +248,7 @@ def resolve_decode_state(
             "MiniMax-M3 decode state missing or geometry-mismatched during "
             "CUDA-graph capture; prepare() attaches it outside capture."
         )
-    state = build_m3_decode_state(geometry, device)
+    state = build_m3_decode_state(geometry, device, sparse_kv_fp8=sparse_kv_fp8)
     try:
         m3_meta.decode_state = state
     except AttributeError:
@@ -501,6 +521,10 @@ def decode_sparse_attention(
     total_q = q.shape[0]
     batch = _split_rows(state, total_q, qo_len)
     seq_lens = seq_lens[:batch]
+
+    # Match q to the sparse variant's dtype (FP8 for an FP8 K/V cache).
+    if q.dtype != state.sparse_q_dtype:
+        q = q.to(state.sparse_q_dtype)
 
     out = state.out[:total_q]
     if qo_len == 1:
