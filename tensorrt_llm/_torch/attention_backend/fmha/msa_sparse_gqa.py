@@ -73,6 +73,7 @@ def run_msa_sparse_gqa(
     sm_scale: float,
     causal: bool,
     head_dim: int = 128,
+    use_fp8: bool = False,
 ) -> torch.Tensor:
     """Single kernel core: `fmha_sm100` block-sparse paged GQA.
 
@@ -81,6 +82,11 @@ def run_msa_sparse_gqa(
     `kv_block_indexes.shape[-1]`), then `fmha_sm100` runs the kernel with
     the block indices threaded through. Returns
     `[total_q, num_qo_heads, head_dim]` bfloat16.
+
+    `use_fp8`: FP8 paged K/V. The variant is chosen by `q.dtype` and uses
+    one dtype for q/k/v, so `q` must be FP8 to match FP8 K/V. The flag also
+    selects the FP8 AOT kernels for an inline sparse-prefill plan and is a
+    no-op for the decode planner. Output is bfloat16 for any input dtype.
     """
     # Imported here, not at module top, so the registry can still
     # advertise the class on hosts where fmha_sm100 is absent.
@@ -127,6 +133,7 @@ def run_msa_sparse_gqa(
         kv_block_num=int(kv_block_indexes.shape[-1]),
         causal=causal,
         num_kv_splits=1,
+        use_fp8_kvcache=use_fp8,
     )
     out, _ = fmha_sm100.fmha_sm100(
         q,
@@ -274,11 +281,16 @@ class MsaSparseGqaFmha(Fmha):
         if m3_meta.is_prefill:
             # Context or mixed batch: eager fmha_sm100 (not graph captured).
             k_paged, v_paged = msa_paged_kv(kv_cache_manager, layer_idx)
+            # FP8 KV cache: cast q to E4M3 to match the FP8 paged K/V (see
+            # run_msa_sparse_gqa). MiniMax-M3 has no KV-cache scales, so the
+            # scale is 1.0 and the cast is exact.
+            use_fp8 = k_paged.dtype == torch.float8_e4m3fn
+            q_in = q3.to(torch.float8_e4m3fn) if use_fp8 else q3
             qo_lens_cpu, kv_lens_cpu, qo_offset_cpu, kv_indices = _whole_batch_lens(
                 m3_meta, config.block_size
             )
             out = run_msa_sparse_gqa(
-                q3,
+                q_in,
                 k_paged,
                 v_paged,
                 kv_block_indexes,
@@ -289,6 +301,7 @@ class MsaSparseGqaFmha(Fmha):
                 sm_scale=sm_scale,
                 causal=True,
                 head_dim=self.HEAD_DIM,
+                use_fp8=use_fp8,
             )
         else:
             # Pure decode: CUDA-graph captured, so route through the
