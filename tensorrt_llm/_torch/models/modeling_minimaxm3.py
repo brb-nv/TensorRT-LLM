@@ -793,10 +793,15 @@ class MiniMaxM3Attention(Attention):
         reshapes back. Matches the SGLang reference's
         ``_qk_norm`` for ``qk_norm_type='per_head'``.
         """
-        q_shape = q.shape
-        k_shape = k.shape
-        q = self.q_norm(q.reshape(-1, self.head_dim_value)).reshape(q_shape)
-        k = self.k_norm(k.reshape(-1, self.head_dim_value)).reshape(k_shape)
+        # unflatten/flatten instead of reshape: q/k arrive as non-contiguous
+        # views of the fused qkv_proj output, and reshape(-1, head_dim) on a
+        # row-strided slice silently materializes a copy of Q and K every
+        # layer. The per-head strided 3-D view is legal, flashinfer's norm
+        # kernels accept it natively (bit-identical, verified on B300 /
+        # flashinfer 0.6.14), and flatten(-2) on the norm's fresh contiguous
+        # output is a free view.
+        q = self.q_norm(q.unflatten(-1, (-1, self.head_dim_value))).flatten(-2)
+        k = self.k_norm(k.unflatten(-1, (-1, self.head_dim_value))).flatten(-2)
         return q, k
 
     def apply_index_qk_norm(
@@ -821,10 +826,13 @@ class MiniMaxM3Attention(Attention):
                 f"apply_index_qk_norm is only valid on sparse attention layers "
                 f"(layer_idx={self.layer_idx} is dense)"
             )
-        idx_q_shape = idx_q.shape
-        idx_k_shape = idx_k.shape
-        idx_q = self.index_q_norm(idx_q.reshape(-1, self.sparse_index_dim)).reshape(idx_q_shape)
-        idx_k = self.index_k_norm(idx_k.reshape(-1, self.sparse_index_dim)).reshape(idx_k_shape)
+        # Same zero-copy pattern as apply_qk_norm (idx_q may be a strided
+        # slice when index heads are TP-sharded; idx_k is single-head and
+        # was already free, kept uniform for stride robustness).
+        idx_q = self.index_q_norm(
+            idx_q.unflatten(-1, (-1, self.sparse_index_dim))).flatten(-2)
+        idx_k = self.index_k_norm(
+            idx_k.unflatten(-1, (-1, self.sparse_index_dim))).flatten(-2)
         return idx_q, idx_k
 
     def apply_rope(
