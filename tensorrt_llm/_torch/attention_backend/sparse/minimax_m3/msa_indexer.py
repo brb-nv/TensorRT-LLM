@@ -145,6 +145,14 @@ class MsaIndexer:
         """
         config = self.config
         idx_k_paged = cache_view_to_msa_paged(idx_k_cache)
+        # Index-K is MQA (num_heads == 1) stored head-major, so the permuted
+        # paged view must alias the cache without a copy. Comparing data_ptr
+        # catches a future cache-layout change that would silently force a
+        # per-forward contiguous() copy on this hot path.
+        assert idx_k_paged.data_ptr() == idx_k_cache.data_ptr(), (
+            "MSA index-K paged conversion made a copy; expected a zero-copy "
+            "view for the MQA index-K cache."
+        )
 
         if proxy_plan is None:
             max_score = _proxy_max_score(
