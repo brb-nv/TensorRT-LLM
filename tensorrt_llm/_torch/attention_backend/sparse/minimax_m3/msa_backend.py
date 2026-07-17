@@ -218,8 +218,9 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
     Length inputs to fmha_sm100_plan (msa_qo_lens_cpu, msa_kv_lens_cpu,
     msa_qo_offset_cpu) are host properties of the base seq_lens/kv_lens,
     read only while building plans in prepare() (outside capture), so they
-    need no graph-stable storage. Plans are built in _build_decode_plans and
-    are absent for prefill/mixed batches, which run eagerly.
+    need no graph-stable storage. Plans are built in _build_step_plans:
+    pure-decode batches use the graph-safe owners (msa_decode_*_plan) while
+    prefill/mixed batches keep plain eager tuples (msa_eager_*_plan).
     """
 
     # Graph-stable buffers; consumers slice to the live count at the call
@@ -241,6 +242,15 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
     _msa_proxy_plan: Optional["_MsaGraphSafePlan"] = None
     _msa_gqa_plan: Optional["_MsaGraphSafePlan"] = None
     _msa_dense_plan: Optional["_MsaGraphSafePlan"] = None
+    # Eager (prefill / mixed) plans. Built once per step in prepare() and
+    # reused by every layer, so a prefill / chunked-prefill forward builds the
+    # three layer-invariant plans once instead of rebuilding proxy + GQA inline
+    # in each of the 57 sparse layers (and dense inline in layers 0-2). These
+    # are plain plan tuples (no graph-stable buffers): prefill runs eagerly and
+    # is never CUDA-graph captured.
+    _msa_eager_proxy_plan: Optional[tuple] = None
+    _msa_eager_gqa_plan: Optional[tuple] = None
+    _msa_eager_dense_plan: Optional[tuple] = None
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -292,6 +302,43 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         """Dense GQA plan tuple, shared by dense layers 0 to 2."""
         plan = self._msa_dense_plan
         return plan.plan if plan is not None else None
+
+    @property
+    def msa_eager_proxy_plan(self) -> Optional[tuple]:
+        """Prebuilt indexer proxy plan for the eager (prefill/mixed) path."""
+        return self._msa_eager_proxy_plan
+
+    @property
+    def msa_eager_gqa_plan(self) -> Optional[tuple]:
+        """Prebuilt sparse GQA plan for the eager (prefill/mixed) path."""
+        return self._msa_eager_gqa_plan
+
+    @property
+    def msa_eager_dense_plan(self) -> Optional[tuple]:
+        """Prebuilt dense GQA plan for the eager (prefill/mixed) path."""
+        return self._msa_eager_dense_plan
+
+    def _msa_main_kv_is_fp8(self) -> bool:
+        """Whether the main paged K/V cache is stored as FP8 E4M3.
+
+        The eager GQA / dense plans must pass ``use_fp8_kvcache`` so the inline
+        sparse-prefill path selects the FP8 AOT kernels (it is a no-op for the
+        decode planner). Mirrors the ``k_paged.dtype`` check in
+        ``run_msa_paged_gqa``.
+        """
+        kv_cache_manager = self.kv_cache_manager
+        if kv_cache_manager is None:
+            return False
+        try:
+            buffers = kv_cache_manager.get_buffers(0, kv_layout="HND")
+        except TypeError:
+            buffers = kv_cache_manager.get_buffers(0)
+        except Exception:
+            return False
+        try:
+            return buffers[:, 0].dtype == torch.float8_e4m3fn
+        except Exception:
+            return False
 
     def _create_msa_buffers(self) -> None:
         """Allocate the CUDA-graph-stable MSA device buffers.
@@ -423,26 +470,36 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
     def prepare(self) -> None:
         super().prepare()
         self._build_msa_fields()
-        self._build_decode_plans()
+        self._build_step_plans()
 
-    def _build_decode_plans(self) -> None:
-        """Build the graph-safe decode plans and buffers for this step.
+    def _build_step_plans(self) -> None:
+        """Build the three layer-invariant fmha_sm100 plans once per step.
 
-        Runs in prepare(), outside CUDA graph capture. The plans are
-        layer-invariant for MiniMax-M3, so they are built once per step from
-        the shared sparse geometry, mirrored into CUDA-graph-stable buffers,
-        and reused by every layer. Mirrors FlashInfer's plan() split.
-        Prefill/mixed batches leave the plans cleared and run eagerly.
+        Runs in prepare(), outside CUDA graph capture. The proxy / GQA / dense
+        plans depend only on the per-step sparse geometry (qo/kv lengths, head
+        counts, topk, page size), never on the layer, so they are built once
+        here and reused by every layer:
+
+          * Pure-decode batches mirror the plans into the CUDA-graph-stable
+            ``_MsaGraphSafePlan`` buffers (surfaced by ``msa_decode_*_plan``),
+            because decode is captured and the plan worklists must keep a fixed
+            address across replays.
+          * Prefill / chunked-prefill / mixed batches run eagerly (never
+            captured), so the plans are stored as plain tuples
+            (``msa_eager_*_plan``). This replaces the previous behaviour of
+            rebuilding the proxy + GQA plans inline in every sparse layer (57x)
+            and the dense plan inline in layers 0-2 (3x) — ~117 identical plan
+            builds per prefill step collapse to 3.
         """
-        # Drop any plan tuples from the previous step; the msa_decode_*_plan
-        # properties then report None until they are rebuilt below.
+        # Drop any plan tuples from the previous step; the msa_decode_*_plan /
+        # msa_eager_*_plan properties then report None until rebuilt below.
         for plan in (self._msa_proxy_plan, self._msa_gqa_plan, self._msa_dense_plan):
             if plan is not None:
                 plan.reset()
+        self._msa_eager_proxy_plan = None
+        self._msa_eager_gqa_plan = None
+        self._msa_eager_dense_plan = None
         if not self._msa_fields_ready:
-            return
-        # A decode batch is pure generation (no context requests).
-        if int(self.num_contexts or 0) > 0:
             return
         # Geometry is captured in __post_init__; skip when it is unavailable.
         params = self._msa_params
@@ -463,6 +520,14 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         page_size = int(self.kv_cache_manager.tokens_per_block)
         capture_graph = self.is_cuda_graph
         max_batch = int(self.max_num_sequences)
+        # A decode batch is pure generation (no context requests). Only that
+        # path is CUDA-graph captured and uses the graph-stable plan buffers.
+        is_decode = int(self.num_contexts or 0) == 0
+        # The main-attention GQA / dense plans need use_fp8_kvcache so the
+        # eager (inline sparse-prefill) kernel selection matches an FP8 paged
+        # cache; it is a no-op for the decode planner. The proxy runs over the
+        # bf16 index-K cache, so it never needs the flag.
+        use_fp8 = self._msa_main_kv_is_fp8()
 
         # Proxy plan: MQA (num_kv_heads=1) max-score pass over the index
         # branch; output_maxscore feeds the indexer's top-k block selection.
@@ -488,6 +553,7 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
             kv_block_num=topk,
             num_kv_splits=1,
             causal=True,
+            use_fp8_kvcache=use_fp8,
         )
         # Dense-layer plan: no kv_block_num, so it attends the full page table.
         dense_plan = fmha_sm100.fmha_sm100_plan(
@@ -499,7 +565,17 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
             page_size=page_size,
             num_kv_splits=1,
             causal=True,
+            use_fp8_kvcache=use_fp8,
         )
+
+        if not is_decode:
+            # Prefill / mixed: run eagerly, so keep the plain plan tuples and
+            # leave the graph-safe owners reset. The indexer computes its own
+            # per-query valid-block count on the eager path.
+            self._msa_eager_proxy_plan = proxy_plan
+            self._msa_eager_gqa_plan = gqa_plan
+            self._msa_eager_dense_plan = dense_plan
+            return
 
         required_max_k_tiles = int(proxy_plan[3]["max_k_tiles"])
         self._ensure_msa_decode_scratch_buffers(
@@ -734,8 +810,12 @@ class MiniMaxM3MsaSparseAttention(TrtllmAttention):
         idx_k_cache = metadata.msa_idx_k_cache(self.layer_idx)
 
         # One selection path: decode passes the prebuilt graph-safe proxy
-        # plan plus the proxy scratch shaped to the live query count; prefill
-        # leaves them None and the proxy plan is built inline.
+        # plan plus the proxy scratch shaped to the live query count; prefill /
+        # mixed passes the prebuilt eager proxy plan (built once per step in
+        # prepare) and lets the kernel allocate the score buffer and the
+        # indexer compute the per-query valid-block count. Only when neither is
+        # present (e.g. a standalone test that skips prepare) does select_blocks
+        # build the proxy plan inline.
         proxy_plan = metadata.msa_decode_proxy_plan
         if proxy_plan is not None:
             # proxy_plan is (has_mixed, split, batch, decode_dict, prefill);
@@ -746,6 +826,7 @@ class MiniMaxM3MsaSparseAttention(TrtllmAttention):
             )
             n_valid_blocks = metadata.msa_n_valid_blocks[:num_tokens]
         else:
+            proxy_plan = metadata.msa_eager_proxy_plan
             max_score = None
             n_valid_blocks = None
         return self.indexer.select_blocks(

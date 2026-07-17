@@ -215,13 +215,19 @@ class MsaSparseGqaFmha(Fmha):
 
         # Sparse layers attend the per-query top-k blocks with the sparse plan;
         # dense layers leave the indices None and attend the full page table
-        # with the dense plan.
+        # with the dense plan. Decode uses the graph-safe plans; prefill / mixed
+        # uses the eager plans prebuilt once per step in prepare() (falling back
+        # to an inline build in run_msa_sparse_gqa only when neither exists,
+        # e.g. a standalone test that skips prepare).
         kv_block_indexes = forward_args.sparse_prediction.sparse_attn_indices
-        plan = (
-            metadata.msa_decode_gqa_plan
-            if kv_block_indexes is not None
-            else metadata.msa_decode_dense_plan
-        )
+        if kv_block_indexes is not None:
+            plan = metadata.msa_decode_gqa_plan
+            if plan is None:
+                plan = getattr(metadata, "msa_eager_gqa_plan", None)
+        else:
+            plan = metadata.msa_decode_dense_plan
+            if plan is None:
+                plan = getattr(metadata, "msa_eager_dense_plan", None)
         run_msa_paged_gqa(
             self.attn,
             q,
