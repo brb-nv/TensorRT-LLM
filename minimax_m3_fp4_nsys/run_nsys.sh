@@ -25,12 +25,18 @@
 #   OUT_DIR       output dir (default minimax_m3_fp4_nsys/out/c<CONCURRENCY>).
 #
 # Common env overrides:
+#   NSYS_ENABLE     master profiling switch (default 1). Set to 0 to run the
+#                   identical trtllm-bench command with NO nsys wrapper and no
+#                   profiler overhead -- useful for a functional/throughput
+#                   sanity check or an A/B baseline. No .nsys-rep is produced.
 #   MODEL           HF model dir (default MiniMax-M3-NVFP4 under llm-models).
 #   TP / EP         tensor / expert parallel size (default 4 / 4).
 #   ISL / OSL       input / output length (default 8192 / 1).
 #   MAX_SEQ_LEN     engine max seq len (default ISL+128).
 #   MAX_BATCH_SIZE  engine max batch size (default 32).
-#   MAX_NUM_TOKENS  engine max num tokens (default 8192).
+#   MAX_NUM_TOKENS  engine max num tokens (default 8320 = 8192 + one 128-token
+#                   block, so config.yaml's top piecewise capture bucket (8320)
+#                   is reachable instead of being skipped and run eager).
 #   WARMUP          trtllm-bench warmup requests (default 5).
 #   NUM_REQUESTS    request supply (default 32; must exceed the profile
 #                   window's stop iteration). With stop-shutdown the run is torn
@@ -50,6 +56,13 @@
 
 set -euo pipefail
 
+# Master on/off switch for profiling. NSYS_ENABLE=1 (default) wraps the run in
+# `nsys profile` exactly as documented below. NSYS_ENABLE=0 runs the identical
+# trtllm-bench command directly -- no nsys, no profiler overhead, no .nsys-rep
+# -- which is handy for a quick functional/throughput sanity check or an A/B
+# baseline without touching any other flags.
+NSYS_ENABLE="${NSYS_ENABLE:-1}"
+
 CONCURRENCY="${1:-1}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -64,7 +77,7 @@ ISL="${ISL:-8192}"
 OSL="${OSL:-1}"
 MAX_SEQ_LEN="${MAX_SEQ_LEN:-$((ISL + 128))}"
 MAX_BATCH_SIZE="${MAX_BATCH_SIZE:-32}"
-MAX_NUM_TOKENS="${MAX_NUM_TOKENS:-8192}"
+MAX_NUM_TOKENS="${MAX_NUM_TOKENS:-8320}"
 WARMUP="${WARMUP:-5}"
 NUM_REQUESTS="${NUM_REQUESTS:-32}"
 PROFILE_ITERS="${PROFILE_ITERS:-12-24}"
@@ -75,14 +88,22 @@ CUDA_GRAPH_TRACE="${CUDA_GRAPH_TRACE:-}"
 # self-spawned children). The profiled data is already flushed at the
 # cudaProfilerStop boundary, so this avoids a teardown hang on multi-GPU runs.
 NSYS_WAIT="${NSYS_WAIT:-primary}"
+# Which nsys binary to use. Defaults to whatever is first on PATH; set to an
+# absolute path to pin a specific version regardless of PATH ordering, e.g.
+#   NSYS=$HOME/nsys-2025.5.1/opt/nvidia/nsight-systems/2025.5.1/bin/nsys
+NSYS="${NSYS:-nsys}"
 
 CONFIG="${SCRIPT_DIR}/config.yaml"
 DATASET="${DATASET:-${SCRIPT_DIR}/dataset_isl${ISL}_osl${OSL}.jsonl}"
 
 # ---- Pre-flight ----------------------------------------------------------
-for tool in nsys trtllm-bench python3; do
+PREFLIGHT_TOOLS=(trtllm-bench python3)
+if [[ "${NSYS_ENABLE}" != "0" ]]; then
+    PREFLIGHT_TOOLS=("${NSYS}" "${PREFLIGHT_TOOLS[@]}")
+fi
+for tool in "${PREFLIGHT_TOOLS[@]}"; do
     if ! command -v "${tool}" >/dev/null 2>&1; then
-        echo "ERROR: ${tool} not on PATH (are you inside the TRT-LLM container?)." >&2
+        echo "ERROR: ${tool} not found (are you inside the TRT-LLM container?)." >&2
         exit 1
     fi
 done
@@ -129,7 +150,13 @@ echo "  warmup/reqs:    ${WARMUP}/${NUM_REQUESTS}"
 echo "  profile iters:  ${PROFILE_ITERS} (steady-state window)"
 echo "  capture end:    ${CAPTURE_END}"
 echo "  cuda-graph-trace: ${CUDA_GRAPH_TRACE:-<off>}"
-echo "  report:         ${REPORT}.nsys-rep"
+if [[ "${NSYS_ENABLE}" != "0" ]]; then
+    echo "  profiling:      ON (NSYS_ENABLE=${NSYS_ENABLE})"
+    echo "  report:         ${REPORT}.nsys-rep"
+    echo "  nsys:           $(command -v "${NSYS}") ($("${NSYS}" --version 2>/dev/null | head -n1))"
+else
+    echo "  profiling:      OFF (NSYS_ENABLE=0) -- running trtllm-bench directly, no trace"
+fi
 echo "=================================================================="
 
 # nsys flags:
@@ -143,53 +170,81 @@ echo "=================================================================="
 #       NCCL collectives captured in CUDA graphs. Opt in via CUDA_GRAPH_TRACE.
 #   --trace-fork-before-exec=true : follow the tp worker processes.
 #   -e ... : propagate profiling env vars to the (forked) worker processes.
+#       TLLM_LLMAPI_ENABLE_NVTX / TLLM_NVTX_DEBUG both gate nvtx_range_debug, so
+#       either one turns on the MiniMax-M3 decoder markers: per-layer ranges
+#       (MiniMaxM3.layer0, layer1, ...) plus the intra-layer breakdown
+#       (layerN.input_layernorm / {dense,sparse}_attn / post_attention_layernorm
+#       / {moe,mlp}).
 NSYS_EXTRA_FLAGS=()
 if [[ -n "${CUDA_GRAPH_TRACE}" ]]; then
     NSYS_EXTRA_FLAGS+=("--cuda-graph-trace=${CUDA_GRAPH_TRACE}")
 fi
 
+# The benchmark command is identical whether or not we profile; only the nsys
+# wrapper (and where TLLM_PROFILE_START_STOP is set) differs.
+BENCH_CMD=(
+    trtllm-bench
+        --model "${MODEL}"
+        --model_path "${MODEL}"
+        throughput
+        --backend pytorch
+        --config "${CONFIG}"
+        --dataset "${DATASET}"
+        --tp "${TP}"
+        --ep "${EP}"
+        --max_seq_len "${MAX_SEQ_LEN}"
+        --max_batch_size "${MAX_BATCH_SIZE}"
+        --max_num_tokens "${MAX_NUM_TOKENS}"
+        --concurrency "${CONCURRENCY}"
+        --warmup "${WARMUP}"
+        --num_requests "${NUM_REQUESTS}"
+        --report_json "${OUT_DIR}/report_c${CONCURRENCY}.json"
+)
+
 # With stop-shutdown, nsys terminates trtllm-bench at the window boundary, so
 # a non-zero pipeline exit is EXPECTED. Don't let it abort the script / sweep;
 # success is judged by the .nsys-rep existing below.
 set +e
-TLLM_PROFILE_START_STOP="${PROFILE_ITERS}" nsys profile \
-    --output "${REPORT}" \
-    --force-overwrite=true \
-    --trace=cuda,nvtx,python-gil \
-    --capture-range=cudaProfilerApi \
-    --capture-range-end="${CAPTURE_END}" \
-    --trace-fork-before-exec=true \
-    --wait="${NSYS_WAIT}" \
-    --stats=false \
-    "${NSYS_EXTRA_FLAGS[@]}" \
-    -e "TLLM_PROFILE_START_STOP=${PROFILE_ITERS},TLLM_LLMAPI_ENABLE_NVTX=1" \
-    -- \
-    trtllm-bench \
-        --model "${MODEL}" \
-        --model_path "${MODEL}" \
-        throughput \
-        --backend pytorch \
-        --config "${CONFIG}" \
-        --dataset "${DATASET}" \
-        --tp "${TP}" \
-        --ep "${EP}" \
-        --max_seq_len "${MAX_SEQ_LEN}" \
-        --max_batch_size "${MAX_BATCH_SIZE}" \
-        --max_num_tokens "${MAX_NUM_TOKENS}" \
-        --concurrency "${CONCURRENCY}" \
-        --warmup "${WARMUP}" \
-        --num_requests "${NUM_REQUESTS}" \
-        --report_json "${OUT_DIR}/report_c${CONCURRENCY}.json" \
-    2>&1 | tee "${RUN_LOG}"
+if [[ "${NSYS_ENABLE}" != "0" ]]; then
+    TLLM_PROFILE_START_STOP="${PROFILE_ITERS}" "${NSYS}" profile \
+        --output "${REPORT}" \
+        --force-overwrite=true \
+        --trace=cuda,nvtx,python-gil \
+        --capture-range=cudaProfilerApi \
+        --capture-range-end="${CAPTURE_END}" \
+        --trace-fork-before-exec=true \
+        --wait="${NSYS_WAIT}" \
+        --stats=false \
+        "${NSYS_EXTRA_FLAGS[@]}" \
+        -e "TLLM_PROFILE_START_STOP=${PROFILE_ITERS},TLLM_LLMAPI_ENABLE_NVTX=1,TLLM_NVTX_DEBUG=1" \
+        -- \
+        "${BENCH_CMD[@]}" \
+        2>&1 | tee "${RUN_LOG}"
+else
+    # No profiling: run the bench directly. No cudaProfilerApi window, so the
+    # run processes the full request set and exits normally.
+    "${BENCH_CMD[@]}" 2>&1 | tee "${RUN_LOG}"
+fi
+BENCH_STATUS=${PIPESTATUS[0]}
 set -e
 
 echo
-if [[ -f "${REPORT}.nsys-rep" ]]; then
+if [[ "${NSYS_ENABLE}" == "0" ]]; then
+    if (( BENCH_STATUS == 0 )); then
+        echo "[run_nsys] Done (profiling OFF). trtllm-bench report: ${OUT_DIR}/report_c${CONCURRENCY}.json"
+    else
+        echo "[run_nsys] ERROR: trtllm-bench exited ${BENCH_STATUS} (profiling OFF). Check ${RUN_LOG}." >&2
+        exit 1
+    fi
+elif [[ -f "${REPORT}.nsys-rep" ]]; then
     echo "[run_nsys] Done. Report: ${REPORT}.nsys-rep"
     echo "[run_nsys] (A non-zero exit above is expected: --capture-range-end="
     echo "            ${CAPTURE_END} tears the run down at the window boundary.)"
     echo "[run_nsys] Summarize NVTX ranges via:"
     echo "    nsys stats --report nvtx_sum --format table ${REPORT}.nsys-rep"
+    echo "[run_nsys] Per-layer / intra-layer breakdown (MiniMax-M3 decoder markers):"
+    echo "    nsys stats --report nvtx_sum --format table ${REPORT}.nsys-rep \\"
+    echo "        | grep -iE 'Range|MiniMaxM3.layer|layer[0-9]+\\.'"
 else
     echo "[run_nsys] ERROR: ${REPORT}.nsys-rep was not produced. Check ${RUN_LOG}." >&2
     echo "[run_nsys] If the log shows the profile window was never reached, raise" >&2
