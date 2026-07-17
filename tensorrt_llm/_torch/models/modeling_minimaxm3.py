@@ -649,11 +649,11 @@ class MiniMaxM3Attention(Attention):
 
     Both branches share the same dense GQA scaffolding (``qkv_proj`` +
     ``o_proj`` + per-head Gemma Q/K norm + partial RoPE). Sparse layers
-    additionally carry the MiniMax index branch (``index_q_proj``,
-    ``index_k_proj`` and their per-head norms). The index value/output
-    branch is omitted because the M3 checkpoint sets
-    ``sparse_disable_index_value=True`` on every sparse layer; if a
-    future config variant flips that flag the gate will catch the
+    additionally carry the MiniMax index branch: a single fused
+    ``index_qk_proj`` (whose output is ``[idx_q | idx_k]``) plus the per-head
+    index norms. The index value/output branch is omitted because the M3
+    checkpoint sets ``sparse_disable_index_value=True`` on every sparse layer;
+    if a future config variant flips that flag the gate will catch the
     unmapped keys.
     """
 
@@ -739,28 +739,27 @@ class MiniMaxM3Attention(Attention):
             self.sparse_local_block = int(sparse_cfg.get("sparse_local_block", 1))
             self.sparse_score_type = str(sparse_cfg.get("sparse_score_type", "max"))
 
-            # index_q_proj is **replicated** across TP ranks. The sparse
-            # forward reshapes idx_q to
-            # ``[num_tokens, sparse_num_index_heads, sparse_index_dim]``,
-            # which requires the rank-local idx_q to carry all heads.
-            index_q_total = self.sparse_num_index_heads * self.sparse_index_dim
-            self.index_q_proj = Linear(
+            # Index Q and K are both **replicated** across TP ranks (no head
+            # sharding) and are plain projections of the same hidden_states, so
+            # they are fused into a single ``index_qk_proj`` GEMM whose output
+            # is [idx_q | idx_k] along the feature axis. This drops one GEMM
+            # launch per sparse layer and removes the ``torch.cat`` that
+            # previously re-joined the two outputs before fused_qk_norm_rope.
+            #   * The idx_q slice (``num_index_heads * sparse_index_dim`` wide)
+            #     is reshaped to [num_tokens, num_index_heads, sparse_index_dim];
+            #     replication keeps all heads rank-local.
+            #   * The idx_k slice (``sparse_index_dim`` wide) is a single K per
+            #     token (not per-head), broadcast across index heads when
+            #     scoring blocks.
+            # The two checkpoint tensors (``index_q_proj.weight`` /
+            # ``index_k_proj.weight``) are concatenated into
+            # ``index_qk_proj.weight`` at load time (see
+            # :func:`_fuse_index_qk_proj_weights`).
+            self.index_q_size = self.sparse_num_index_heads * self.sparse_index_dim
+            self.index_k_size = self.sparse_index_dim
+            self.index_qk_proj = Linear(
                 config.hidden_size,
-                index_q_total,
-                bias=False,
-                dtype=config.torch_dtype,
-                mapping=model_config.mapping,
-                tensor_parallel_mode=None,
-                quant_config=None,
-                skip_create_weights_in_init=model_config.skip_create_weights_in_init,
-            )
-            # index_k_proj is also replicated across TP ranks and
-            # outputs ``sparse_index_dim`` channels — a single K per
-            # token (not per-head), broadcast across index heads when
-            # scoring blocks.
-            self.index_k_proj = Linear(
-                config.hidden_size,
-                self.sparse_index_dim,
+                self.index_q_size + self.index_k_size,
                 bias=False,
                 dtype=config.torch_dtype,
                 mapping=model_config.mapping,
@@ -1347,10 +1346,11 @@ class MiniMaxM3Attention(Attention):
                 f"MiniMax-M3 sparse forward (layer {self.layer_idx}) requires "
                 "attn_metadata; received None."
             )
-        # 1. Projections.
+        # 1. Projections. The index branch is a single fused GEMM whose output
+        # is already the [idx_q | idx_k] concatenation the fused QK-norm+RoPE
+        # kernel consumes, so no separate index_k GEMM or torch.cat is needed.
         qkv = self.qkv_proj(hidden_states)
-        idx_q = self.index_q_proj(hidden_states)
-        idx_k = self.index_k_proj(hidden_states)
+        idx_qk = self.index_qk_proj(hidden_states)
 
         # 2-3. Main branch: per-head Gemma RMSNorm + partial RoPE. The
         # bf16 fast path fuses both into a single kernel over the
@@ -1381,11 +1381,11 @@ class MiniMaxM3Attention(Attention):
             if self.rotary_emb is not None and position_ids is not None:
                 q, k = self.rotary_emb(position_ids, [q, k])
 
-        # 2-3. Index branch: same fused Gemma norm + partial RoPE over the
-        # concatenated [idx_q, idx_k] (num_heads_v=0; the kernel touches
-        # only the Q/K segments). idx_k is a single replicated head, so
-        # num_heads_k=1. Fall back to separate norm + RoPE otherwise.
-        idx_qk = torch.cat([idx_q, idx_k], dim=-1)
+        # 2-3. Index branch: fused Gemma norm + partial RoPE over the already
+        # concatenated [idx_q, idx_k] produced by index_qk_proj (num_heads_v=0;
+        # the kernel touches only the Q/K segments). idx_k is a single
+        # replicated head, so num_heads_k=1. Fall back to separate norm + RoPE
+        # otherwise, splitting the fused projection output first.
         fused_idx = self._fused_qk_norm_rope(
             idx_qk,
             position_ids,
@@ -1397,10 +1397,7 @@ class MiniMaxM3Attention(Attention):
             k_norm=self.index_k_norm,
         )
         if fused_idx is not None:
-            idx_q, idx_k = fused_idx.split(
-                [self.sparse_num_index_heads * self.sparse_index_dim, self.sparse_index_dim],
-                dim=-1,
-            )
+            idx_q, idx_k = fused_idx.split([self.index_q_size, self.index_k_size], dim=-1)
             idx_q, idx_k = idx_q.contiguous(), idx_k.contiguous()
         else:
             assert not self._expect_fused_qk_norm_rope(position_ids, self.sparse_index_dim), (
@@ -1409,6 +1406,7 @@ class MiniMaxM3Attention(Attention):
                 f"{self.sparse_index_dim}) but fell back to the separate path; idx "
                 f"dtype is {idx_qk.dtype} (expected {self.attn_activation_dtype})."
             )
+            idx_q, idx_k = idx_qk.split([self.index_q_size, self.index_k_size], dim=-1)
             idx_q, idx_k = self.apply_index_qk_norm(idx_q, idx_k)
             if self.rotary_emb is not None and position_ids is not None:
                 idx_q, idx_k = self.rotary_emb(position_ids, [idx_q, idx_k])
@@ -1704,6 +1702,48 @@ _M3_GATE_BIAS_RENAME_MAP = {
     r"^(.*\.block_sparse_moe)\.e_score_correction_bias$": (r"\1.gate.e_score_correction_bias"),
 }
 
+# Suffixes for the two sparse index projections that :class:`MiniMaxM3Attention`
+# now fuses into a single ``index_qk_proj`` GEMM.
+_M3_INDEX_Q_SUFFIX = ".index_q_proj.weight"
+_M3_INDEX_K_SUFFIX = ".index_k_proj.weight"
+_M3_INDEX_QK_SUFFIX = ".index_qk_proj.weight"
+
+
+def _fuse_index_qk_proj_weights(weights):
+    """Fuse ``index_q_proj``/``index_k_proj`` checkpoint weights in place.
+
+    :class:`MiniMaxM3Attention` replaces the two replicated index projections
+    with a single ``index_qk_proj`` whose output is ``[idx_q | idx_k]``. The
+    checkpoint still ships the two separate ``self_attn.index_q_proj.weight``
+    and ``self_attn.index_k_proj.weight`` tensors, so concatenate each matched
+    pair along the output (row) axis into ``self_attn.index_qk_proj.weight``
+    and drop the sources before the generic loader runs.
+
+    Both index projections are plain (unquantized, ``quant_config=None``)
+    replicated bf16 Linears, so a row-wise ``torch.cat`` is exactly the fused
+    weight; there are no block scales to merge. The ``weights`` mapping is a
+    plain ``dict`` or a :class:`ConsumableWeightsDict`; both support item
+    mutation. A no-op when the sources are absent (already fused, or a partial
+    load), so it is safe to call unconditionally.
+    """
+    q_keys = [k for k in list(weights.keys()) if k.endswith(_M3_INDEX_Q_SUFFIX)]
+    for q_key in q_keys:
+        prefix = q_key[: -len(_M3_INDEX_Q_SUFFIX)]
+        k_key = prefix + _M3_INDEX_K_SUFFIX
+        if k_key not in weights:
+            # Unpaired index_q without its index_k: leave both to the loader so
+            # it raises a clear missing-weight error rather than us silently
+            # fabricating a half-populated fused tensor.
+            continue
+        wq = weights[q_key]
+        wk = weights[k_key]
+        wq = wq[:] if hasattr(wq, "__getitem__") else wq
+        wk = wk[:] if hasattr(wk, "__getitem__") else wk
+        weights[prefix + _M3_INDEX_QK_SUFFIX] = torch.cat([wq, wk], dim=0)
+        del weights[q_key]
+        del weights[k_key]
+    return weights
+
 
 @register_auto_model("MiniMaxM3SparseForCausalLM")
 class MiniMaxM3ForCausalLM(DecoderModelForCausalLM[MiniMaxM3Model, PretrainedConfig]):
@@ -1721,6 +1761,11 @@ class MiniMaxM3ForCausalLM(DecoderModelForCausalLM[MiniMaxM3Model, PretrainedCon
         )
 
     def load_weights(self, weights, *args, **kwargs):
+        # Fuse the two sparse index projections into index_qk_proj before the
+        # generic loader dispatches (matches the fused module in
+        # MiniMaxM3Attention). Covers the VL path too, which routes its
+        # text weights through this method.
+        weights = _fuse_index_qk_proj_weights(weights)
         # Merge the M3-specific gate-bias rename into any caller-
         # supplied ``params_map`` so the VL wrapper and any downstream
         # tooling that already passes one keep working.
