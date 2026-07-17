@@ -415,6 +415,9 @@ class MiniMaxM3MoE(nn.Module):
         self.enable_attention_dp = model_config.mapping.enable_attention_dp
         self.use_dp = self.enable_attention_dp
         self.mapping = model_config.mapping
+        # Retained for fine-grained NVTX range labels in ``forward`` (the
+        # router / routed-experts / shared-expert / all-reduce sub-steps).
+        self.layer_idx = layer_idx
 
         self.swiglu_alpha_value = float(getattr(config, "swiglu_alpha", 1.702))
         self.swiglu_beta_value = 1.0  # SGLang's ``(up + 1)`` offset in swiglu_no_interleaved.
@@ -534,17 +537,23 @@ class MiniMaxM3MoE(nn.Module):
     ) -> torch.Tensor:
         all_rank_num_tokens = attn_metadata.all_rank_num_tokens
 
+        # Fine-grained NVTX ranges (no-ops unless TLLM_NVTX_DEBUG=1 or
+        # TLLM_LLMAPI_ENABLE_NVTX=1). Nested under the layer-level
+        # ``layer{idx}.moe`` range emitted by MiniMaxM3DecoderLayer.
         def _compute_routed_output():
-            router_logits = self.gate(hidden_states)
-            return self.experts(
-                hidden_states,
-                router_logits,
-                all_rank_num_tokens=all_rank_num_tokens,
-                use_dp_padding=False,
-            )
+            with nvtx_range_debug(f"layer{self.layer_idx}.moe.router"):
+                router_logits = self.gate(hidden_states)
+            with nvtx_range_debug(f"layer{self.layer_idx}.moe.routed_experts"):
+                return self.experts(
+                    hidden_states,
+                    router_logits,
+                    all_rank_num_tokens=all_rank_num_tokens,
+                    use_dp_padding=False,
+                )
 
         def _compute_shared_output():
-            return self.shared_experts(hidden_states)
+            with nvtx_range_debug(f"layer{self.layer_idx}.moe.shared_expert"):
+                return self.shared_experts(hidden_states)
 
         if self.shared_experts is None:
             result = _compute_routed_output()
@@ -562,7 +571,8 @@ class MiniMaxM3MoE(nn.Module):
             result = shared_output.add_(routed_output)
 
         if self.allreduce is not None:
-            result = self.allreduce(result, all_reduce_params=final_all_reduce_params)
+            with nvtx_range_debug(f"layer{self.layer_idx}.moe.allreduce"):
+                result = self.allreduce(result, all_reduce_params=final_all_reduce_params)
         return result
 
 
@@ -1022,48 +1032,55 @@ class MiniMaxM3Attention(Attention):
                 "attn_metadata; received None."
             )
 
+        # Fine-grained NVTX ranges (no-ops unless TLLM_NVTX_DEBUG=1 or
+        # TLLM_LLMAPI_ENABLE_NVTX=1). Nested under the layer-level
+        # ``layer{idx}.dense_attn`` range emitted by MiniMaxM3DecoderLayer.
         # 1. Projections (no index branch).
-        qkv = self.qkv_proj(hidden_states)
+        with nvtx_range_debug(f"layer{self.layer_idx}.dense_attn.qkv_proj"):
+            qkv = self.qkv_proj(hidden_states)
 
         # 2-3. Per-head Gemma RMSNorm + partial RoPE on Q/K. The bf16
         # fast path fuses both into a single kernel over the still-fused
         # qkv; otherwise fall back to separate norm + RoPE.
-        fused_qkv = self._fused_qk_norm_rope(
-            qkv,
-            position_ids,
-            num_heads_q=self.num_heads,
-            num_heads_k=self.num_key_value_heads,
-            num_heads_v=self.num_key_value_heads,
-            head_dim=self.head_dim,
-            q_norm=self.q_norm,
-            k_norm=self.k_norm,
-        )
-        if fused_qkv is not None:
-            q, k, v = fused_qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-            # Match the post-RoPE contiguity contract of the fallback
-            # path (the rotary_emb output is contiguous); V is left as a
-            # column-slice view exactly as the fallback split produces.
-            q, k = q.contiguous(), k.contiguous()
-        else:
-            # bf16-activation configs (incl. the MXFP8+NVFP4 "FP4"
-            # checkpoint) must hit the fused kernel; a fallback here means
-            # qkv came back non-bf16 — a silent perf/regression we reject.
-            assert not self._expect_fused_qk_norm_rope(position_ids, self.head_dim), (
-                f"MiniMax-M3 dense attention (layer {self.layer_idx}) expected the "
-                f"fused QK-norm+RoPE kernel (bf16 activations, head_dim="
-                f"{self.head_dim}) but fell back to the separate path; qkv dtype "
-                f"is {qkv.dtype} (expected {self.attn_activation_dtype})."
+        with nvtx_range_debug(f"layer{self.layer_idx}.dense_attn.qk_norm_rope"):
+            fused_qkv = self._fused_qk_norm_rope(
+                qkv,
+                position_ids,
+                num_heads_q=self.num_heads,
+                num_heads_k=self.num_key_value_heads,
+                num_heads_v=self.num_key_value_heads,
+                head_dim=self.head_dim,
+                q_norm=self.q_norm,
+                k_norm=self.k_norm,
             )
-            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-            q, k = self.apply_qk_norm(q, k)
-            if self.rotary_emb is not None and position_ids is not None:
-                q, k = self.rotary_emb(position_ids, [q, k])
+            if fused_qkv is not None:
+                q, k, v = fused_qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+                # Match the post-RoPE contiguity contract of the fallback
+                # path (the rotary_emb output is contiguous); V is left as a
+                # column-slice view exactly as the fallback split produces.
+                q, k = q.contiguous(), k.contiguous()
+            else:
+                # bf16-activation configs (incl. the MXFP8+NVFP4 "FP4"
+                # checkpoint) must hit the fused kernel; a fallback here means
+                # qkv came back non-bf16 — a silent perf/regression we reject.
+                assert not self._expect_fused_qk_norm_rope(position_ids, self.head_dim), (
+                    f"MiniMax-M3 dense attention (layer {self.layer_idx}) expected the "
+                    f"fused QK-norm+RoPE kernel (bf16 activations, head_dim="
+                    f"{self.head_dim}) but fell back to the separate path; qkv dtype "
+                    f"is {qkv.dtype} (expected {self.attn_activation_dtype})."
+                )
+                q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+                q, k = self.apply_qk_norm(q, k)
+                if self.rotary_emb is not None and position_ids is not None:
+                    q, k = self.rotary_emb(position_ids, [q, k])
 
         # Keep token-wise projections and the output projection visible to
         # torch.compile. Only the metadata/cache-dependent attention core is
         # hidden behind the inplace custom op.
-        o = self._forward_attention_core(q, k, v, None, None, attn_metadata)
-        return self.o_proj(o)
+        with nvtx_range_debug(f"layer{self.layer_idx}.dense_attn.attn_core"):
+            o = self._forward_attention_core(q, k, v, None, None, attn_metadata)
+        with nvtx_range_debug(f"layer{self.layer_idx}.dense_attn.o_proj"):
+            return self.o_proj(o)
 
     def _dense_attention_core(
         self,
@@ -1346,73 +1363,84 @@ class MiniMaxM3Attention(Attention):
                 f"MiniMax-M3 sparse forward (layer {self.layer_idx}) requires "
                 "attn_metadata; received None."
             )
+        # Fine-grained NVTX ranges (no-ops unless TLLM_NVTX_DEBUG=1 or
+        # TLLM_LLMAPI_ENABLE_NVTX=1). Nested under the layer-level
+        # ``layer{idx}.sparse_attn`` range emitted by MiniMaxM3DecoderLayer.
         # 1. Projections. The index branch is a single fused GEMM whose output
         # is already the [idx_q | idx_k] concatenation the fused QK-norm+RoPE
         # kernel consumes, so no separate index_k GEMM or torch.cat is needed.
-        qkv = self.qkv_proj(hidden_states)
-        idx_qk = self.index_qk_proj(hidden_states)
+        with nvtx_range_debug(f"layer{self.layer_idx}.sparse_attn.qkv_proj"):
+            qkv = self.qkv_proj(hidden_states)
+        with nvtx_range_debug(f"layer{self.layer_idx}.sparse_attn.index_qk_proj"):
+            idx_qk = self.index_qk_proj(hidden_states)
 
         # 2-3. Main branch: per-head Gemma RMSNorm + partial RoPE. The
         # bf16 fast path fuses both into a single kernel over the
         # still-fused qkv; otherwise fall back to separate norm + RoPE.
         # (self.rotary_emb exists here because rope_fusion=False.)
-        fused_qkv = self._fused_qk_norm_rope(
-            qkv,
-            position_ids,
-            num_heads_q=self.num_heads,
-            num_heads_k=self.num_key_value_heads,
-            num_heads_v=self.num_key_value_heads,
-            head_dim=self.head_dim,
-            q_norm=self.q_norm,
-            k_norm=self.k_norm,
-        )
-        if fused_qkv is not None:
-            q, k, v = fused_qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-            q, k = q.contiguous(), k.contiguous()
-        else:
-            assert not self._expect_fused_qk_norm_rope(position_ids, self.head_dim), (
-                f"MiniMax-M3 sparse attention (layer {self.layer_idx}) expected the "
-                f"fused QK-norm+RoPE kernel (bf16 activations, head_dim="
-                f"{self.head_dim}) but fell back to the separate path; qkv dtype "
-                f"is {qkv.dtype} (expected {self.attn_activation_dtype})."
+        with nvtx_range_debug(f"layer{self.layer_idx}.sparse_attn.qk_norm_rope"):
+            fused_qkv = self._fused_qk_norm_rope(
+                qkv,
+                position_ids,
+                num_heads_q=self.num_heads,
+                num_heads_k=self.num_key_value_heads,
+                num_heads_v=self.num_key_value_heads,
+                head_dim=self.head_dim,
+                q_norm=self.q_norm,
+                k_norm=self.k_norm,
             )
-            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-            q, k = self.apply_qk_norm(q, k)
-            if self.rotary_emb is not None and position_ids is not None:
-                q, k = self.rotary_emb(position_ids, [q, k])
+            if fused_qkv is not None:
+                q, k, v = fused_qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+                q, k = q.contiguous(), k.contiguous()
+            else:
+                assert not self._expect_fused_qk_norm_rope(position_ids, self.head_dim), (
+                    f"MiniMax-M3 sparse attention (layer {self.layer_idx}) expected the "
+                    f"fused QK-norm+RoPE kernel (bf16 activations, head_dim="
+                    f"{self.head_dim}) but fell back to the separate path; qkv dtype "
+                    f"is {qkv.dtype} (expected {self.attn_activation_dtype})."
+                )
+                q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+                q, k = self.apply_qk_norm(q, k)
+                if self.rotary_emb is not None and position_ids is not None:
+                    q, k = self.rotary_emb(position_ids, [q, k])
 
         # 2-3. Index branch: fused Gemma norm + partial RoPE over the already
         # concatenated [idx_q, idx_k] produced by index_qk_proj (num_heads_v=0;
         # the kernel touches only the Q/K segments). idx_k is a single
         # replicated head, so num_heads_k=1. Fall back to separate norm + RoPE
         # otherwise, splitting the fused projection output first.
-        fused_idx = self._fused_qk_norm_rope(
-            idx_qk,
-            position_ids,
-            num_heads_q=self.sparse_num_index_heads,
-            num_heads_k=1,
-            num_heads_v=0,
-            head_dim=self.sparse_index_dim,
-            q_norm=self.index_q_norm,
-            k_norm=self.index_k_norm,
-        )
-        if fused_idx is not None:
-            idx_q, idx_k = fused_idx.split([self.index_q_size, self.index_k_size], dim=-1)
-            idx_q, idx_k = idx_q.contiguous(), idx_k.contiguous()
-        else:
-            assert not self._expect_fused_qk_norm_rope(position_ids, self.sparse_index_dim), (
-                f"MiniMax-M3 sparse index branch (layer {self.layer_idx}) expected the "
-                f"fused QK-norm+RoPE kernel (bf16 activations, index_dim="
-                f"{self.sparse_index_dim}) but fell back to the separate path; idx "
-                f"dtype is {idx_qk.dtype} (expected {self.attn_activation_dtype})."
+        with nvtx_range_debug(f"layer{self.layer_idx}.sparse_attn.index_qk_norm_rope"):
+            fused_idx = self._fused_qk_norm_rope(
+                idx_qk,
+                position_ids,
+                num_heads_q=self.sparse_num_index_heads,
+                num_heads_k=1,
+                num_heads_v=0,
+                head_dim=self.sparse_index_dim,
+                q_norm=self.index_q_norm,
+                k_norm=self.index_k_norm,
             )
-            idx_q, idx_k = idx_qk.split([self.index_q_size, self.index_k_size], dim=-1)
-            idx_q, idx_k = self.apply_index_qk_norm(idx_q, idx_k)
-            if self.rotary_emb is not None and position_ids is not None:
-                idx_q, idx_k = self.rotary_emb(position_ids, [idx_q, idx_k])
+            if fused_idx is not None:
+                idx_q, idx_k = fused_idx.split([self.index_q_size, self.index_k_size], dim=-1)
+                idx_q, idx_k = idx_q.contiguous(), idx_k.contiguous()
+            else:
+                assert not self._expect_fused_qk_norm_rope(position_ids, self.sparse_index_dim), (
+                    f"MiniMax-M3 sparse index branch (layer {self.layer_idx}) expected the "
+                    f"fused QK-norm+RoPE kernel (bf16 activations, index_dim="
+                    f"{self.sparse_index_dim}) but fell back to the separate path; idx "
+                    f"dtype is {idx_qk.dtype} (expected {self.attn_activation_dtype})."
+                )
+                idx_q, idx_k = idx_qk.split([self.index_q_size, self.index_k_size], dim=-1)
+                idx_q, idx_k = self.apply_index_qk_norm(idx_q, idx_k)
+                if self.rotary_emb is not None and position_ids is not None:
+                    idx_q, idx_k = self.rotary_emb(position_ids, [idx_q, idx_k])
 
-        o = self._forward_attention_core(q, k, v, idx_q, idx_k, attn_metadata)
-        return self.o_proj(o)
+        # The attention core covers top-k block selection (run_indexer) +
+        # the sparse GQA FMHA; both are inside _forward_attention_core.
+        with nvtx_range_debug(f"layer{self.layer_idx}.sparse_attn.attn_core"):
+            o = self._forward_attention_core(q, k, v, idx_q, idx_k, attn_metadata)
+        with nvtx_range_debug(f"layer{self.layer_idx}.sparse_attn.o_proj"):
+            return self.o_proj(o)
 
     def _sparse_attention_core(
         self,
