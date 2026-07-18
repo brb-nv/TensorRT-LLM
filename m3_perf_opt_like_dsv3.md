@@ -8,7 +8,7 @@
 | 4 | Fuse `index_q_proj` + `index_k_proj` into one GEMM | **Landed** | Numerically identical; load-time row-wise weight concat. Commit "fuse MiniMax-M3 index_q/k projections". |
 | 1 | Gemma-norm weight fold → fused norm+quant | Deferred | Fold alone is pure churn; the payoff needs the fused-quant Linear wiring (input_scale attach) which is GPU-only to validate. Do with #2. |
 | 2 | AllReduce + residual + RMSNorm(+quant) fusion | Deferred | Multi-GPU (TP>1) only; the quant variant is blocked by gemma norm (#1). Restructures the decoder forward like DSV3 `forward_MoE`/`forward_mlp`. |
-| 3 | Fused GEMM + SwiGLU-OAI (dense MLP + shared expert) | Deferred | `silu_and_mul` has no `alpha` gain / `up+1` offset, so this needs a new/extended CUDA/Triton kernel + GPU validation. |
+| 3 | Fused SwiGLU-OAI activation (dense MLP + shared expert) | **Implemented (pending GPU validation)** | Extended the Triton `silu_and_mul` kernel + `trtllm::silu_and_mul` op with `swiglu_alpha`/`swiglu_beta`; `GatedMLP` now carries them and the dense/shared MLP routes swigluoai through the fused kernel (6 eager kernels → 1, + optional fp8 epilogue) instead of the Python `_minimax_m3_swiglu_oai` fallback. GEMM-epilogue fusion (CuteDSL) still N/A — that path is NVFP4-only and the dense/shared MLP is MXFP8. |
 | 5 | Drop redundant post-split `contiguous()` | Deferred | Whether `fmha_sm100` tolerates a strided Q is unverifiable without a GPU; low value, correctness risk. |
 
 Deferred items all require either a new kernel, multi-GPU, or GPU-only

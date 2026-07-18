@@ -35,6 +35,7 @@ from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_minimaxm3 import (
     MiniMaxM3Attention,
     _build_swiglu_oai_dense_mlp,
+    _minimax_m3_swiglu_oai,
     _strip_language_model_prefix,
     _wrap_dict_as_config,
     get_moe_layer_ids,
@@ -686,17 +687,11 @@ def test_minimax_m3_fused_qk_norm_rope_main_matches_separate():
     head_dim = attn.head_dim
 
     torch.manual_seed(0)
-    attn.q_norm.weight = torch.nn.Parameter(
-        torch.randn(head_dim, dtype=dtype, device=device) * 0.2
-    )
-    attn.k_norm.weight = torch.nn.Parameter(
-        torch.randn(head_dim, dtype=dtype, device=device) * 0.2
-    )
+    attn.q_norm.weight = torch.nn.Parameter(torch.randn(head_dim, dtype=dtype, device=device) * 0.2)
+    attn.k_norm.weight = torch.nn.Parameter(torch.randn(head_dim, dtype=dtype, device=device) * 0.2)
 
     seq = 6
-    qkv = torch.randn(
-        seq, attn.q_size + 2 * attn.kv_size, dtype=dtype, device=device
-    )
+    qkv = torch.randn(seq, attn.q_size + 2 * attn.kv_size, dtype=dtype, device=device)
     position_ids = torch.arange(seq, dtype=torch.int32, device=device) + 3
 
     # Fused path.
@@ -770,9 +765,7 @@ def test_minimax_m3_fused_qk_norm_rope_index_matches_separate():
         k_norm=attn.index_k_norm,
     )
     assert fused is not None
-    iq_f, ik_f = fused.split(
-        [num_index_heads * sparse_index_dim, sparse_index_dim], dim=-1
-    )
+    iq_f, ik_f = fused.split([num_index_heads * sparse_index_dim, sparse_index_dim], dim=-1)
 
     # Separate fallback path.
     iq_s, ik_s = attn.apply_index_qk_norm(idx_q, idx_k)
@@ -1221,3 +1214,47 @@ def test_minimax_m3_swiglu_oai_dense_mlp_under_adp_is_replicated():
         "ADP down_proj must skip the cross-rank all-reduce; otherwise it "
         "mixes outputs across independent rank-local token sets"
     )
+
+
+# ---------------------------------------------------------------------------
+# Fused SwiGLU-OAI numeric equivalence
+# ---------------------------------------------------------------------------
+#
+# The dense MLP and MoE shared expert run the swigluoai activation, expressed
+# as plain SwiGLU with (alpha, beta, limit) so it routes through the fused
+# silu_and_mul kernel. This pins that the fused kernel with alpha=1.702,
+# beta=1.0, limit=7.0 matches the reference _minimax_m3_swiglu_oai, and that
+# alpha=1.0, beta=0.0 recovers plain SwiGLU.
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not _has_cuda(), reason="fused silu_and_mul Triton kernel requires CUDA")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_minimax_m3_swiglu_oai_fused_matches_reference(dtype):
+    """The fused silu_and_mul kernel with (alpha, beta, limit) must match the
+    eager _minimax_m3_swiglu_oai reference, and reduce to plain SwiGLU when
+    alpha=1 and beta=0.
+    """
+    from tensorrt_llm._torch.modules.swiglu import swiglu
+
+    torch.manual_seed(0)
+    alpha, limit = 1.702, 7.0
+    # Wide range so both clamp branches (gate upper, up symmetric) are hit.
+    gate_up = torch.randn(64, 2 * 128, device="cuda", dtype=dtype) * 6.0
+
+    ref = _minimax_m3_swiglu_oai(gate_up, alpha=alpha, limit=limit)
+    fused = swiglu(gate_up, swiglu_alpha=alpha, swiglu_beta=1.0, swiglu_limit=limit)
+
+    assert fused.shape == ref.shape
+    assert fused.dtype == gate_up.dtype
+    # fp32 accumulation inside the kernel; loose tol for bf16 rounding.
+    atol = 2e-2 if dtype == torch.bfloat16 else 1e-4
+    torch.testing.assert_close(fused.float(), ref.float(), atol=atol, rtol=1e-2)
+
+    # alpha=1 / beta=0 reduces to plain SwiGLU: silu(gate_clamped) * up_clamped.
+    gate, up = gate_up.chunk(2, dim=-1)
+    gate_c = gate.clamp(max=limit)
+    up_c = up.clamp(min=-limit, max=limit)
+    plain_ref = torch.nn.functional.silu(gate_c) * up_c
+    plain = swiglu(gate_up, swiglu_limit=limit)
+    torch.testing.assert_close(plain.float(), plain_ref.float(), atol=atol, rtol=1e-2)
