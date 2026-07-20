@@ -17,6 +17,8 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from tensorrt_llm._utils import nvtx_range_debug
+
 from .msa_utils import (
     MSA_REQUIRED_TOPK,
     per_token_valid_blocks,
@@ -131,6 +133,7 @@ class MsaIndexer:
         proxy_plan: Optional[tuple] = None,
         max_score: Optional[torch.Tensor] = None,
         n_valid_blocks: Optional[torch.Tensor] = None,
+        layer_idx: Optional[int] = None,
     ) -> torch.Tensor:
         """Return [total_q, num_kv_heads, topk] selected block indices.
 
@@ -141,59 +144,72 @@ class MsaIndexer:
         `max_score` buffer with a precomputed `n_valid_blocks`, so there is
         no host sync inside the captured region. The same top-k selection serves
         both, and generation is the one-query-token-per-request special case.
+
+        The two phases are wrapped in nested NVTX ranges so profiles separate
+        the MSA ``fmha_sm100`` proxy forward (``.proxy_fmha``) from the native-op
+        top-k block selection (``.select_topk``). ``layer_idx`` only labels those
+        ranges; both no-op unless NVTX debug profiling is enabled.
         """
         config = self.config
-
-        if proxy_plan is None:
-            max_score = _proxy_max_score(
-                idx_q,
-                idx_k_paged,
-                qo_lens_cpu=qo_lens_cpu,
-                kv_lens_cpu=kv_lens_cpu,
-                qo_offset_cpu=qo_offset_cpu,
-                kv_indices=kv_indices,
-                sm_scale=idx_sm_scale,
-                causal=True,
-            )
-        else:
-            fmha_sm100 = require_msa_module()
-            _, max_score = fmha_sm100.fmha_sm100(
-                idx_q,
-                idx_k_paged,
-                idx_k_paged,
-                proxy_plan,
-                kv_indices=kv_indices,
-                output_o=False,
-                output_maxscore=True,
-                max_score=max_score,
-                sm_scale=idx_sm_scale,
-            )
-        max_score_kv = _group_max_reduce(max_score, config)
-
-        if n_valid_blocks is None:
-            n_valid_blocks = per_token_valid_blocks(
-                qo_lens_cpu,
-                kv_lens_cpu,
-                qo_offset_cpu,
-                causal=True,
-                block_size=int(idx_k_paged.shape[2]),
-            )
-            # The empty-selection guard uses a host sync, so it only runs on the
-            # eager path; a decode batch always has valid blocks.
-            if n_valid_blocks.numel() == 0 or int(n_valid_blocks.max().item()) <= 0:
-                return torch.full(
-                    (idx_q.shape[0], config.num_kv_heads, MSA_REQUIRED_TOPK),
-                    -1,
-                    dtype=torch.int32,
-                    device=idx_q.device,
-                )
-        return select_blocks_from_maxscore(
-            max_score_kv,
-            topk=MSA_REQUIRED_TOPK,
-            n_valid_blocks=n_valid_blocks,
-            init_blocks=config.init_blocks,
-            local_blocks=config.local_blocks,
+        label = (
+            f"layer{layer_idx}.msa.sparse.indexer"
+            if layer_idx is not None
+            else "msa.sparse.indexer"
         )
+
+        with nvtx_range_debug(f"{label}.proxy_fmha", color="yellow"):
+            if proxy_plan is None:
+                max_score = _proxy_max_score(
+                    idx_q,
+                    idx_k_paged,
+                    qo_lens_cpu=qo_lens_cpu,
+                    kv_lens_cpu=kv_lens_cpu,
+                    qo_offset_cpu=qo_offset_cpu,
+                    kv_indices=kv_indices,
+                    sm_scale=idx_sm_scale,
+                    causal=True,
+                )
+            else:
+                fmha_sm100 = require_msa_module()
+                _, max_score = fmha_sm100.fmha_sm100(
+                    idx_q,
+                    idx_k_paged,
+                    idx_k_paged,
+                    proxy_plan,
+                    kv_indices=kv_indices,
+                    output_o=False,
+                    output_maxscore=True,
+                    max_score=max_score,
+                    sm_scale=idx_sm_scale,
+                )
+
+        with nvtx_range_debug(f"{label}.select_topk", color="orange"):
+            max_score_kv = _group_max_reduce(max_score, config)
+
+            if n_valid_blocks is None:
+                n_valid_blocks = per_token_valid_blocks(
+                    qo_lens_cpu,
+                    kv_lens_cpu,
+                    qo_offset_cpu,
+                    causal=True,
+                    block_size=int(idx_k_paged.shape[2]),
+                )
+                # The empty-selection guard uses a host sync, so it only runs on
+                # the eager path; a decode batch always has valid blocks.
+                if n_valid_blocks.numel() == 0 or int(n_valid_blocks.max().item()) <= 0:
+                    return torch.full(
+                        (idx_q.shape[0], config.num_kv_heads, MSA_REQUIRED_TOPK),
+                        -1,
+                        dtype=torch.int32,
+                        device=idx_q.device,
+                    )
+            return select_blocks_from_maxscore(
+                max_score_kv,
+                topk=MSA_REQUIRED_TOPK,
+                n_valid_blocks=n_valid_blocks,
+                init_blocks=config.init_blocks,
+                local_blocks=config.local_blocks,
+            )
 
 
 __all__ = ["MsaIndexer"]

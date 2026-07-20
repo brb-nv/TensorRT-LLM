@@ -987,6 +987,7 @@ class MiniMaxM3MsaSparseAttention(TrtllmAttention):
             proxy_plan=proxy_plan,
             max_score=max_score,
             n_valid_blocks=n_valid_blocks,
+            layer_idx=self.layer_idx,
         )
 
     def sparse_attn_predict(

@@ -19,6 +19,7 @@ activation). Q/K are per-head Gemma-RMSNormed before partial RoPE
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import dataclasses
 import os
@@ -969,6 +970,21 @@ class MiniMaxM3Attention(Attention):
             **kwargs,
         )
 
+    def _msa_nvtx_range(self, name: str, color: str = "grey"):
+        """Fine-grained NVTX range scoped to the MSA attention codepath.
+
+        ``_dense_forward`` / ``_sparse_forward`` run the same projection,
+        norm+RoPE, and o_proj steps for every backend, so gate the extra
+        ``layer{idx}.msa.*`` ranges on the MSA backend
+        (:class:`MiniMaxM3MsaSparseAttention`) to keep the Triton/SDPA paths
+        unannotated. The returned :func:`nvtx_range_debug` still no-ops unless
+        ``TLLM_NVTX_DEBUG`` / ``TLLM_LLMAPI_ENABLE_NVTX`` is set, so these
+        ranges are inert outside profiling runs.
+        """
+        if isinstance(self.attn, MiniMaxM3MsaSparseAttention):
+            return nvtx_range_debug(f"layer{self.layer_idx}.msa.{name}", color=color)
+        return contextlib.nullcontext()
+
     def _dense_forward(
         self,
         position_ids: torch.IntTensor,
@@ -1019,36 +1035,38 @@ class MiniMaxM3Attention(Attention):
             )
 
         # Projections (no index branch).
-        qkv = self.qkv_proj(hidden_states)
+        with self._msa_nvtx_range("dense.qkv_proj", color="green"):
+            qkv = self.qkv_proj(hidden_states)
 
         # Per-head Gemma RMSNorm and partial RoPE on Q/K. The bf16 fast
         # path fuses both into one kernel over the fused qkv; otherwise fall
         # back to separate norm and RoPE.
-        fused_qkv = self._fused_qk_norm_rope(
-            qkv,
-            position_ids,
-            num_heads_q=self.num_heads,
-            num_heads_k=self.num_key_value_heads,
-            num_heads_v=self.num_key_value_heads,
-            head_dim=self.head_dim,
-            q_norm=self.q_norm,
-            k_norm=self.k_norm,
-        )
-        if fused_qkv is not None:
-            q, k, v = fused_qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-            # Match the fallback contiguity; V stays a column-slice view.
-            q, k = q.contiguous(), k.contiguous()
-        else:
-            assert not self._expect_fused_qk_norm_rope(position_ids), (
-                f"MiniMax-M3 dense attention (layer {self.layer_idx}) expected the "
-                f"fused QK-norm+RoPE kernel (bf16 activations, head_dim="
-                f"{self.head_dim}) but fell back to the separate path; qkv dtype "
-                f"is {qkv.dtype} (expected {self.attn_activation_dtype})."
+        with self._msa_nvtx_range("dense.qk_norm_rope", color="yellow"):
+            fused_qkv = self._fused_qk_norm_rope(
+                qkv,
+                position_ids,
+                num_heads_q=self.num_heads,
+                num_heads_k=self.num_key_value_heads,
+                num_heads_v=self.num_key_value_heads,
+                head_dim=self.head_dim,
+                q_norm=self.q_norm,
+                k_norm=self.k_norm,
             )
-            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-            q, k = self.apply_qk_norm(q, k)
-            if self.rotary_emb is not None and position_ids is not None:
-                q, k = self.rotary_emb(position_ids, [q, k])
+            if fused_qkv is not None:
+                q, k, v = fused_qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+                # Match the fallback contiguity; V stays a column-slice view.
+                q, k = q.contiguous(), k.contiguous()
+            else:
+                assert not self._expect_fused_qk_norm_rope(position_ids), (
+                    f"MiniMax-M3 dense attention (layer {self.layer_idx}) expected the "
+                    f"fused QK-norm+RoPE kernel (bf16 activations, head_dim="
+                    f"{self.head_dim}) but fell back to the separate path; qkv dtype "
+                    f"is {qkv.dtype} (expected {self.attn_activation_dtype})."
+                )
+                q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+                q, k = self.apply_qk_norm(q, k)
+                if self.rotary_emb is not None and position_ids is not None:
+                    q, k = self.rotary_emb(position_ids, [q, k])
 
         # Keep token-wise projections and the output projection visible to
         # torch.compile. Only the metadata/cache-dependent attention core is
@@ -1058,7 +1076,8 @@ class MiniMaxM3Attention(Attention):
         # it can be fused with post_attention_layernorm (RESIDUAL_RMS_NORM).
         # Passing None preserves the standalone o_proj reduction used by the
         # single-GPU, attention-DP, and fusion-disabled paths.
-        return self.o_proj(o, all_reduce_params=all_reduce_params)
+        with self._msa_nvtx_range("dense.o_proj", color="purple"):
+            return self.o_proj(o, all_reduce_params=all_reduce_params)
 
     def _sdpa_dense_attention_core(
         self,
@@ -1331,13 +1350,22 @@ class MiniMaxM3Attention(Attention):
         if self.is_sparse_attention_layer:
             assert idx_q is not None and idx_k is not None
             # Publish the selected blocks so the FMHA runs the sparse path.
-            kv_block_indexes = self.attn.run_indexer(idx_q, idx_k, attn_metadata)
+            # ``run_indexer`` further splits into nested ``indexer.proxy_fmha``
+            # (MSA fmha_sm100 forward) and ``indexer.select_topk`` (native-op
+            # block selection) ranges inside ``MsaIndexer.select_blocks``.
+            with nvtx_range_debug(f"layer{self.layer_idx}.msa.sparse.indexer", color="orange"):
+                kv_block_indexes = self.attn.run_indexer(idx_q, idx_k, attn_metadata)
             forward_args = AttentionForwardArgs(output=output, topk_indices=kv_block_indexes)
+            fmha_label = f"layer{self.layer_idx}.msa.sparse.fmha"
+            fmha_color = "red"
         else:
             assert idx_q is None and idx_k is None
             # No top-k selection means the FMHA attends the full page table.
             forward_args = AttentionForwardArgs(output=output)
-        self.attn.forward(q, k, v, attn_metadata, forward_args=forward_args)
+            fmha_label = f"layer{self.layer_idx}.msa.dense.fmha"
+            fmha_color = "cyan"
+        with nvtx_range_debug(fmha_label, color=fmha_color):
+            self.attn.forward(q, k, v, attn_metadata, forward_args=forward_args)
         return output
 
     def _sparse_forward(
@@ -1451,21 +1479,23 @@ class MiniMaxM3Attention(Attention):
                 idx_q, idx_k = self.rotary_emb(position_ids, [idx_q, idx_k])
             return idx_q, idx_k
 
-        (q, k, v), (idx_q, idx_k) = maybe_execute_in_parallel(
-            _main_norm_rope,
-            _index_norm_rope,
-            self.ln_events[0],
-            self.ln_events[1],
-            self.aux_stream,
-            disable_on_compile=True,
-        )
+        with self._msa_nvtx_range("sparse.qkv_index_proj_norm_rope", color="green"):
+            (q, k, v), (idx_q, idx_k) = maybe_execute_in_parallel(
+                _main_norm_rope,
+                _index_norm_rope,
+                self.ln_events[0],
+                self.ln_events[1],
+                self.aux_stream,
+                disable_on_compile=True,
+            )
 
         o = self._forward_attention_core(q, k, v, idx_q, idx_k, attn_metadata)
         # all_reduce_params lets the decoder defer the o_proj output AllReduce so
         # it can be fused with post_attention_layernorm (RESIDUAL_RMS_NORM).
         # Passing None preserves the standalone o_proj reduction used by the
         # single-GPU, attention-DP, and fusion-disabled paths.
-        return self.o_proj(o, all_reduce_params=all_reduce_params)
+        with self._msa_nvtx_range("sparse.o_proj", color="purple"):
+            return self.o_proj(o, all_reduce_params=all_reduce_params)
 
     def _triton_sparse_attention_core(
         self,
