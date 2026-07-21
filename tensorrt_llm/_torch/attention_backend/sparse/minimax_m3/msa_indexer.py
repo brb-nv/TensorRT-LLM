@@ -139,20 +139,9 @@ class MsaIndexer:
 
         Plan/run split, mirroring the sparse GQA. Both production paths pass a
         prebuilt `proxy_plan` and a precomputed device `n_valid_blocks` (decode
-        from the graph-safe scratch, eager from the step-level device buffer), so
-        no per-layer host sync occurs; decode additionally runs into the
-        preallocated `max_score` buffer inside the captured region. When
-        `proxy_plan` is None (focused tests that skip prepare) the plan is built
-        inline and the valid-block count is derived here, the one path that still
-        takes the host recompute and the empty-selection guard. Generation is the
-        one-query-token-per-request special case.
-
-        The phases are wrapped in nested NVTX ranges so profiles separate the
-        proxy forward (proxy_fmha) from top-k block selection (select_topk).
-        select_topk is split into group_reduce, valid_blocks_guard (inline path
-        only), and select_blocks; select_blocks_from_maxscore adds scores_clone,
-        mask, and topk_sort. `layer_idx` only labels these ranges, which no-op
-        unless NVTX debug profiling is enabled.
+        from the graph-safe scratch, eager from the step-level device buffer);
+        decode additionally runs into the preallocated `max_score` buffer inside
+        the captured region.
         """
         config = self.config
         label = (
@@ -188,27 +177,25 @@ class MsaIndexer:
                 )
 
         with nvtx_range_debug(f"{label}.select_topk", color="orange"):
-            with nvtx_range_debug(f"{label}.select_topk.group_reduce", color="green"):
-                max_score_kv = _group_max_reduce(max_score, config)
+            max_score_kv = _group_max_reduce(max_score, config)
 
             if n_valid_blocks is None:
-                with nvtx_range_debug(f"{label}.select_topk.valid_blocks_guard", color="magenta"):
-                    n_valid_blocks = per_token_valid_blocks(
-                        qo_lens_cpu,
-                        kv_lens_cpu,
-                        qo_offset_cpu,
-                        causal=True,
-                        block_size=int(idx_k_paged.shape[2]),
+                n_valid_blocks = per_token_valid_blocks(
+                    qo_lens_cpu,
+                    kv_lens_cpu,
+                    qo_offset_cpu,
+                    causal=True,
+                    block_size=int(idx_k_paged.shape[2]),
+                )
+                # Empty-selection guard. n_valid_blocks is a host tensor on
+                # this path, so the .item() read does not sync the device.
+                if n_valid_blocks.numel() == 0 or int(n_valid_blocks.max().item()) <= 0:
+                    return torch.full(
+                        (idx_q.shape[0], config.num_kv_heads, MSA_REQUIRED_TOPK),
+                        -1,
+                        dtype=torch.int32,
+                        device=idx_q.device,
                     )
-                    # Empty-selection guard. n_valid_blocks is a host tensor on
-                    # this path, so the .item() read does not sync the device.
-                    if n_valid_blocks.numel() == 0 or int(n_valid_blocks.max().item()) <= 0:
-                        return torch.full(
-                            (idx_q.shape[0], config.num_kv_heads, MSA_REQUIRED_TOPK),
-                            -1,
-                            dtype=torch.int32,
-                            device=idx_q.device,
-                        )
             with nvtx_range_debug(f"{label}.select_topk.select_blocks", color="blue"):
                 return select_blocks_from_maxscore(
                     max_score_kv,
