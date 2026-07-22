@@ -49,6 +49,7 @@ from ..attention_backend.sparse.minimax_m3 import (
     _write_main_kv_slots_to_pool,
 )
 from ..distributed import AllReduce, AllReduceFusionOp, AllReduceParams, MiniMaxAllReduceRMS
+from ..distributed.allreduce_helper import CustomAllReduceHelper
 from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
@@ -336,16 +337,27 @@ class MiniMaxM3Gate(nn.Module):
             requires_grad=False,
         )
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        hidden_states_fp32: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         # Router matmul runs against the full-precision fp32 weight to match
-        # SGLang. The fused GEMM widens the bf16/fp16 activation to fp32 on-chip
-        # with fp32 accumulation, so no separate fp32 copy of the activation is
-        # materialized. The eager cast plus linear covers fp32 activations and
-        # non-CUDA tensors.
-        if hidden_states.is_cuda and hidden_states.dtype in (torch.bfloat16, torch.float16):
-            return torch.ops.trtllm.moe_router_gemm_op(
-                hidden_states, self.weight, out_dtype=torch.float32
-            )
+        # SGLang. The bf16/fp16 activation upcasts losslessly to fp32 and the
+        # matmul accumulates in fp32, so routing precision is preserved. The
+        # cuBLAS TF32 GEMM is already at the tensor-core ceiling, so no custom
+        # router GEMM kernel is warranted.
+        #
+        # ``hidden_states_fp32`` is the float32 side-output of the producing
+        # post_attention_layernorm (emitted only on the large-token prefill
+        # path, see MiniMaxM3DecoderLayer._apply_pre_feed_forward_norm). When
+        # present it is bit-identical to ``hidden_states.to(float32)`` but was
+        # materialized inside the norm kernel, so consuming it here removes the
+        # standalone bf16->fp32 upcast (~137 us of ~175 us at M=8192, see
+        # tests/unittest/_torch/thop/parallel/bench_moe_router_gemm.py). Decode
+        # and non-fused paths pass None and take the eager cast (a few us).
+        if hidden_states_fp32 is not None:
+            return torch.nn.functional.linear(hidden_states_fp32, self.weight)
         return torch.nn.functional.linear(hidden_states.to(torch.float32), self.weight)
 
     def load_weights(self, weights: List[Dict]):
@@ -553,11 +565,12 @@ class MiniMaxM3MoE(nn.Module):
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
         final_all_reduce_params: Optional[AllReduceParams] = None,
+        router_hidden_fp32: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         all_rank_num_tokens = attn_metadata.all_rank_num_tokens
 
         def _compute_routed_output():
-            router_logits = self.gate(hidden_states)
+            router_logits = self.gate(hidden_states, hidden_states_fp32=router_hidden_fp32)
             return self.experts(
                 hidden_states,
                 router_logits,
@@ -1862,19 +1875,57 @@ class MiniMaxM3DecoderLayer(DecoderLayer):
 
         return hidden_states, residual
 
+    def _should_emit_fp32_router_input(self, hidden_states: torch.Tensor) -> bool:
+        """Whether to request the float32 norm side-output for the MoE router.
+
+        Only worthwhile when the fused AllReduce+RMSNorm would already fall back
+        to NCCL for this shape (large-token prefill): there the standalone
+        ``bf16->fp32`` router-input cast dominates, and requesting the float32
+        side-output (which forces the NCCL fallback) costs nothing because the
+        plain path falls back anyway. Below the workspace crossover the fused
+        kernel is faster and the cast is only a few microseconds, so keep the
+        plain norm + eager cast. Mirrors the C++ ``ifFallbackToNCCL`` size test
+        (and reads the same workspace size, honoring any env override).
+        """
+        num_tokens = hidden_states.shape[0]
+        hidden = hidden_states.shape[-1]
+        workspace_bytes = CustomAllReduceHelper.max_workspace_size_auto(
+            self.mapping.tp_size, support_deterministic=False
+        )
+        message_bytes = num_tokens * hidden * hidden_states.element_size()
+        return message_bytes > workspace_bytes
+
     def _apply_pre_feed_forward_norm(
         self,
         hidden_states: torch.Tensor,
         residual: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        want_fp32_router_input: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         """AllReduce(+residual+RMSNorm) between attention and the feed-forward.
 
         On the PRE-fusion path the deferred attention o_proj AllReduce is fused
         with post_attention_layernorm into one kernel; otherwise it is the plain
         add+RMSNorm and the attention already reduced its own output.
+
+        Returns ``(norm, residual, router_fp32)``. ``router_fp32`` is a float32
+        copy of the norm output for the MoE router and is None unless
+        ``want_fp32_router_input`` is set and the shape clears the NCCL-fallback
+        crossover (see :meth:`_should_emit_fp32_router_input`).
         """
         if self.pre_feed_forward_fusion:
-            return self.allreduce(
+            if want_fp32_router_input and self._should_emit_fp32_router_input(hidden_states):
+                norm_out, norm_out_fp32, residual_out = self.allreduce(
+                    hidden_states,
+                    all_reduce_params=AllReduceParams(
+                        fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_FP32,
+                        residual=residual,
+                        norm_weight=self.post_attention_layernorm.weight,
+                        eps=self.post_attention_layernorm.variance_epsilon,
+                        trigger_completion_at_end=False,
+                    ),
+                )
+                return norm_out, residual_out, norm_out_fp32
+            hidden_states, residual = self.allreduce(
                 hidden_states,
                 all_reduce_params=AllReduceParams(
                     fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
@@ -1884,7 +1935,9 @@ class MiniMaxM3DecoderLayer(DecoderLayer):
                     trigger_completion_at_end=False,
                 ),
             )
-        return self.post_attention_layernorm(hidden_states, residual)
+            return hidden_states, residual, None
+        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        return hidden_states, residual, None
 
     def _apply_next_layer_layernorm(
         self,
@@ -1934,13 +1987,16 @@ class MiniMaxM3DecoderLayer(DecoderLayer):
         residual: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         with nvtx_range_debug(f"layer{self.layer_idx}.post_attention_layernorm"):
-            hidden_states, residual = self._apply_pre_feed_forward_norm(hidden_states, residual)
+            hidden_states, residual, router_hidden_fp32 = self._apply_pre_feed_forward_norm(
+                hidden_states, residual, want_fp32_router_input=True
+            )
 
         with nvtx_range_debug(f"layer{self.layer_idx}.moe"):
             hidden_states = self.block_sparse_moe(
                 hidden_states,
                 attn_metadata,
                 final_all_reduce_params=self._feed_forward_all_reduce_params(),
+                router_hidden_fp32=router_hidden_fp32,
             )
 
         with nvtx_range_debug(f"layer{self.layer_idx}.next_layer_layernorm"):
@@ -1953,7 +2009,7 @@ class MiniMaxM3DecoderLayer(DecoderLayer):
         residual: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         with nvtx_range_debug(f"layer{self.layer_idx}.post_attention_layernorm"):
-            hidden_states, residual = self._apply_pre_feed_forward_norm(hidden_states, residual)
+            hidden_states, residual, _ = self._apply_pre_feed_forward_norm(hidden_states, residual)
 
         with nvtx_range_debug(f"layer{self.layer_idx}.mlp"):
             hidden_states = self.mlp(

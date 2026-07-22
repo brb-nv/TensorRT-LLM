@@ -852,11 +852,23 @@ private:
 
         torch::Tensor norm_out = torch::empty_like(input);
 
+        // For RESIDUAL_RMS_NORM_OUT_FP32 additionally materialize the normalized
+        // activation in float32 (bit-identical to ``norm_out.to(float32)``), so
+        // a downstream float32 consumer skips a standalone upcast kernel.
+        torch::Tensor norm_out_fp32;
+        void* fp32_norm_output_ptr = nullptr;
+        if (mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_FP32)
+        {
+            norm_out_fp32 = torch::empty_like(input, input.options().dtype(torch::kFloat32));
+            fp32_norm_output_ptr = norm_out_fp32.mutable_data_ptr();
+        }
+
         tensorrt_llm::kernels::AllReduceParams params;
         params.fusion_params.bias_buffer = bias ? bias.value().data_ptr() : nullptr;
         params.fusion_params.residual_buffer = residual ? residual.value().data_ptr() : nullptr;
         params.fusion_params.weight_buffer = norm_weight ? norm_weight.value().data_ptr() : nullptr;
         params.local_output_buffer_ptr = norm_out.mutable_data_ptr();
+        params.fusion_params.fp32_norm_output_buffer = fp32_norm_output_ptr;
         params.elts_total = size;
 
         params.fusion_params.hidden_size = hidden_size;
@@ -879,6 +891,12 @@ private:
         if (mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM)
         {
             return {norm_out, reduce_output};
+        }
+
+        // Same as RESIDUAL_RMS_NORM plus the float32 side output of the norm.
+        if (mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_FP32)
+        {
+            return {norm_out, norm_out_fp32, reduce_output};
         }
 
         int64_t const sf_vecsize = 16;
@@ -1381,6 +1399,16 @@ private:
 
     AllReduceStrategyType selectImplementation(size_t seq_len, size_t hidden_size)
     {
+        // The float32 norm side-output is only implemented on the NCCL fallback
+        // path (fallbackRunSubsequentOps); force it there regardless of size or
+        // configured strategy. At the shapes that request it (large-M prefill)
+        // the plain RESIDUAL_RMS_NORM already falls back to NCCL, so this does
+        // not change the strategy actually used for that regime.
+        if (mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_FP32)
+        {
+            return AllReduceStrategyType::NCCL;
+        }
+
         if (mStrategy != AllReduceStrategyType::AUTO)
         {
             // For UB,NCCL,NCCL_SYMMETRIC, the correctness of the strategy dispatching is guaranteed by the user.

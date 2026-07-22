@@ -81,6 +81,11 @@ enum class AllReduceFusionOp : int8_t
     RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4 = 7,
     MOE_FINALIZE_ALLREDUCE_RESIDUAL_RMS_NORM = 8,
     RMS_NORM = 9,
+    // Same as RESIDUAL_RMS_NORM, but additionally emits the post-RMSNorm
+    // activation in float32 as a side output (in addition to the model-dtype
+    // norm output). Consumed by routers that run their matmul in float32
+    // (e.g. MiniMax-M3), removing a standalone bf16->fp32 upcast kernel.
+    RESIDUAL_RMS_NORM_OUT_FP32 = 10,
 };
 
 inline std::ostream& operator<<(std::ostream& os, AllReduceFusionOp op)
@@ -99,6 +104,7 @@ inline std::ostream& operator<<(std::ostream& os, AllReduceFusionOp op)
         os << "MOE_FINALIZE_ALLREDUCE_RESIDUAL_RMS_NORM";
         break;
     case AllReduceFusionOp::RMS_NORM: os << "RMS_NORM"; break;
+    case AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_FP32: os << "RESIDUAL_RMS_NORM_OUT_FP32"; break;
     default: os << "UNKNOWN"; break;
     }
     return os;
@@ -143,6 +149,7 @@ struct AllReduceFusionParams
         , weight_buffer(nullptr)
         , weight_buffer_pre_residual_norm(nullptr)
         , intermediate_buffer(nullptr)
+        , fp32_norm_output_buffer(nullptr)
     {
     }
 
@@ -157,6 +164,12 @@ struct AllReduceFusionParams
     float eps;
     // new residual
     void* intermediate_buffer;
+    // Optional float32 copy of the post-RMSNorm output (nullptr disables it).
+    // When set, the RMSNorm kernel writes the normalized activation to this
+    // buffer in float32 in addition to the model-dtype output, so a downstream
+    // float32 consumer (e.g. the MiniMax-M3 router GEMM) does not need a
+    // separate bf16->fp32 upcast kernel.
+    void* fp32_norm_output_buffer;
     void* lamport_peer_comm_buffer_ptrs[MAX_RANKS_PER_NODE * 3];
 };
 

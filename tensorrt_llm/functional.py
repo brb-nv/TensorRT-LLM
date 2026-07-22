@@ -128,6 +128,10 @@ class AllReduceFusionOp(IntEnum):
     RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4 = 7
     MOE_FINALIZE_ALLREDUCE_RESIDUAL_RMS_NORM = 8
     RMS_NORM = 9
+    # Same as RESIDUAL_RMS_NORM but also emits the post-norm activation in
+    # float32 as a side output (returns [norm, norm_fp32, residual]). Used by
+    # routers that run their matmul in float32 to avoid a standalone upcast.
+    RESIDUAL_RMS_NORM_OUT_FP32 = 10
 
 
 class AllReduceParams:

@@ -287,6 +287,11 @@ __global__ void rms_norm_kernel(AllReduceParams params)
     T const* weight_buffer = reinterpret_cast<T const*>(params.fusion_params.weight_buffer);
     T* local_final_output_buffer = reinterpret_cast<T*>(params.local_output_buffer_ptr);
     T* intermediate_buffer = reinterpret_cast<T*>(params.fusion_params.intermediate_buffer);
+    // Optional float32 side output of the normalized activation. When non-null
+    // the kernel additionally writes the (model-dtype) norm result widened to
+    // float32; this is bit-identical to a downstream ``norm_out.to(float32)``
+    // and lets a float32 consumer skip a standalone upcast kernel.
+    float* fp32_norm_output_buffer = reinterpret_cast<float*>(params.fusion_params.fp32_norm_output_buffer);
 
     int block_offset = bid * params.fusion_params.hidden_size;
     int thread_offset = tid * kPackedSize;
@@ -297,6 +302,10 @@ __global__ void rms_norm_kernel(AllReduceParams params)
     }
     local_final_output_buffer += block_offset;
     intermediate_buffer += block_offset;
+    if (fp32_norm_output_buffer != nullptr)
+    {
+        fp32_norm_output_buffer += block_offset;
+    }
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900) && (__CUDA_ARCH__ < 1200))
     cudaGridDependencySynchronize();
@@ -340,6 +349,24 @@ __global__ void rms_norm_kernel(AllReduceParams params)
         }
         inter_vec.packed = rms_norm<T, Affine>(denom, inter_vec, weight_vec);
         *reinterpret_cast<int4*>(&local_final_output_buffer[offset]) = inter_vec.packed;
+        if (fp32_norm_output_buffer != nullptr)
+        {
+            // Vectorize the fp32 side-output into 128-bit (float4) stores. Scalar
+            // per-element stores here would issue kPackedSize separate STG.E.32
+            // instructions, throttling the load-store unit on this bandwidth-bound
+            // kernel; kPackedSize floats == kPackedSize/4 coalesced float4 stores.
+            T const* out_vals = reinterpret_cast<T const*>(inter_vec.unpacked);
+#pragma unroll
+            for (int k = 0; k < kPackedSize; k += 4)
+            {
+                float4 f4;
+                f4.x = static_cast<float>(out_vals[k + 0]);
+                f4.y = static_cast<float>(out_vals[k + 1]);
+                f4.z = static_cast<float>(out_vals[k + 2]);
+                f4.w = static_cast<float>(out_vals[k + 3]);
+                *reinterpret_cast<float4*>(fp32_norm_output_buffer + offset + k) = f4;
+            }
+        }
     }
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900) && (__CUDA_ARCH__ < 1200))
     cudaTriggerProgrammaticLaunchCompletion();

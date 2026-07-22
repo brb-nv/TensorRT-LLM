@@ -2390,6 +2390,11 @@ def _(
         norm_out = torch.empty_like(input)
         residual_out = torch.empty_like(input)
         return [norm_out, quant_fp4, scale_fp4, residual_out]
+    elif op == int(AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_FP32):
+        norm_out = torch.empty_like(input)
+        norm_out_fp32 = torch.empty_like(input, dtype=torch.float32)
+        residual_out = torch.empty_like(input)
+        return [norm_out, norm_out_fp32, residual_out]
     else:
         return [torch.empty_like(input)]
 

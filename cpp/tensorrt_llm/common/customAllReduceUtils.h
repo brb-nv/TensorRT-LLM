@@ -73,6 +73,10 @@ inline std::unordered_map<AllReduceFusionOp, int> mapFusionOpToIndex = {
     // norm out quant fusion ops share the same index with norm quant fusion ops
     {AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_FP8, 2},
     {AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4, 3},
+    // The float32 norm side-output op is forced onto the NCCL fallback path and
+    // never consults the fusion lookup table, but share RESIDUAL_RMS_NORM's
+    // index defensively in case the map is queried for buffer sizing.
+    {AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_FP32, 1},
 };
 
 // AllReduce lookup: [tp][fusion][hidden][tokens] = strategy
