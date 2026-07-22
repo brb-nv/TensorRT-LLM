@@ -139,7 +139,13 @@ def run_msa_paged_gqa(
             kv_cache_manager, layer_idx, metadata.msa_out_cache_loc[:num_tokens], k, v
         )
 
-    q_view = q.view(num_tokens, attn.num_heads, head_dim)
+    # q may be a strided column-view of a fused [q|k|v] buffer (the model skips
+    # the split contiguous copy on this path). fmha_sm100 reads q's real strides
+    # through the TMA descriptor, so reshape here is a zero-copy view for that
+    # layout; it only falls back to a copy for an otherwise non-viewable q.
+    q_view = q.reshape(num_tokens, attn.num_heads, head_dim)
+    # output is freshly allocated and contiguous; view keeps out_view aliasing it
+    # so the kernel's in-place write lands in the caller's buffer.
     out_view = output.view(num_tokens, attn.num_heads, head_dim)
     k_paged, v_paged = msa_paged_kv(kv_cache_manager, layer_idx)
     sm_scale = (head_dim**-0.5) / float(attn.q_scaling)

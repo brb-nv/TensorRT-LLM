@@ -976,6 +976,15 @@ class MiniMaxM3Attention(Attention):
         """
         return self.attn_activation_dtype == torch.bfloat16 and position_ids is not None
 
+    def _msa_backend_active(self) -> bool:
+        """Whether the MSA fmha_sm100 backend handles this layer's attention.
+
+        Used to gate MSA-only main-branch optimizations (FP8 q/k/v emission and
+        skipping the split q/k contiguous copies). The Triton/SDPA reference
+        backends are left on the conservative contiguous/bf16 path.
+        """
+        return isinstance(self.attn, MiniMaxM3MsaSparseAttention)
+
     def _emit_fp8_main_qkv(self) -> bool:
         """Whether the main-branch fused QK-norm+RoPE should emit FP8 q/k/v.
 
@@ -984,7 +993,25 @@ class MiniMaxM3Attention(Attention):
         paths keep bf16, so gate on the MSA backend being active in addition to
         the cache being FP8. The index branch always stays bf16.
         """
-        return self.main_kv_is_fp8 and isinstance(self.attn, MiniMaxM3MsaSparseAttention)
+        return self.main_kv_is_fp8 and self._msa_backend_active()
+
+    def _split_main_qkv(
+        self, fused_qkv: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Split the fused [q|k|v] buffer into per-tensor q/k/v.
+
+        The MSA fmha_sm100 kernel reads q with its real strides through the TMA
+        descriptor (both the dense and the packed-decode Q load paths address
+        global memory with q.stride()), and k/v are scattered into the paged
+        cache by an indexed copy that tolerates a strided source. So on the MSA
+        backend the split column-views can be handed over directly with no
+        contiguous copy. Other backends keep the previous contiguity (q/k made
+        contiguous, v a column-slice view).
+        """
+        q, k, v = fused_qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        if self._msa_backend_active():
+            return q, k, v
+        return q.contiguous(), k.contiguous(), v
 
     def forward(
         self,
@@ -1110,9 +1137,7 @@ class MiniMaxM3Attention(Attention):
                 out_fp8=self._emit_fp8_main_qkv(),
             )
             if fused_qkv is not None:
-                q, k, v = fused_qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-                # Match the fallback contiguity; V stays a column-slice view.
-                q, k = q.contiguous(), k.contiguous()
+                q, k, v = self._split_main_qkv(fused_qkv)
             else:
                 assert not self._expect_fused_qk_norm_rope(position_ids), (
                     f"MiniMax-M3 dense attention (layer {self.layer_idx}) expected the "
@@ -1499,8 +1524,7 @@ class MiniMaxM3Attention(Attention):
                 out_fp8=self._emit_fp8_main_qkv(),
             )
             if fused_qkv is not None:
-                q, k, v = fused_qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-                return q.contiguous(), k.contiguous(), v
+                return self._split_main_qkv(fused_qkv)
             assert not self._expect_fused_qk_norm_rope(position_ids), (
                 f"MiniMax-M3 sparse attention (layer {self.layer_idx}) expected the "
                 f"fused QK-norm+RoPE kernel (bf16 activations, head_dim="

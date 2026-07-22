@@ -25,6 +25,66 @@ fusion changes.
 
 ---
 
+## 0. Model & test setup
+
+### Model: MiniMax-M3 NVFP4
+- **HF id / checkpoint:** `nvidia/MiniMax-M3-NVFP4`
+  - Files: `/home/scratch.trt_llm_data_ci/llm-models/MiniMax-M3-NVFP4/`
+  - `architectures = ["MiniMaxM3SparseForConditionalGeneration"]`,
+    `model_type = minimax_m3_vl` (published as multimodal; the **text-decoder**
+    path is what we profile/eval), `torch_dtype = bfloat16`.
+- **Quantization:** `MIXED_PRECISION` — **MXFP8 base layers + NVFP4 routed
+  experts**. On the MSA path the **KV cache is FP8**; on the Triton path it stays
+  BF16.
+- **TRT-LLM model file:** `tensorrt_llm/_torch/models/modeling_minimaxm3.py`
+- **Sparse-attention codepath:** **MSA** (`implementation="msa"`, not Triton).
+  MSA kernels (`fmha_sm100`, combine/proxy, `k2q` CSR-build,
+  `minimaxM3SelectBlocks`) are cloned at `/home/scratch.bbuddharaju_gpu/msa`.
+
+### Architecture (from `config.json` → `text_config`)
+| Field | Value |
+|---|---|
+| `hidden_size` | 6144 |
+| `num_hidden_layers` | 60 → **3 dense + 57 sparse/MoE** (`sparse_disable_index_value` / `moe_layer_freq` = `[0,0,0,1,…,1]`) |
+| `num_attention_heads` / `num_key_value_heads` | 64 / 4 (GQA), `head_dim=128` |
+| RoPE | `rope_theta=5e6`, `partial_rotary_factor=0.5`, `rotary_dim=64` (partial RoPE on 64 of 128) |
+| QK norm | `use_qk_norm=True`, `qk_norm_type=per_head`, `use_gemma_norm=True`, `rms_norm_eps=1e-6` |
+| Activation | `hidden_act=swigluoai`, `swiglu_alpha=1.702`, `swiglu_limit=7.0` |
+| `attention_output_gate` | False |
+| `max_position_embeddings` | 1,048,576 (1M) |
+| `vocab_size` | 200,064 |
+| **MoE** | `num_local_experts=128`, `num_experts_per_tok=4` (top-4), `scoring_func=sigmoid`, `use_routing_bias=True`, `routed_scaling_factor=2.0` |
+| Shared expert | `n_shared_experts=1`, `shared_intermediate_size=3072` |
+| Dense MLP (first 3 layers) | `dense_intermediate_size=12288` |
+| MTP | `num_mtp_modules=1` |
+
+### Sparse attention (`sparse_attention_config`)
+`use_sparse_attention=True`, `sparse_block_size=128`, `sparse_topk_blocks=16`,
+`sparse_num_index_heads=4`, `sparse_index_dim=128`. Layers 0–2 run **dense**
+attention; layers 3–59 run **block-sparse** (indexer selects top-16 128-token
+blocks per query).
+
+### Test of interest
+```bash
+pytest tests/integration/defs/accuracy/test_llm_api_pytorch.py::TestMiniMaxM3::test_nvfp4[use_msa=True] -s -v
+```
+Runtime config exercised by this test (`TestMiniMaxM3.test_nvfp4`):
+- **TP=4, EP=4** (`tensor_parallel_size=4`, `moe_expert_parallel_size=4`)
+- `sparse_attention_config = MiniMaxM3SparseAttentionConfig(implementation="msa")`
+- `moe_config = MoeConfig(backend="CUTLASS")`
+- `kv_cache_config`: `free_gpu_memory_fraction=0.6`, `enable_block_reuse=False`,
+  `dtype="fp8"` (MSA path)
+- `max_seq_len=4096`, `trust_remote_code=True`
+- Asserts `quant_algo == MIXED_PRECISION`; evaluates **MMLU** + **GSM8K**
+- Gated: `skip_less_device(4)`, `skip_less_device_memory(140000)`, **Blackwell-only (SM100+)**
+
+> **Profiling vs test:** the nsys captures analyzed below were taken at
+> **ISL=8192 / OSL=1 (prefill)** on **B200, TP4/EP4, NVFP4 MIXED_PRECISION** — the
+> same model/parallelism/codepath as the test, but a fixed 8K-token prefill shape
+> (the accuracy test itself runs MMLU/GSM8K at `max_seq_len=4096`).
+
+---
+
 ## 1. Elementwise-op split per module
 
 Per forward step (device 0), MSA run. "elem" = the `*elementwise*` kernel family
@@ -94,8 +154,80 @@ win than the busy-time math alone.
 
 ## A. Router fp32 cast → DSV3 bf16 router-GEMM op
 
-**Fixes the 136 µs `unrolled_elementwise` × 57 = ~7.78 ms/step.** Highest impact,
-lowest risk, self-contained.
+**Fixes the 136 µs `unrolled_elementwise` × 57 = ~7.78 ms/step.**
+
+> **STATUS: the bf16-weight variant below (A) is a no-go for now** (weight
+> fp32→bf16 is lossy and can flip top-4 routing vs SGLang). See
+> **A-deep-dive** for what's actually happening and the *safe* ways to remove the
+> 136 µs cast without changing routing numerics — that is the recommended path.
+
+### Deep dive: what the "fp32 router" is really doing
+
+Current path, per MoE layer (×57/step):
+```339:341:tensorrt_llm/_torch/models/modeling_minimaxm3.py
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # Router runs in fp32 to match SGLang.
+        return torch.nn.functional.linear(hidden_states.to(torch.float32), self.weight)
+```
+1. `hidden_states.to(torch.float32)` → `unrolled_elementwise_kernel`, **136 µs**
+   — casts `[8192, 6144]` bf16 → fp32 (~74 MB read, ~147 MB write). Pure HBM
+   movement.
+2. `F.linear(hidden_fp32, weight_fp32)` →
+   `cutlass3x_sm100_tensorop_s128x128x8**tf32**gemm_f32_...`, **43 µs**. Output is
+   only `[8192, 128]`.
+3. Routing (`MiniMaxM3MoeRoutingMethod`): sigmoid + `e_score_correction_bias` +
+   group top-k + `routed_scaling_factor`, in fp32.
+
+So ~179 µs/layer; the **cast is 136 µs, the matmul only 43 µs.**
+
+**The nuance — the matmul is already TF32, not fp32.** The kernel is a `tf32gemm`:
+the tensor cores truncate inputs to TF32 (10 mantissa bits) in the MMA. The
+activation data path is:
+
+> bf16 (8 mantissa bits) → cast to fp32 → **TF32 truncation (10 bits) in the MMA**
+
+The activation began as bf16 (8 bits), so upcasting to fp32 then feeding TF32
+recovers **no real precision**. The fp32 cast is essentially a no-op for accuracy
+on the activation side. Precision that *does* matter comes from the **fp32 weight**
+and the **fp32 accumulation** over the 6144 reduction dim — not from the cast.
+
+**Why the bf16 path (A) is a no-go, precisely.** `dsv3_router_gemm_op` uses bf16
+activation × **bf16 weight** → fp32. Vs today, the only meaningful loss is the
+**weight** (fp32→bf16); the activation was already 8-bit and accumulate stays
+fp32. Router picks top-4 of 128, so a perturbed weight can flip selections →
+accuracy drift. That weight change is the legitimate blocker — *not* the
+activation/cast handling.
+
+### Safe ways to remove the 136 µs cast (recommended), best first
+
+The cast is **separable from the matmul numerics** — `bf16 → fp32` upcast is
+exact, so it can be removed without changing a single routing decision.
+
+1. **Fold the fp32 upcast into the producing RMSNorm (best).** The router input is
+   `post_attention_layernorm`'s output (already fused into the AllReduce as
+   `RESIDUAL_RMS_NORM`). RMSNorm computes in fp32 then downcasts to bf16 — have it
+   emit an **fp32 side-output** for the router in the same kernel. Removes the
+   136 µs cast (7.8 ms/step) **and is more accurate** than today (router sees the
+   true fp32 norm output, not the bf16-rounded-then-upcast value). Dovetails with
+   **Fix C**: the same norm becomes one multi-output kernel emitting **bf16**
+   (shared expert) + **fp32** (router) + **fp4+scale** (routed experts) — one pass,
+   three consumers, zero standalone cast/quant kernels.
+2. **Fuse the bf16→fp32 upcast into the GEMM load (bit-identical).** A GEMM that
+   loads the current bf16 activation and converts on-chip against the fp32 weight
+   (fp32 accumulate) gives **bit-identical** logits minus the HBM round-trip.
+   Fallback if a mixed-input convert-on-load cutlass kernel is available.
+3. **bf16-weight `dsv3_router_gemm_op` (A, fastest, lossy, gated).** Removes the
+   cast *and* speeds the matmul, but changes the weight to bf16 → validate top-4
+   match-rate vs SGLang on a calibration set before enabling. The sigmoid/bias/
+   top-k stay fp32 regardless.
+
+> **To confirm upstream:** whether SGLang does the router **matmul** in fp32 or
+> only the **sigmoid/top-k** in fp32 (many implementations do bf16 matmul + fp32
+> scoring). If the latter, even option 3's activation handling matches the
+> reference and only the weight precision is in question.
+
+**Recommendation: option 1** — biggest safe win, improves fidelity, and merges
+into the **Fix C** norm-fold work. The bf16-weight rewrite (A) below stays gated.
 
 ### How DSV3 does it
 The gate stores a **bf16** weight and uses a dedicated router GEMM that takes
@@ -310,7 +442,14 @@ removes the largest share of the ~1,718 elementwise launches/step (sparse attn i
 
 ### Priority if A is excluded (router bf16 GEMM is a no-go)
 
-All TRT-LLM-only except where noted. **Suggested sequence: E → C → D → B.**
+All TRT-LLM-only except where noted. **Suggested sequence: C(+router fp32 side-output) → E → D → B.**
+
+> Even with **A** gated, the **136 µs router cast (7.8 ms/step)** is still
+> removable *safely* — fold the `bf16→fp32` upcast into the producing
+> `post_attention_layernorm` as an **fp32 side-output** (see A-deep-dive
+> option 1). This is bit-safe (actually more accurate) and rides along with the
+> **Fix C** norm-fold, so it costs almost nothing extra once C is done. This makes
+> C the top item.
 
 1. **E — cut the sparse-attn elementwise count** (~2–4 ms/step + **~600–900
    launches/step**). Biggest wall-clock win: GPU idle is 28–30 % and dominated by
