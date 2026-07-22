@@ -713,6 +713,19 @@ class MiniMaxM3Attention(Attention):
         # (fp8/fp4) only changes cache storage, not the activation dtype.
         self.attn_activation_dtype = config.torch_dtype
 
+        # Whether the main K/V cache is stored as FP8 E4M3. When true (and the
+        # MSA backend is active), the fused QK-norm+RoPE kernel emits FP8 q/k/v
+        # directly, folding the FP8 activation-quant into its epilogue so the
+        # downstream q-cast and cache-write casts become no-ops (one kernel
+        # instead of three per layer). The kernel consumes FP8 K/V in place, so
+        # this only changes where the E4M3 conversion happens, not its value.
+        quant_config = getattr(model_config, "quant_config", None)
+        self.main_kv_is_fp8 = bool(
+            quant_config is not None
+            and quant_config.quant_mode is not None
+            and quant_config.quant_mode.has_fp8_kv_cache()
+        )
+
         # Per-head Gemma RMSNorm — one set of weights shared across heads.
         self.q_norm = RMSNorm(
             hidden_size=self.head_dim_value,
@@ -868,6 +881,7 @@ class MiniMaxM3Attention(Attention):
         head_dim: int,
         q_norm: RMSNorm,
         k_norm: RMSNorm,
+        out_fp8: bool = False,
     ) -> Optional[torch.Tensor]:
         """Fuse per-head Gemma RMSNorm and partial RoPE into one kernel.
 
@@ -877,6 +891,12 @@ class MiniMaxM3Attention(Attention):
         first rotary_dim channels read from RopeParams.dim, which matches M3's
         whole-head norm with front partial RoPE, and applies the same Gemma
         (1 + weight) scaling as apply_qk_norm.
+
+        When ``out_fp8`` is True, the FP8 out-of-place variant is used instead:
+        it reads the bf16 fused qkv and returns a **new FP8 (E4M3)** tensor with
+        Q/K normed+roped and V copy-cast, folding the FP8 activation-quant into
+        the norm+RoPE epilogue (used by the MSA path with an FP8 KV cache). The
+        input ``qkv`` is left untouched in that case.
 
         Returns None, leaving qkv untouched, when the fused path does not apply
         so callers fall back to separate norm and RoPE. This happens when
@@ -896,6 +916,32 @@ class MiniMaxM3Attention(Attention):
         rotary_dim = int(self.pos_embd_params.rope.dim)
         # The kernel assumes a contiguous [num_tokens, total_heads * head_dim].
         qkv = qkv.contiguous()
+        position_ids_i32 = position_ids.reshape(-1).contiguous().to(torch.int32)
+        if out_fp8:
+            # Out-of-place FP8 variant: returns a fresh E4M3 [q|k|v] tensor.
+            return torch.ops.trtllm.fused_qk_norm_rope_to_fp8(
+                qkv,
+                num_heads_q,
+                num_heads_k,
+                num_heads_v,
+                head_dim,
+                rotary_dim,
+                q_norm.variance_epsilon,
+                q_norm.weight,
+                k_norm.weight,
+                self.pos_embd_params.rope.theta,
+                self.pos_embd_params.is_neox,
+                position_ids_i32,
+                1.0,  # factor: no YARN (M3 has no rope_scaling)
+                0.0,  # low
+                0.0,  # high
+                1.0,  # attention_factor
+                True,  # is_qk_norm
+                self.use_gemma_norm,  # use_gemma
+                False,  # use_mrope
+                0,  # mrope_section1
+                0,  # mrope_section2
+            )
         torch.ops.trtllm.fused_qk_norm_rope(
             qkv,
             num_heads_q,
@@ -908,7 +954,7 @@ class MiniMaxM3Attention(Attention):
             k_norm.weight,
             self.pos_embd_params.rope.theta,
             self.pos_embd_params.is_neox,
-            position_ids.reshape(-1).contiguous().to(torch.int32),
+            position_ids_i32,
             1.0,  # factor: no YARN (M3 has no rope_scaling)
             0.0,  # low
             0.0,  # high
@@ -929,6 +975,16 @@ class MiniMaxM3Attention(Attention):
         fallback is a regression. Guards the forward asserts.
         """
         return self.attn_activation_dtype == torch.bfloat16 and position_ids is not None
+
+    def _emit_fp8_main_qkv(self) -> bool:
+        """Whether the main-branch fused QK-norm+RoPE should emit FP8 q/k/v.
+
+        Only the MSA backend consumes an FP8 paged K/V cache directly (the
+        kernel variant shares one dtype across q/k/v). The Triton/SDPA reference
+        paths keep bf16, so gate on the MSA backend being active in addition to
+        the cache being FP8. The index branch always stays bf16.
+        """
+        return self.main_kv_is_fp8 and isinstance(self.attn, MiniMaxM3MsaSparseAttention)
 
     def forward(
         self,
@@ -1051,6 +1107,7 @@ class MiniMaxM3Attention(Attention):
                 head_dim=self.head_dim,
                 q_norm=self.q_norm,
                 k_norm=self.k_norm,
+                out_fp8=self._emit_fp8_main_qkv(),
             )
             if fused_qkv is not None:
                 q, k, v = fused_qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
@@ -1287,7 +1344,12 @@ class MiniMaxM3Attention(Attention):
         idx_k: Optional[torch.Tensor],
         attn_metadata: AttentionMetadata,
     ) -> torch.Tensor:
-        output = q.new_empty((q.shape[0], self.num_heads * self.head_dim))
+        # Attention output is always the compute dtype (bf16); q may be FP8 when
+        # the MSA FP8-KV path emits FP8 q/k/v, so pin the dtype rather than
+        # inheriting it from q.
+        output = q.new_empty(
+            (q.shape[0], self.num_heads * self.head_dim), dtype=self.attn_activation_dtype
+        )
         if self.register_to_config and is_torch_compiling():
             minimax_m3_attn_custom_op_inplace(
                 q,
@@ -1434,6 +1496,7 @@ class MiniMaxM3Attention(Attention):
                 head_dim=self.head_dim,
                 q_norm=self.q_norm,
                 k_norm=self.k_norm,
+                out_fp8=self._emit_fp8_main_qkv(),
             )
             if fused_qkv is not None:
                 q, k, v = fused_qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)

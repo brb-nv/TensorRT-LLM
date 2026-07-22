@@ -146,9 +146,11 @@ def run_msa_paged_gqa(
 
     # The fmha_sm100 variant is chosen from q.dtype and shares one dtype across
     # q/k/v, so q must be FP8 to match an FP8 paged K/V. MiniMax-M3 has no
-    # KV-cache scales, so the scale is 1.0 and this is a plain E4M3 cast.
+    # KV-cache scales, so the scale is 1.0 and this is a plain E4M3 cast. When the
+    # model's fused QK-norm+RoPE already emitted FP8 q/k/v (the FP8-KV fast path),
+    # this .to() is a no-op; it stays as a safety net for callers that pass bf16 q.
     use_fp8 = k_paged.dtype == torch.float8_e4m3fn
-    if use_fp8:
+    if use_fp8 and q_view.dtype != torch.float8_e4m3fn:
         q_view = q_view.to(torch.float8_e4m3fn)
 
     run_msa_sparse_gqa(
