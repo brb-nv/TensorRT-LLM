@@ -60,7 +60,7 @@ __device__ __forceinline__ float selectMRopePosId(int const* position_ids, int t
 // Store a per-thread run of `numElemsPerThread` float elements to the output
 // head, converting to the output dtype. BF16 uses the packed uint vector store;
 // FP8 E4M3 packs pairs via __nv_fp8x2_e4m3 (saturating round-to-nearest, matching
-// torch's ``.to(torch.float8_e4m3fn)``).
+// torch's .to(torch.float8_e4m3fn)).
 template <typename OutT, int numElemsPerThread, int vecSize>
 __device__ __forceinline__ void storeHeadElements(
     OutT* out, int offsetThread, float const (&elements)[numElemsPerThread])

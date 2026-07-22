@@ -713,12 +713,10 @@ class MiniMaxM3Attention(Attention):
         # (fp8/fp4) only changes cache storage, not the activation dtype.
         self.attn_activation_dtype = config.torch_dtype
 
-        # Whether the main K/V cache is stored as FP8 E4M3. When true (and the
-        # MSA backend is active), the fused QK-norm+RoPE kernel emits FP8 q/k/v
-        # directly, folding the FP8 activation-quant into its epilogue so the
-        # downstream q-cast and cache-write casts become no-ops (one kernel
-        # instead of three per layer). The kernel consumes FP8 K/V in place, so
-        # this only changes where the E4M3 conversion happens, not its value.
+        # Whether the main K/V cache is stored as FP8 E4M3. When true and the MSA
+        # backend is active, the fused QK-norm+RoPE kernel emits FP8 q/k/v
+        # directly, so the separate q-cast and cache-write casts collapse into one
+        # kernel. This only moves where the E4M3 conversion happens, not its value.
         quant_config = getattr(model_config, "quant_config", None)
         self.main_kv_is_fp8 = bool(
             quant_config is not None
@@ -892,11 +890,10 @@ class MiniMaxM3Attention(Attention):
         whole-head norm with front partial RoPE, and applies the same Gemma
         (1 + weight) scaling as apply_qk_norm.
 
-        When ``out_fp8`` is True, the FP8 out-of-place variant is used instead:
-        it reads the bf16 fused qkv and returns a **new FP8 (E4M3)** tensor with
-        Q/K normed+roped and V copy-cast, folding the FP8 activation-quant into
-        the norm+RoPE epilogue (used by the MSA path with an FP8 KV cache). The
-        input ``qkv`` is left untouched in that case.
+        When out_fp8 is True, an out-of-place FP8 variant runs instead: it reads
+        the bf16 fused qkv and returns a fresh FP8 E4M3 tensor with Q/K normed
+        and roped and V copy-cast, folding the FP8 activation quant into the
+        norm+RoPE epilogue. The input qkv is left untouched.
 
         Returns None, leaving qkv untouched, when the fused path does not apply
         so callers fall back to separate norm and RoPE. This happens when
@@ -1012,6 +1009,27 @@ class MiniMaxM3Attention(Attention):
         if self._msa_backend_active():
             return q, k, v
         return q.contiguous(), k.contiguous(), v
+
+    def _split_index_qk(
+        self, fused_idx: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Split the fused [idx_q|idx_k] buffer into per-tensor idx_q/idx_k.
+
+        The index analogue of _split_main_qkv. The index cache is bf16, so there
+        is no FP8 output variant here. On the MSA backend the split is stride
+        safe: idx_q feeds the fmha_sm100 proxy, which loads Q via TMA using its
+        real strides, and idx_k is scattered into the paged index-K cache by an
+        indexed copy that tolerates a strided source. The split column-views are
+        handed over directly with no contiguous copy. Other backends fall back to
+        contiguous idx_q and idx_k.
+        """
+        idx_q, idx_k = fused_idx.split(
+            [self.sparse_num_index_heads * self.sparse_index_dim, self.sparse_index_dim],
+            dim=-1,
+        )
+        if self._msa_backend_active():
+            return idx_q, idx_k
+        return idx_q.contiguous(), idx_k.contiguous()
 
     def forward(
         self,
@@ -1550,11 +1568,7 @@ class MiniMaxM3Attention(Attention):
                 k_norm=self.index_k_norm,
             )
             if fused_idx is not None:
-                idx_q, idx_k = fused_idx.split(
-                    [self.sparse_num_index_heads * self.sparse_index_dim, self.sparse_index_dim],
-                    dim=-1,
-                )
-                return idx_q.contiguous(), idx_k.contiguous()
+                return self._split_index_qk(fused_idx)
             assert not self._expect_fused_qk_norm_rope(position_ids), (
                 f"MiniMax-M3 sparse index branch (layer {self.layer_idx}) expected the "
                 f"fused QK-norm+RoPE kernel (bf16 activations, index_dim="
