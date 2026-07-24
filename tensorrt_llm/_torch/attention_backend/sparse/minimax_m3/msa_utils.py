@@ -53,6 +53,33 @@ def msa_package_available() -> bool:
     return importlib.util.find_spec("fmha_sm100") is not None
 
 
+# Symbol added by 3rdparty/patches/msa_strided_paged_kv.patch. Its presence in
+# the imported module is the runtime signal that the downstream MSA patch was
+# applied to the fmha_sm100 sources that actually got loaded.
+_MSA_PATCH_MARKER = "_prepare_paged_hnd_input"
+
+
+def _require_msa_patch() -> None:
+    """Fail fast if the loaded fmha_sm100 is missing the downstream patch.
+
+    The patch (avoiding paged K/V materialization during prefill) is applied in
+    place on the 3rdparty/MSA submodule by scripts/build_wheel.py. If an
+    unpatched copy is imported -- e.g. the submodule was never patched -- running
+    silently would regress prefill, so surface it with an actionable error that
+    names the exact module file that was loaded.
+    """
+    from fmha_sm100.cute import interface
+
+    if not hasattr(interface, _MSA_PATCH_MARKER):
+        raise RuntimeError(
+            "The imported fmha_sm100 is missing the TensorRT-LLM MSA patch "
+            f"(expected symbol '{_MSA_PATCH_MARKER}' in "
+            f"'{getattr(interface, '__file__', '<unknown>')}'). Rebuild with "
+            "scripts/build_wheel.py, which applies "
+            "3rdparty/patches/msa_strided_paged_kv.patch in place, or apply the "
+            "patch to 3rdparty/MSA manually.")
+
+
 def require_msa_module():
     """Import fmha_sm100 from the MSA submodule or raise a clear error.
 
@@ -71,6 +98,7 @@ def require_msa_module():
             "MSA git submodule at 3rdparty/MSA. Initialize it with "
             "'git submodule update --init --recursive', or install fmha_sm100."
         ) from exc
+    _require_msa_patch()
     return fmha_sm100
 
 

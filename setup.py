@@ -406,10 +406,10 @@ else:
 # internal absolute imports (e.g., "from triton_kernels.foo import bar") work.
 packages += find_packages(include=["triton_kernels", "triton_kernels.*"])
 
-msa_package_dir = {
-    "fmha_sm100":
-    os.environ.get("TRTLLM_MSA_PACKAGE_DIR", "3rdparty/MSA/python/fmha_sm100")
-}
+# The downstream MSA patch is applied in place on the submodule by
+# scripts/build_wheel.py (apply_msa_patch), so this always points at the
+# patched fmha_sm100 sources.
+msa_package_dir = {"fmha_sm100": "3rdparty/MSA/python/fmha_sm100"}
 packages += ["fmha_sm100"]
 
 # https://setuptools.pypa.io/en/latest/references/keywords.html
