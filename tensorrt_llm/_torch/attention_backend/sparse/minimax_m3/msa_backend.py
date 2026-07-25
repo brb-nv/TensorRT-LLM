@@ -32,6 +32,7 @@ import torch
 
 from tensorrt_llm._torch.attention_backend.interface import AttentionForwardArgs
 from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttention, TrtllmAttentionMetadata
+from tensorrt_llm._utils import maybe_pin_memory
 
 from .common import (
     MiniMaxM3SparseConfig,
@@ -58,31 +59,6 @@ def _cache_device(meta) -> torch.device:
         except Exception:
             pass
     return torch.device(f"cuda:{torch.cuda.current_device()}")
-
-
-def _stage_sparse_plan_kv_lens_host(plan: tuple, kv_lens_cpu: torch.Tensor) -> None:
-    """Keep the sparse-prefill plan's kv_segment_lens on the host.
-
-    The fmha_sm100 sparse-prefill plan (MM-SA-Nv) rebuilds its KV page table
-    every sparse layer in sparse_fmha._build_page_table, which reads
-    plan["kv_segment_lens"] on the host via .tolist(). The planner stores it on
-    the device, so that read is a blocking D2H sync per sparse layer. Store a
-    host copy of the per-request KV lengths (already available as kv_lens_cpu)
-    instead; the page table still builds on the device from kv_indices, so no
-    copy is added. Mirrors the in-place plan-dict edits in on_update_kv_lens.
-
-    Only the sparse-prefill sub-plan is MM-SA-Nv. Decode and dense plans keep
-    their device kv_segment_lens for the kernel.
-    """
-    has_mixed, split = plan[0], plan[1]
-    # Non-mixed batches are one sparse plan (plan[3]). Mixed batches place the
-    # sparse prefill rows in the second sub-plan (plan[4]), after split decode
-    # rows.
-    sparse_dict = plan[4] if has_mixed else plan[3]
-    if sparse_dict is None or not sparse_dict.get("MM-SA-Nv"):
-        return
-    lens = kv_lens_cpu[split:] if has_mixed else kv_lens_cpu
-    sparse_dict["kv_segment_lens"] = lens.to(torch.int32).contiguous()
 
 
 def _worst_case_proxy_max_k_tiles(
@@ -300,12 +276,19 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
 
     @property
     def msa_qo_lens_cpu(self) -> Optional[torch.Tensor]:
-        """Per-request query length (host int32), from the base seq_lens."""
+        """Per-request query length (host int32), from the base seq_lens.
+
+        Pinned where pinning helps, as with the other two length properties:
+        the planners stage them to the device with non-blocking copies, which
+        degrade to a synchronous staging copy from pageable memory.
+        """
         seq_lens = self.seq_lens
         if seq_lens is None:
             return None
         out = seq_lens[: self.num_seqs]
-        return out if out.dtype == torch.int32 else out.to(torch.int32)
+        if out.dtype != torch.int32:
+            out = out.to(torch.int32)
+        return maybe_pin_memory(out)
 
     @property
     def msa_kv_lens_cpu(self) -> Optional[torch.Tensor]:
@@ -326,7 +309,9 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         extra = params.num_extra_kv_tokens if params is not None else 0
         if extra:
             out = out - extra
-        return out if out.dtype == torch.int32 else out.to(torch.int32)
+        if out.dtype != torch.int32:
+            out = out.to(torch.int32)
+        return maybe_pin_memory(out)
 
     @property
     def msa_qo_offset_cpu(self) -> Optional[torch.Tensor]:
@@ -335,7 +320,7 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         kv = self.msa_kv_lens_cpu
         if qo is None or kv is None:
             return None
-        return kv - qo
+        return maybe_pin_memory(kv - qo)
 
     @property
     def msa_decode_proxy_plan(self) -> Optional[tuple]:
@@ -620,7 +605,9 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
             # corrected lens and rebuild both. Mixed steps are never captured.
             if torch.cuda.is_current_stream_capturing():
                 return
-            self._msa_corrected_kv_lens_cpu = self.kv_lens_cuda[:batch].to("cpu", torch.int32)
+            self._msa_corrected_kv_lens_cpu = maybe_pin_memory(
+                self.kv_lens_cuda[:batch].to("cpu", torch.int32)
+            )
             self._build_msa_fields()
             self._build_step_plans()
             return
@@ -768,8 +755,6 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
             self._msa_eager_proxy_plan = proxy_plan
             self._msa_eager_gqa_plan = gqa_plan
             self._msa_eager_dense_plan = dense_plan
-            # Avoid the per-layer page-table D2H sync in sparse prefill.
-            _stage_sparse_plan_kv_lens_host(gqa_plan, kv_lens_cpu)
             # Stage the valid-block count to the device once for the whole step
             # (see _msa_eager_n_valid_blocks). The empty-selection check runs
             # here on the host, so run_indexer can short-circuit cheaply.
@@ -866,14 +851,18 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         # fine: forwards read only the persistent buffers filled below.
         # qo_offset is the prefix length, so one build covers prefill
         # (num_cached) and decode (kv_len - 1 with qo_len 1).
-        req_to_token, slot_ids, out_cache_loc = build_paged_kv_slot_mapping(
+        mapping = build_paged_kv_slot_mapping(
             kv_cache_manager=kv_cache_manager,
             request_ids=request_ids,
             qo_lens_cpu=qo_lens_cpu,
             qo_offset_cpu=qo_offset_cpu,
             device=cache_device,
         )
-        kv_indices = build_kv_page_indices(req_to_token, slot_ids, kv_lens_cpu, page_size)
+        req_to_token = mapping.req_to_token
+        out_cache_loc = mapping.out_cache_loc
+        # The page table comes from the same host block ids the mapping was
+        # built from, so it costs no device work.
+        kv_indices = build_kv_page_indices(mapping.block_ids_cpu, kv_lens_cpu, page_size)
 
         total_new_tokens = int(out_cache_loc.shape[0])
         total_pages = int(kv_indices.shape[0])
@@ -903,9 +892,13 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
             torch.arange(total_new_tokens, dtype=torch.int64)
             - torch.repeat_interleave(starts, qo_long)
         ).to(torch.int32)
-        self.msa_q_batch_row[:total_new_tokens].copy_(batch_row_cpu)
-        self.msa_q_intra[:total_new_tokens].copy_(intra_cpu)
-        self.msa_qo_lens_dev[:batch_size].copy_(qo_lens_cpu)
+        # Pinned and non-blocking: a plain copy_ from pageable host memory ends
+        # in cudaStreamSynchronize, which drains the whole queue.
+        self.msa_q_batch_row[:total_new_tokens].copy_(
+            maybe_pin_memory(batch_row_cpu), non_blocking=True
+        )
+        self.msa_q_intra[:total_new_tokens].copy_(maybe_pin_memory(intra_cpu), non_blocking=True)
+        self.msa_qo_lens_dev[:batch_size].copy_(maybe_pin_memory(qo_lens_cpu), non_blocking=True)
         self._msa_live_batch = batch_size
         self._msa_live_total_q = total_new_tokens
         self._msa_page_size = page_size
