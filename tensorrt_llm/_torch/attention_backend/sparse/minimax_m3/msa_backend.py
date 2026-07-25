@@ -75,14 +75,20 @@ def _stage_sparse_plan_kv_lens_host(plan: tuple, kv_lens_cpu: torch.Tensor) -> N
     their device kv_segment_lens for the kernel.
     """
     has_mixed, split = plan[0], plan[1]
-    # Non-mixed batches are one sparse plan (plan[3]). Mixed batches place the
-    # sparse prefill rows in the second sub-plan (plan[4]), after split decode
-    # rows.
-    sparse_dict = plan[4] if has_mixed else plan[3]
-    if sparse_dict is None or not sparse_dict.get("MM-SA-Nv"):
-        return
-    lens = kv_lens_cpu[split:] if has_mixed else kv_lens_cpu
-    sparse_dict["kv_segment_lens"] = lens.to(torch.int32).contiguous()
+    # A non-mixed batch is one sparse plan (plan[3]). A mixed batch is split into
+    # the rows before and after `split`, and which half holds the sparse prefill
+    # rows follows the batch order: context-first batches put them in plan[3],
+    # decode-first batches in plan[4]. Stage whichever half is MM-SA-Nv.
+    if has_mixed:
+        halves = ((plan[3], slice(0, split)), (plan[4], slice(split, None)))
+    else:
+        halves = ((plan[3], slice(None)),)
+    for sparse_dict, rows in halves:
+        if sparse_dict is None or not sparse_dict.get("MM-SA-Nv"):
+            continue
+        sparse_dict["kv_segment_lens"] = (
+            kv_lens_cpu[rows].to(torch.int32).contiguous()
+        )
 
 
 def _worst_case_proxy_max_k_tiles(
@@ -725,6 +731,10 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
 
         # Proxy plan: MQA (num_kv_heads=1) max-score pass over the index
         # branch; output_maxscore feeds the indexer's top-k block selection.
+        # Splitting a mixed batch only pays off for the sparse GQA plan, whose
+        # per-layer host prep scales with batch width. Keeping this pass on a
+        # single plan leaves its kernel routing and max-score layout as they
+        # are, so block selection is unaffected.
         proxy_plan = fmha_sm100.fmha_sm100_plan(
             qo_lens_cpu,
             kv_lens_cpu,
@@ -735,6 +745,7 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
             output_maxscore=True,
             num_kv_splits=1,
             causal=True,
+            split_prefill_decode=False,
         )
         # Sparse-layer plan: kv_block_num=topk limits attention to top-k blocks.
         gqa_plan = fmha_sm100.fmha_sm100_plan(
@@ -750,6 +761,7 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
             use_fp8_kvcache=use_fp8,
         )
         # Dense-layer plan: no kv_block_num, so it attends the full page table.
+        # Single plan for the same reason as the proxy pass.
         dense_plan = fmha_sm100.fmha_sm100_plan(
             qo_lens_cpu,
             kv_lens_cpu,
@@ -760,6 +772,7 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
             num_kv_splits=1,
             causal=True,
             use_fp8_kvcache=use_fp8,
+            split_prefill_decode=False,
         )
 
         if not is_decode:
