@@ -101,6 +101,9 @@ _MSA_PLAN_STABLE_KEYS = (
     "qo_segment_lens",
     "kv_segment_lens",
     "qo_offset",
+    # Sparse plans mask with seqused_k rather than kv_segment_lens, so it is a
+    # length mirror on_update_kv_lens patches and must be equally graph-stable.
+    "seqused_k",
 )
 _MSA_PLAN_INT64_KEYS = ("packed_work_range", "packed_work_info")
 # fmha_sm100 sizes packed_work_info at 131072 * max(num_kv_splits, 1); forcing
@@ -114,6 +117,22 @@ _MSA_SPLIT_KV_KEYS = (
     "workspace_o",
     "workspace_lse",
 )
+# The per-row lengths on_update_kv_lens patches, by plan flavour. Dense plans
+# mask with kv_segment_lens/qo_offset; sparse plans mask with seqused_k and keep
+# kv_segment_lens on the host for the page-table builder, which consumed it at
+# plan time. cu_seqlens_k is excluded: it describes the page-table layout staged
+# by prepare(), which stays valid because corrections only shrink lengths.
+_MSA_DENSE_LENGTH_KEYS = ("kv_segment_lens", "qo_offset")
+_MSA_SPARSE_LENGTH_KEYS = ("seqused_k",)
+
+
+def _msa_plan_length_keys(sub_plan: dict) -> tuple:
+    """The length mirrors to patch in one fmha_sm100 sub-plan.
+
+    fmha_sm100 tags sparse plans with "MM-SA-Nv"; the two flavours expose the
+    attended length under different keys.
+    """
+    return _MSA_SPARSE_LENGTH_KEYS if sub_plan.get("MM-SA-Nv") else _MSA_DENSE_LENGTH_KEYS
 
 
 class _MsaGraphSafePlan:
@@ -272,6 +291,7 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         self._msa_live_batch = 0
         self._msa_live_total_q = 0
         self._msa_page_size = 0
+        self._msa_q_token_starts = (0,)
         self._create_msa_buffers()
 
     @property
@@ -649,32 +669,53 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         if n_valid_buf is not None:
             n_valid_buf[:total_q].copy_(n_valid.to(torch.int32))
 
-        # Plan length mirrors. Each plan holds either one row per request or one
-        # per query token, since the planner row-expands the sparse plan when
-        # qo_len > 1, so the row count selects the source. qo_offset must stay
-        # non-negative: negative values hit the kernel's packed-length sentinel
-        # fallback.
+        # Plan length mirrors. A plan is (has_mixed, split, batch, decode_sub,
+        # prefill_sub); a mixed batch is split at the first long request, so
+        # each sub-plan mirrors only its own request range. Within a range a
+        # sub-plan holds either one row per request or one per query token,
+        # since the planner row-expands dense plans over query tokens, so the row
+        # count selects the source. qo_offset must stay non-negative: negative
+        # values hit the kernel's packed-length sentinel fallback.
         per_request = {
             "kv_segment_lens": kv_true,
             "qo_offset": (kv_true - qo_dev).clamp_min(0),
+            "seqused_k": kv_true,
         }
-        per_token = {"kv_segment_lens": kv_true_tok, "qo_offset": pos.clamp_min(0)}
-        for plan in self._msa_live_plans():
-            for key in ("kv_segment_lens", "qo_offset"):
-                dst = plan[3].get(key)
-                if dst is None:
+        per_token = {
+            "kv_segment_lens": kv_true_tok,
+            "qo_offset": pos.clamp_min(0),
+            "seqused_k": (pos + 1).clamp_min(0),
+        }
+        starts = self._msa_q_token_starts
+        for has_mixed, split, _, decode_sub, prefill_sub in self._msa_live_plans():
+            subs = (
+                ((decode_sub, 0, split), (prefill_sub, split, batch))
+                if has_mixed
+                else ((decode_sub, 0, batch),)
+            )
+            for sub, first, last in subs:
+                if sub is None:
                     continue
-                rows = int(dst.shape[0])
-                if rows == total_q:
-                    src = per_token[key]
-                elif rows == batch:
-                    src = per_request[key]
-                else:
-                    raise RuntimeError(
-                        f"MSA plan {key!r} has {rows} rows; expected {batch} (one per "
-                        f"request) or {total_q} (one per query token)."
-                    )
-                dst.copy_(src.to(dst.dtype))
+                tok_first, tok_last = starts[first], starts[last]
+                for key in _msa_plan_length_keys(sub):
+                    dst = sub.get(key)
+                    if dst is None:
+                        raise RuntimeError(
+                            f"MSA plan has no length mirror {key!r}, so the corrected "
+                            "kv_lens cannot reach the kernel."
+                        )
+                    rows = int(dst.shape[0])
+                    if rows == last - first:
+                        src = per_request[key][first:last]
+                    elif rows == tok_last - tok_first:
+                        src = per_token[key][tok_first:tok_last]
+                    else:
+                        raise RuntimeError(
+                            f"MSA plan {key!r} has {rows} rows for requests "
+                            f"[{first}, {last}); expected {last - first} (one per "
+                            f"request) or {tok_last - tok_first} (one per query token)."
+                        )
+                    dst.copy_(src)
 
     def _build_step_plans(self) -> None:
         """Build the three layer-invariant fmha_sm100 plans once per step.
@@ -926,6 +967,10 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         kv_lens_cuda = getattr(self, "kv_lens_cuda", None)
         if kv_lens_cuda is not None:
             self.msa_kv_lens_staged[:batch_size].copy_(kv_lens_cuda[:batch_size], non_blocking=True)
+        # Token offset of each request, plus total_new_tokens as the tail. Host
+        # side, so on_update_kv_lens can slice a sub-plan's token range without
+        # a device read.
+        self._msa_q_token_starts = (0, *torch.cumsum(qo_long, 0).tolist())
         self._msa_live_batch = batch_size
         self._msa_live_total_q = total_new_tokens
         self._msa_page_size = page_size
