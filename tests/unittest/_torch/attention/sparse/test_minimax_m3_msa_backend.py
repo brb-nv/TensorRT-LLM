@@ -15,6 +15,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from tensorrt_llm._torch.attention_backend.interface import AttentionForwardArgs
 from tensorrt_llm._torch.attention_backend.sparse.minimax_m3 import (
     MiniMaxM3KVCacheManagerV2,
     MiniMaxM3MsaSparseAttention,
@@ -163,6 +164,81 @@ def test_cache_manager_rejects_non_positive_sparse_index_dim(sparse_index_dim: i
     ):
         with pytest.raises(ValueError, match=r"sparse_index_dim must be greater than 0"):
             MiniMaxM3KVCacheManagerV2(num_layers=4, **kwargs)
+
+
+def test_fused_qkv_index_projection_is_explicit_and_shards_index_heads():
+    cfg = MiniMaxM3SparseAttentionConfig(
+        implementation="msa",
+        fuse_qkv_index_projection=True,
+    )
+    sparse_params = cfg.to_sparse_params()
+    metadata_params = cfg.to_sparse_metadata_params(
+        pretrained_config=SimpleNamespace(num_attention_heads=64, num_key_value_heads=4)
+    )
+    mapping = SimpleNamespace(tp_size=2, enable_attention_dp=False)
+
+    assert sparse_params.fuse_qkv_index_projection is True
+    assert metadata_params.sharded_head_counts(mapping) == (32, 2)
+    assert metadata_params.sharded_index_head_count(mapping) == 2
+
+    compatibility = MiniMaxM3SparseAttentionConfig(implementation="msa").to_sparse_metadata_params(
+        pretrained_config=SimpleNamespace(num_attention_heads=64, num_key_value_heads=4)
+    )
+    assert compatibility.sharded_index_head_count(mapping) == 4
+
+    with pytest.raises(ValueError, match=r"requires the 'msa' implementation"):
+        MiniMaxM3SparseAttentionConfig(
+            implementation="triton",
+            fuse_qkv_index_projection=True,
+        )
+
+
+def test_prepopulated_kv_dispatches_compact_q_and_consumes_marker(monkeypatch):
+    from tensorrt_llm._torch.attention_backend.fmha import msa_sparse_gqa
+
+    attention = MiniMaxM3MsaSparseAttention.__new__(MiniMaxM3MsaSparseAttention)
+    q = torch.empty(3, 8 * 128)
+    output = torch.empty_like(q)
+    topk = torch.zeros(3, 1, 16, dtype=torch.int32)
+    eager_plan = object()
+
+    class FakeMetadata:
+        msa_decode_gqa_plan = None
+        msa_eager_gqa_plan = eager_plan
+        msa_decode_dense_plan = None
+        msa_eager_dense_plan = object()
+        _msa_prewritten_layer = 7
+
+    captured = {}
+
+    def fake_run(attn, q_arg, k, v, metadata, output_arg, **kwargs):
+        captured.update(
+            attn=attn,
+            q=q_arg,
+            k=k,
+            v=v,
+            metadata=metadata,
+            output=output_arg,
+            kwargs=kwargs,
+        )
+        metadata._msa_prewritten_layer = None
+
+    monkeypatch.setattr(msa_sparse_gqa, "run_msa_paged_gqa", fake_run)
+    metadata = FakeMetadata()
+    attention.forward_prepopulated_kv(
+        q,
+        metadata,
+        AttentionForwardArgs(output=output, topk_indices=topk),
+    )
+
+    assert captured["attn"] is attention
+    assert captured["q"] is q
+    assert captured["k"] is None and captured["v"] is None
+    assert captured["metadata"] is metadata
+    assert captured["output"] is output
+    assert captured["kwargs"]["kv_block_indexes"] is topk
+    assert captured["kwargs"]["plan"] is eager_plan
+    assert metadata._msa_prewritten_layer is None
 
 
 def test_msa_metadata_rejects_undersized_max_score_buffer():
