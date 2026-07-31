@@ -3520,6 +3520,13 @@ class PyExecutor:
     def _apply_disagg_transfer_admission(
         self, fitting_disagg_gen_init_requests: List[LlmRequest]
     ) -> Tuple[List[LlmRequest], bool]:
+        # Disabled: the controller deferred gen-init requests to bound the
+        # number of in-flight KV transfer blocks. Its FCFS deferral bursts
+        # admissions and was measured costing ~18% of GEN GPU-idle time. With
+        # the idle check above also removed there is no transfer budget left to
+        # wait on, so admit every fitting request and never report "blocked".
+        return fitting_disagg_gen_init_requests, False
+
         # gen_only_no_context has no CTX worker and does not transfer data.
         # Real synchronous gen_only transfers still honor the budget to bound
         # the number of blocking transfers started in one executor iteration.
@@ -3614,6 +3621,30 @@ class PyExecutor:
             wait_for_disagg_gen_transfer_progress: bool,
             all_gen_first: bool,
             is_idle: bool = False) -> None:
+        # Disabled: this ran two collectives on every executor iteration --
+        # _sync_disagg_gen_status_entry (WORLD-scoped) and
+        # _sync_disagg_ctx_status_entry (TP/CP) -- purely to vote on whether any
+        # rank should enter a blocking transfer-status wait. Instrumented on a
+        # GLM-5.2 disagg GEN worker they were 3,995 ms of the method's 4,012 ms
+        # over 3,000 calls, i.e. 99% of its cost was the votes themselves. An
+        # NVTX capture of the CTX put the WORLD allreduce at 19.4% of context
+        # wall-clock (18 calls, 211 ms mean) because it spans every rank in the
+        # deployment, so each call waits on the slowest participant anywhere.
+        #
+        # Removal is safe because transfer completion is still reaped at the
+        # other call sites in the executor loop; only the ones inside this
+        # method are dropped. What is left below is rank-uniform and contains no
+        # collectives, so ranks cannot diverge -- the deadlock the voting
+        # guarded against cannot arise once nothing here is conditional.
+        #
+        # A single-rank worker cannot diverge on a collective, so its
+        # non-blocking reap is kept: an idle CTX worker must still release the
+        # pinned KV blocks of completed sends for the next context requests.
+        if (is_idle and self._dist_size(self.dist, "world_size") == 1
+                and self.async_transfer_manager.has_any_inflight_requests()):
+            self._check_disagg_ctx_cache_transfer_status(0)
+        return
+
         local_needs_progress = (num_fitting_reqs == 0
                                 and not fitting_disagg_gen_init_requests)
 
