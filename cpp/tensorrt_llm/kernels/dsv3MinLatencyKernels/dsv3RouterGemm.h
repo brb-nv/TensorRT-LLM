@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2019-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -27,8 +27,13 @@ TRTLLM_NAMESPACE_BEGIN
 namespace kernels::dsv3MinLatencyKernels
 {
 
-template <typename T, int kNumTokens, int kNumExperts, int kHiddenDim>
-void invokeRouterGemm(float* output, T const* mat_a, T const* mat_b, cudaStream_t stream);
+//! \brief Skinny router GEMM: [kNumTokens, kHiddenDim] x [kHiddenDim, kNumExperts] -> fp32.
+//!
+//! \tparam T activation element type.
+//! \tparam WeightT weight element type. Trails the non-type parameters so it can default to \p T,
+//! which keeps the DeepSeek call sites and their explicit instantiations unchanged.
+template <typename T, int kNumTokens, int kNumExperts, int kHiddenDim, typename WeightT = T>
+void invokeRouterGemm(float* output, T const* mat_a, WeightT const* mat_b, cudaStream_t stream);
 
 } // namespace kernels::dsv3MinLatencyKernels
 

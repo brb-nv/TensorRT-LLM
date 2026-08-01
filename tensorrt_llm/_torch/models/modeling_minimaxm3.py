@@ -469,6 +469,12 @@ def _resolve_minimax_m3_expert_size_per_partition(
     return max(1, num_experts // ep_size)
 
 
+# (num_experts, hidden_size) pairs that ``trtllm::fp32_router_gemm_op`` is
+# instantiated for, and the num_tokens range those instantiations cover.
+_FP32_ROUTER_GEMM_SHAPES = frozenset({(128, 6144)})
+_FP32_ROUTER_GEMM_MAX_TOKENS = 16
+
+
 class MiniMaxM3Gate(nn.Module):
     """MiniMax-M3 router gate: float32 sigmoid scoring + per-expert bias correction.
 
@@ -500,9 +506,26 @@ class MiniMaxM3Gate(nn.Module):
             torch.empty((num_experts,), dtype=torch.float32),
             requires_grad=False,
         )
+        self._fp32_router_gemm_shape_ok = (
+            num_experts,
+            hidden_size,
+        ) in _FP32_ROUTER_GEMM_SHAPES
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        # Router runs in fp32 to match SGLang.
+        # Router runs in fp32 to match SGLang. The specialized kernel converts the
+        # bf16 activation while loading registers, so it never materializes the
+        # [num_tokens, hidden_size] fp32 copy the fallback below needs. It only
+        # covers a few shapes, and only the token counts it is instantiated for.
+        if (
+            self._fp32_router_gemm_shape_ok
+            and hidden_states.dtype == torch.bfloat16
+            and hidden_states.dim() == 2
+            and 0 < hidden_states.shape[0] <= _FP32_ROUTER_GEMM_MAX_TOKENS
+            and hidden_states.stride(-1) == 1
+        ):
+            return torch.ops.trtllm.fp32_router_gemm_op(
+                hidden_states, self.weight.t(), None, torch.float32
+            )
         return torch.nn.functional.linear(hidden_states.to(torch.float32), self.weight)
 
     def load_weights(self, weights: List[Dict]):

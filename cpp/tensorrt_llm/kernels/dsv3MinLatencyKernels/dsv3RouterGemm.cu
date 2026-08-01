@@ -34,11 +34,12 @@ __device__ __forceinline__ void fma(float2& d, float2 const& a, float2 const& b,
                  "l"(reinterpret_cast<uint64_t const&>(c)));
 }
 
-// Convert 8 bfloat16 values from a uint4 to float array - optimized conversion
+// Load VPT bf16 values with a single 16-byte vector load and convert to float
 template <int VPT>
-__device__ __forceinline__ void bf16_uint4_to_float8(uint4 const& vec, float* dst)
+__device__ __forceinline__ void load_bf16_to_float(__nv_bfloat16 const* src, float* dst)
 {
-    __nv_bfloat16* bf16_ptr = reinterpret_cast<__nv_bfloat16*>(const_cast<uint4*>(&vec));
+    uint4 const vec = *reinterpret_cast<uint4 const*>(src);
+    __nv_bfloat16 const* bf16_ptr = reinterpret_cast<__nv_bfloat16 const*>(&vec);
 
 #pragma unroll
     for (int i = 0; i < VPT; i++)
@@ -47,8 +48,39 @@ __device__ __forceinline__ void bf16_uint4_to_float8(uint4 const& vec, float* ds
     }
 }
 
-template <typename T, int kBlockSize, int VPT, int kNumTokens, int kNumExperts, int kHiddenDim>
-__global__ __launch_bounds__(128, 1) void router_gemm_kernel(float* out, T const* mat_a, T const* mat_b)
+// Activations are always bf16; VPT is sized so that this is one 16-byte load
+template <int VPT>
+__device__ __forceinline__ void load_activation(__nv_bfloat16 const* src, float* dst)
+{
+    load_bf16_to_float<VPT>(src, dst);
+}
+
+template <int VPT>
+__device__ __forceinline__ void load_weight(__nv_bfloat16 const* src, float* dst)
+{
+    load_bf16_to_float<VPT>(src, dst);
+}
+
+// The same VPT values span twice the bytes when the weight is fp32, so this
+// takes two 16-byte loads rather than one
+template <int VPT>
+__device__ __forceinline__ void load_weight(float const* src, float* dst)
+{
+    static_assert(VPT % 4 == 0, "fp32 weights are loaded four elements at a time");
+
+#pragma unroll
+    for (int i = 0; i < VPT; i += 4)
+    {
+        float4 const vec = *reinterpret_cast<float4 const*>(src + i);
+        dst[i + 0] = vec.x;
+        dst[i + 1] = vec.y;
+        dst[i + 2] = vec.z;
+        dst[i + 3] = vec.w;
+    }
+}
+
+template <typename T, typename WeightT, int kBlockSize, int VPT, int kNumTokens, int kNumExperts, int kHiddenDim>
+__global__ __launch_bounds__(128, 1) void router_gemm_kernel(float* out, T const* mat_a, WeightT const* mat_b)
 {
     // Each block handles one expert column
     int const n_idx = blockIdx.x;
@@ -66,7 +98,7 @@ __global__ __launch_bounds__(128, 1) void router_gemm_kernel(float* out, T const
     __shared__ float sm_reduction[kNumTokens][kNumWarps]; // kNumWarps
 
     // B matrix is in column-major order, so we can directly load a column for the n_idx expert
-    T const* b_col = mat_b + n_idx * kHiddenDim;
+    WeightT const* b_col = mat_b + n_idx * kHiddenDim;
 
     // Pre-compute k_base values for each iteration to help compiler optimize
     // int k_bases[k_iterations];
@@ -86,23 +118,17 @@ __global__ __launch_bounds__(128, 1) void router_gemm_kernel(float* out, T const
     {
         int const k_base = k_bases[ki];
 
-        // Load B matrix values using vector load (8 bf16 values)
-        uint4 b_vec = *reinterpret_cast<uint4 const*>(b_col + k_base);
-
-        // Convert B values to float
+        // Load B matrix values and convert to float
         float b_float[VPT];
-        bf16_uint4_to_float8<VPT>(b_vec, b_float);
+        load_weight<VPT>(b_col + k_base, b_float);
 
 // Process each token
 #pragma unroll
         for (int m_idx = 0; m_idx < kNumTokens; m_idx++)
         {
-            // Load both rows of A matrix using vector loads
-            uint4 a_vec = *reinterpret_cast<uint4 const*>(mat_a + (m_idx * kHiddenDim) + k_base);
-
-            // Convert A values to float
+            // Load this row of A matrix and convert to float
             float a_float[VPT];
-            bf16_uint4_to_float8<VPT>(a_vec, a_float);
+            load_activation<VPT>(mat_a + (m_idx * kHiddenDim) + k_base, a_float);
 
 // Process elements in this chunk
 #pragma unroll
@@ -175,9 +201,11 @@ __global__ __launch_bounds__(128, 1) void router_gemm_kernel(float* out, T const
 #endif
 }
 
-template <typename T, int kNumTokens, int kNumExperts, int kHiddenDim>
-void invokeRouterGemm(float* output, T const* mat_a, T const* mat_b, cudaStream_t stream)
+template <typename T, int kNumTokens, int kNumExperts, int kHiddenDim, typename WeightT>
+void invokeRouterGemm(float* output, T const* mat_a, WeightT const* mat_b, cudaStream_t stream)
 {
+    // Sized from the activation so that A is always a single 16-byte load; a wider
+    // weight type then just takes proportionally more loads for the same VPT values.
     constexpr int VPT = 16 / sizeof(T);
     constexpr int kBlockSize = 128;
     cudaLaunchConfig_t config;
@@ -190,8 +218,8 @@ void invokeRouterGemm(float* output, T const* mat_a, T const* mat_b, cudaStream_
     attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
     config.numAttrs = 1;
     config.attrs = attrs;
-    TLLM_CUDA_CHECK(cudaLaunchKernelEx(
-        &config, router_gemm_kernel<T, kBlockSize, VPT, kNumTokens, kNumExperts, kHiddenDim>, output, mat_a, mat_b));
+    TLLM_CUDA_CHECK(cudaLaunchKernelEx(&config,
+        router_gemm_kernel<T, WeightT, kBlockSize, VPT, kNumTokens, kNumExperts, kHiddenDim>, output, mat_a, mat_b));
 }
 
 template void tensorrt_llm::kernels::dsv3MinLatencyKernels::invokeRouterGemm<__nv_bfloat16, 1, 256, 7168>(
@@ -339,6 +367,56 @@ template void tensorrt_llm::kernels::dsv3MinLatencyKernels::invokeRouterGemm<__n
 
 template void tensorrt_llm::kernels::dsv3MinLatencyKernels::invokeRouterGemm<__nv_bfloat16, 16, 256, 4096>(
     float*, __nv_bfloat16 const*, __nv_bfloat16 const*, cudaStream_t);
+
+// bf16 activation x fp32 weight, hidden_dim=6144, 128 experts (MiniMax-M3). Only
+// num_tokens 1..16 to bound compile time; M=1 is the config's operating point.
+template void tensorrt_llm::kernels::dsv3MinLatencyKernels::invokeRouterGemm<__nv_bfloat16, 1, 128, 6144, float>(
+    float*, __nv_bfloat16 const*, float const*, cudaStream_t);
+
+template void tensorrt_llm::kernels::dsv3MinLatencyKernels::invokeRouterGemm<__nv_bfloat16, 2, 128, 6144, float>(
+    float*, __nv_bfloat16 const*, float const*, cudaStream_t);
+
+template void tensorrt_llm::kernels::dsv3MinLatencyKernels::invokeRouterGemm<__nv_bfloat16, 3, 128, 6144, float>(
+    float*, __nv_bfloat16 const*, float const*, cudaStream_t);
+
+template void tensorrt_llm::kernels::dsv3MinLatencyKernels::invokeRouterGemm<__nv_bfloat16, 4, 128, 6144, float>(
+    float*, __nv_bfloat16 const*, float const*, cudaStream_t);
+
+template void tensorrt_llm::kernels::dsv3MinLatencyKernels::invokeRouterGemm<__nv_bfloat16, 5, 128, 6144, float>(
+    float*, __nv_bfloat16 const*, float const*, cudaStream_t);
+
+template void tensorrt_llm::kernels::dsv3MinLatencyKernels::invokeRouterGemm<__nv_bfloat16, 6, 128, 6144, float>(
+    float*, __nv_bfloat16 const*, float const*, cudaStream_t);
+
+template void tensorrt_llm::kernels::dsv3MinLatencyKernels::invokeRouterGemm<__nv_bfloat16, 7, 128, 6144, float>(
+    float*, __nv_bfloat16 const*, float const*, cudaStream_t);
+
+template void tensorrt_llm::kernels::dsv3MinLatencyKernels::invokeRouterGemm<__nv_bfloat16, 8, 128, 6144, float>(
+    float*, __nv_bfloat16 const*, float const*, cudaStream_t);
+
+template void tensorrt_llm::kernels::dsv3MinLatencyKernels::invokeRouterGemm<__nv_bfloat16, 9, 128, 6144, float>(
+    float*, __nv_bfloat16 const*, float const*, cudaStream_t);
+
+template void tensorrt_llm::kernels::dsv3MinLatencyKernels::invokeRouterGemm<__nv_bfloat16, 10, 128, 6144, float>(
+    float*, __nv_bfloat16 const*, float const*, cudaStream_t);
+
+template void tensorrt_llm::kernels::dsv3MinLatencyKernels::invokeRouterGemm<__nv_bfloat16, 11, 128, 6144, float>(
+    float*, __nv_bfloat16 const*, float const*, cudaStream_t);
+
+template void tensorrt_llm::kernels::dsv3MinLatencyKernels::invokeRouterGemm<__nv_bfloat16, 12, 128, 6144, float>(
+    float*, __nv_bfloat16 const*, float const*, cudaStream_t);
+
+template void tensorrt_llm::kernels::dsv3MinLatencyKernels::invokeRouterGemm<__nv_bfloat16, 13, 128, 6144, float>(
+    float*, __nv_bfloat16 const*, float const*, cudaStream_t);
+
+template void tensorrt_llm::kernels::dsv3MinLatencyKernels::invokeRouterGemm<__nv_bfloat16, 14, 128, 6144, float>(
+    float*, __nv_bfloat16 const*, float const*, cudaStream_t);
+
+template void tensorrt_llm::kernels::dsv3MinLatencyKernels::invokeRouterGemm<__nv_bfloat16, 15, 128, 6144, float>(
+    float*, __nv_bfloat16 const*, float const*, cudaStream_t);
+
+template void tensorrt_llm::kernels::dsv3MinLatencyKernels::invokeRouterGemm<__nv_bfloat16, 16, 128, 6144, float>(
+    float*, __nv_bfloat16 const*, float const*, cudaStream_t);
 
 } // namespace kernels::dsv3MinLatencyKernels
 
