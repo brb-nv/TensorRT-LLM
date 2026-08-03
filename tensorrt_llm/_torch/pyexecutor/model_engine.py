@@ -1467,8 +1467,12 @@ class PyTorchModelEngine(ModelEngine):
                                       flashinfer_mxfp8_autotune)
 
         enable_trtllm_autotuner = self.llm_args.enable_autotuner
+        # The automatic FlashInfer dispatch keys off context state that Dynamo
+        # cannot trace, so a compiled model never reaches it (see
+        # MXFP8LinearMethod.apply); leave those layers on the native backend
+        # instead of tuning tactics that would go unused.
         use_mxfp8_flashinfer_graph_default = (
-            self.cuda_graph_runner.enabled
+            self.cuda_graph_runner.enabled and not self._torch_compile_enabled
             and "TRTLLM_MXFP8_GEMM_BACKEND" not in os.environ and any(
                 getattr(module, "_use_flashinfer_mxfp8_decode_graph_default",
                         False) for module in self.model.modules()))

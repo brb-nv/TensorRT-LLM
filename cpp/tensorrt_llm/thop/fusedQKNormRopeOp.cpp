@@ -165,15 +165,18 @@ torch::Tensor fused_qk_norm_rope_to_fp8(torch::Tensor const& qkv, // [num_tokens
 }
 
 // Meta (fake) implementation for torch.compile / tracing: only shape+dtype.
+// The token dimension stays symbolic. A concrete size here would make every
+// downstream tensor static and break piecewise CUDA graph partitioning.
 torch::Tensor fused_qk_norm_rope_to_fp8_meta(torch::Tensor const& qkv, int64_t num_heads_q, int64_t num_heads_k,
     int64_t num_heads_v, int64_t head_dim, int64_t /*rotary_dim*/, double /*eps*/, torch::Tensor const& /*q_weight*/,
     torch::Tensor const& /*k_weight*/, double /*base*/, bool /*is_neox*/, torch::Tensor const& /*position_ids*/,
     double /*factor*/, double /*low*/, double /*high*/, double /*attention_factor*/, bool /*is_qk_norm*/,
     bool /*use_gemma*/, bool /*use_mrope*/, int64_t /*mrope_section1*/, int64_t /*mrope_section2*/)
 {
-    int64_t num_tokens = qkv.size(0);
-    int64_t total_heads = num_heads_q + num_heads_k + num_heads_v;
-    return torch::empty({num_tokens, total_heads * head_dim}, qkv.options().dtype(torch::kFloat8_e4m3fn));
+    c10::SymInt const numTokens = qkv.sym_size(0);
+    int64_t const totalHeads = num_heads_q + num_heads_k + num_heads_v;
+    return torch::empty_symint(
+        {numTokens, c10::SymInt(totalHeads * head_dim)}, qkv.options().dtype(torch::kFloat8_e4m3fn));
 }
 
 torch::Tensor minimaxM3Fp8QKNormRopeKVInsert(torch::Tensor const& qkv, torch::Tensor& kvCache,
@@ -239,7 +242,8 @@ torch::Tensor minimaxM3Fp8QKNormRopeKVInsertMeta(torch::Tensor const& qkv, torch
     int64_t headDim, int64_t /*rotaryDim*/, double /*eps*/, torch::Tensor const& /*qWeight*/,
     torch::Tensor const& /*kWeight*/, double /*base*/, bool /*isNeox*/, torch::Tensor const& /*positionIds*/)
 {
-    return torch::empty({qkv.size(0), numHeadsQ, headDim}, qkv.options().dtype(at::ScalarType::Float8_e4m3fn));
+    return torch::empty_symint({qkv.sym_size(0), c10::SymInt(numHeadsQ), c10::SymInt(headDim)},
+        qkv.options().dtype(at::ScalarType::Float8_e4m3fn));
 }
 
 std::tuple<torch::Tensor, torch::Tensor> minimaxM3Fp8QKVIndexerNormRopeKVInsert(torch::Tensor const& packed,
@@ -324,9 +328,10 @@ std::tuple<torch::Tensor, torch::Tensor> minimaxM3Fp8QKVIndexerNormRopeKVInsertM
     torch::Tensor const& /*indexKWeight*/, torch::Tensor const& /*rotaryCosSin*/, torch::Tensor const& /*positionIds*/)
 {
     auto options = packed.options().dtype(at::ScalarType::Float8_e4m3fn);
+    c10::SymInt const numTokens = packed.sym_size(0);
     return {
-        torch::empty({packed.size(0), numHeadsQ, headDim}, options),
-        torch::empty({packed.size(0), numHeadsIndex, headDim}, options),
+        torch::empty_symint({numTokens, c10::SymInt(numHeadsQ), c10::SymInt(headDim)}, options),
+        torch::empty_symint({numTokens, c10::SymInt(numHeadsIndex), c10::SymInt(headDim)}, options),
     };
 }
 

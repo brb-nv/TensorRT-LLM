@@ -162,6 +162,32 @@ def test_mxfp8_auto_keeps_eager_native_and_captures_flashinfer(monkeypatch):
     assert native_gemm.call_count == 2
 
 
+def test_mxfp8_auto_stays_native_under_torch_compile(monkeypatch):
+    """Dynamo cannot trace the context lookups that gate FlashInfer dispatch."""
+    monkeypatch.delenv("TRTLLM_MXFP8_GEMM_BACKEND", raising=False)
+    monkeypatch.setattr(linear_module, "_mxfp8_cutlass_op_available", lambda: True)
+    monkeypatch.setattr(linear_module, "is_torch_compiling", lambda: True)
+
+    mm_mxfp8 = Mock(return_value=torch.empty((2, 3), dtype=torch.bfloat16))
+    monkeypatch.setitem(sys.modules, "flashinfer", SimpleNamespace(mm_mxfp8=mm_mxfp8))
+    _, _, _, native_gemm, native_output, _, _ = _mock_mxfp8_ops(monkeypatch)
+
+    module = SimpleNamespace(
+        weight=torch.empty((3, 4), dtype=torch.float8_e4m3fn),
+        weight_scale=torch.empty(512, dtype=torch.uint8),
+        dtype=torch.bfloat16,
+    )
+    activation = torch.randn((2, 4), dtype=torch.bfloat16)
+    method = MXFP8LinearMethod()
+    assert method.enable_flashinfer_auto()
+    method.mark_flashinfer_autotuned()
+
+    with flashinfer_mxfp8_decode_graph_capture():
+        assert method.apply(module, activation, bias=None) is native_output
+    native_gemm.assert_called_once()
+    mm_mxfp8.assert_not_called()
+
+
 @pytest.mark.parametrize(
     "num_tokens,expected",
     [

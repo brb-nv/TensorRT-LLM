@@ -252,6 +252,7 @@ class TestWarmupCleanup(unittest.TestCase):
             engine = SimpleNamespace(
                 llm_args=SimpleNamespace(enable_autotuner=False),
                 cuda_graph_runner=SimpleNamespace(enabled=True),
+                _torch_compile_enabled=False,
                 model=SimpleNamespace(
                     modules=lambda: [
                         SimpleNamespace(_use_flashinfer_mxfp8_decode_graph_default=True),
@@ -290,6 +291,49 @@ class TestWarmupCleanup(unittest.TestCase):
         self.assertEqual(method.backend, "auto")
         self.assertTrue(method._flashinfer_autotuned)
         flashinfer_autotuner_module.autotune.assert_called_once_with()
+
+    def test_flashinfer_mxfp8_stays_native_under_torch_compile(self):
+        """A compiled model cannot reach the context-gated FlashInfer dispatch."""
+        flashinfer_module = ModuleType("flashinfer")
+        flashinfer_module.mm_mxfp8 = Mock()
+        flashinfer_autotuner_module = ModuleType("flashinfer.autotuner")
+        flashinfer_autotuner_module.autotune = Mock()
+        flashinfer_module.autotuner = flashinfer_autotuner_module
+
+        with (
+            patch.dict(
+                sys.modules,
+                {
+                    "flashinfer": flashinfer_module,
+                    "flashinfer.autotuner": flashinfer_autotuner_module,
+                },
+            ),
+            patch(
+                "tensorrt_llm._torch.modules.linear._mxfp8_cutlass_op_available",
+                return_value=True,
+            ),
+            patch.dict("os.environ", {}, clear=True),
+        ):
+            method = MXFP8LinearMethod()
+            engine = SimpleNamespace(
+                llm_args=SimpleNamespace(enable_autotuner=False),
+                cuda_graph_runner=SimpleNamespace(enabled=True),
+                _torch_compile_enabled=True,
+                model=SimpleNamespace(
+                    modules=lambda: [
+                        SimpleNamespace(_use_flashinfer_mxfp8_decode_graph_default=True),
+                        SimpleNamespace(quant_method=method),
+                    ]
+                ),
+                forward=Mock(),
+            )
+
+            PyTorchModelEngine._run_autotuner_warmup(engine, Mock())
+
+        self.assertEqual(method.backend, "trtllm")
+        self.assertFalse(method._flashinfer_autotuned)
+        flashinfer_autotuner_module.autotune.assert_not_called()
+        engine.forward.assert_not_called()
 
     def test_native_mxfp8_retries_after_missing_warmup_batch(self):
         """MXFP8 tuning remains pending until a warmup forward can run."""

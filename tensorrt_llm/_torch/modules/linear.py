@@ -33,7 +33,7 @@ from tensorrt_llm.quantization.utils.fp8_utils import (
 from ..._utils import get_sm_version, is_sm_100f
 from ...models.modeling_utils import QuantConfig
 from ..utils import (Fp4QuantizedTensor, get_model_extra_attrs,
-                     is_nvfp4_marlin_enabled,
+                     is_nvfp4_marlin_enabled, is_torch_compiling,
                      replace_parameter_and_save_metadata, unswizzle_sf)
 
 
@@ -3075,8 +3075,8 @@ class MXFP8LinearMethod(LinearMethodBase):
         MXFP8 activation quantize + block-scaled e4m3xe4m3 GEMM.
       - FlashInfer: reuse the CUTLASS-layout activations, weights, and scales
         with ``mm_mxfp8``. MiniMax-M3 enables this path automatically only
-        while tuning or capturing decode CUDA graphs; eager execution remains
-        on the native TensorRT-LLM op.
+        while tuning or capturing decode CUDA graphs; eager execution and
+        torch.compile remain on the native TensorRT-LLM op.
 
     ``TRTLLM_MXFP8_GEMM_BACKEND`` can explicitly select ``trtllm``,
     ``flashinfer``, or ``auto``. The reference layout is 2D [O,K/32]; both
@@ -3211,8 +3211,12 @@ class MXFP8LinearMethod(LinearMethodBase):
             # the CUTLASS block-scaled e4m3xe4m3 GEMM.
             act_e4m3, act_sf = torch.ops.trtllm.mxfp8_quantize(
                 input.contiguous(), True)
+            # The automatic path switches per call on context state, which
+            # Dynamo cannot trace (and could not honor anyway, since the
+            # decision would be baked into the compiled graph). A compiled
+            # model therefore stays on the native backend.
             use_flashinfer = self.backend == "flashinfer" or (
-                self.backend == "auto" and
+                self.backend == "auto" and not is_torch_compiling() and
                 (_FLASHINFER_MXFP8_AUTOTUNE_ACTIVE.get() or
                  (self._flashinfer_autotuned
                   and _FLASHINFER_MXFP8_DECODE_GRAPH_CAPTURE_ACTIVE.get())))
