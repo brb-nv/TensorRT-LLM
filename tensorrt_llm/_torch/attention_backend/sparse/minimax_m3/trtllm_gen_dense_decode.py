@@ -20,6 +20,7 @@ point the generic path calls.
 
 from __future__ import annotations
 
+import functools
 from typing import Optional
 
 import torch
@@ -27,9 +28,21 @@ import torch
 from tensorrt_llm._torch.memory_buffer_utils import get_memory_buffers
 
 
-def _multi_processor_count(device: torch.device) -> int:
-    index = device.index if device.index is not None else torch.cuda.current_device()
-    return torch.cuda.get_device_properties(index).multi_processor_count
+@functools.lru_cache(maxsize=None)
+def _counter_size(num_heads: int, max_num_requests: int, device_index: int) -> int:
+    """Byte size of the multi-CTA KV counter block.
+
+    Cached like the workspace size below: it depends only on the head count,
+    the request bound and the device's SM count, none of which move during a
+    run, while computing it reaches C++ through a deferred import and a
+    device-properties query on every dense layer of every step.
+    """
+    from tensorrt_llm._torch.attention_backend.fmha.flashinfer_trtllm_gen import (
+        _get_multi_ctas_kv_counter_size,
+    )
+
+    multi_processor_count = torch.cuda.get_device_properties(device_index).multi_processor_count
+    return int(_get_multi_ctas_kv_counter_size(num_heads, max_num_requests, multi_processor_count))
 
 
 def _counter_buffer(
@@ -42,15 +55,9 @@ def _counter_buffer(
     back uninitialized memory, so the zeroing is per call rather than per
     allocation; a few KB of memset costs nothing next to the kernel it feeds.
     """
-    from tensorrt_llm._torch.attention_backend.fmha.flashinfer_trtllm_gen import (
-        _get_multi_ctas_kv_counter_size,
-    )
-
-    size = _get_multi_ctas_kv_counter_size(
-        num_heads, max_num_requests, _multi_processor_count(device)
-    )
+    device_index = device.index if device.index is not None else torch.cuda.current_device()
     counters = get_memory_buffers().get_buffer(
-        [size],
+        [_counter_size(num_heads, max_num_requests, device_index)],
         torch.uint8,
         buffer_name="m3_trtllm_gen_kv_counters",
         reserve_buffer=reserve,
@@ -59,11 +66,14 @@ def _counter_buffer(
     return counters
 
 
+@functools.lru_cache(maxsize=None)
 def _workspace(q_dtype: torch.dtype, num_heads: int, head_dim: int, num_kv_heads: int) -> int:
     """Byte size of the trtllm-gen scratch slab.
 
     It is a fixed slab (kTrtllmGenWorkspaceSize), independent of the batch, but
-    the size is read from the C++ layout rather than hardcoded.
+    the size is read from the C++ layout rather than hardcoded. Cached so that
+    read, and the layout dict it builds, happen once instead of once per dense
+    layer per step.
     """
     from tensorrt_llm._torch.attention_backend.fmha.flashinfer_trtllm_gen import (
         _get_generation_workspace_layout,
@@ -193,6 +203,20 @@ def minimax_m3_trtllm_gen_dense_decode(
     )
 
 
+@functools.lru_cache(maxsize=1)
+def _flashinfer_available() -> bool:
+    """Whether flashinfer can be imported, resolved once for the process.
+
+    The verdict below is consulted once per step by prepare() and again per
+    dense layer, so the import statement would otherwise be on the hot path.
+    """
+    try:
+        import flashinfer  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
 def dense_decode_unsupported_reason(kv_cache_manager, head_dim: int) -> Optional[str]:
     """Return None when the geometry is supported, else why it is not.
 
@@ -203,9 +227,7 @@ def dense_decode_unsupported_reason(kv_cache_manager, head_dim: int) -> Optional
         return "the KV cache manager does not expose a flat sub-page pool."
     if int(head_dim) != 128:
         return f"head_dim {int(head_dim)}; only 128 has trtllm-gen H128 cubins."
-    try:
-        import flashinfer  # noqa: F401
-    except ImportError:
+    if not _flashinfer_available():
         return "flashinfer is not installed."
     return None
 

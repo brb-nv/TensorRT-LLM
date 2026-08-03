@@ -17,6 +17,7 @@ Results are [total_q, num_kv_heads, topk] int32, ascending with -1 padding.
 
 from __future__ import annotations
 
+import functools
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -32,6 +33,7 @@ if TYPE_CHECKING:
     from .common import MiniMaxM3SparseConfig
 
 
+@functools.lru_cache(maxsize=1)
 def cutedsl_score_runner():
     """Return the CuTe DSL indexer scoring runner, or None if unavailable.
 
@@ -39,6 +41,9 @@ def cutedsl_score_runner():
     importable, so this stays a soft dependency. prepare() consults the same
     runner to decide whether to skip the fmha_sm100 proxy plan, so the answer
     here and there must come from one place.
+
+    Resolved once for the process: package availability cannot change under a
+    running model, and every sparse layer of every step scores through here.
     """
     try:
         from tensorrt_llm._torch.custom_ops import cute_dsl_custom_ops
