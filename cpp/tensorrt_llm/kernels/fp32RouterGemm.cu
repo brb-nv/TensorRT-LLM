@@ -28,6 +28,10 @@
 // invokeFp32RouterGemm, follow the fp32 router GEMM in vLLM (Apache-2.0),
 // csrc/libtorch_stable/fp32_router_gemm.cu, added in
 // https://github.com/vllm-project/vllm/pull/48335.
+//
+// One deliberate difference: the PDL completion trigger stays at kernel end
+// rather than firing right after the grid-dependency wait, so a PDL consumer
+// that grid-syncs before reading the logits cannot observe unwritten output.
 
 #include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
@@ -230,6 +234,14 @@ void invokeFp32RouterGemm(float* output, InputT const* mat_a, float const* mat_b
     //   kNumTokens <= 5 or odd     : 384 threads, 1 token group
     // Only applied on Blackwell, where it was measured; earlier architectures
     // and fp32 activation keep the legacy geometry.
+    //
+    // Four token groups for kNumTokens divisible by 4 was measured on B200 and
+    // is not worth it, so the sweep stays at two: at 1024 threads per block
+    // __launch_bounds__ caps the kernel at 65536 / 1024 == 64 registers per
+    // thread and nvcc spills 16 to 48 bytes, costing 7 to 16%; capping the K
+    // loop unroll clears the spill but gives back the gain, and 768 threads
+    // never spills but lands within 3% of two groups. See `--verify` and
+    // `--regs` in tests/microbenchmarks/fp32_router_gemm.py to re-measure.
     if constexpr (std::is_same_v<InputT, __nv_bfloat16> && kNumExperts == 128 && kHiddenDim == 6144)
     {
         if (tensorrt_llm::common::getSMVersion() < 100)
