@@ -221,6 +221,11 @@ def _register_fake():
             shape, dtype=out_dtype if out_dtype is not None else mat_a.dtype)
         return ret
 
+    @torch.library.register_fake("trtllm::fp32_router_gemm")
+    def _(mat_a, mat_b):
+        return mat_a.new_empty((mat_a.shape[0], mat_b.shape[0]),
+                               dtype=torch.float32)
+
     @torch.library.register_fake("trtllm::dsv3_fused_a_gemm_op")
     def _(mat_a, mat_b, bias, out_dtype):
         shape = list(mat_a.shape)
