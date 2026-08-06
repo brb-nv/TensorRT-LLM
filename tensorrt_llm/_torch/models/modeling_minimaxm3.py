@@ -30,7 +30,7 @@ from torch import nn
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from transformers import PretrainedConfig
 
-from tensorrt_llm._utils import nvtx_range_debug
+from tensorrt_llm._utils import get_sm_version, nvtx_range_debug
 from tensorrt_llm.functional import AllReduceStrategy, PositionEmbeddingType
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -80,6 +80,12 @@ from .modeling_utils import DecoderModel, ModelConfig, filter_weights, register_
 # Limit backends to memory-efficient and math; cuDNN SDPA fails for this layout,
 # and flash SDPA does not accept attn_mask.
 _DENSE_SDPA_BACKENDS = [SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]
+
+# ``trtllm::fp32_router_gemm`` is explicitly instantiated per
+# ``(num_experts, hidden_dim)`` and per token count; keep these in sync with
+# cpp/tensorrt_llm/kernels/fp32RouterGemm.cu.
+_FP32_ROUTER_GEMM_SHAPES = frozenset({(128, 6144)})
+_FP32_ROUTER_GEMM_MAX_TOKENS = 32
 
 # Experimental A/B gate for producing compact FP8 Q while inserting main K/V
 # directly into the MSA paged cache during supported eager pure-prefill steps.
@@ -500,9 +506,24 @@ class MiniMaxM3Gate(nn.Module):
             torch.empty((num_experts,), dtype=torch.float32),
             requires_grad=False,
         )
+        self._use_fp32_router_gemm = (
+            get_sm_version() >= 90
+            and (num_experts, hidden_size) in _FP32_ROUTER_GEMM_SHAPES
+        )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        # Router runs in fp32 to match SGLang.
+        # Router runs in fp32 to match SGLang. The generic path casts the
+        # activation and hands cuBLAS a skinny fp32 GEMM, which for the decode
+        # token counts we care about is latency-bound on the cast plus the
+        # launch. trtllm::fp32_router_gemm fuses the widening into the GEMM and
+        # is instantiated only for this weight shape and num_tokens <= 32.
+        if (
+            self._use_fp32_router_gemm
+            and hidden_states.dim() == 2
+            and hidden_states.shape[0] <= _FP32_ROUTER_GEMM_MAX_TOKENS
+            and hidden_states.dtype in (torch.bfloat16, torch.float32)
+        ):
+            return torch.ops.trtllm.fp32_router_gemm(hidden_states.contiguous(), self.weight)
         return torch.nn.functional.linear(hidden_states.to(torch.float32), self.weight)
 
     def load_weights(self, weights: List[Dict]):
