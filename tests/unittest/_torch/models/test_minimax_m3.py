@@ -31,6 +31,7 @@ from torch import nn
 from transformers import AutoConfig
 from utils.llm_data import llm_models_root
 
+import tensorrt_llm._torch.models.modeling_minimaxm3 as minimax_m3_module
 from tensorrt_llm._torch.attention_backend.sparse.minimax_m3 import MiniMaxM3MsaSparseAttention
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.checkpoints.hf.minimaxm3_weight_mapper import (
@@ -104,6 +105,26 @@ def test_model_init_validates_sparse_attention_runtime_config() -> None:
 
     with pytest.raises(ValueError, match="algorithm='minimax_m3'"):
         MiniMaxM3Model(model_config)
+def test_minimax_m3_fused_sparse_producer_fake_shapes(monkeypatch):
+    """The compile-time custom-op contract returns compact FP8 Q tensors."""
+    attention = SimpleNamespace(q_size=512, index_q_size=128)
+    monkeypatch.setattr(
+        minimax_m3_module,
+        "_extract_minimax_m3_attention_extra_attrs",
+        lambda _layer_idx: (None, attention),
+    )
+    hidden_states = torch.empty((7, 256), dtype=torch.bfloat16)
+
+    q, index_q = minimax_m3_module._minimax_m3_fused_sparse_qkv_producer_fake(
+        hidden_states,
+        position_ids=None,
+        layer_idx="3",
+    )
+
+    assert q.shape == (7, 512)
+    assert index_q.shape == (7, 128)
+    assert q.dtype == torch.float8_e4m3fn
+    assert index_q.dtype == torch.float8_e4m3fn
 
 
 def _make_text_config():
