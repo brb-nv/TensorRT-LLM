@@ -1672,6 +1672,19 @@ class KvCacheCreator:
                            self._kv_cache_config)
         return is_vswa_enabled(kv_cache_config)
 
+    @staticmethod
+    def _drop_explicit_host_cache_size(
+        kv_cache_config: Optional[KvCacheConfig]
+    ) -> Optional[KvCacheConfig]:
+        """Return *kv_cache_config* with any explicit ``host_cache_size`` unset.
+
+        Leaving it unset hands sizing to the V2 auto host tier policy, which
+        matches the tier to the manager's own device quota.
+        """
+        if kv_cache_config is None or not kv_cache_config.host_cache_size:
+            return kv_cache_config
+        return kv_cache_config.model_copy(update={"host_cache_size": None})
+
     def build_managers(self,
                        resources: Dict,
                        estimating_kv_cache: bool = False) -> None:
@@ -1690,17 +1703,34 @@ class KvCacheCreator:
             self_kv_cache_config, cross_kv_cache_config = self._split_kv_cache_budget_for_cross(
             )
 
-        # Split combined KV cache budgets before creating managers. Skip during
-        # estimation — estimation uses max_tokens-based logic and must not
-        # mutate the config.
+        # Estimation managers are throwaway probes: their GPU pool only has to
+        # hold the dummy requests and is torn down right after. host_cache_size
+        # is honored verbatim by every manager, and HostMem prefaults and
+        # page-locks the tier at construction, so a probe would pin the full
+        # configured budget for the whole estimation pass to back a cache it
+        # cannot fill. Leave it unset so the auto policy sizes the probe's tier
+        # from its own device quota, which also bounds all co-located ranks
+        # together to half of available host memory.
+        if estimating_kv_cache:
+            self_kv_cache_config = self._drop_explicit_host_cache_size(
+                self_kv_cache_config)
+            cross_kv_cache_config = self._drop_explicit_host_cache_size(
+                cross_kv_cache_config)
+
+        # Split combined KV cache budgets before creating managers.
         has_draft = (
             self._draft_model_engine is not None  # two-model
             or self._should_create_separate_draft_kv_cache())  # one-model
         draft_kv_cache_config = None
-        if not estimating_kv_cache and has_draft:
+        if has_draft:
             # Used when each manager sizes pools from max_gpu_total_bytes (V2
             # and V1 VSWA). V1 non-VSWA GPU uses shared max_tokens instead.
-            if self._needs_gpu_kv_cache_budget_split(self_kv_cache_config):
+            # Skipped during estimation, which sizes GPU pools from max_tokens
+            # rather than from max_gpu_total_bytes.
+            needs_gpu_split = (
+                not estimating_kv_cache
+                and self._needs_gpu_kv_cache_budget_split(self_kv_cache_config))
+            if needs_gpu_split:
                 self_kv_cache_config, draft_kv_cache_config = (
                     self._split_kv_cache_budget_for_draft(
                         "max_gpu_total_bytes", self_kv_cache_config,
@@ -1709,7 +1739,10 @@ class KvCacheCreator:
             v2_two_model = (self._is_kv_cache_manager_v2
                             and self._draft_model_engine is not None)
             if not v2_two_model:
-                # Each manager sizes its host pool from host_cache_size directly.
+                # Each manager sizes its host pool from host_cache_size
+                # directly and target and draft are alive at the same time, so
+                # without the split both pin the full budget and the node needs
+                # twice the configured memory.
                 self_kv_cache_config, draft_kv_cache_config = (
                     self._split_kv_cache_budget_for_draft(
                         "host_cache_size", self_kv_cache_config,

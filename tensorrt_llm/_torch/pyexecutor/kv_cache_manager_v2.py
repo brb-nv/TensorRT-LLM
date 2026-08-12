@@ -233,6 +233,46 @@ def _estimate_full_attn_size_per_token(
     )
 
 
+def _format_host_memory() -> str:
+    """Summarize node memory composition for host tier sizing diagnostics.
+
+    Reports MemFree and MemAvailable separately: auto sizing reads free pages
+    (``SC_AVPHYS_PAGES``), which exclude reclaimable page cache, so a node
+    holding a large checkpoint in page cache looks far fuller than it is to a
+    new allocation. Cached quantifies that gap, and Unevictable accounts for
+    memory already pinned beyond the reach of reclaim.
+    """
+    wanted = ("MemTotal", "MemFree", "MemAvailable", "Cached", "AnonPages", "Unevictable")
+    try:
+        with open("/proc/meminfo") as f:
+            values = {}
+            for line in f:
+                name, _, rest = line.partition(":")
+                if name in wanted:
+                    values[name] = int(rest.split()[0]) / (1 << 20)
+    except (OSError, ValueError, IndexError):
+        return "node memory unavailable"
+    return "node " + " ".join(f"{name}={values[name]:.2f}GiB" for name in wanted if name in values)
+
+
+def _format_memlock_limit() -> str:
+    """Report RLIMIT_MEMLOCK, the ceiling on how much a rank can page-lock.
+
+    Auto sizing caps itself against this limit, but an explicitly configured
+    host_cache_size does not, so record it to separate a pinning refusal from a
+    genuine shortage of memory.
+    """
+    import resource
+
+    try:
+        soft, _hard = resource.getrlimit(resource.RLIMIT_MEMLOCK)
+    except (ValueError, OSError):
+        return "memlock=unknown"
+    if soft == resource.RLIM_INFINITY:
+        return "memlock=unlimited"
+    return f"memlock={soft / (1 << 30):.2f}GiB"
+
+
 def _compute_auto_host_tier_quota(
     quota: int,
     local_ranks: int,
@@ -980,6 +1020,7 @@ class KVCacheManagerV2(BaseResourceManager):
         logger.info(f"KV cache manager v2 device quota set to {quota / (1 << 30)}GiB")
 
         cache_tiers: List[CacheTierConfig] = [GpuCacheTierConfig(quota=int(quota))]
+        local_ranks = max(1, Distributed.get(mapping).local_world_size)
         if kv_cache_config.host_cache_size is not None and kv_cache_config.host_cache_size >= 0:
             host_quota = kv_cache_config.host_cache_size
         else:
@@ -1000,8 +1041,6 @@ class KVCacheManagerV2(BaseResourceManager):
             # co-located ranks each reserving a device-quota-sized block can
             # OOM the host (observed on GB300 NVL72 with 4 ranks/node and
             # ~170GiB device quota each on a 975GiB node).
-            local_ranks = max(1, Distributed.get(mapping).local_world_size)
-
             try:
                 mem_available = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_AVPHYS_PAGES")
             except (ValueError, OSError):
@@ -1023,6 +1062,17 @@ class KVCacheManagerV2(BaseResourceManager):
             cache_tiers.append(HostCacheTierConfig(quota=int(host_quota)))
             logger.info(
                 f"KV cache manager v2 host cache quota set to {host_quota / (1 << 30):.2f}GiB"
+            )
+            # Each co-located rank pins its own host tier, so the quantity that
+            # has to fit on the node is the quota times the local rank count.
+            # An explicitly configured host_cache_size bypasses the auto sizing
+            # caps above, which makes this the only record of whether the
+            # request was ever satisfiable on this node.
+            logger.info(
+                f"KV cache manager v2 host tier node budget: "
+                f"per-rank {host_quota / (1 << 30):.2f}GiB x {local_ranks} local rank(s) "
+                f"= {host_quota * local_ranks / (1 << 30):.2f}GiB demanded, "
+                f"{_format_host_memory()}, {_format_memlock_limit()}"
             )
         disk_cache_size = kv_cache_config.disk_cache_size
         if disk_cache_size is not None and disk_cache_size > 0:

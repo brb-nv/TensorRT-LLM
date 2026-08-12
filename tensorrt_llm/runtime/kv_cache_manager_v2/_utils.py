@@ -23,6 +23,7 @@ import operator
 import os
 import platform
 import sys
+import time
 import traceback
 import warnings
 import weakref
@@ -420,6 +421,77 @@ PREFAULT_THREADS: Final[int] = int(
 )
 
 
+# TLLM_KV_CACHE_MANAGER_V2_MEM_TRACE=1 logs host memory accounting around every
+# stage of host pool allocation. Populating a pool moves memory between kernel
+# accounting buckets (reclaimable page cache -> anonymous -> unevictable once
+# pinned), and a post-mortem OOM message cannot distinguish a pool that is too
+# large from a pool that merely failed to reclaim page cache in time, so the
+# trace records the transitions rather than the end state.
+MEM_TRACE: Final[bool] = os.environ.get("TLLM_KV_CACHE_MANAGER_V2_MEM_TRACE", "0") == "1"
+
+# MemAvailable estimates what a new allocation can get including reclaim;
+# MemFree excludes reclaimable page cache. Auto host tier sizing reads free
+# pages, so both are needed to tell a real shortage from a conservative one.
+_MEMINFO_FIELDS: Final[tuple[str, ...]] = (
+    "MemTotal",
+    "MemFree",
+    "MemAvailable",
+    "Cached",
+    "AnonPages",
+    "Mapped",
+    "Shmem",
+    "Dirty",
+    "Unevictable",
+    "Mlocked",
+    "SReclaimable",
+    "AnonHugePages",
+    "Committed_AS",
+)
+# VmLck and VmPin are the two ways a page becomes unevictable: mlock and
+# cuMemHostRegister respectively. Host pools land in VmPin.
+_STATUS_FIELDS: Final[tuple[str, ...]] = ("RssAnon", "RssFile", "VmLck", "VmPin", "VmHWM")
+
+_GIB: Final[float] = float(1 << 30)
+_live_host_pool_bytes: int = 0
+
+
+def _read_kib_fields(path: str, fields: Sequence[str]) -> dict[str, int]:
+    """Parse the `Name: <value> kB` format shared by meminfo and proc status."""
+    wanted = set(fields)
+    out: dict[str, int] = {}
+    try:
+        with open(path) as f:
+            for line in f:
+                name, _, rest = line.partition(":")
+                if name in wanted:
+                    out[name] = int(rest.split()[0])
+    except (OSError, ValueError, IndexError):
+        pass
+    return out
+
+
+def _mem_trace(phase: str, req_bytes: int, elapsed: float | None = None) -> None:
+    if not MEM_TRACE:
+        return
+    node = _read_kib_fields("/proc/meminfo", _MEMINFO_FIELDS)
+    proc = _read_kib_fields("/proc/self/status", _STATUS_FIELDS)
+    fields = [
+        f"phase={phase}",
+        f"pid={os.getpid()}",
+        f"req_GiB={req_bytes / _GIB:.2f}",
+        f"live_pools_GiB={_live_host_pool_bytes / _GIB:.2f}",
+    ]
+    if elapsed is not None:
+        fields.append(f"dt_s={elapsed:.2f}")
+    for name in _MEMINFO_FIELDS:
+        if name in node:
+            fields.append(f"{name}={node[name] / (1 << 20):.2f}")
+    for name in _STATUS_FIELDS:
+        if name in proc:
+            fields.append(f"self_{name}={proc[name] / (1 << 20):.2f}")
+    print("KVHOSTMEM " + " ".join(fields), file=sys.stderr, flush=True)
+
+
 def _madvise(ptr: int, size: int, advice: int) -> None:
     if os.name == "nt":
         return
@@ -519,12 +591,14 @@ class HostMem:
         return self._size
 
     def __init__(self, size: int) -> None:
+        global _live_host_pool_bytes
         self._num_registered_chunks = 0
         if size == 0:
             self._address = 0
             self._size = 0
             return
 
+        _mem_trace("pre_mmap", size)
         # Allocate with standard mmap (4KB alignment)
         self._address = _mmap(size)
         assert self._address % self.ALIGNMENT == 0
@@ -533,13 +607,30 @@ class HostMem:
         # Opportunistically advise huge pages for the whole range.
         # The kernel will use huge pages for aligned 2MB chunks within this range.
         _madvise(self._address, self._size, MADV_HUGEPAGE if USE_THP else MADV_NOHUGEPAGE)
+        _mem_trace("post_mmap", size)
 
         if PREFAULT_THREADS > 0:
-            self._parallel_prefault(PREFAULT_THREADS)
-        self._register_to_cuda()
+            start = time.monotonic()
+            try:
+                self._parallel_prefault(PREFAULT_THREADS)
+            except BaseException:
+                _mem_trace("prefault_failed", size, time.monotonic() - start)
+                raise
+            _mem_trace("post_prefault", size, time.monotonic() - start)
+        start = time.monotonic()
+        try:
+            self._register_to_cuda()
+        except BaseException:
+            _mem_trace("register_failed", size, time.monotonic() - start)
+            raise
+        _live_host_pool_bytes += size
+        _mem_trace("post_register", size, time.monotonic() - start)
 
     def resize(self, new_size: int) -> None:
+        global _live_host_pool_bytes
+        _mem_trace("pre_resize", new_size)
         self._unregister_from_cuda()
+        _live_host_pool_bytes -= self._size
         try:
             self._address = _mremap(self._address, self._size, new_size)
             assert self._address % self.ALIGNMENT == 0
@@ -549,12 +640,17 @@ class HostMem:
             _madvise(self._address, self._size, MADV_HUGEPAGE if USE_THP else MADV_NOHUGEPAGE)
         finally:
             self._register_to_cuda()
+            _live_host_pool_bytes += self._size
+        _mem_trace("post_resize", new_size)
 
     def destroy(self) -> None:
+        global _live_host_pool_bytes
         if self._address == 0:
             return
         self._unregister_from_cuda()
         _munmap(self._address, self._size)
+        _live_host_pool_bytes -= self._size
+        _mem_trace("post_destroy", self._size)
         self._address = 0
         self._size = 0
 
