@@ -200,6 +200,14 @@ def remove_subtree(root: "Block") -> None:
                 break
             assert isinstance(prev_block, Block)
             block = prev_block
+    if _dyn_trace.ENABLED:
+        # Every block here stops being reusable, and none of them reach the page
+        # destructor's hook: _release_pages() nulls the page's back-pointer first,
+        # so the page dies not knowing which block it belonged to. Dropping one
+        # full-attention page prunes the whole subtree under it, so without this
+        # the collateral blocks would later look like blocks never cached --
+        # understating precisely the eviction cost being measured.
+        _dyn_trace.record_prune(removed_block_hashes)
     if event_manager is not None:
         event_manager.add_removed_event(removed_block_hashes)
 

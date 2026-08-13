@@ -72,6 +72,17 @@ check("unlink did not inflate drop counts", st.drops[1], 2)
 dyn.record_match(KEYS[:4], 0, 0)
 check("its later miss is eviction-induced", st.evicted, 5)
 
+print("\n5b. a pruned subtree enters the ghost too")
+# Blocks invalidated as collateral of a drop never reach the page destructor, so
+# a later miss on one would look cold unless the prune itself is recorded.
+dyn.record_match(KEYS[4:7], 3, 3)  # cache them so they have hit counts
+dyn.record_prune(KEYS[4:7])
+check("collateral blocks counted apart from drops", st.pruned_tree, 3)
+check("drop counts untouched", st.drops[1], 2)
+before = st.evicted
+dyn.record_match(KEYS[4:7], 0, 0)
+check("their later misses are eviction-induced", st.evicted - before, 3)
+
 print("\n6. ghost capacity is enforced and reported")
 dyn.record_drop(KEYS[3:8], level=1, free_frac=0.5)
 check("ghost stays at the cap", len(st.ghost), 4)

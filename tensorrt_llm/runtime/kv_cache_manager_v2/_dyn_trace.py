@@ -134,6 +134,7 @@ class _State:
         "last_emit",
         "matched",
         "pruned",
+        "pruned_tree",
         "requested",
         "requests",
         "start",
@@ -160,6 +161,7 @@ class _State:
         self.cold = 0  # misses on blocks never cached
         self.ghost_full = 0  # keys forgotten because the ghost was at capacity
         self.unlinked = 0  # blocks lost outside the allocator's drop path
+        self.pruned_tree = 0  # blocks invalidated as collateral of a drop
         self.drops: list[int] = []  # indexed by cache level
         self.age = _Ring()  # seconds between a block's death and its re-request
         self.hits_at_death = _Ring()
@@ -186,6 +188,7 @@ class _State:
         self.cold = 0
         self.ghost_full = 0
         self.unlinked = 0
+        self.pruned_tree = 0
         self.drops = [0] * len(self.drops)
         self.age.clear()
         self.hits_at_death.clear()
@@ -267,6 +270,22 @@ def record_drop(keys: Iterable[bytes], level: int, free_frac: float = -1.0) -> N
             st.level_ring(level).add(free_frac)
 
 
+def record_prune(keys: Sequence[bytes]) -> None:
+    """Record a whole subtree of blocks removed from the reusable set at once.
+
+    Counted apart from the allocator's drops because these are consequences of
+    one, not independent decisions: losing a block's page invalidates everything
+    cached beneath it, since a longer prefix is unusable without its start.
+    """
+    if _state is None or not keys:
+        return
+    st = _state
+    death_ms = int((time.monotonic() - st.start) * 1000.0)
+    for key in keys:
+        _remember(st, _key64(key), death_ms)
+    st.pruned_tree += len(keys)
+
+
 def record_unlink(key: bytes) -> None:
     """Record a block that lost its page without passing through the allocator.
 
@@ -312,6 +331,7 @@ def _emit(now: float) -> None:
         f"ghost={len(st.ghost)}",
         f"ghost_full={st.ghost_full}",
         f"unlinked={st.unlinked}",
+        f"pruned_tree={st.pruned_tree}",
         f"tracked_hits={len(st.hits)}",
     ]
     for level, count in enumerate(st.drops):
