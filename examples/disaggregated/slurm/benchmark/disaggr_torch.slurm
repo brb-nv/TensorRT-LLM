@@ -101,7 +101,7 @@ elif [ -d "${trtllm_repo}" ]; then
 
     if [ "${build_wheel}" = "true" ]; then
         echo "Building TensorRT-LLM wheel on one node..."
-        build_command="python3 ./scripts/build_wheel.py --trt_root /usr/local/tensorrt --use_ccache --clean"
+        build_command="python3 ./scripts/build_wheel.py --use_ccache"
         if [ -n "${cuda_architectures:-}" ]; then
             build_command="${build_command} --cuda_architectures \"${cuda_architectures}\""
         fi
@@ -161,6 +161,20 @@ for base_file in "${full_logdir}"/hostfile_*_base.txt "${full_logdir}"/gpu_map_*
     runtime_file="${base_file%_base.txt}.txt"
     replace_placeholder "${base_file}" "${all_nodes_str}" "${runtime_file}"
 done
+
+# Sample host memory composition on every node for the whole run. Started
+# before the workers so the trace covers weight loading, which is when page
+# cache grows, and KV cache host tier allocation, which is where host OOM kills
+# have happened. Runs outside the container to see every process on the node.
+mem_sampler_script=${work_dir}/host_mem_sampler.sh
+if [ -f "${mem_sampler_script}" ]; then
+    echo "Starting host memory sampler on ${SLURM_NNODES} node(s)..."
+    srun -l --overlap -N $SLURM_NNODES --ntasks-per-node=1 \
+        bash "${mem_sampler_script}" "${full_logdir}" "${host_mem_sample_interval:-1}" \
+        &> ${full_logdir}/0_host_mem_sampler.log &
+else
+    echo "Host memory sampler not found at ${mem_sampler_script}, skipping"
+fi
 
 # start the servers (skip ctx workers if TRTLLM_DISAGG_BENCHMARK_GEN_ONLY is set).
 echo "Starting worker commands from ${start_server_cmds_file}..."

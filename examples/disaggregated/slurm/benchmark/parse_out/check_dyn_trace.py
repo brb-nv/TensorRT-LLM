@@ -1,0 +1,95 @@
+#!/usr/bin/env python3
+"""Offline check of the KV dynamics trace bookkeeping.
+
+Loads _dyn_trace.py in isolation (it depends only on the standard library) and
+drives it through the sequences that matter, so the accounting can be trusted
+before a wheel is built around it.
+"""
+
+import hashlib
+import importlib.util
+import os
+import pathlib
+import sys
+
+os.environ["TLLM_KV_DYN_TRACE"] = "1"
+os.environ["TLLM_KV_DYN_TRACE_INTERVAL_S"] = "3600"  # emit only when we ask
+os.environ["TLLM_KV_DYN_GHOST_CAP"] = "4"
+os.environ["TLLM_KV_DYN_PAGE_FRAC"] = "1"
+
+SRC = (pathlib.Path(__file__).resolve().parents[5]
+       / "tensorrt_llm/runtime/kv_cache_manager_v2/_dyn_trace.py")
+spec = importlib.util.spec_from_file_location("_dyn_trace", SRC)
+assert spec is not None and spec.loader is not None
+dyn = importlib.util.module_from_spec(spec)
+sys.modules["_dyn_trace"] = dyn
+spec.loader.exec_module(dyn)
+
+lines: list = []
+dyn._log = lines.append  # the real one pulls in tensorrt_llm.logger
+
+KEYS = [hashlib.sha256(str(i).encode()).digest() for i in range(8)]
+st = dyn._state
+failures = []
+
+
+def check(label, got, want):
+    if got != want:
+        failures.append(f"{label}: got {got!r}, want {want!r}")
+    print(f"  {'ok  ' if got == want else 'FAIL'} {label} = {got!r}")
+
+
+print("1. cold lookup: nothing has ever been cached")
+dyn.record_match(KEYS[:4], 0, 0)
+check("requests", st.requests, 1)
+check("blocks wanted", st.requested, 4)
+check("cold misses", st.cold, 4)
+check("eviction-induced misses", st.evicted, 0)
+
+print("\n2. partial hit, two blocks usable")
+dyn.record_match(KEYS[:4], 2, 2)
+check("blocks matched", st.matched, 2)
+check("cold misses accumulate", st.cold, 6)
+check("hits tracked for matched blocks", len(st.hits), 2)
+
+print("\n3. allocator drops the two matched blocks")
+dyn.record_drop(KEYS[:2], level=1, free_frac=0.02)
+check("drops at level 1", st.drops[1], 2)
+check("ghost holds both", len(st.ghost), 2)
+check("hit counts moved out of the live map", len(st.hits), 0)
+check("per-page lines emitted", len([x for x in lines if "KVDYNPAGE" in x]), 2)
+check("served count reached the sample ring", st.hits_at_death.count, 2)
+
+print("\n4. the same prefix is wanted again")
+dyn.record_match(KEYS[:4], 0, 0)
+check("dropped blocks attributed to eviction", st.evicted, 2)
+check("never-cached blocks still cold", st.cold, 8)
+
+print("\n5. structural loss also enters the ghost")
+dyn.record_unlink(KEYS[2])
+check("unlink counted separately from drops", st.unlinked, 1)
+check("unlink did not inflate drop counts", st.drops[1], 2)
+dyn.record_match(KEYS[:4], 0, 0)
+check("its later miss is eviction-induced", st.evicted, 5)
+
+print("\n6. ghost capacity is enforced and reported")
+dyn.record_drop(KEYS[3:8], level=1, free_frac=0.5)
+check("ghost stays at the cap", len(st.ghost), 4)
+check("forgotten keys are counted", st.ghost_full > 0, True)
+
+print("\n7. summary line")
+dyn._emit(dyn.time.monotonic())
+summary = [x for x in lines if x.startswith("KVDYN ")][-1]
+print("  " + summary)
+check("window counters reset after emit", (st.requests, st.evicted, st.cold), (0, 0, 0))
+for field in ("miss_evicted=", "miss_cold=", "evicted_share=", "free_at_drop_l1_p50=",
+              "age_p50=", "served_p50=", "ghost_full=", "unlinked="):
+    check(f"reports {field}", field in summary, True)
+
+print()
+if failures:
+    print(f"FAILED ({len(failures)}):")
+    for f in failures:
+        print("  " + f)
+    sys.exit(1)
+print("all checks passed")

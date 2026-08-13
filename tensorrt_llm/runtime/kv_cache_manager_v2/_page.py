@@ -17,7 +17,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, NamedTuple, cast
 
-from . import rawref
+from . import _dyn_trace, rawref
 from ._block_radix_tree import Block
 from ._common import (
     BAD_BLOCK_ORDINAL,
@@ -277,6 +277,11 @@ class CommittedPage(Page):
         # block may be None when rebase happens, i.e. another block with the same key is committed,
         # replacing it, but the page is still used by a _KVCache.
         if block is not None and block.unlink_page(self.life_cycle, self):
+            if _dyn_trace.ENABLED:
+                # This block is no longer reusable, whatever the reason. The trace
+                # needs every such block, not just the allocator's evictions, or a
+                # later miss on one would be misread as a block never cached.
+                _dyn_trace.record_unlink(block.key)
             Block.clear_stale_blocks_after_page_unlink(
                 block,
                 self.life_cycle,
