@@ -208,6 +208,7 @@ def launch_disaggregated_llm(
     gen_extra_env: Optional[Dict[str, str]] = None,
     request_timeout_s: float = DEFAULT_REQUEST_TIMEOUT_S,
     request_max_retries: Optional[int] = None,
+    assert_worker_log_contains: Optional[str] = None,
 ):
     temp_dir = tempfile.TemporaryDirectory()
     disaggregated_serving_config_path = os.path.join(
@@ -409,6 +410,8 @@ def launch_disaggregated_llm(
 
         gen_servers.append((env, gen_server_args))
 
+    worker_log_paths: List[str] = []
+
     @contextlib.contextmanager
     def multi_popen(server_configs, server_name="", enable_redirect_log=False):
         processes = []
@@ -416,9 +419,12 @@ def launch_disaggregated_llm(
         try:
             for i, (env, args) in enumerate(server_configs):
                 if enable_redirect_log:
-                    f = open(f"output_{server_name}_{i}.log", "w+")
+                    log_path = os.path.join(temp_dir.name,
+                                            f"output_{server_name}_{i}.log")
+                    f = open(log_path, "w+")
                     proc = popen(args, env=env, stdout=f, stderr=f)
                     log_files.append(f)
+                    worker_log_paths.append(log_path)
                 else:
                     proc = popen(args, env=env)
                 processes.append(proc)
@@ -457,10 +463,15 @@ def launch_disaggregated_llm(
         print(f"Using HTTP service discovery at http://localhost:{serve_port}")
         write_worker_configs(f"http://localhost:{serve_port}")
 
+        redirect_worker_log = assert_worker_log_contains is not None
         ctx_processes = server_stack.enter_context(
-            multi_popen(ctx_servers, "ctx"))
+            multi_popen(ctx_servers,
+                        "ctx",
+                        enable_redirect_log=redirect_worker_log))
         gen_processes = server_stack.enter_context(
-            multi_popen(gen_servers, "gen"))
+            multi_popen(gen_servers,
+                        "gen",
+                        enable_redirect_log=redirect_worker_log))
 
         start_time = time.time()
         server_is_ready = False
@@ -568,9 +579,11 @@ def launch_disaggregated_llm(
                         print(line.strip())
 
         tokenizer = load_hf_tokenizer(model_name)
+        body_succeeded = False
         try:
             yield DuckLLM(args, tokenizer, generate_async,
                           f"http://localhost:{serve_port}")
+            body_succeeded = True
         finally:
             if enable_perf:
                 _show_kvcache_time(kv_cache_perf_dir)
@@ -598,6 +611,22 @@ def launch_disaggregated_llm(
                         pass  # already exited between timeout and kill
                 except OSError:
                     pass  # process already gone
+
+            if body_succeeded and assert_worker_log_contains is not None:
+                logs = {}
+                for path in worker_log_paths:
+                    with open(path) as f:
+                        logs[path] = f.read()
+                if not any(assert_worker_log_contains in log
+                           for log in logs.values()):
+                    log_tails = "".join(
+                        f"\n--- {os.path.basename(path)} (last 100 lines) ---\n"
+                        + "\n".join(log.splitlines()[-100:])
+                        for path, log in logs.items())
+                    pytest.fail(
+                        f"expected marker {assert_worker_log_contains!r} in a "
+                        f"CTX or GEN worker log, but it was absent. Worker "
+                        f"log tails:{log_tails}")
 
 
 def run_parallel_test(model_name: str,
