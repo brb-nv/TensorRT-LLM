@@ -739,6 +739,24 @@ def _copy_swa_block_offsets_with_scratch_compiled(
     output.copy_(converted.permute(0, 2, 1, 3))
 
 
+def _format_layer_id_ranges(layer_ids: Sequence[int], max_ranges: int = 8) -> str:
+    """Collapse sorted layer ids into ranges, e.g. ``[3, 4, 5, 9]`` -> ``3-5,9``.
+
+    Truncates to ``max_ranges`` so a model whose layers alternate (VSWA) does
+    not emit one range per layer; callers log the exact count alongside.
+    """
+    runs: List[List[int]] = []
+    for layer_id in sorted(layer_ids):
+        if runs and layer_id == runs[-1][1] + 1:
+            runs[-1][1] = layer_id
+        else:
+            runs.append([layer_id, layer_id])
+    formatted = [str(beg) if beg == end else f"{beg}-{end}" for beg, end in runs[:max_ranges]]
+    if len(runs) > max_ranges:
+        formatted.append("...")
+    return ",".join(formatted)
+
+
 class KVCacheManagerV2(BaseResourceManager):
     def __init__(
         self,
@@ -1472,29 +1490,55 @@ class KVCacheManagerV2(BaseResourceManager):
         }
 
     def _format_kv_cache_pool_lifecycle_entry(self, layer_id: LayerId, role: DataRole) -> str:
+        """Describe one role's placement in the storage layout.
+
+        ``pool_group_id`` identifies the life cycle (buffers allocated and
+        freed together), while ``pool_index`` identifies the memory pool
+        within that group — roles coalesce into one pool only when their
+        per-block size matches, so both are needed to read off the layout.
+        """
         attr = self.impl._storage.get_buffer_attr(layer_id, role)
         pool_group_id = self.impl._storage.get_pool_group_index(attr.life_cycle_id)
         lifecycle = self.impl._life_cycles.get_life_cycle(attr.life_cycle_id)
         return (
             f"role={str(role)}, pool_group_id={int(pool_group_id)}, "
+            f"pool_index={int(attr.pool_index)}, "
+            f"bytes_per_block={int(attr.size)}, "
             f"lifecycle_id={int(attr.life_cycle_id)}, "
             f"lifecycle={lifecycle}"
         )
 
     def _log_kv_cache_pool_lifecycle_mapping(self) -> None:
-        entries = OrderedDict()
+        """Log one line per distinct role placement, with its local layers.
+
+        Layers whose placement is identical collapse onto one line, so the
+        ``num_layers`` / ``layers`` fields are what tell a reader whether a
+        line stands for every layer or only a subset (for example MiniMax-M3's
+        ``index_key``, which only sparse layers register).
+        """
+        entries: "OrderedDict[str, List[int]]" = OrderedDict()
+        pools = set()
         for layer in self.kv_cache_manager_py_config.layers:
             for buffer in layer.buffers:
-                entries.setdefault(
-                    self._format_kv_cache_pool_lifecycle_entry(layer.layer_id, buffer.role), None
-                )
+                entry = self._format_kv_cache_pool_lifecycle_entry(layer.layer_id, buffer.role)
+                entries.setdefault(entry, []).append(int(layer.layer_id))
+                attr = self.impl._storage.get_buffer_attr(layer.layer_id, buffer.role)
+                pool_group_id = self.impl._storage.get_pool_group_index(attr.life_cycle_id)
+                pools.add((int(pool_group_id), int(attr.pool_index)))
 
         if not entries:
             return
 
-        logger.info(f"{type(self).__name__} role-to-pool/lifecycle mapping:")
-        for entry in entries:
-            logger.info(entry)
+        num_pool_groups = len({pool_group_id for pool_group_id, _ in pools})
+        logger.info(
+            f"{type(self).__name__} role-to-pool/lifecycle mapping "
+            f"({self.num_local_layers} local layers, {num_pool_groups} storage pool group(s), "
+            f"{len(pools)} memory pool(s)):"
+        )
+        for entry, layer_ids in entries.items():
+            logger.info(
+                f"{entry}, num_layers={len(layer_ids)}, layers={_format_layer_id_ranges(layer_ids)}"
+            )
 
     def _prepare_swa_scratch_copy_tensors(self, index_mapper_capacity: int) -> None:
         pool_ids = torch.empty(
