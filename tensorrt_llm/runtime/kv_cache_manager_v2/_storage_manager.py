@@ -513,6 +513,11 @@ class StorageManager:
             old_free_cnt = storage.get_num_free_slots(pg_idx)
             evictable_cnt = ctrl.num_evictable_pages(pg_idx)
             num_to_evict[pg_idx] = max(0, min(goal + fallen - old_free_cnt, evictable_cnt))
+            if _dyn_trace.ENABLED and fallen > 0:
+                # Pages spilling out of a warmer level, measured against this
+                # level's free slots before it makes room for them.
+                total = storage.num_slots(pg_idx)
+                _dyn_trace.record_device_evict(fallen, old_free_cnt / total if total else 0.0)
             fallen_held_cnt = 0  # fallen held pages we must accept in the current level.
             if self.is_last_level(lvl_id):
                 held_pages[pg_idx] = remove_if(

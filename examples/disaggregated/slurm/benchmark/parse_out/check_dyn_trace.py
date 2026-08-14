@@ -88,13 +88,31 @@ dyn.record_drop(KEYS[3:8], level=1, free_frac=0.5)
 check("ghost stays at the cap", len(st.ghost), 4)
 check("forgotten keys are counted", st.ghost_full > 0, True)
 
+print("\n6b. host fullness is bucketed at both eviction points")
+# Bin edges are upper bounds on percent free, so a tier with 0.5% free lands in
+# the fullest bucket and one with 30% free lands above the 25% edge.
+check("0.5% free is the fullest bucket", dyn._free_bin(0.5), 0)
+check("30% free sits above the 25% edge", dyn._free_bin(30.0), 5)
+dev_before = list(st.dev_evict_hist)
+dyn.record_device_evict(3, 0.005)
+check("GPU spill binned by the room the host had",
+      [a - b for a, b in zip(st.dev_evict_hist, dev_before)][0], 3)
+check("spilled pages counted", st.dev_evicted_pages, 3)
+host_before = list(st.host_drop_hist)
+dyn.record_drop(KEYS[:2], level=1, free_frac=0.30)
+check("host drop binned by the free space it was taken with",
+      [a - b for a, b in zip(st.host_drop_hist, host_before)][5], 2)
+
 print("\n7. summary line")
 dyn._emit(dyn.time.monotonic())
 summary = [x for x in lines if x.startswith("KVDYN ")][-1]
 print("  " + summary)
 check("window counters reset after emit", (st.requests, st.evicted, st.cold), (0, 0, 0))
+check("fullness histograms reset after emit",
+      (sum(st.dev_evict_hist), sum(st.host_drop_hist), st.dev_evicted_pages), (0, 0, 0))
 for field in ("miss_evicted=", "miss_cold=", "evicted_share=", "free_at_drop_l1_p50=",
-              "age_p50=", "served_p50=", "ghost_full=", "unlinked="):
+              "age_p50=", "served_p50=", "ghost_full=", "unlinked=", "dev_evicted=",
+              "hostfree_at_dev_evict=", "hostfree_at_host_drop="):
     check(f"reports {field}", field in summary, True)
 
 print()

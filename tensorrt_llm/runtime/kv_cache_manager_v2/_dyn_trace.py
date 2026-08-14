@@ -117,6 +117,20 @@ class _Ring:
         return self._n
 
 
+# Upper edges, in percent, of the host-fullness histogram attached to every
+# eviction. A per-window percentile hides the shape: it cannot say whether a
+# handful of drops came from a full tier and the rest from an empty one. The
+# bins are narrow near zero because that is where a capacity eviction lives.
+_FREE_BINS = (1.0, 2.0, 5.0, 10.0, 25.0, 50.0, 75.0, 100.01)
+
+
+def _free_bin(free_pct: float) -> int:
+    for index, upper in enumerate(_FREE_BINS):
+        if free_pct < upper:
+            return index
+    return len(_FREE_BINS) - 1
+
+
 class _State:
     """Per-process trace state. One instance per rank, created on import."""
 
@@ -125,8 +139,11 @@ class _State:
         "_ctx_samples",
         "age",
         "cold",
+        "dev_evict_hist",
+        "dev_evicted_pages",
         "drops",
         "evicted",
+        "host_drop_hist",
         "ghost",
         "ghost_full",
         "hits",
@@ -167,6 +184,13 @@ class _State:
         self.hits_at_death = _Ring()
         self._ctx_free_frac: list[_Ring] = []  # free slot fraction per level at drop
         self._ctx_samples = 0
+        # Pages weighted into host-fullness bins, split by what forced the move:
+        # a GPU eviction arriving at the host tier, versus a host drop leaving
+        # the hierarchy. Both are measured against the host tier's own free
+        # slots, so the two rows are directly comparable.
+        self.dev_evict_hist = [0] * len(_FREE_BINS)
+        self.host_drop_hist = [0] * len(_FREE_BINS)
+        self.dev_evicted_pages = 0
 
     def level_ring(self, level: int) -> _Ring:
         while len(self._ctx_free_frac) <= level:
@@ -195,6 +219,9 @@ class _State:
         for ring in self._ctx_free_frac:
             ring.clear()
         self._ctx_samples = 0
+        self.dev_evict_hist = [0] * len(_FREE_BINS)
+        self.host_drop_hist = [0] * len(_FREE_BINS)
+        self.dev_evicted_pages = 0
 
 
 _state = _State() if ENABLED else None
@@ -268,6 +295,24 @@ def record_drop(keys: Iterable[bytes], level: int, free_frac: float = -1.0) -> N
         st.bump_drop(level, count)
         if free_frac >= 0.0:
             st.level_ring(level).add(free_frac)
+            st.host_drop_hist[_free_bin(free_frac * 100.0)] += count
+
+
+def record_device_evict(num_pages: int, host_free_frac: float) -> None:
+    """Record pages evicted from GPU that are arriving at the host tier.
+
+    `host_free_frac` is the host tier's free-slot fraction before it takes them,
+    so this answers how much room the host had at the instant the GPU had to
+    spill. Paired with the host-drop histogram it separates two different
+    inefficiencies: spilling into a tier that is already full, and discarding
+    from a tier that still had room.
+    """
+    if _state is None or num_pages <= 0:
+        return
+    st = _state
+    st.dev_evicted_pages += num_pages
+    if host_free_frac >= 0.0:
+        st.dev_evict_hist[_free_bin(host_free_frac * 100.0)] += num_pages
 
 
 def record_prune(keys: Sequence[bytes]) -> None:
@@ -339,6 +384,12 @@ def _emit(now: float) -> None:
         ring = st._ctx_free_frac[level] if level < len(st._ctx_free_frac) else None
         if ring is not None and ring.count:
             fields.append(f"free_at_drop_l{level}_p50={ring.percentile(0.5):.4f}")
+    fields.append(f"dev_evicted={st.dev_evicted_pages}")
+    # Bin upper edges are fixed, so the reader can label these without being
+    # told; emitting counts only keeps the line short.
+    fields.append("hostfree_bins=" + ":".join(f"{edge:g}" for edge in _FREE_BINS))
+    fields.append("hostfree_at_dev_evict=" + ":".join(str(c) for c in st.dev_evict_hist))
+    fields.append("hostfree_at_host_drop=" + ":".join(str(c) for c in st.host_drop_hist))
     _log("KVDYN " + " ".join(fields))
     st.last_emit = now
     st.reset_window()
