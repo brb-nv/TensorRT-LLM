@@ -18,6 +18,8 @@ import math
 import time
 from typing import Dict, List, Optional, Union
 
+from tensorrt_llm.logger import logger
+
 from .enums import MetricNames
 
 
@@ -56,6 +58,8 @@ class MetricsCollector:
             trtllm_kv_cache_hit_rate
             trtllm_kv_cache_utilization
             trtllm_kv_cache_host_utilization
+            trtllm_kv_cache_host_max_blocks
+            trtllm_kv_cache_host_occupied_blocks
             trtllm_kv_cache_iter_reuse_rate
             trtllm_kv_cache_reused_blocks_total
             trtllm_kv_cache_missed_blocks_total
@@ -66,6 +70,7 @@ class MetricsCollector:
             trtllm_kv_cache_gen_alloc_blocks_total
             trtllm_kv_cache_onboard_bytes_total
             trtllm_kv_cache_offload_bytes_total
+            trtllm_kv_cache_host_dropped_blocks_total
             trtllm_kv_cache_intra_device_copy_bytes_total
             trtllm_num_requests_running
             trtllm_num_requests_waiting
@@ -257,6 +262,19 @@ class MetricsCollector:
             name=self.metric_prefix + "kv_cache_host_utilization",
             documentation="KV cache host (secondary) pool utilization",
             labelnames=self.labels.keys())
+        # Exported alongside the ratio so that a utilization of zero can be told
+        # apart from a host tier that was never reported. Without these, an
+        # unreported tier and an empty one both scrape as 0.
+        self.kv_cache_host_max_blocks = Gauge(
+            name=self.metric_prefix + "kv_cache_host_max_blocks",
+            documentation=
+            "Capacity of the KV cache host (secondary) pool, in blocks",
+            labelnames=self.labels.keys())
+        self.kv_cache_host_occupied_blocks = Gauge(
+            name=self.metric_prefix + "kv_cache_host_occupied_blocks",
+            documentation=
+            "Occupied slots in the KV cache host (secondary) pool, in blocks",
+            labelnames=self.labels.keys())
         self.kv_cache_iter_reuse_rate = Gauge(
             name=self.metric_prefix + "kv_cache_iter_reuse_rate",
             documentation="Per-iteration KV cache block reuse rate",
@@ -290,6 +308,14 @@ class MetricsCollector:
         self.kv_cache_offload_bytes_total = Counter(
             name=self.metric_prefix + "kv_cache_offload_bytes_total",
             documentation="Total bytes transferred from GPU to host (offload)",
+            labelnames=self.labels.keys())
+        # A warm host tier sits near full occupancy whatever its size, so
+        # utilization alone cannot say whether the tier is big enough. Drops are
+        # what separate a healthy full tier from an undersized thrashing one.
+        self.kv_cache_host_dropped_blocks_total = Counter(
+            name=self.metric_prefix + "kv_cache_host_dropped_blocks_total",
+            documentation=
+            "Total blocks discarded from the host (secondary) pool before reuse",
             labelnames=self.labels.keys())
         self.kv_cache_intra_device_copy_bytes_total = Counter(
             name=self.metric_prefix + "kv_cache_intra_device_copy_bytes_total",
@@ -538,6 +564,20 @@ class MetricsCollector:
     def _log_gauge(self, gauge, data: Union[int, float]) -> None:
         # Convenience function for logging to gauge.
         gauge.labels(**self.labels).set(data)
+
+    def _warn_host_tier_unreported(self) -> None:
+        # Blocks crossed the host tier but it reports either no capacity or no
+        # occupancy, so utilization is not trustworthy. Say so rather than
+        # leaving the gauge at zero, which is indistinguishable from an idle
+        # tier and has been misread as one.
+        logger.warning_once(
+            "KV cache host tier reported no capacity or no occupancy while "
+            "offloading or dropping blocks; "
+            f"{self.metric_prefix}kv_cache_host_utilization is not reliable. "
+            f"Compare {self.metric_prefix}kv_cache_host_max_blocks and "
+            f"{self.metric_prefix}kv_cache_host_occupied_blocks against the "
+            "configured host_cache_size.",
+            key="kv_cache_host_tier_unreported")
 
     def log_request_metrics_dict(self, metrics_dict: dict[str, float]) -> None:
         """Log per-request metrics from TRTLLM engine responses.
@@ -817,6 +857,8 @@ class MetricsCollector:
             pool_group_stats = kv_iter_by_pool_group or kv_iter or {}
             total_secondary_max = 0
             total_secondary_used = 0
+            total_secondary_evictable = 0
+            total_host_dropped = 0
             total_reused = 0
             total_full_reused = 0
             total_partial_reused = 0
@@ -835,16 +877,33 @@ class MetricsCollector:
             for stats in pool_group_stats.values():
                 total_secondary_max += stats.get("secondaryMaxNumBlocks", 0)
                 total_secondary_used += stats.get("secondaryUsedNumBlocks", 0)
+                total_secondary_evictable += stats.get(
+                    "secondaryEvictableNumBlocks", 0)
+                total_host_dropped += stats.get("iterHostDroppedBlocks", 0)
                 total_gen_alloc += stats.get("iterGenAllocBlocks", 0)
                 total_onboard_bytes += stats.get("iterOnboardBytes", 0)
                 total_offload_bytes += stats.get("iterOffloadBytes", 0)
                 total_intra_device_copy_bytes += stats.get(
                     "iterIntraDeviceCopyBytes", 0)
 
-            # Gauges
+            # Gauges. A host slot holding a reusable block is reported as
+            # evictable rather than used: nothing computes out of host memory, so
+            # the tier is cache-only and its "used" count stays at zero.
+            # Occupancy has to count both, or utilization reads as a permanently
+            # idle tier while offloads and drops are in flight.
+            total_secondary_occupied = (total_secondary_used +
+                                        total_secondary_evictable)
+            self._log_gauge(self.kv_cache_host_max_blocks, total_secondary_max)
+            self._log_gauge(self.kv_cache_host_occupied_blocks,
+                            total_secondary_occupied)
+            host_traffic = total_offload_bytes or total_host_dropped
             if total_secondary_max > 0:
                 self._log_gauge(self.kv_cache_host_utilization,
-                                total_secondary_used / total_secondary_max)
+                                total_secondary_occupied / total_secondary_max)
+                if total_secondary_occupied == 0 and host_traffic:
+                    self._warn_host_tier_unreported()
+            elif host_traffic:
+                self._warn_host_tier_unreported()
             iter_total = total_reused + total_missed
             if iter_total > 0:
                 self._log_gauge(self.kv_cache_iter_reuse_rate,
@@ -875,6 +934,9 @@ class MetricsCollector:
             if total_intra_device_copy_bytes > 0:
                 self._log_counter(self.kv_cache_intra_device_copy_bytes_total,
                                   {}, total_intra_device_copy_bytes)
+            if total_host_dropped > 0:
+                self._log_counter(self.kv_cache_host_dropped_blocks_total, {},
+                                  total_host_dropped)
 
     def log_request_error(self, http_code: Union[int, str] = "") -> None:
         """Increment the error counter, labeled by HTTP status code."""

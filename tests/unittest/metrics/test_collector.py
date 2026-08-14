@@ -1291,3 +1291,64 @@ class TestRequestErrorCounter:
         collector.log_request_error()
         labels = {**collector.labels, "http_code": ""}
         assert _counter_value_with_labels(collector.counter_request_error, labels) == 1
+
+
+class TestHostTierOccupancy:
+    """Host (secondary) tier occupancy accounting.
+
+    A host slot holding a reusable block is reported as evictable, not used:
+    nothing computes out of host memory, so a cache-only tier reports zero used
+    blocks no matter how full it is.
+    """
+
+    def _pool_group_stats(self, **secondary):
+        base = {
+            "primaryMaxNumBlocks": 100,
+            "primaryUsedNumBlocks": 40,
+            "secondaryMaxNumBlocks": 50,
+            "secondaryUsedNumBlocks": 0,
+            "iterOffloadBytes": 2048,
+            "iterOnboardBytes": 4096,
+        }
+        base.update(secondary)
+        return {"kvCacheIterationStatsByPoolGroup": {"0": base}}
+
+    def test_evictable_slots_count_as_occupied(self, collector):
+        """A full cache-only tier must not report as idle."""
+        collector.log_iteration_stats(self._pool_group_stats(secondaryEvictableNumBlocks=50))
+        assert _get_gauge_value(collector, "kv_cache_host_utilization") == pytest.approx(1.0)
+        assert _get_gauge_value(collector, "kv_cache_host_occupied_blocks") == 50
+
+    def test_used_and_evictable_are_summed(self, collector):
+        collector.log_iteration_stats(
+            self._pool_group_stats(secondaryUsedNumBlocks=10, secondaryEvictableNumBlocks=20)
+        )
+        assert _get_gauge_value(collector, "kv_cache_host_utilization") == pytest.approx(0.6)
+        assert _get_gauge_value(collector, "kv_cache_host_occupied_blocks") == 30
+
+    def test_capacity_is_exported(self, collector):
+        """max_blocks tells an unreported tier apart from an empty one."""
+        collector.log_iteration_stats(self._pool_group_stats())
+        assert _get_gauge_value(collector, "kv_cache_host_max_blocks") == 50
+
+    def test_drops_are_counted(self, collector):
+        """Occupancy is ambiguous without drops: a warm tier is always near full."""
+        stats = self._pool_group_stats(secondaryEvictableNumBlocks=50, iterHostDroppedBlocks=7)
+        before = _get_counter_value(collector, "kv_cache_host_dropped_blocks_total")
+        collector.log_iteration_stats(stats)
+        collector.log_iteration_stats(stats)
+        assert (
+            _get_counter_value(collector, "kv_cache_host_dropped_blocks_total") - before
+        ) == pytest.approx(14)
+
+    def test_traffic_without_occupancy_warns(self, collector, monkeypatch):
+        warned = []
+        monkeypatch.setattr(collector, "_warn_host_tier_unreported", lambda: warned.append(True))
+        collector.log_iteration_stats(self._pool_group_stats())
+        assert warned, "offloading into a tier reporting no occupancy should warn"
+
+    def test_occupied_tier_does_not_warn(self, collector, monkeypatch):
+        warned = []
+        monkeypatch.setattr(collector, "_warn_host_tier_unreported", lambda: warned.append(True))
+        collector.log_iteration_stats(self._pool_group_stats(secondaryEvictableNumBlocks=25))
+        assert not warned
