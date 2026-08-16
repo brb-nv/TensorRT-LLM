@@ -1,5 +1,6 @@
 import bisect
 import contextlib
+import os
 from dataclasses import dataclass
 from typing import (Any, Callable, Dict, Iterator, List, NamedTuple, Optional,
                     Tuple, TypeAlias)
@@ -804,6 +805,16 @@ class CUDAGraphRunner:
             return 0
 
         batch.generation_requests.extend([padding_dummy_request] * padding_size)
+        # [HELIX-DEBUG] Confirm CUDA-graph padding is actually firing (and how
+        # many empty-rank dummies it injects) rather than inferring it. Padding
+        # dummies are the suspected trigger for nvbugs/6410881: each one adds an
+        # inactive CP rank whose stale kv_len can escape _helix_zero_kv_mask.
+        if os.environ.get("TLLM_HELIX_DEBUG", "0") == "1":
+            logger.info(
+                f"[HELIX-DEBUG] cuda-graph padding fired: batch_size="
+                f"{batch_size} -> {padded_batch_size} "
+                f"(padding_size={padding_size}, runtime_draft_len="
+                f"{runtime_draft_len})")
         return padding_size
 
     def _get_or_create_padding_dummy(

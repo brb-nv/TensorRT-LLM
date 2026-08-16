@@ -5379,6 +5379,29 @@ class PyTorchModelEngine(ModelEngine):
                     position_id = request.total_input_len_cp + request.py_decoding_iter - 1
                     if request.py_helix_is_inactive_rank:
                         past_seen_token_num = request.seqlen_this_rank_cp
+                        # [HELIX-DEBUG] An "inactive" (empty) CP rank owns zero KV
+                        # blocks for this sequence, so _helix_zero_kv_mask (which
+                        # keys on kv_len == 0) can only sanitize it when its
+                        # reported KV length is 0. A non-zero value here means the
+                        # empty-rank row escapes masking. Flag it once so the very
+                        # first padded step tells us whether the dummy bookkeeping
+                        # (resource_manager.add_dummy_requests) is the root cause.
+                        if (os.environ.get("TLLM_HELIX_DEBUG", "0") == "1"
+                                and past_seen_token_num != 0
+                                and not getattr(
+                                    self, "_helix_dbg_warned_inactive", False)):
+                            self._helix_dbg_warned_inactive = True
+                            logger.warning(
+                                "[HELIX-DEBUG] empty/inactive CP rank reports "
+                                f"kv_len={past_seen_token_num} != 0 "
+                                f"(req_id={request.py_request_id}, "
+                                f"is_dummy={getattr(request, 'is_dummy', None)}, "
+                                "is_cuda_graph_dummy="
+                                f"{getattr(request, 'is_cuda_graph_dummy', False)}, "
+                                f"seqlen_this_rank_cp={request.seqlen_this_rank_cp}, "
+                                f"total_input_len_cp={request.total_input_len_cp}); "
+                                "_helix_zero_kv_mask keys on kv_len==0 and will "
+                                "NOT mask this row.")
                     else:
                         # Discount the token added to active rank in resource manager as it hasn't
                         # been previously seen.

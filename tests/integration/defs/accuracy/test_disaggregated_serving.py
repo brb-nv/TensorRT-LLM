@@ -21,11 +21,13 @@ import json
 import os
 import re
 import secrets
+import shutil
 import subprocess
 import tempfile
 import time
 from collections import namedtuple
 from concurrent.futures import ThreadPoolExecutor
+from difflib import SequenceMatcher
 from typing import Any, Dict, List, Optional, Union
 
 import openai
@@ -1108,12 +1110,19 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     @pytest.mark.parametrize("gen_pp,gen_tp,gen_cp,enable_attention_dp", [
         (1, 2, 2, False),
         (1, 2, 2, True),
+        (1, 1, 4, False),
     ],
-                             ids=["pp1tp2cp2", "pp1dp2cp2"])
+                             ids=["pp1tp2cp2", "pp1dp2cp2", "pp1tp1cp4"])
     @pytest.mark.parametrize("cuda_graph_config", [
         {
+            # Single capture size forces almost every decode batch to pad up to
+            # 64, injecting many empty-rank padding dummies each step. This
+            # maximizes the suspected trigger for nvbugs/6410881 (empty CP ranks
+            # with stale kv_len escaping _helix_zero_kv_mask). Pair with
+            # max_batch_size=64 on the gen server so nothing exceeds the capture
+            # size and falls back to eager (which would skip padding entirely).
             "enable_padding": True,
-            "batch_sizes": [1, 2, 4, 8, 16, 32, 64]
+            "batch_sizes": [64]
         },
     ],
                              ids=["cudagraph:with_padding"])
@@ -1170,6 +1179,10 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             "kv_cache_config": kv_cache_config,
             "enable_chunked_prefill": False,
             "cuda_graph_config": cuda_graph_config,
+            # Cap the decode batch at the single CUDA-graph capture size so every
+            # step stays graph-eligible and pads (batches above the max capture
+            # size fall back to eager and skip padding entirely).
+            "max_batch_size": 64,
             "cache_transceiver_config": {
                 "backend": "DEFAULT",
                 "max_tokens_in_buffer": 8192,
@@ -1352,6 +1365,255 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                                       ctx_server_config, gen_server_config,
                                       self.MODEL_PATH) as llm:
             run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
+
+
+def _build_two_layer_dsv3_checkpoint(src_dir: str, dst_dir: str) -> None:
+    """Materialize a 2-layer DeepSeek-V3-Lite checkpoint from *src_dir*.
+
+    Only ``embed_tokens``, decoder layers 0 (dense) and 1 (MoE), the final
+    norm, and ``lm_head`` weights are copied from the sharded source
+    checkpoint into a single ``model.safetensors`` in *dst_dir*. This keeps
+    weight loading fast while still exercising the real MLA + dense + MoE code
+    paths (layer 0 is dense and layer 1 is MoE because
+    ``first_k_dense_replace=1``). The MTP/nextn predict layer is dropped.
+    """
+    import safetensors.torch
+    from safetensors import safe_open
+
+    os.makedirs(dst_dir, exist_ok=True)
+
+    # Decide which source weights to keep.
+    keep_layer_re = re.compile(r"^model\.layers\.(0|1)\.")
+
+    def _keep(name: str) -> bool:
+        return (name.startswith("model.embed_tokens.")
+                or name.startswith("model.norm.")
+                or name.startswith("lm_head.")
+                or bool(keep_layer_re.match(name)))
+
+    index_path = os.path.join(src_dir, "model.safetensors.index.json")
+    with open(index_path, "r") as f:
+        weight_map = json.load(f)["weight_map"]
+
+    # Group the kept weights by their source shard to minimize file opens.
+    shard_to_names: Dict[str, List[str]] = {}
+    for name, shard in weight_map.items():
+        if _keep(name):
+            shard_to_names.setdefault(shard, []).append(name)
+
+    tensors: Dict[str, "torch.Tensor"] = {}
+    for shard, names in shard_to_names.items():
+        with safe_open(os.path.join(src_dir, shard),
+                       framework="pt",
+                       device="cpu") as reader:
+            for name in names:
+                tensors[name] = reader.get_tensor(name)
+
+    safetensors.torch.save_file(tensors,
+                                os.path.join(dst_dir, "model.safetensors"),
+                                metadata={"format": "pt"})
+
+    # Emit a matching single-file index so any HF-style loader is satisfied.
+    total_size = sum(t.numel() * t.element_size() for t in tensors.values())
+    index = {
+        "metadata": {
+            "total_size": total_size
+        },
+        "weight_map": {name: "model.safetensors"
+                       for name in tensors},
+    }
+    with open(os.path.join(dst_dir, "model.safetensors.index.json"), "w") as f:
+        json.dump(index, f)
+
+    # Copy every non-weight file (tokenizer, remote-code modules, ...) and
+    # write an edited config truncated to 2 layers with MTP disabled.
+    for fname in os.listdir(src_dir):
+        if fname.endswith(".safetensors") or fname in (
+                "config.json", "model.safetensors.index.json"):
+            continue
+        src_file = os.path.join(src_dir, fname)
+        if os.path.isfile(src_file):
+            shutil.copy(src_file, os.path.join(dst_dir, fname))
+
+    with open(os.path.join(src_dir, "config.json"), "r") as f:
+        config = json.load(f)
+    config["num_hidden_layers"] = 2
+    config["num_nextn_predict_layers"] = 0
+    with open(os.path.join(dst_dir, "config.json"), "w") as f:
+        json.dump(config, f, indent=2)
+
+
+# Long-enough prompts so that the tokenized context spans multiple KV blocks
+# (tokens_per_block=32) across up to 4 helix CP ranks, keeping every rank
+# active instead of empty/inactive.
+_HELIX_PROMPTS = [
+    ("The history of computing spans many centuries, beginning with simple "
+     "counting tools and evolving into the powerful machines we use today. "
+     "Early mechanical calculators gave way to electronic computers, which "
+     "in turn enabled the software revolution that reshaped science, "
+     "industry, communication, and everyday life across the entire world. "
+     "Describe in detail how modern processors execute instructions and "
+     "manage memory hierarchies, how caches and pipelines improve throughput, "
+     "and explain why parallelism at many levels has become so important for "
+     "sustained performance on today's demanding workloads. In summary,"),
+    ("Large language models are trained on vast amounts of text drawn from "
+     "books, articles, and websites collected from across the internet. "
+     "During training they gradually learn statistical patterns that let "
+     "them predict the next token in a sequence with surprising fluency. "
+     "When these models are later deployed for inference, both latency and "
+     "throughput matter a great deal for real interactive applications that "
+     "serve many users at once. Explain the fundamental trade-offs involved "
+     "in serving such models efficiently at scale, covering batching, "
+     "memory, and parallelism, and note that"),
+]
+
+
+@pytest.mark.timeout(DEFAULT_TEST_TIMEOUT)
+@skip_pre_blackwell
+class TestDeepSeekV3LiteHelixParallelism(LlmapiAccuracyTestHarness):
+    """Helix generation-server coverage across parallelism combinations.
+
+    Uses a fast, truncated 2-layer DeepSeek-V3-Lite (layer 0 dense, layer 1
+    MoE) served disaggregated with a TP4 context server. Each helix
+    generation-server layout (cp4 / tp2cp2 / dp2cp2 / pp2cp2) is compared
+    against a non-helix TP4 generation reference to confirm correctness.
+    Follow-up coverage for PR #16570 which consolidated helix tests.
+    """
+
+    MODEL_NAME = "deepseek-ai/DeepSeek-V3-Lite"
+
+    KV_CACHE_CONFIG = {
+        "free_gpu_memory_fraction": 0.5,
+        "enable_block_reuse": False,
+        "enable_partial_reuse": False,
+        "tokens_per_block": 32,
+    }
+    CACHE_TRANSCEIVER_CONFIG = {
+        "backend": "DEFAULT",
+        "max_tokens_in_buffer": 8192,
+    }
+    SAMPLING_PARAMS = SamplingParams(max_tokens=24, temperature=0)
+
+    @pytest.fixture(scope="session")
+    def two_layer_model_path(self, tmp_path_factory) -> str:
+        src_dir = f"{llm_models_root()}/DeepSeek-V3-Lite/bf16"
+        dst_dir = str(tmp_path_factory.mktemp("dsv3_lite_2layer"))
+        _build_two_layer_dsv3_checkpoint(src_dir, dst_dir)
+        return dst_dir
+
+    def _ctx_server_config(self) -> Dict[str, Any]:
+        return {
+            "pipeline_parallel_size": 1,
+            "tensor_parallel_size": 4,
+            "context_parallel_size": 1,
+            "disable_overlap_scheduler": True,
+            "kv_cache_config": self.KV_CACHE_CONFIG,
+            "enable_chunked_prefill": False,
+            "cuda_graph_config": None,
+            "cache_transceiver_config": self.CACHE_TRANSCEIVER_CONFIG,
+        }
+
+    def _disagg_server_config(self) -> Dict[str, Any]:
+        return {
+            "hostname": "localhost",
+            "backend": "pytorch",
+            "context_servers": {
+                "num_instances": 1
+            },
+            "generation_servers": {
+                "num_instances": 1
+            },
+        }
+
+    def _generate(self, llm) -> List[str]:
+        futures = [
+            llm.generate_async(prompt, sampling_params=self.SAMPLING_PARAMS)
+            for prompt in _HELIX_PROMPTS
+        ]
+        return [future.result().outputs[0].text for future in futures]
+
+    @pytest.fixture(scope="session")
+    def reference_texts(self, two_layer_model_path) -> List[str]:
+        """Greedy generations from a non-helix TP4 generation server."""
+        gen_server_config = {
+            "tensor_parallel_size": 4,
+            "pipeline_parallel_size": 1,
+            "context_parallel_size": 1,
+            "disable_overlap_scheduler": True,
+            "kv_cache_config": self.KV_CACHE_CONFIG,
+            "enable_chunked_prefill": False,
+            "cuda_graph_config": None,
+            "cache_transceiver_config": self.CACHE_TRANSCEIVER_CONFIG,
+        }
+        with launch_disaggregated_llm(self._disagg_server_config(),
+                                      self._ctx_server_config(),
+                                      gen_server_config,
+                                      two_layer_model_path) as llm:
+            return self._generate(llm)
+
+    @pytest.mark.skip_less_device(8)
+    @pytest.mark.parametrize("comms_medium", ["fifo_v2"])
+    @pytest.mark.parametrize(
+        "gen_pp,gen_tp,gen_cp,enable_attention_dp",
+        [
+            (1, 1, 4, False),
+            (1, 2, 2, False),
+            (1, 2, 2, True),
+            pytest.param(2,
+                         1,
+                         2,
+                         False,
+                         marks=pytest.mark.xfail(
+                             reason="helix + pipeline parallel (pp2cp2) is not "
+                             "yet supported; tracking for follow-up",
+                             strict=False)),
+        ],
+        ids=["cp4", "tp2cp2", "dp2cp2", "pp2cp2"],
+    )
+    def test_helix_parallelism_combos(self, two_layer_model_path,
+                                      reference_texts, gen_pp, gen_tp, gen_cp,
+                                      enable_attention_dp, comms_medium):
+        if comms_medium == "nccl":
+            use_nccl_for_alltoall, fifo_version = True, 2
+        elif comms_medium == "fifo_v1":
+            use_nccl_for_alltoall, fifo_version = False, 1
+        elif comms_medium == "fifo_v2":
+            use_nccl_for_alltoall, fifo_version = False, 2
+        else:
+            raise ValueError(f"Unknown comms_medium: {comms_medium}")
+
+        gen_ep = gen_tp * gen_cp
+        gen_server_config = {
+            "tensor_parallel_size": gen_tp,
+            "pipeline_parallel_size": gen_pp,
+            "context_parallel_size": gen_cp,
+            "moe_expert_parallel_size": gen_ep,
+            "cp_config": {
+                "cp_type": "HELIX",
+                "tokens_per_block": 32,
+                "use_nccl_for_alltoall": use_nccl_for_alltoall,
+                "fifo_version": fifo_version,
+            },
+            "disable_overlap_scheduler": True,
+            "kv_cache_config": self.KV_CACHE_CONFIG,
+            "enable_chunked_prefill": False,
+            "cuda_graph_config": None,
+            "cache_transceiver_config": self.CACHE_TRANSCEIVER_CONFIG,
+            "enable_attention_dp": enable_attention_dp,
+        }
+        with launch_disaggregated_llm(self._disagg_server_config(),
+                                      self._ctx_server_config(),
+                                      gen_server_config,
+                                      two_layer_model_path) as llm:
+            helix_texts = self._generate(llm)
+
+        for prompt, ref, got in zip(_HELIX_PROMPTS, reference_texts,
+                                    helix_texts):
+            ratio = SequenceMatcher(None, ref, got).ratio()
+            assert ratio >= 0.9, (
+                f"Helix output diverged from TP4 reference (ratio={ratio:.3f}) "
+                f"for prompt {prompt!r}:\n  reference: {ref!r}\n  helix:     "
+                f"{got!r}")
 
 
 @pytest.mark.timeout(DEFAULT_TEST_TIMEOUT)
