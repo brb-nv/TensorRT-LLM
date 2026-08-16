@@ -548,56 +548,59 @@ class TestHelixZeroKvMask(unittest.TestCase):
         assert out_o is partial_o
         assert out_stats is softmax_stats
 
-    def test_empty_rank_with_stale_kv_len_escapes_mask(self):
-        """Reproduces the root-cause mechanism of nvbugs/6410881 (CPU-only).
+    def test_stale_nonzero_kv_len_is_not_recoverable_at_combine(self):
+        """Guards the invariant that motivated the fix for nvbugs/6410881.
 
-        _helix_zero_kv_mask decides which rows are empty CP ranks purely from
-        ``kv_lens_cuda == 0``. But the CUDA-graph padding dummy is a 2-token /
-        1-block generation request, and add_dummy_requests sets
-        ``seqlen_this_rank_cp = token_num`` (== 2) on its *inactive* ranks -- the
-        ranks that actually own zero KV blocks (resource_manager.py). So an
-        empty rank ends up reporting ``kv_len == 2``, the mask fails to flag it,
-        and the NaN produced by attending over zero local keys is NOT cleared by
-        _helix_sanitize_empty_kv, leaking into the Helix combine. This only
-        happens with cudagraph:with_padding, which is exactly the failing
-        parametrization, and it is flaky because the padding count varies with
-        the dynamic decode batch size.
+        By design, _helix_zero_kv_mask decides which rows are empty CP ranks
+        purely from ``kv_lens_cuda == 0``. It *cannot* use helix_is_inactive_rank
+        instead, because a real inactive rank legitimately owns previously cached
+        KV blocks (it just doesn't append the new token this step) and must
+        contribute a valid partial to the combine -- masking it would zero out
+        correct output.
 
-        This test pins that broken interaction. The DESIRED behavior is that a
-        rank owning zero KV blocks is a no-op in the combine regardless of the
-        reported kv_len; the fix must either force ``seqlen_this_rank_cp == 0``
-        for empty dummy ranks or derive empty-ness from helix_is_inactive_rank
-        rather than ``kv_len == 0``. When that lands, the assertions marked
-        "BUG" below should be inverted.
+        The consequence is that a rank owning zero KV blocks must truthfully
+        report ``kv_len == 0``. The flaky failure came from the CUDA-graph
+        padding dummy (a 2-token / 1-block gen request) whose *inactive* ranks
+        own zero KV yet reported ``seqlen_this_rank_cp == token_num`` (== 2) in
+        resource_manager.add_dummy_requests. That stale kv_len (== 2) escaped the
+        mask, so the NaN from attending over zero local keys leaked into the
+        Helix combine. The fix forces those inactive dummy ranks to report
+        ``seqlen_this_rank_cp == 0`` at the source (see resource_manager.py).
+
+        This test pins the reason the fix has to live upstream: once an empty
+        rank reports a stale non-zero kv_len, the combine stage can no longer
+        rescue it -- the mask misses the row and the NaN survives.
         """
         # One decode token for a sequence that owns zero KV blocks on this rank
-        # but reports a stale/non-zero kv_len of 2 (the padding-dummy value).
+        # but reports a stale/non-zero kv_len of 2 (the pre-fix padding-dummy
+        # value). The mask correctly keys on kv_len == 0, so it cannot flag this
+        # mis-reported row -- which is exactly why the dummy bookkeeping must set
+        # seqlen_this_rank_cp = 0 at the source.
         meta = _FakeAttnMetadata(
             kv_lens_cuda=torch.tensor([2], dtype=torch.int32),
             seq_lens_cuda=torch.tensor([1], dtype=torch.int32),
         )
         mask = _helix_zero_kv_mask(meta, num_tokens=1)
         assert mask is not None
-        # BUG: a truly empty rank should be flagged (True), but kv_len (2) != 0
-        # so the mask misses it.
+        # A stale non-zero kv_len is indistinguishable from a rank that truly
+        # holds cached KV, so the mask (correctly) does not flag it.
         assert bool(mask[0]) is False
 
-        # The zero-key attention kernel yields NaN for this empty rank. With the
-        # row left unmasked, sanitization cannot clear it, so the NaN reaches the
-        # combine and corrupts the output.
+        # With the row left unmasked, sanitization cannot clear the zero-key NaN,
+        # so it reaches the combine and corrupts the output. This is unavoidable
+        # at the combine stage and is precisely what the upstream fix prevents by
+        # never producing a stale kv_len for empty dummy ranks.
         partial_o = torch.full((1, 4), float("nan"))
         softmax_stats = torch.full((1, 1, 2), float("nan"))
         out_o, out_stats = _helix_sanitize_empty_kv(partial_o, softmax_stats, mask)
-        # BUG: out_o should be finite (a zeroed no-op) but the NaN survives.
         assert not torch.isfinite(out_o).all()
 
     def test_empty_rank_with_zero_kv_len_is_sanitized(self):
-        """Control for test_empty_rank_with_stale_kv_len_escapes_mask.
+        """The behavior the fix restores for empty dummy ranks.
 
-        When the empty rank is correctly reported with ``kv_len == 0`` (what the
-        padding dummy *should* do), the mask flags it and _helix_sanitize_empty_kv
-        turns the NaN row into a finite no-op. This is the behavior the fix must
-        restore for the stale-kv_len case above.
+        When the empty rank is correctly reported with ``kv_len == 0`` (what
+        add_dummy_requests now does for inactive helix ranks), the mask flags it
+        and _helix_sanitize_empty_kv turns the NaN row into a finite no-op.
         """
         meta = _FakeAttnMetadata(
             kv_lens_cuda=torch.tensor([0], dtype=torch.int32),

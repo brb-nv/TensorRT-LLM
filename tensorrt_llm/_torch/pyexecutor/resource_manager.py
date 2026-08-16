@@ -1251,7 +1251,18 @@ class KVCacheManager(BaseResourceManager):
                             req.py_helix_is_inactive_rank = True
                             req.prompt_len = token_num
                             req.py_prompt_len = req.prompt_len
-                            req.seqlen_this_rank_cp = req.prompt_len
+                            # An inactive CP rank of this dummy owns zero KV for
+                            # the sequence, so it must report zero cached tokens.
+                            # _prepare_tp_inputs derives the inactive-rank kv_len
+                            # directly from seqlen_this_rank_cp, and
+                            # _helix_zero_kv_mask keys on kv_len == 0 to
+                            # neutralize the (-inf, 0) / NaN that attending over
+                            # zero local keys produces. Reporting a non-zero
+                            # length here (e.g. prompt_len) makes the empty row
+                            # escape the mask and leak NaN into the Helix combine,
+                            # which is the root cause of the flaky
+                            # CUDA-graph-padding accuracy failure (nvbugs/6410881).
+                            req.seqlen_this_rank_cp = 0
                             req.total_input_len_cp = token_num * self.mapping.cp_size - 1
                             req.py_decoding_iter = 1
                     req.py_draft_tokens = [1] * max_num_draft_tokens
