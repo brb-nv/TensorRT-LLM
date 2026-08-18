@@ -1131,6 +1131,12 @@ class KVCacheManagerV2(BaseResourceManager):
         self.enable_block_reuse = kv_cache_config.enable_block_reuse
         self.enable_partial_reuse = kv_cache_config.enable_partial_reuse
         self.disk_prefetch_num_reqs = kv_cache_config.disk_prefetch_num_reqs
+        # Host->GPU prefetch is still being measured, so it is env-gated rather
+        # than a KvCacheConfig field: adding a field means regenerating the LLM
+        # args golden manifest. Promote it next to disk_prefetch_num_reqs once
+        # the measurement justifies keeping it.
+        self.gpu_prefetch_num_reqs = int(os.environ.get("TLLM_KV_GPU_PREFETCH_NUM_REQS", "0"))
+        self.max_util_for_resume = kv_cache_config.max_util_for_resume
         enable_conversation_manager = (
             self.enable_block_reuse
             and self.block_reuse_policy == BlockReusePolicy.PER_CONVERSATION
@@ -3670,8 +3676,16 @@ class KVCacheManagerV2(BaseResourceManager):
             input_tokens,
         )
 
-    def prefetch_for_context_tokens(self, requests: list) -> bool:
-        """Prefetch radix-tree blocks from disk→host for upcoming context requests.
+    def prefetch_for_context_tokens(
+        self, requests: list, target_level: CacheLevel = CACHE_LEVEL1
+    ) -> bool:
+        """Prefetch radix-tree blocks up to ``target_level`` for upcoming context requests.
+
+        ``target_level`` defaults to the first tier below GPU, which only moves
+        bytes between host and disk and so cannot disturb the running batch.
+        ``GPU_LEVEL`` onboards instead, and competes for GPU slots; go through
+        ``prefetch_to_gpu_for_context_tokens`` for that, which applies the
+        pressure guard this method does not.
 
         Returns True if all prefetches succeeded, False if any failed.
         """
@@ -3691,13 +3705,30 @@ class KVCacheManagerV2(BaseResourceManager):
             kv_cache = self.impl.create_kv_cache(
                 ReuseScope(lora_id=req.lora_task_id, salt=salt_int), tokens
             )
-            # Prefetch to the first tier below GPU (host if present, otherwise
-            # disk). prefetch() is a best-effort hint either way.
-            if not kv_cache.prefetch(CACHE_LEVEL1):
+            # prefetch() is a best-effort hint: a False return means the pages
+            # could not be recalled under pressure, not that anything is wrong.
+            if not kv_cache.prefetch(target_level):
                 logger.warning("prefetch failed for request %s", req.py_request_id)
                 success = False
             kv_cache.close()
         return success
+
+    def prefetch_to_gpu_for_context_tokens(self, requests: list) -> bool:
+        """Onboard reuse-matched blocks to GPU for context requests not yet scheduled.
+
+        Refuses above ``max_util_for_resume``, the same threshold ``resume()``
+        stops at. Onboarding calls ``prepare_free_slots``, which evicts resident
+        pages to make room, so without the guard a speculative prefetch could
+        evict pages the live batch is about to read and push the pool into the
+        state where ``resume()`` itself starts refusing.
+
+        Returns False when the prefetch was skipped or could not be dispatched.
+        """
+        if not self.enable_block_reuse:
+            return False
+        if max(self.impl._storage.get_utilization(GPU_LEVEL)) > self.max_util_for_resume:
+            return False
+        return self.prefetch_for_context_tokens(requests, GPU_LEVEL)
 
     def reset_reuse_state(self):
         self.impl.clear_reusable_blocks()

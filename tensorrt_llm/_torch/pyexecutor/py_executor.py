@@ -645,6 +645,7 @@ class PyExecutor:
         self._is_kv_manager_v2 = isinstance(self.kv_cache_manager,
                                             KVCacheManagerV2)
         self._prefetched_request_ids: set[int] = set()
+        self._gpu_prefetched_request_ids: set[int] = set()
         self.enable_kv_cache_events = self.kv_cache_manager is not None and self.kv_cache_manager.event_buffer_max_size > 0
         self.enable_kv_cache_reuse = self.kv_cache_manager is not None and self.kv_cache_manager.enable_block_reuse
         # AsyncTransferManager pin/unpin path is V1-only; V2 holds blocks via _KVCache refcount.
@@ -3365,6 +3366,44 @@ class PyExecutor:
         if candidates:
             self.kv_cache_manager.prefetch_for_context_tokens(candidates)
 
+    @nvtx_range("_prefetch_to_gpu_for_context_requests")
+    def _prefetch_to_gpu_for_context_requests(self) -> None:
+        """Onboard host-resident KV to GPU before a context request is scheduled.
+
+        The V2 scheduler allocates inline, so a turn's history is onboarded when
+        the scheduling loop reaches that request and the consumer's wait is
+        enqueued a few statements later. The compute available to hide the copy
+        is therefore whatever was already queued, about one decode step, while a
+        turn's reuse-matched history is one large transfer. Issuing it here, at
+        least an iteration earlier, is what widens that window.
+
+        Prefetching too far ahead is not free: onboarded pages occupy GPU slots
+        until the request is scheduled, and slots are the scarce resource under
+        the pressure this is meant to relieve. The bound is the control, so keep
+        it small; pages are left evictable so pressure can reclaim them.
+        """
+        if not isinstance(getattr(self, "kv_cache_manager", None),
+                          KVCacheManagerV2):
+            return
+        if not self.kv_cache_manager.enable_block_reuse:
+            return
+        if self.kv_cache_manager.gpu_prefetch_num_reqs <= 0:
+            return
+        max_prefetch = self.kv_cache_manager.gpu_prefetch_num_reqs
+        candidates = []
+        for req in self.active_requests:
+            if len(candidates) >= max_prefetch:
+                break
+            if (req.is_first_context_chunk and req.py_request_id
+                    not in self.kv_cache_manager.kv_cache_map
+                    and req.py_request_id
+                    not in self._gpu_prefetched_request_ids):
+                candidates.append(req)
+                self._gpu_prefetched_request_ids.add(req.py_request_id)
+
+        if candidates:
+            self.kv_cache_manager.prefetch_to_gpu_for_context_tokens(candidates)
+
     def _commit_kv_cache_stats(self,
                                scheduled_batch: ScheduledRequests) -> None:
         if self._is_kv_manager_v2:
@@ -3574,6 +3613,7 @@ class PyExecutor:
         self._pad_attention_dp_dummy_request()
 
         self._prefetch_for_context_requests()
+        self._prefetch_to_gpu_for_context_requests()
 
         if self.drafter is not None:
             # Honor permanent disable flag based on rolling acceptance first
@@ -6549,6 +6589,7 @@ class PyExecutor:
     def _do_terminate_request(self, request: LlmRequest):
         self.resource_manager.free_resources(request)
         self._prefetched_request_ids.discard(request.py_request_id)
+        self._gpu_prefetched_request_ids.discard(request.py_request_id)
         self._disagg_timed_out_ctx_cancelled_ids.discard(request.py_request_id)
         self._disagg_timed_out_gen_cancelled_ids.discard(request.py_request_id)
 
