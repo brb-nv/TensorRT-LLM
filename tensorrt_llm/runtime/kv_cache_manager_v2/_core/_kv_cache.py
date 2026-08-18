@@ -1338,7 +1338,9 @@ class _KVCache:
         self._status = self.Status.ACTIVE
         return True
 
-    def prefetch(self, target: CacheLevel) -> bool:
+    def prefetch(
+        self, target: CacheLevel, events_out: list[CachedCudaEvent] | None = None
+    ) -> bool:
         """Best-effort prefetch active pages to the target cache level.
 
         The cache must be suspended. Prefetch is only a performance hint: a False
@@ -1347,6 +1349,10 @@ class _KVCache:
 
         Args:
             target: Destination cache level for active pages in lower tiers.
+            events_out: When supplied, receives the completion events of the
+                migrations this call dispatched, letting a caller poll for
+                arrival instead of enqueueing a wait on a stream. Left empty
+                when every page was already at or above the target.
 
         Returns:
             True if the prefetch was dispatched, False if storage could not reserve enough pages.
@@ -1364,6 +1370,8 @@ class _KVCache:
             lambda _: make_typed(lambda _: list[Page](), num_tiers), num_pool_groups
         )
 
+        migrating = list[Page]() if events_out is not None else None
+
         for ordinal, beam_idx, lc_idx in self._active_pages():
             holder = self._page(ordinal, beam_idx, lc_idx)
             if holder is None:
@@ -1374,11 +1382,25 @@ class _KVCache:
                 continue
             pg_idx = lc2pg(lc_idx)
             all_pages[pg_idx][lvl].append(page)
+            if migrating is not None and lvl > target:
+                migrating.append(page)
 
         try:
             storage.prefetch(target, all_pages)
         except OutOfPagesError:
             return False
+        if events_out is not None:
+            assert migrating is not None
+            # Read after dispatch, because the migration is what assigns the
+            # event. One event covers a whole batch and is shared by every page
+            # in it, so dedupe by identity to poll each copy once rather than
+            # once per page.
+            seen = set[int]()
+            for page in migrating:
+                event = page.ready_event
+                if id(event) not in seen:
+                    seen.add(id(event))
+                    events_out.append(event)
         return True
 
     def _active_pages(self) -> Iterator[tuple[BlockOrdinal, BeamIndex, LifeCycleId]]:

@@ -3385,8 +3385,14 @@ class PyExecutor:
 
         Prefetching too far ahead is not free: onboarded pages occupy GPU slots
         until the request is scheduled, and slots are the scarce resource under
-        the pressure this is meant to relieve. The bound is the control, so keep
-        it small; pages are left evictable so pressure can reclaim them.
+        the pressure this is meant to relieve. So the bound is a window over the
+        head of the scheduling order rather than a per-iteration issue rate --
+        requests already prefetched still occupy their slot in it, which caps the
+        outstanding set instead of letting it walk deeper each iteration. Only a
+        few iterations of lead are needed to cover a copy, and measured deferral
+        runs far longer than that, so there is nothing to gain from reaching
+        further down the queue and a lot of device memory to lose. Pages are left
+        evictable so pressure can still reclaim them.
         """
         if not isinstance(getattr(self, "kv_cache_manager", None),
                           KVCacheManagerV2):
@@ -3395,17 +3401,20 @@ class PyExecutor:
             return
         if self.kv_cache_manager.gpu_prefetch_num_reqs <= 0:
             return
-        max_prefetch = self.kv_cache_manager.gpu_prefetch_num_reqs
+        window = self.kv_cache_manager.gpu_prefetch_num_reqs
         candidates = []
+        in_window = 0
         for req in self.active_requests:
-            if len(candidates) >= max_prefetch:
+            if in_window >= window:
                 break
-            if (req.is_first_context_chunk and req.py_request_id
-                    not in self.kv_cache_manager.kv_cache_map
-                    and req.py_request_id
-                    not in self._gpu_prefetched_request_ids):
-                candidates.append(req)
-                self._gpu_prefetched_request_ids.add(req.py_request_id)
+            if (not req.is_first_context_chunk or req.py_request_id
+                    in self.kv_cache_manager.kv_cache_map):
+                continue
+            in_window += 1
+            if req.py_request_id in self._gpu_prefetched_request_ids:
+                continue
+            candidates.append(req)
+            self._gpu_prefetched_request_ids.add(req.py_request_id)
 
         if candidates:
             self.kv_cache_manager.prefetch_to_gpu_for_context_tokens(candidates)
@@ -6616,6 +6625,8 @@ class PyExecutor:
         self._prefetched_request_ids.discard(request.py_request_id)
         self._gpu_prefetched_request_ids.discard(request.py_request_id)
         self._gpu_prefetch_iter.pop(request.py_request_id, None)
+        if self._is_kv_manager_v2:
+            self.kv_cache_manager.forget_gpu_prefetch(request.py_request_id)
         self._disagg_timed_out_ctx_cancelled_ids.discard(request.py_request_id)
         self._disagg_timed_out_gen_cancelled_ids.discard(request.py_request_id)
 

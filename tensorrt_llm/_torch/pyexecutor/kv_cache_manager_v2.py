@@ -1136,6 +1136,17 @@ class KVCacheManagerV2(BaseResourceManager):
         # args golden manifest. Promote it next to disk_prefetch_num_reqs once
         # the measurement justifies keeping it.
         self.gpu_prefetch_num_reqs = int(os.environ.get("TLLM_KV_GPU_PREFETCH_NUM_REQS", "0"))
+        # How many scheduling attempts a request may be held back waiting for its
+        # onboarding to land before it is admitted anyway. Prefetched pages stay
+        # evictable, so under pressure they can be dropped before the request is
+        # ever admitted; without a deadline such a request would be skipped
+        # forever. Giving up restores today's behaviour for it -- a stall -- which
+        # is strictly better than never running.
+        self.gpu_prefetch_max_wait_iters = int(
+            os.environ.get("TLLM_KV_GPU_PREFETCH_MAX_WAIT_ITERS", "8")
+        )
+        # request id -> [migration completion events, attempts so far]
+        self._gpu_prefetch_pending: Dict[int, list] = {}
         self.max_util_for_resume = kv_cache_config.max_util_for_resume
         enable_conversation_manager = (
             self.enable_block_reuse
@@ -3677,7 +3688,10 @@ class KVCacheManagerV2(BaseResourceManager):
         )
 
     def prefetch_for_context_tokens(
-        self, requests: list, target_level: CacheLevel = CACHE_LEVEL1
+        self,
+        requests: list,
+        target_level: CacheLevel = CACHE_LEVEL1,
+        track_arrival: bool = False,
     ) -> bool:
         """Prefetch radix-tree blocks up to ``target_level`` for upcoming context requests.
 
@@ -3686,6 +3700,10 @@ class KVCacheManagerV2(BaseResourceManager):
         ``GPU_LEVEL`` onboards instead, and competes for GPU slots; go through
         ``prefetch_to_gpu_for_context_tokens`` for that, which applies the
         pressure guard this method does not.
+
+        With ``track_arrival`` the dispatched migrations' completion events are
+        retained per request so ``gpu_prefetch_ready`` can tell whether the data
+        has landed.
 
         Returns True if all prefetches succeeded, False if any failed.
         """
@@ -3705,11 +3723,14 @@ class KVCacheManagerV2(BaseResourceManager):
             kv_cache = self.impl.create_kv_cache(
                 ReuseScope(lora_id=req.lora_task_id, salt=salt_int), tokens
             )
+            events: Optional[list] = [] if track_arrival else None
             # prefetch() is a best-effort hint: a False return means the pages
             # could not be recalled under pressure, not that anything is wrong.
-            if not kv_cache.prefetch(target_level):
+            if not kv_cache.prefetch(target_level, events):
                 logger.warning("prefetch failed for request %s", req.py_request_id)
                 success = False
+            elif events:
+                self._gpu_prefetch_pending[req.py_request_id] = [events, 0]
             kv_cache.close()
         return success
 
@@ -3728,7 +3749,36 @@ class KVCacheManagerV2(BaseResourceManager):
             return False
         if max(self.impl._storage.get_utilization(GPU_LEVEL)) > self.max_util_for_resume:
             return False
-        return self.prefetch_for_context_tokens(requests, GPU_LEVEL)
+        return self.prefetch_for_context_tokens(requests, GPU_LEVEL, track_arrival=True)
+
+    def gpu_prefetch_ready(self, request_id: int) -> bool:
+        """Whether a prefetched request's onboarding has landed and it may be admitted.
+
+        True for anything with no prefetch outstanding, so this only ever holds
+        back a request whose own copies are still moving. Admitting one early is
+        what stalls the batch: the wait ``batched_lock_to_gpu`` puts on the
+        execution stream blocks the whole forward, not just this request, so the
+        ready generation requests scheduled alongside it pay for its copy too.
+
+        Polling is non-blocking and consumes the event once complete.
+        """
+        entry = self._gpu_prefetch_pending.get(request_id)
+        if entry is None:
+            return True
+        events, attempts = entry
+        if all(event.query_complete() for event in events):
+            del self._gpu_prefetch_pending[request_id]
+            return True
+        attempts += 1
+        if attempts >= self.gpu_prefetch_max_wait_iters:
+            del self._gpu_prefetch_pending[request_id]
+            return True
+        entry[1] = attempts
+        return False
+
+    def forget_gpu_prefetch(self, request_id: int) -> None:
+        """Drop any retained prefetch state for a request that is going away."""
+        self._gpu_prefetch_pending.pop(request_id, None)
 
     def reset_reuse_state(self):
         self.impl.clear_reusable_blocks()

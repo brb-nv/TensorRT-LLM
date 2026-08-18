@@ -413,7 +413,19 @@ class KVCacheV2Scheduler(RequestScheduler):
                 scheduled_encoder.append(req)
                 budget.commit(req, tokens, peft_pages)
             else:
-                action, tokens, chunking_flag = self._try_schedule_context(req, budget)
+                # Deferring for an in-flight onboarding only pays when there is
+                # something else for the forward to run meanwhile. With the batch
+                # still empty there is nothing to overlap: the GPU would idle
+                # either way, and holding the request back would idle it on the
+                # host, spinning through empty iterations and burning the wait
+                # deadline without the copy getting any further. So admit the
+                # first request unconditionally and let it wait in the forward,
+                # which is where waiting is free.
+                action, tokens, chunking_flag = self._try_schedule_context(
+                    req,
+                    budget,
+                    may_defer=bool(scheduled_gen or scheduled_ctx or scheduled_encoder),
+                )
                 if action is ScheduleAction.STOP:
                     break
                 if action is ScheduleAction.SKIP:
@@ -505,16 +517,43 @@ class KVCacheV2Scheduler(RequestScheduler):
         return ScheduleAction.SCHEDULED, 0
 
     def _try_schedule_context(
-        self, req: LlmRequest, budget: BudgetTracker
+        self, req: LlmRequest, budget: BudgetTracker, may_defer: bool = True
     ) -> tuple[ScheduleAction, int, bool]:
         """Try to schedule a context request (chunked or non-chunked).
+
+        *may_defer* allows holding the request back until its speculatively
+        onboarded KV has arrived; see ``_gpu_prefetch_ready``.
 
         Returns ``(action, tokens, chunking_flag)``.  *tokens* and
         *chunking_flag* are meaningful only when *action* is ``SCHEDULED``.
         """
+        if may_defer and not self._gpu_prefetch_ready(req):
+            return ScheduleAction.SKIP, 0, False
         if self.chunking_enabled:
             return self._try_schedule_context_chunked(req, budget)
         return self._try_schedule_context_full(req, budget)
+
+    def _gpu_prefetch_ready(self, req: LlmRequest) -> bool:
+        """Whether req's speculatively onboarded KV has landed, if any is in flight.
+
+        Admitting a request whose onboarding is still moving is what exposes the
+        copy: the wait ``batched_lock_to_gpu`` places on the execution stream
+        holds up the entire forward, so every ready request batched alongside it
+        waits too. Skipping it costs only its own latency, and the caller treats
+        this as SKIP rather than STOP so requests behind it -- whose blocks may
+        well be resident -- are still considered this iteration.
+
+        Only the first chunk matters: that is where reuse is matched and the
+        onboarding is issued.
+
+        Not a pure predicate: it consumes arrived events and counts the attempt
+        against the request's wait deadline, so call it once per request per
+        scheduling pass.
+        """
+        ready = getattr(self.kv_cache_manager, "gpu_prefetch_ready", None)
+        if ready is None or not req.is_first_context_chunk:
+            return True
+        return ready(req.py_request_id)
 
     def _try_schedule_context_full(
         self, req: LlmRequest, budget: BudgetTracker
