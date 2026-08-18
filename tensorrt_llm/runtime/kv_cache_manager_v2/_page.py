@@ -557,12 +557,16 @@ def batched_lock_to_gpu(
             if e:
                 storage.schedule_for_eviction(t.page)
         raise
-    # Bracketed only when something actually had to come up from a lower tier.
-    # With nothing to wait for the bracket would measure the enqueue of a no-op
-    # and dilute the stall average towards zero.
-    _dyn_handle = (
-        _dyn_trace.onboard_wait_begin(kv_cache.cuda_stream) if num_off_gpu else None
-    )
+    # Bracketed whatever num_off_gpu says, because the wait below is
+    # unconditional. A page prefetched to GPU but still in flight is already at
+    # GPU_LEVEL, so the loop above skips it and num_off_gpu stays zero while the
+    # execution stream still stalls on its ready_event. Gating the bracket on
+    # num_off_gpu would hide exactly the residual stall a prefetch exists to
+    # remove, leaving onboard_wait_ms to fall either because the prefetch worked
+    # or because the stall moved out of the metric.
+    # Groups that onboard nothing arm no copy bracket, so they reach the stall
+    # total without entering the overlap statistics.
+    _dyn_handle = _dyn_trace.onboard_wait_begin(kv_cache.cuda_stream)
     stream_wait_events(kv_cache.cuda_stream, (p.page.ready_event for p in tasks))
     if _dyn_handle is not None:
         _dyn_trace.onboard_wait_end(_dyn_handle, kv_cache.cuda_stream, num_off_gpu)
