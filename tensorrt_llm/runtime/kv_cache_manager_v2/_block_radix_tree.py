@@ -17,7 +17,7 @@ import hashlib
 from array import array
 from typing import TYPE_CHECKING, Iterable, Iterator, NamedTuple, Sequence, TypeVar, cast
 
-from . import rawref
+from . import _dyn_trace, rawref
 from ._common import NDEBUG, BlockOrdinal, PageStatus, TokenId, TokenIdExt
 from ._life_cycle_registry import AttnLifeCycle, LifeCycle, LifeCycleId, LifeCycleRegistry
 from ._utils import (
@@ -200,6 +200,14 @@ def remove_subtree(root: "Block") -> None:
                 break
             assert isinstance(prev_block, Block)
             block = prev_block
+    if _dyn_trace.ENABLED:
+        # Every block here stops being reusable, and none of them reach the page
+        # destructor's hook: _release_pages() nulls the page's back-pointer first,
+        # so the page dies not knowing which block it belonged to. Dropping one
+        # full-attention page prunes the whole subtree under it, so without this
+        # the collateral blocks would later look like blocks never cached --
+        # understating precisely the eviction cost being measured.
+        _dyn_trace.record_prune(removed_block_hashes)
     if event_manager is not None:
         event_manager.add_removed_event(removed_block_hashes)
 
@@ -669,21 +677,52 @@ class BlockRadixTree:
         reuse_scope: ReuseScope,
         tokens: Sequence[TokenIdExt],
         enable_partial_match: bool = False,
+        trace: bool = False,
     ) -> ReuseMatch:
         """
         Return the currently reusable prefix match without holding pages.
 
         The result is volatile: callers that need to reuse the returned blocks must
         acquire ownership of the pages before depending on them.
+
+        `trace` attributes this lookup's misses when the KV dynamics trace is on.
+        It must be set only by the authoritative once-per-request caller: advisory
+        probes hit the same tree and would otherwise be counted as extra requests.
         """
-        matched = self._prune_match(
-            list(self._match_token_path(reuse_scope, tokens, enable_partial_match))
-        )
+        found = list(self._match_token_path(reuse_scope, tokens, enable_partial_match))
+        matched = self._prune_match(found)
+        if trace and _dyn_trace.ENABLED:
+            self._trace_match(reuse_scope, tokens, len(found), len(matched))
         return ReuseMatch(
             [block for block, _ in matched],
             self._num_matched_tokens(matched),
             len(tokens),
         )
+
+    def _trace_match(
+        self,
+        reuse_scope: ReuseScope,
+        tokens: Sequence[TokenIdExt],
+        num_found: int,
+        num_usable: int,
+    ) -> None:
+        """Hand this lookup's full key chain to the miss attributor.
+
+        The chain is recomputed rather than captured during the walk: it depends
+        only on the tokens, not on what happens to be cached, so it also covers
+        the blocks the walk never reached -- which are precisely the misses that
+        need classifying. The keys past the match point are what a previous
+        identical prefix would have inserted, so finding one among the evicted
+        keys proves the block was cached and then thrown away.
+        """
+        keys = [
+            key
+            for _, key in sequence_to_blockchain_keys(self._tokens_per_block, reuse_scope, tokens)
+        ][1:]  # drop the reuse-scope root, which is not a token block
+        # A partial match can consume a block whose key is not on the chain, so
+        # the found count is not guaranteed to index into it.
+        num_found = min(num_found, len(keys))
+        _dyn_trace.record_match(keys, num_found, min(num_usable, num_found))
 
     def _check_sanity(self) -> bool:
         raise NotImplementedError(

@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from fractions import Fraction
 from typing import TYPE_CHECKING, Callable, Iterator, Sequence, cast
 
-from . import rawref
+from . import _dyn_trace, rawref
 from ._common import (
     GPU_LEVEL,
     NDEBUG,
@@ -434,6 +434,33 @@ class StorageManager:
         fallen_pages = make_typed(lambda _: list[Page](), self.num_pool_groups)
         self._prepare_free_slots(goals, level, fallen_pages, migration_recorder, drop_recorder)
 
+    def _trace_drop(
+        self,
+        pages: Sequence[Page],
+        level: CacheLevel,
+        pg_idx: PoolGroupIndex,
+        num_free: int = -1,
+    ) -> None:
+        """Report a batch of last-level drops to the KV dynamics trace.
+
+        `num_free` must be read before the pages are released, so that it
+        describes the pressure that forced the drop rather than the relief it
+        produced. A drop taken with most of the tier free is not a capacity
+        eviction and has to be told apart from one that is.
+        """
+        storage = self._levels[level].storage
+        if num_free < 0:
+            num_free = storage.get_num_free_slots(pg_idx)
+        total = storage.num_slots(pg_idx)
+        keys = []
+        for page in pages:
+            if not isinstance(page, CommittedPage):
+                continue
+            block = page.block()
+            if block is not None:
+                keys.append(block.key)
+        _dyn_trace.record_drop(keys, int(level), num_free / total if total else 0.0)
+
     def force_evict(
         self,
         level: CacheLevel,
@@ -447,10 +474,13 @@ class StorageManager:
             assert all(p.status == PageStatus.DROPPABLE for pages in evicted for p in pages), (
                 "Corrupted eviction controller"
             )
-            if drop_recorder is not None:
-                for pg_idx in typed_range(self.num_pool_groups):
-                    if evicted[pg_idx]:
-                        drop_recorder(evicted[pg_idx], level)
+            for pg_idx in typed_range(self.num_pool_groups):
+                if not evicted[pg_idx]:
+                    continue
+                if _dyn_trace.ENABLED:
+                    self._trace_drop(evicted[pg_idx], level, pg_idx)
+                if drop_recorder is not None:
+                    drop_recorder(evicted[pg_idx], level)
             return
         next_lvl = CacheLevel(level + 1)
         goals = filled_array2d(self.num_cache_levels, self.num_pool_groups, 0)
@@ -483,6 +513,11 @@ class StorageManager:
             old_free_cnt = storage.get_num_free_slots(pg_idx)
             evictable_cnt = ctrl.num_evictable_pages(pg_idx)
             num_to_evict[pg_idx] = max(0, min(goal + fallen - old_free_cnt, evictable_cnt))
+            if _dyn_trace.ENABLED and fallen > 0:
+                # Pages spilling out of a warmer level, measured against this
+                # level's free slots before it makes room for them.
+                total = storage.num_slots(pg_idx)
+                _dyn_trace.record_device_evict(fallen, old_free_cnt / total if total else 0.0)
             fallen_held_cnt = 0  # fallen held pages we must accept in the current level.
             if self.is_last_level(lvl_id):
                 held_pages[pg_idx] = remove_if(
@@ -510,6 +545,8 @@ class StorageManager:
                     dbg_rawrefs = [rawref.ref(p) for p in evicted[pg_idx]]
                 # Record the drop event before releasing — these pages are leaving the
                 # cache hierarchy entirely without being onboarded back to GPU.
+                if _dyn_trace.ENABLED and num_evicted > 0:
+                    self._trace_drop(evicted[pg_idx], lvl_id, pg_idx, old_free_cnt)
                 if drop_recorder is not None and num_evicted > 0:
                     drop_recorder(evicted[pg_idx], lvl_id)
                 evicted[pg_idx].clear()
@@ -612,10 +649,27 @@ class StorageManager:
                     )
             dst_tier = self._levels[dst_level].cache_tier
             src_tier = self._levels[src_level].cache_tier
+            onboarding = _dyn_trace.ENABLED and not defrag and dst_level < src_level
             with TemporaryCudaStream(prior_events) as stream:
                 slot_sizes = self.slot_size(pool_group_index)
+                if onboarding:
+                    # Inside the context, so the stream's waits on prior_events are
+                    # already enqueued: the event then completes when the copy is
+                    # free to move bytes, not when it was submitted. Timing from
+                    # submission would charge the transfer for waiting on whatever
+                    # last touched these slots, which is the case this exists to
+                    # tell apart from a slow transfer.
+                    _dyn_trace.onboard_copy_begin(stream.get())
                 for pool_idx, tasks in typed_enumerate(tasks_per_pool):
                     batched_copy(dst_tier, src_tier, slot_sizes[pool_idx], tasks, stream.get())
+                if onboarding:
+                    _dyn_trace.onboard_copy_end(stream.get())
+            if _dyn_trace.ENABLED and not defrag:
+                # Every pool receives one task per page, so the byte count is the
+                # page count times the summed slot size rather than a per-pool sum.
+                _dyn_trace.record_migration(
+                    int(dst_level), int(src_level), num_slots, num_slots * sum(slot_sizes)
+                )
             finish_event = stream.take_finish_event()
             emit_cache_level_updates = (
                 update_src

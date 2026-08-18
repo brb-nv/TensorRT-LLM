@@ -422,7 +422,11 @@ class KVCacheManager:
     def _match_reuse(
         self, reuse_scope: ReuseScope, input_tokens: Sequence[TokenIdExt]
     ) -> ReuseMatch:
-        return self._radix_tree.match(reuse_scope, input_tokens, self.enable_partial_match)
+        # The one place a request's reuse is decided, so the only place the
+        # dynamics trace should count it; probe_reuse() walks the same tree.
+        return self._radix_tree.match(
+            reuse_scope, input_tokens, self.enable_partial_match, trace=True
+        )
 
     def probe_reuse(
         self,

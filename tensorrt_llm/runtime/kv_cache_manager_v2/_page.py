@@ -17,7 +17,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, NamedTuple, cast
 
-from . import rawref
+from . import _dyn_trace, rawref
 from ._block_radix_tree import Block
 from ._common import (
     BAD_BLOCK_ORDINAL,
@@ -277,6 +277,11 @@ class CommittedPage(Page):
         # block may be None when rebase happens, i.e. another block with the same key is committed,
         # replacing it, but the page is still used by a _KVCache.
         if block is not None and block.unlink_page(self.life_cycle, self):
+            if _dyn_trace.ENABLED:
+                # This block is no longer reusable, whatever the reason. The trace
+                # needs every such block, not just the allocator's evictions, or a
+                # later miss on one would be misread as a block never cached.
+                _dyn_trace.record_unlink(block.key)
             Block.clear_stale_blocks_after_page_unlink(
                 block,
                 self.life_cycle,
@@ -515,16 +520,26 @@ def batched_lock_to_gpu(
     requirements = filled_list(0, storage.num_pool_groups)
     scheduled_for_eviction = [t.page.scheduled_for_eviction for t in tasks]
     lc2pg = storage._life_cycle_grouping
+    # Counted here rather than after the migration loop because _batched_migrate
+    # rewrites page.cache_level to GPU_LEVEL as it goes, so afterwards there is
+    # nothing left to distinguish an onboarded page from one already resident.
+    num_off_gpu = 0
     for t, e in zip(tasks, scheduled_for_eviction):
         if e:
             storage.exclude_from_eviction(t.page)
         if t.page.cache_level == GPU_LEVEL:
             continue
+        num_off_gpu += 1
         requirements[lc2pg[t.life_cycle]] += 1
 
     try:
         storage.prepare_free_slots(GPU_LEVEL, requirements, migration_recorder, drop_recorder)
         partitioned = partition(tasks, lambda p: (p.page.cache_level, lc2pg[p.life_cycle]))
+        if num_off_gpu:
+            # Scopes copy-start capture to the migrations this wait will cover.
+            # prepare_free_slots above can itself migrate, and those copies belong
+            # to no wait here.
+            _dyn_trace.onboard_group_begin()
         for (lvl, pg_idx), part in partitioned.items():
             if lvl == GPU_LEVEL:
                 continue
@@ -537,11 +552,20 @@ def batched_lock_to_gpu(
                 migration_recorder=migration_recorder,
             )
     except Exception:
+        _dyn_trace.onboard_group_abort()
         for t, e in zip(tasks, scheduled_for_eviction):
             if e:
                 storage.schedule_for_eviction(t.page)
         raise
+    # Bracketed only when something actually had to come up from a lower tier.
+    # With nothing to wait for the bracket would measure the enqueue of a no-op
+    # and dilute the stall average towards zero.
+    _dyn_handle = (
+        _dyn_trace.onboard_wait_begin(kv_cache.cuda_stream) if num_off_gpu else None
+    )
     stream_wait_events(kv_cache.cuda_stream, (p.page.ready_event for p in tasks))
+    if _dyn_handle is not None:
+        _dyn_trace.onboard_wait_end(_dyn_handle, kv_cache.cuda_stream, num_off_gpu)
     return [
         page.lock(kv_cache, beam_index, ordinal, life_cycle, skip_wait=True)
         for page, beam_index, ordinal, life_cycle in tasks
