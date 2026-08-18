@@ -646,6 +646,12 @@ class PyExecutor:
                                             KVCacheManagerV2)
         self._prefetched_request_ids: set[int] = set()
         self._gpu_prefetched_request_ids: set[int] = set()
+        # request id -> iteration the GPU prefetch was issued, and a histogram of
+        # iterations of lead time it ended up getting. A prefetch issued in the
+        # same iteration the scheduler admits the request buys nothing, so this
+        # is what says whether the prefetch is early enough to matter.
+        self._gpu_prefetch_iter: dict[int, int] = {}
+        self._gpu_prefetch_lead_hist: dict[int, int] = {}
         self.enable_kv_cache_events = self.kv_cache_manager is not None and self.kv_cache_manager.event_buffer_max_size > 0
         self.enable_kv_cache_reuse = self.kv_cache_manager is not None and self.kv_cache_manager.enable_block_reuse
         # AsyncTransferManager pin/unpin path is V1-only; V2 holds blocks via _KVCache refcount.
@@ -3403,12 +3409,31 @@ class PyExecutor:
 
         if candidates:
             self.kv_cache_manager.prefetch_to_gpu_for_context_tokens(candidates)
+            for req in candidates:
+                self._gpu_prefetch_iter[req.py_request_id] = self.iter_counter
+
+    def _record_gpu_prefetch_lead(self,
+                                  scheduled_batch: ScheduledRequests) -> None:
+        """Bucket how many iterations of lead time each GPU prefetch actually got."""
+        if not self._gpu_prefetch_iter:
+            return
+        for req in scheduled_batch.context_requests:
+            issued = self._gpu_prefetch_iter.pop(req.py_request_id, None)
+            if issued is None:
+                continue
+            lead = self.iter_counter - issued
+            self._gpu_prefetch_lead_hist[lead] = (
+                self._gpu_prefetch_lead_hist.get(lead, 0) + 1)
+        if self.iter_counter % 500 == 0 and self._gpu_prefetch_lead_hist:
+            logger.info("KVDYN gpu_prefetch_lead_iters=%s",
+                        dict(sorted(self._gpu_prefetch_lead_hist.items())))
 
     def _commit_kv_cache_stats(self,
                                scheduled_batch: ScheduledRequests) -> None:
         if self._is_kv_manager_v2:
             self.kv_cache_manager.commit_scheduled_kv_cache_stats(
                 scheduled_batch)
+            self._record_gpu_prefetch_lead(scheduled_batch)
 
     def _get_disagg_transfer_admission_controller(
             self) -> DisaggTransferAdmissionController:
@@ -6590,6 +6615,7 @@ class PyExecutor:
         self.resource_manager.free_resources(request)
         self._prefetched_request_ids.discard(request.py_request_id)
         self._gpu_prefetched_request_ids.discard(request.py_request_id)
+        self._gpu_prefetch_iter.pop(request.py_request_id, None)
         self._disagg_timed_out_ctx_cancelled_ids.discard(request.py_request_id)
         self._disagg_timed_out_gen_cancelled_ids.discard(request.py_request_id)
 
