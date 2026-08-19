@@ -1011,6 +1011,8 @@ if IS_MEGAMOE_OP_AVAILABLE:
         max_tokens_per_rank: int,
         tactic: Optional[Tuple] = None,
         apply_topk_in_fc1: bool = True,
+        swiglu_alpha: Optional[float] = None,
+        swiglu_beta: Optional[float] = None,
         gate_up_clamp: Optional[float] = None,
         situ_beta: Optional[float] = None,
         situ_linear_beta: Optional[float] = None,
@@ -1070,6 +1072,8 @@ if IS_MEGAMOE_OP_AVAILABLE:
             flag_batch=int(flag_batch),
             epi_flag_batch=tuple(epi_flag_batch),
             apply_topk_in_fc1=bool(apply_topk_in_fc1),
+            swiglu_alpha=(None if swiglu_alpha is None else float(swiglu_alpha)),
+            swiglu_beta=(None if swiglu_beta is None else float(swiglu_beta)),
             gate_up_clamp=(None if gate_up_clamp is None else float(gate_up_clamp)),
             situ_beta=(None if situ_beta is None else float(situ_beta)),
             situ_linear_beta=(None if situ_linear_beta is None else float(situ_linear_beta)),
@@ -1118,6 +1122,8 @@ if IS_MEGAMOE_OP_AVAILABLE:
             max_tokens_per_rank: int,
             output_dtype: torch.dtype,
             apply_topk_in_fc1: bool = True,
+            swiglu_alpha: Optional[float] = None,
+            swiglu_beta: Optional[float] = None,
             gate_up_clamp: Optional[float] = None,
             situ_beta: Optional[float] = None,
             situ_linear_beta: Optional[float] = None,
@@ -1156,6 +1162,8 @@ if IS_MEGAMOE_OP_AVAILABLE:
             # part of ``unique_id`` (compile + workspace cache key), never
             # per-call runtime kwargs.
             self.apply_topk_in_fc1 = bool(apply_topk_in_fc1)
+            self.swiglu_alpha = None if swiglu_alpha is None else float(swiglu_alpha)
+            self.swiglu_beta = None if swiglu_beta is None else float(swiglu_beta)
             self.gate_up_clamp = None if gate_up_clamp is None else float(gate_up_clamp)
             # SiTU constants are baked into the generated kernel exactly like
             # gate_up_clamp, so they are part of unique_id() below.
@@ -1192,6 +1200,8 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 self.max_tokens_per_rank,
                 str(self.output_dtype),
                 self.apply_topk_in_fc1,
+                self.swiglu_alpha,
+                self.swiglu_beta,
                 self.gate_up_clamp,
                 self.situ_beta,
                 self.situ_linear_beta,
@@ -1386,6 +1396,8 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 flag_batch=int(flag_batch),
                 epi_flag_batch=tuple(epi_flag_batch),
                 apply_topk_in_fc1=self.apply_topk_in_fc1,
+                swiglu_alpha=self.swiglu_alpha,
+                swiglu_beta=self.swiglu_beta,
                 gate_up_clamp=self.gate_up_clamp,
                 situ_beta=self.situ_beta,
                 situ_linear_beta=self.situ_linear_beta,
@@ -1699,6 +1711,8 @@ if IS_MEGAMOE_OP_AVAILABLE:
         max_tokens_per_rank: int,
         peer_offsets: List[int],
         apply_topk_in_fc1: bool = True,
+        swiglu_alpha: Optional[float] = None,
+        swiglu_beta: Optional[float] = None,
         gate_up_clamp: Optional[float] = None,
         situ_beta: Optional[float] = None,
         situ_linear_beta: Optional[float] = None,
@@ -1755,6 +1769,8 @@ if IS_MEGAMOE_OP_AVAILABLE:
             max_tokens_per_rank=max_tokens_per_rank,
             output_dtype=combine_output.dtype,
             apply_topk_in_fc1=apply_topk_in_fc1,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
             gate_up_clamp=gate_up_clamp,
             situ_beta=situ_beta,
             situ_linear_beta=situ_linear_beta,
@@ -1869,6 +1885,8 @@ if IS_MEGAMOE_OP_AVAILABLE:
         max_tokens_per_rank: int,
         peer_offsets: List[int],
         apply_topk_in_fc1: bool = True,
+        swiglu_alpha: Optional[float] = None,
+        swiglu_beta: Optional[float] = None,
         gate_up_clamp: Optional[float] = None,
         situ_beta: Optional[float] = None,
         situ_linear_beta: Optional[float] = None,

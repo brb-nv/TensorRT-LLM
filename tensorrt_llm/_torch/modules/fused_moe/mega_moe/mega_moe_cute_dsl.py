@@ -68,6 +68,7 @@ non-1 scales compute correctly.
 
 from __future__ import annotations
 
+import math
 import os
 import socket
 import weakref
@@ -410,10 +411,11 @@ class MegaMoECuteDsl(MoEImplBase):
         # The fused path also requires the ``trtllm::cute_dsl_megamoe_nvfp4_*``
         # custom ops to be registered (strict import of every kernel symbol in
         # cute_dsl_megamoe_custom_op).
-        if p.activation_type != ActivationType.Swiglu:
+        if p.activation_type not in (ActivationType.Swiglu, ActivationType.SwigluBias):
             return _reject(
                 MoERejectReason.ACTIVATION_UNSUPPORTED,
-                f"MegaMoECuteDsl only supports ActivationType.Swiglu (got {p.activation}).",
+                "MegaMoECuteDsl only supports ActivationType.Swiglu and "
+                f"ActivationType.SwigluBias (got {p.activation}).",
             )
         if d.tp_size != 1:
             return _reject(
@@ -467,6 +469,8 @@ class MegaMoECuteDsl(MoEImplBase):
         layer_idx: Optional[int] = None,
         init_load_balancer: bool = False,
         activation_type: ActivationType = ActivationType.Swiglu,
+        swiglu_alpha: Optional[torch.Tensor] = None,
+        swiglu_beta: Optional[torch.Tensor] = None,
         swiglu_limit: Optional[torch.Tensor] = None,
         # ``activation=None`` infers Kimi K3 SiTU from the pretrained config and
         # otherwise defaults to SwiGLU. Mirrors MegaMoEDeepGemm.
@@ -493,6 +497,8 @@ class MegaMoECuteDsl(MoEImplBase):
             weight_loading_mode=weight_loading_mode,
             layer_idx=layer_idx,
             activation_type=activation_type,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
             swiglu_limit=swiglu_limit,
             init_load_balancer=init_load_balancer,
         )
@@ -506,20 +512,57 @@ class MegaMoECuteDsl(MoEImplBase):
             )
         # ``ActivationType.Swiglu`` describes the gated FC1 tensor geometry shared
         # by SwiGLU and SiTU; the elementwise function is selected by
-        # ``activation`` below. Same reasoning as MegaMoEDeepGemm.
-        if activation_type != ActivationType.Swiglu:
+        # ``activation`` below. ``ActivationType.SwigluBias`` is the MiniMax-M3
+        # alpha/beta/limit variant. Same reasoning as MegaMoEDeepGemm.
+        if activation_type not in (ActivationType.Swiglu, ActivationType.SwigluBias):
             raise ValueError(
-                f"MegaMoECuteDsl only supports ActivationType.Swiglu (got {activation_type})."
+                "MegaMoECuteDsl only supports ActivationType.Swiglu and "
+                f"ActivationType.SwigluBias (got {activation_type})."
             )
-        activation, situ_beta, situ_linear_beta = self._resolve_activation_config(
-            model_config,
-            activation=activation,
-            situ_beta=situ_beta,
-            situ_linear_beta=situ_linear_beta,
-        )
-        self.activation = activation
-        self.situ_beta = situ_beta
-        self.situ_linear_beta = situ_linear_beta
+        if activation_type == ActivationType.SwigluBias:
+            # MiniMax-M3: alpha/beta/limit come from the checkpoint and are baked
+            # into the epilogue, so they are mutually exclusive with SiTU.
+            if activation is not None or situ_beta is not None or situ_linear_beta is not None:
+                raise ValueError(
+                    "MegaMoECuteDsl ActivationType.SwigluBias is exclusive with the "
+                    "SiTU activation; drop activation / situ_beta / situ_linear_beta."
+                )
+            if swiglu_alpha is None or swiglu_beta is None or swiglu_limit is None:
+                raise ValueError(
+                    "MegaMoECuteDsl ActivationType.SwigluBias requires "
+                    "swiglu_alpha, swiglu_beta, and swiglu_limit."
+                )
+            self.activation = "swiglu"
+            self.situ_beta = None
+            self.situ_linear_beta = None
+            self.swiglu_activation_alpha = self._resolve_uniform_codegen_scalar(
+                swiglu_alpha, parameter_name="swiglu_alpha"
+            )
+            self.swiglu_activation_beta = self._resolve_uniform_codegen_scalar(
+                swiglu_beta, parameter_name="swiglu_beta"
+            )
+            if self.swiglu_activation_alpha <= 0:
+                raise ValueError(
+                    "MegaMoECuteDsl requires swiglu_alpha > 0 for "
+                    f"ActivationType.SwigluBias; got {self.swiglu_activation_alpha}."
+                )
+        else:
+            if swiglu_alpha is not None or swiglu_beta is not None:
+                raise ValueError(
+                    "MegaMoECuteDsl ActivationType.Swiglu requires "
+                    "swiglu_alpha and swiglu_beta to be unset."
+                )
+            self.swiglu_activation_alpha = None
+            self.swiglu_activation_beta = None
+            activation, situ_beta, situ_linear_beta = self._resolve_activation_config(
+                model_config,
+                activation=activation,
+                situ_beta=situ_beta,
+                situ_linear_beta=situ_linear_beta,
+            )
+            self.activation = activation
+            self.situ_beta = situ_beta
+            self.situ_linear_beta = situ_linear_beta
         self.apply_router_weight_on_input = apply_router_weight_on_input
 
         # topk-score application point. v2 default is the deepgemm graph
@@ -557,6 +600,15 @@ class MegaMoECuteDsl(MoEImplBase):
             raise ValueError(
                 "MegaMoECuteDsl SiTU does not support a gate/up clamp; "
                 "drop swiglu_limit for SiTU checkpoints."
+            )
+        if activation_type == ActivationType.SwigluBias and (
+            self.gate_up_clamp is None
+            or not math.isfinite(self.gate_up_clamp)
+            or self.gate_up_clamp < 0
+        ):
+            raise ValueError(
+                "MegaMoECuteDsl requires finite swiglu_limit >= 0 for "
+                f"ActivationType.SwigluBias; got {self.gate_up_clamp}."
             )
 
         # Buffer sizing. MoE layers execute serially per forward; one pool
@@ -684,35 +736,52 @@ class MegaMoECuteDsl(MoEImplBase):
         return activation, float(situ_beta), float(situ_linear_beta)
 
     @staticmethod
-    def _resolve_gate_up_clamp(
-        swiglu_limit: Optional[torch.Tensor],
-    ) -> Optional[float]:
-        """Reduce a per-layer ``swiglu_limit`` tensor to a single codegen-time
-        ``gate_up_clamp`` float, or ``None`` when no clamp is configured.
+    def _resolve_uniform_codegen_scalar(
+        value: Union[torch.Tensor, float], *, parameter_name: str, require_finite: bool = True
+    ) -> float:
+        """Reduce a scalar or uniform tensor to one codegen constant.
 
-        The MegaMoE kernel bakes ``gate_up_clamp`` into the compiled kernel as
-        one scalar, so only a uniform (per-layer) clamp is representable.
-        Non-uniform / per-expert clamp is rejected with a clear ``ValueError``
-        rather than silently using one element. GPT-OSS-style clamp is rejected
-        earlier in ``can_implement`` via ``swiglu_gptoss_style``.
+        MegaMoE bakes the activation parameters into the compiled epilogue, so
+        only a uniform value per layer is representable. Reject non-uniform or
+        non-finite values when requested rather than silently selecting one
+        expert's value. The legacy clamp path permits infinity for backward
+        compatibility; SwiGLUBias validates a finite clamp separately.
         """
-        if swiglu_limit is None:
-            return None
-        if not isinstance(swiglu_limit, torch.Tensor):
-            # Accept a plain python scalar for robustness.
-            return float(swiglu_limit)
-        flat = swiglu_limit.detach().reshape(-1)
+        if not isinstance(value, torch.Tensor):
+            resolved = float(value)
+            if require_finite and not math.isfinite(resolved):
+                raise ValueError(
+                    f"MegaMoECuteDsl requires finite {parameter_name}; got {resolved}."
+                )
+            return resolved
+        flat = value.detach().reshape(-1)
         if flat.numel() == 0:
-            return None
+            raise ValueError(f"MegaMoECuteDsl requires non-empty {parameter_name}.")
         first = flat[0]
         if flat.numel() > 1 and not torch.allclose(flat, first.expand_as(flat), rtol=1e-5, atol=0):
             raise ValueError(
                 "MegaMoECuteDsl only supports a uniform (per-layer) "
-                "swiglu_limit because the kernel bakes gate_up_clamp as a "
-                "codegen-time scalar; got a non-uniform / per-expert "
-                f"swiglu_limit with values {flat.cpu().tolist()}."
+                f"{parameter_name} because the kernel bakes it as a "
+                "codegen-time scalar; got non-uniform / per-expert values "
+                f"{flat.cpu().tolist()}."
             )
-        return float(first.item())
+        resolved = float(first.item())
+        if require_finite and not math.isfinite(resolved):
+            raise ValueError(f"MegaMoECuteDsl requires finite {parameter_name}; got {resolved}.")
+        return resolved
+
+    @staticmethod
+    def _resolve_gate_up_clamp(
+        swiglu_limit: Optional[torch.Tensor],
+    ) -> Optional[float]:
+        """Resolve the optional uniform SwiGLU clamp codegen constant."""
+        if swiglu_limit is None:
+            return None
+        return MegaMoECuteDsl._resolve_uniform_codegen_scalar(
+            swiglu_limit,
+            parameter_name="swiglu_limit",
+            require_finite=False,
+        )
 
     @staticmethod
     def _resolve_maxt_buckets(max_num_tokens: int) -> List[int]:
@@ -1005,6 +1074,9 @@ class MegaMoECuteDsl(MoEImplBase):
                     self.expand_intermediate_size_per_partition
                 ),
                 max_tokens_per_rank=max_T,
+                swiglu_alpha=self.swiglu_activation_alpha,
+                swiglu_beta=self.swiglu_activation_beta,
+                gate_up_clamp=self.gate_up_clamp,
                 in_kernel_fc2_reduce=False,
                 combine_format=self.combine_format,
             )
@@ -1308,6 +1380,9 @@ class MegaMoECuteDsl(MoEImplBase):
                     self.expand_intermediate_size_per_partition
                 ),
                 max_tokens_per_rank=max_T,
+                swiglu_alpha=self.swiglu_activation_alpha,
+                swiglu_beta=self.swiglu_activation_beta,
+                gate_up_clamp=self.gate_up_clamp,
                 in_kernel_fc2_reduce=False,
                 combine_format=self.combine_format,
             )
@@ -1526,6 +1601,8 @@ class MegaMoECuteDsl(MoEImplBase):
                 max_tokens_per_rank=int(launch_max_T),
                 peer_offsets=peer_offsets,
                 apply_topk_in_fc1=bool(self.apply_topk_in_fc1),
+                swiglu_alpha=self.swiglu_activation_alpha,
+                swiglu_beta=self.swiglu_activation_beta,
                 gate_up_clamp=self.gate_up_clamp,
                 situ_beta=self.situ_beta,
                 situ_linear_beta=self.situ_linear_beta,
