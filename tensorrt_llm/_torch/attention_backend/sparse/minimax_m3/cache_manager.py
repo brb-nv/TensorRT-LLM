@@ -47,6 +47,51 @@ from tensorrt_llm.runtime.kv_cache_manager_v2._config import DataRole
 
 from ....pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2, Role
 
+# --- TEMPORARY FAULT INJECTION (scratch branch only, do not merge) ----------
+# Forces MiniMaxM3KVCacheManagerV2.add_dummy_requests() to refuse the attention
+# DP pad dummy so _pad_attention_dp_dummy_request()'s allocation-failure path
+# runs on demand instead of waiting for natural KV saturation.
+#
+#   TRTLLM_ADP_DUMMY_FAIL_RANKS      comma-separated ranks to fail on
+#   TRTLLM_ADP_DUMMY_FAIL_COUNT      refusals before allowing recovery (50)
+#   TRTLLM_ADP_DUMMY_FAIL_AFTER_SEC  arming delay, keeps warmup clear (180)
+_ADP_FAULT_STATE = {"armed_at": None, "remaining": None}
+
+
+def _adp_dummy_fault_injected(request_ids) -> bool:
+    import time
+
+    from tensorrt_llm._utils import global_mpi_rank
+
+    from ....pyexecutor.llm_request import ATTENTION_DP_DUMMY_REQUEST_ID
+
+    ranks = os.environ.get("TRTLLM_ADP_DUMMY_FAIL_RANKS")
+    if not ranks or request_ids != [ATTENTION_DP_DUMMY_REQUEST_ID]:
+        return False
+    rank = global_mpi_rank()
+    if rank not in {int(r) for r in ranks.split(",") if r.strip()}:
+        return False
+
+    state = _ADP_FAULT_STATE
+    if state["armed_at"] is None:
+        state["armed_at"] = time.monotonic()
+        state["remaining"] = int(
+            os.environ.get("TRTLLM_ADP_DUMMY_FAIL_COUNT", "50"))
+    arm_after = float(
+        os.environ.get("TRTLLM_ADP_DUMMY_FAIL_AFTER_SEC", "180"))
+    if time.monotonic() - state["armed_at"] < arm_after:
+        return False
+    if state["remaining"] <= 0:
+        return False
+
+    state["remaining"] -= 1
+    logger.warning(f"[fault-injection] refused ADP pad dummy on rank {rank}, "
+                   f"{state['remaining']} refusals left")
+    return True
+
+
+# --- END TEMPORARY FAULT INJECTION -----------------------------------------
+
 
 class MiniMaxM3SparseIndexCache:
     """Plain-tensor side cache for the M3 sparse index branch.
@@ -351,6 +396,8 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         Retires with the P128 Eagle kernel fixes; see
         ``draft_manager_tokens_per_block``.
         """
+        if _adp_dummy_fault_injected(kwargs.get("request_ids")):
+            return None
         if isinstance(kwargs.get("draft_kv_cache_manager"), MiniMaxM3DraftSubpageView):
             kwargs["draft_kv_cache_manager"] = None
         return super().add_dummy_requests(*args, **kwargs)
