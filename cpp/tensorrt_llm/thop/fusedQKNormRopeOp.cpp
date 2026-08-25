@@ -65,26 +65,27 @@ int64_t validateFusedQKNormRopeInputs(torch::Tensor const& qkv, torch::Tensor co
         qkv.size(1) == total_heads * head_dim, "QKV tensor size must match total number of heads and head dimension");
 
     return num_tokens;
-    void checkMinimaxM3HndKVPool(torch::Tensor const& kvCache, int64_t numHeads, int64_t headDim)
-    {
-        TORCH_CHECK(kvCache.is_cuda(), "kv_cache must be a CUDA tensor");
-        TORCH_CHECK(kvCache.scalar_type() == at::ScalarType::Float8_e4m3fn, "kv_cache must use torch.float8_e4m3fn");
-        TORCH_CHECK(kvCache.dim() == 5, "kv_cache must be HND [num_pages, 2, num_heads, page_size, head_dim]");
-        TORCH_CHECK(kvCache.size(0) > 0 && kvCache.size(3) > 0, "kv_cache must have positive num_pages and page_size");
-        TORCH_CHECK(kvCache.size(1) == 2, "kv_cache plane dimension must contain K and V");
-        TORCH_CHECK(kvCache.size(2) == numHeads, "kv_cache num_heads mismatch");
-        TORCH_CHECK(kvCache.size(4) == headDim, "kv_cache head_dim mismatch");
-        TORCH_CHECK(kvCache.stride(4) == 1 && kvCache.stride(3) == headDim,
-            "kv_cache must have contiguous head_dim rows in HND layout");
-        TORCH_CHECK(kvCache.stride(2) == kvCache.size(3) * kvCache.stride(3),
-            "kv_cache must have contiguous [page_size, head_dim] blocks in HND layout");
-        TORCH_CHECK(
-            kvCache.stride(1) >= kvCache.size(2) * kvCache.stride(2), "kv_cache K and V planes must not overlap");
-        TORCH_CHECK(kvCache.stride(0) >= kvCache.size(1) * kvCache.stride(1),
-            "kv_cache page stride must not overlap adjacent HND pages");
-        TORCH_CHECK(kvCache.stride(0) % 4 == 0 && kvCache.stride(1) % 4 == 0,
-            "kv_cache page and plane strides must preserve 32-bit FP8 store alignment");
-    }
+}
+
+void checkMinimaxM3HndKVPool(torch::Tensor const& kvCache, int64_t numHeads, int64_t headDim)
+{
+    TORCH_CHECK(kvCache.is_cuda(), "kv_cache must be a CUDA tensor");
+    TORCH_CHECK(kvCache.scalar_type() == at::ScalarType::Float8_e4m3fn, "kv_cache must use torch.float8_e4m3fn");
+    TORCH_CHECK(kvCache.dim() == 5, "kv_cache must be HND [num_pages, 2, num_heads, page_size, head_dim]");
+    TORCH_CHECK(kvCache.size(0) > 0 && kvCache.size(3) > 0, "kv_cache must have positive num_pages and page_size");
+    TORCH_CHECK(kvCache.size(1) == 2, "kv_cache plane dimension must contain K and V");
+    TORCH_CHECK(kvCache.size(2) == numHeads, "kv_cache num_heads mismatch");
+    TORCH_CHECK(kvCache.size(4) == headDim, "kv_cache head_dim mismatch");
+    TORCH_CHECK(kvCache.stride(4) == 1 && kvCache.stride(3) == headDim,
+        "kv_cache must have contiguous head_dim rows in HND layout");
+    TORCH_CHECK(kvCache.stride(2) == kvCache.size(3) * kvCache.stride(3),
+        "kv_cache must have contiguous [page_size, head_dim] blocks in HND layout");
+    TORCH_CHECK(kvCache.stride(1) >= kvCache.size(2) * kvCache.stride(2), "kv_cache K and V planes must not overlap");
+    TORCH_CHECK(kvCache.stride(0) >= kvCache.size(1) * kvCache.stride(1),
+        "kv_cache page stride must not overlap adjacent HND pages");
+    TORCH_CHECK(kvCache.stride(0) % 4 == 0 && kvCache.stride(1) % 4 == 0,
+        "kv_cache page and plane strides must preserve 32-bit FP8 store alignment");
+}
 
 } // namespace
 

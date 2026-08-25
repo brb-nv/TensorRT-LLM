@@ -1884,7 +1884,10 @@ class MiniMaxM3MsaSparseAttention(TrtllmAttention):
                 f"{type(self).__name__}.forward_prepopulated_kv requires an output buffer."
             )
 
-        kv_block_indexes = forward_args.topk_indices
+        sparse_backend_args = forward_args.sparse_backend_args
+        kv_block_indexes = (
+            sparse_backend_args.topk_indices if sparse_backend_args is not None else None
+        )
         if kv_block_indexes is not None:
             plan = metadata.msa_decode_gqa_plan
             if plan is None:
