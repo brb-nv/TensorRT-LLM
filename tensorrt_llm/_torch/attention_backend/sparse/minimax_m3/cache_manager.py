@@ -39,7 +39,12 @@ from tensorrt_llm._utils import (
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal.batch_manager import CacheType as CacheTypeCpp
 from tensorrt_llm.logger import logger
-from tensorrt_llm.runtime.kv_cache_manager_v2 import BufferConfig, PageIndexMode
+from tensorrt_llm.runtime.kv_cache_manager_v2 import (
+    AttentionLayerConfig,
+    BufferConfig,
+    LayerId,
+    PageIndexMode,
+)
 from tensorrt_llm.runtime.kv_cache_manager_v2._common import BAD_PAGE_INDEX
 from tensorrt_llm.runtime.kv_cache_manager_v2._config import DataRole
 
@@ -184,6 +189,22 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
 
     _main_kv_layout = "NHD"
 
+    # Life-cycle group tags used by the sparse-KV hot-window layout. Each tag
+    # forks the tagged layers into a distinct life cycle (own pool group row
+    # and per-sequence page chain), so their KV can be migrated between GPU and
+    # host tiers independently:
+    #   * DENSE       - dense target layers + shared Eagle draft layer (normal,
+    #                   whole-sequence residency).
+    #   * SPARSE_MAIN - sparse target layers' main K/V (hot-window residency:
+    #                   only the per-request top-k blocks stay GPU-resident
+    #                   during decode; the rest live on the pinned host tier).
+    #   * INDEX       - sparse target layers' index-K, carried on phantom
+    #                   layers so it stays fully resident while sparse main KV
+    #                   is offloaded (the indexer scores every block from it).
+    _LC_GROUP_DENSE = 0
+    _LC_GROUP_SPARSE_MAIN = 1
+    _LC_GROUP_INDEX = 2
+
     def __init__(
         self,
         *args,
@@ -191,6 +212,7 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         disable_index_value_layer_ids=None,
         sparse_index_dim: Optional[int] = None,
         num_one_model_draft_layers: int = 0,
+        enable_sparse_kv_hot_window: bool = False,
         **kwargs,
     ):
         # Linear Eagle3 verification is a causal multi-token append and is
@@ -244,6 +266,18 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         self.sparse_layer_ids = sorted(int(i) for i in sparse_layer_ids)
         self.disable_index_value_layer_ids = set(int(i) for i in disable_index_value_layer_ids)
         self.sparse_index_dim = int(sparse_index_dim)
+        # Opt-in sparse-KV hot-window layout. When enabled, sparse main K/V,
+        # dense K/V, and (phantom) sparse index-K are split into three separate
+        # life-cycle pool groups so only sparse main KV is offloaded during
+        # decode. Default off preserves the historical single mega-slot layout
+        # exactly. Must be set before ``super().__init__`` because the base
+        # ``_build_base_config`` -> ``_build_cache_config`` chain reads it.
+        self.enable_sparse_kv_hot_window = bool(enable_sparse_kv_hot_window)
+        # Maps a global sparse layer id -> the local layer offset of the
+        # phantom INDEX_KEY layer that carries its index-K in the split layout.
+        # Populated by ``_apply_hot_window_layout``; empty when the layout is
+        # disabled.
+        self._sparse_index_phantom_offset: dict[int, int] = {}
         self.indexer_kv_dtype = str(getattr(sparse_attn_config, "indexer_kv_dtype", "bf16"))
         if self.indexer_kv_dtype not in ("bf16", "fp8"):
             raise ValueError(
@@ -259,6 +293,12 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
             )
 
         super().__init__(*args, **kwargs)
+
+        if self.enable_sparse_kv_hot_window and self.enable_swa_scratch_reuse:
+            raise NotImplementedError(
+                "MiniMax-M3 sparse-KV hot-window layout is not yet supported "
+                "together with SWA scratch reuse."
+            )
 
         if self.dtype == DataType.NVFP4:
             dense_target_layers = [
@@ -316,19 +356,71 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         not have a matching TRTLLM-Gen NVFP4 cubin, so those buffers retain
         the proven FP8/P128 representation.
         """
-        if self.dtype != DataType.NVFP4:
-            return super()._build_cache_config(config)
+        if self.dtype == DataType.NVFP4:
+            scale_roles = {Role.KEY_BLOCK_SCALE, Role.VALUE_BLOCK_SCALE}
+            for layer in config.layers:
+                local_layer_idx = int(layer.layer_id)
+                global_layer_idx = int(self.pp_layers[local_layer_idx])
+                if global_layer_idx in self.sparse_layer_ids:
+                    continue
+                layer.buffers[:] = [
+                    buffer for buffer in layer.buffers if buffer.role not in scale_roles
+                ]
 
-        scale_roles = {Role.KEY_BLOCK_SCALE, Role.VALUE_BLOCK_SCALE}
+        if self.enable_sparse_kv_hot_window:
+            self._apply_hot_window_layout(config)
+
+        return super()._build_cache_config(config)
+
+    def _apply_hot_window_layout(self, config) -> None:
+        """Split the single mega-slot pool group into three life-cycle groups.
+
+        In place on ``config.layers``:
+          * tag each real layer ``life_cycle_group`` as DENSE or SPARSE_MAIN;
+          * move every sparse layer's ``Role.INDEX_KEY`` buffer onto a new
+            phantom ``AttentionLayerConfig`` tagged INDEX, so index-K forms its
+            own pool group (kept fully resident) instead of coalescing into the
+            sparse main-KV slot (which is hot-windowed during decode).
+
+        Phantom layers use synthetic local layer ids ``>= num_local_layers``.
+        They carry only INDEX_KEY (no K/V/scale), so pool-pointer construction
+        must skip them (see :meth:`_build_pool_mapping_tensors`). Their local
+        offsets are recorded in ``self._sparse_index_phantom_offset`` keyed by
+        the source layer's *global* id, and addressed via
+        :meth:`get_index_k_buffer`.
+        """
+        num_real_layers = len(config.layers)
+        phantom_layers: List[AttentionLayerConfig] = []
+        next_phantom_id = num_real_layers
+        self._sparse_index_phantom_offset = {}
+
         for layer in config.layers:
             local_layer_idx = int(layer.layer_id)
             global_layer_idx = int(self.pp_layers[local_layer_idx])
-            if global_layer_idx in self.sparse_layer_ids:
+            is_sparse = global_layer_idx in self.sparse_layer_ids
+            layer.life_cycle_group = (
+                self._LC_GROUP_SPARSE_MAIN if is_sparse else self._LC_GROUP_DENSE
+            )
+            if not is_sparse:
                 continue
-            layer.buffers[:] = [
-                buffer for buffer in layer.buffers if buffer.role not in scale_roles
-            ]
-        return super()._build_cache_config(config)
+            index_buffers = [b for b in layer.buffers if b.role == Role.INDEX_KEY]
+            if not index_buffers:
+                continue
+            layer.buffers[:] = [b for b in layer.buffers if b.role != Role.INDEX_KEY]
+            phantom_local_id = next_phantom_id
+            next_phantom_id += 1
+            phantom_layers.append(
+                AttentionLayerConfig(
+                    layer_id=LayerId(phantom_local_id),
+                    buffers=index_buffers,
+                    sliding_window_size=layer.sliding_window_size,
+                    num_sink_tokens=layer.num_sink_tokens,
+                    life_cycle_group=self._LC_GROUP_INDEX,
+                )
+            )
+            self._sparse_index_phantom_offset[global_layer_idx] = phantom_local_id
+
+        config.layers.extend(phantom_layers)
 
     def get_layer_bytes_per_token(self, local_layer_idx: int, data_role: Role):
         """Report the hybrid sparse-NVFP4 / dense-FP8 storage footprint."""
@@ -364,6 +456,57 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
     def uses_hybrid_nvfp4_kv_cache(self) -> bool:
         return self.dtype == DataType.NVFP4
 
+    def _is_index_pool(self, pool_id: int) -> bool:
+        """Whether ``pool_id`` is a phantom INDEX_KEY pool (split layout).
+
+        Phantom index layers use synthetic local ids ``>= num_local_layers``
+        and carry only ``Role.INDEX_KEY``. In the default (non-split) layout no
+        such pool exists, so this is always ``False``.
+        """
+        if not self._sparse_index_phantom_offset:
+            return False
+        return int(self.impl.layer_grouping[pool_id][0]) >= self.num_local_layers
+
+    def _get_pool_roles(self, pool_id: int) -> Tuple[DataRole, Optional[DataRole]]:
+        """Route phantom INDEX_KEY pools to their single index-K role.
+
+        The base implementation assumes every pool holds K (+ V). A phantom
+        index pool holds only ``Role.INDEX_KEY`` with no value lane, so the
+        base K/V role pair would raise when the shared page-table builders
+        query the pool's base address / index scale.
+        """
+        if self._is_index_pool(pool_id):
+            return Role.INDEX_KEY, None
+        return super()._get_pool_roles(pool_id)
+
+    @property
+    def sparse_main_pool_id(self) -> Optional[int]:
+        """Pool/life-cycle id (block-offset row) of sparse main K/V.
+
+        ``None`` unless the split hot-window layout is active. Used by the MSA
+        backend to read the sparse main-KV block table, and by the residency
+        controller to offload/onboard sparse main-KV pages.
+        """
+        if not self.enable_sparse_kv_hot_window:
+            return None
+        any_sparse = next(
+            (lid for lid in self.sparse_layer_ids if lid in self.layer_offsets), None
+        )
+        if any_sparse is None:
+            return None
+        return int(self.impl.get_layer_group_id(self.layer_offsets[any_sparse]))
+
+    @property
+    def sparse_index_pool_id(self) -> Optional[int]:
+        """Pool/life-cycle id (block-offset row) of the phantom index-K group.
+
+        ``None`` unless the split hot-window layout is active.
+        """
+        if not self._sparse_index_phantom_offset:
+            return None
+        any_phantom = next(iter(self._sparse_index_phantom_offset.values()))
+        return int(self.impl.get_layer_group_id(LayerId(any_phantom)))
+
     def _build_pool_mapping_tensors(self):
         """Publish scale pointers only for physical pools that own them.
 
@@ -396,6 +539,13 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         else:
             for pool_id in range(self.num_pools):
                 local_layer_idx = int(self.impl.layer_grouping[pool_id][0])
+                if self._is_index_pool(pool_id):
+                    # Phantom INDEX_KEY pool (sparse hot-window layout): no K/V
+                    # or block-scale data. Addressed via get_index_k_buffer, not
+                    # these NVFP4 K/V pool pointers. Keep a placeholder row so
+                    # pool_id stays aligned with the physical pool count.
+                    pointer_rows.append([[0, 0], [0, 0]])
+                    continue
                 group_layers = [int(layer) for layer in self.impl.layer_grouping[pool_id]]
                 group_is_uniform_nvfp4 = all(
                     self.is_nvfp4_layer(int(self.pp_layers[layer])) for layer in group_layers
@@ -543,12 +693,17 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         """
         if kv_layout is None:
             kv_layout = self._main_kv_layout
+        # In the split hot-window layout, index-K lives on a phantom layer that
+        # is absent from ``self.layer_offsets``; address it by its recorded
+        # local offset. Otherwise index-K is coalesced onto the sparse layer.
+        layer_offset_override = self._sparse_index_phantom_offset.get(int(layer_idx))
         return super().get_index_k_buffer(
             layer_idx,
             num_heads=1,
             head_dim=self.sparse_index_dim,
             dtype=self._torch_dtype_for_index_cache(),
             kv_layout=kv_layout,
+            layer_offset_override=layer_offset_override,
         )
 
     def get_index_v_buffer(self, layer_idx: int) -> Optional[torch.Tensor]:

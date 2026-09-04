@@ -1958,6 +1958,7 @@ class KVCacheManagerV2(BaseResourceManager):
         head_dim: int,
         dtype: Union[torch.dtype, "DataType", str] = torch.bfloat16,
         kv_layout: str = "NHD",
+        layer_offset_override: Optional[int] = None,
     ) -> Optional[torch.Tensor]:
         """Return a torch view over the V2-managed paged ``Role.INDEX_KEY``
         buffer for ``layer_idx``, or ``None`` when the layer has no
@@ -1990,9 +1991,18 @@ class KVCacheManagerV2(BaseResourceManager):
         """
         if kv_layout not in ("NHD", "HND"):
             raise ValueError(f"Unsupported kv_layout: {kv_layout}")
-        if layer_idx not in self.layer_offsets:
-            return None
-        layer_offset = self.layer_offsets[layer_idx]
+        # ``layer_offset_override`` lets callers address an INDEX_KEY buffer
+        # that lives on a *phantom* local layer (a synthetic layer carrying
+        # only INDEX_KEY so it forms its own life cycle / pool group). Such
+        # phantom layers are not present in ``self.layer_offsets`` (which maps
+        # only real model layers), so the override supplies the local offset
+        # directly. See MiniMaxM3KVCacheManagerV2 sparse hot-window layout.
+        if layer_offset_override is not None:
+            layer_offset = layer_offset_override
+        else:
+            if layer_idx not in self.layer_offsets:
+                return None
+            layer_offset = self.layer_offsets[layer_idx]
         try:
             addr = self.impl.get_mem_pool_base_address(layer_offset, Role.INDEX_KEY)
             page_stride = self.impl.get_page_stride(layer_offset, Role.INDEX_KEY)
