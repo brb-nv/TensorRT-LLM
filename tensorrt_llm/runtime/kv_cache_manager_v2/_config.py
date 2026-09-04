@@ -112,6 +112,15 @@ class AttentionLayerConfig:
     # Note that we use None to represent "no sliding window". Sink tokens are excluded.
     sliding_window_size: int | None = None
     num_sink_tokens: int | None = None
+    # Opaque tag that forks the layer into a distinct life cycle (hence its own
+    # pool group and per-sequence page chain) without changing sliding-window /
+    # sink semantics. Layers that are otherwise identical but carry different
+    # ``life_cycle_group`` values will not share pages, so their KV can be
+    # migrated between cache tiers independently. Default ``0`` preserves the
+    # historical single-group behavior. Used by MiniMax-M3 to keep dense,
+    # sparse-main-KV, and (phantom) sparse-index-K layers in separate pool
+    # groups so only sparse main KV is offloaded during decode.
+    life_cycle_group: int = 0
 
     @property
     def window_size(self) -> int | None:

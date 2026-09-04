@@ -1526,6 +1526,62 @@ class TestComplexModels(unittest.TestCase):
         manager = KVCacheManager(config)
         del manager
 
+    def test_life_cycle_group_forks_pool_group(self) -> None:
+        """``life_cycle_group`` forks otherwise-identical layers into distinct
+        life cycles (own pool group row + page chain) without changing window
+        semantics; identical tags still share a life cycle."""
+        role = DataRole("key")
+        size = 131072
+        layers = [
+            # Two layers, default group 0: identical window/size -> shared LC.
+            AttentionLayerConfig(
+                layer_id=LayerId(0),
+                buffers=[BufferConfig(role=role, size=size)],
+                sliding_window_size=None,
+            ),
+            AttentionLayerConfig(
+                layer_id=LayerId(1),
+                buffers=[BufferConfig(role=role, size=size)],
+                sliding_window_size=None,
+            ),
+            # Two layers, group 1: identical window/size to the above, but the
+            # tag forces a separate life cycle.
+            AttentionLayerConfig(
+                layer_id=LayerId(2),
+                buffers=[BufferConfig(role=role, size=size)],
+                sliding_window_size=None,
+                life_cycle_group=1,
+            ),
+            AttentionLayerConfig(
+                layer_id=LayerId(3),
+                buffers=[BufferConfig(role=role, size=size)],
+                sliding_window_size=None,
+                life_cycle_group=1,
+            ),
+        ]
+        config = KVCacheManagerConfig(
+            tokens_per_block=128,
+            cache_tiers=[
+                GpuCacheTierConfig(quota=1024 * 1024 * 1024),
+                HostCacheTierConfig(quota=1024 << 20),
+            ],
+            layers=layers,
+        )
+        manager = KVCacheManager(config)
+        try:
+            lc0 = manager.get_layer_group_id(LayerId(0))
+            lc1 = manager.get_layer_group_id(LayerId(1))
+            lc2 = manager.get_layer_group_id(LayerId(2))
+            lc3 = manager.get_layer_group_id(LayerId(3))
+            # Same tag + same window/size -> shared life cycle.
+            self.assertEqual(lc0, lc1)
+            self.assertEqual(lc2, lc3)
+            # Different tag -> distinct life cycle despite identical window/size.
+            self.assertNotEqual(lc0, lc2)
+            self.assertEqual(len({lc0, lc1, lc2, lc3}), 2)
+        finally:
+            del manager
+
     def test_complex_model_1(self) -> None:
         """Regression: large slot_size PGs with low slot_cnt caused deadloop."""
         role = DataRole("key")
