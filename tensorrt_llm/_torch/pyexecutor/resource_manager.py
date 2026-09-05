@@ -16,6 +16,7 @@ import copy
 import enum
 import math
 import os
+import time
 from abc import ABC, abstractmethod
 from collections import OrderedDict, defaultdict, deque
 from dataclasses import dataclass
@@ -2312,13 +2313,36 @@ class NoFreeSlotsError(ValueError):
 
 class SlotManager:
 
-    def __init__(self, max_num_requests: int):
+    def __init__(self, max_num_requests: int, name: str = "slots"):
         self.max_num_requests = max_num_requests
+        self.name = name
         self.slot_mapping = dict()
         self.free_slots = set(range(max_num_requests))
+        # Acquisition time per holder. A pool that is merely oversubscribed for
+        # one iteration and a pool that leaks look identical by occupancy alone;
+        # they are told apart by how old the holders are.
+        self.acquired_at = dict()
 
     def get_slot(self, request_id: int):
         return self.slot_mapping.get(request_id, None)
+
+    def occupancy_str(self) -> str:
+        """`used/total` plus the age of the longest-held slot, for the iteration log."""
+        used = len(self.slot_mapping)
+        if used == 0:
+            return f"0/{self.max_num_requests}"
+        oldest = time.monotonic() - min(self.acquired_at.values())
+        return f"{used}/{self.max_num_requests}(oldest={oldest:.1f}s)"
+
+    def exhaustion_report(self) -> str:
+        """Every holder with its age, emitted when the pool cannot admit a request."""
+        now = time.monotonic()
+        holders = sorted(self.acquired_at.items(), key=lambda kv: kv[1])
+        held = ", ".join(f"req={rid}@slot{self.slot_mapping.get(rid)}"
+                         f"/{now - acquired:.1f}s" for rid, acquired in holders)
+        return (f"No free slots in '{self.name}' pool: "
+                f"{len(self.slot_mapping)}/{self.max_num_requests} held; "
+                f"holders (oldest first): [{held}]")
 
     def fill_slot_id_tensor(self, requests: List[LlmRequest],
                             slot_id_tensor: torch.Tensor):
@@ -2338,15 +2362,17 @@ class SlotManager:
             return self.slot_mapping[request_id]
 
         if len(self.free_slots) == 0:
-            raise NoFreeSlotsError("No free slots")
+            raise NoFreeSlotsError(self.exhaustion_report())
         slot = self.free_slots.pop()
         self.slot_mapping[request_id] = slot
+        self.acquired_at[request_id] = time.monotonic()
         return slot
 
     def remove_slot(self, request_id: int):
         if request_id in self.slot_mapping:
             slot = self.slot_mapping.pop(request_id)
             self.free_slots.add(slot)
+            self.acquired_at.pop(request_id, None)
 
     def shutdown(self):
         req_ids_list = list(self.slot_mapping.keys())

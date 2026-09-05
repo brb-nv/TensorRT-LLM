@@ -1770,6 +1770,12 @@ class PyExecutor:
                         kv_stats = self.kv_cache_manager.get_kv_cache_stats()
                         if kv_stats.max_num_blocks > 0:
                             kv_util_str = f"{1.0 - kv_stats.free_num_blocks / kv_stats.max_num_blocks:.3f}"
+                    seq_slot_str = "N/A"
+                    seq_slot_manager = self.resource_manager.get_resource_manager(
+                        ResourceManagerType.SEQ_SLOT_MANAGER)
+                    if seq_slot_manager is not None:
+                        seq_slot_str = seq_slot_manager.slot_manager.occupancy_str(
+                        )
                     formatted_timestamp = datetime.datetime.now().strftime(
                         "%Y-%m-%d %H:%M:%S")
                     logger.info(
@@ -1778,6 +1784,7 @@ class PyExecutor:
                         f"rank = {self.dist.rank}, "
                         f"num_scheduled_requests = {self.num_scheduled_requests}, "
                         f"kv_cache_util = {kv_util_str}, "
+                        f"seq_slots = {seq_slot_str}, "
                         f"currank_total_requests = {self.num_fetch_requests_cur_rank}/"
                         f"{self.num_fetch_requests}, "
                         f"host_step_time = {host_step_time}ms, "
