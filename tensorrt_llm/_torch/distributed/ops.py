@@ -12,6 +12,7 @@ from tensorrt_llm._torch.distributed.allreduce_helper import \
     CustomAllReduceHelper
 from tensorrt_llm._torch.distributed.symm_mem_allreduce import \
     SymmetricMemoryAllReduce
+from tensorrt_llm._torch.pyexecutor import hang_trace
 from tensorrt_llm._torch.utils import get_model_extra_attrs
 from tensorrt_llm._utils import mpi_comm, mpi_disabled
 from tensorrt_llm.bindings import internal as _tllm_internal
@@ -308,6 +309,11 @@ def allgather(
     Returns:
         The gathered tensor or tensor list.
     '''
+    if hang_trace.active():
+        hang_trace.record_collective(
+            "allgather",
+            input.numel() if isinstance(input, torch.Tensor) else len(input),
+            sizes)
     group_boxed = mapping.tp_group_pg.boxed() if mpi_disabled() else None
     return _allgather(input, mapping.tp_group, mapping.tp_rank, group_boxed,
                       dim, sizes)
@@ -462,6 +468,12 @@ def reducescatter(
 ) -> Union[torch.Tensor, List[torch.Tensor]]:
     if mapping.tp_size == 1:
         return input
+
+    if hang_trace.active():
+        hang_trace.record_collective(
+            "reducescatter",
+            input.numel() if isinstance(input, torch.Tensor) else len(input),
+            sizes)
 
     if sizes is not None:
         assert len(sizes) == len(mapping.tp_group)
@@ -852,6 +864,17 @@ class AllReduce(nn.Module):
         if all_reduce_params is None:
             all_reduce_params = AllReduceParams()
 
+        # Counted here rather than in the strategy branches below so one
+        # logical collective increments the sequence exactly once however it
+        # is dispatched (symm-mem, MNNVL, or the fallback op). The sequence is
+        # the cross-rank divergence detector: peers in the same TP group must
+        # agree on it, and the first index where they disagree is the
+        # collective that deadlocked.
+        if hang_trace.active():
+            hang_trace.record("allreduce", hang_trace.bump("allreduce"),
+                              input.numel(), all_reduce_params.fusion_op,
+                              allreduce_strategy)
+
         # Try Symmetric Memory AllReduce first if available
         # Note: Currently only supports NONE fusion op (plain allreduce)
         if self.symm_mem_allreduce and all_reduce_params.fusion_op == AllReduceFusionOp.NONE:
@@ -975,6 +998,9 @@ class MoEAllReduce(nn.Module):
     ) -> torch.Tensor:
 
         assert all_reduce_params.is_valid(), "MoEAllReduceParams is not valid"
+
+        if hang_trace.active():
+            hang_trace.record_collective("moe_allreduce", input.numel())
 
         if all_reduce_params.is_cutlass_min_latency:
             """
@@ -1230,6 +1256,8 @@ class MiniMaxAllReduceRMS(nn.Module):
 
     def forward(self, input: torch.Tensor, rms_weights: torch.Tensor,
                 eps: float):
+        if hang_trace.active():
+            hang_trace.record_collective("minimax_ar_rms", input.numel())
         return torch.ops.trtllm.minimax_allreduce_rms(input, rms_weights,
                                                       self.workspace,
                                                       self.mapping.tp_rank,
@@ -1240,6 +1268,9 @@ class MiniMaxAllReduceRMS(nn.Module):
                    rms_weights_q: torch.Tensor, rms_weights_k: torch.Tensor,
                    eps: float):
         """Fused Q+K RMS norm with allreduce. Returns (q_out, k_out)."""
+        if hang_trace.active():
+            hang_trace.record_collective("minimax_ar_rms_qk", q.numel(),
+                                         k.numel())
         out_list = torch.ops.trtllm.minimax_allreduce_rms_qk(
             q,
             k,

@@ -29,6 +29,7 @@ from tensorrt_llm import deep_gemm
 from tensorrt_llm._torch.distributed.allreduce_helper import \
     CustomAllReduceHelper
 from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm._torch.pyexecutor import hang_trace
 from tensorrt_llm.functional import AllReduceFusionOp, AllReduceStrategy
 from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.utils import fp8_quantize
@@ -2642,6 +2643,23 @@ def tunable_allreduce(
         tuning_config,
         [input, residual, norm_weight, scale, bias, workspace],
     )
+
+    # The tactic selects the *algorithm* (ONESHOT / TWOSHOT / NCCL /
+    # NCCL_SYMMETRIC), so peers in a group must resolve the same one or the
+    # collective never completes. MERGE is supposed to guarantee that during
+    # tuning, but the cache lookup and its tactic == -1 fallback above are
+    # per-rank, so a shape that misses on some ranks and hits on others still
+    # diverges. Job 2994219 wedged on allreduce #342383 with every rank's
+    # collective count in agreement -- exactly what an algorithm mismatch
+    # looks like, and what the count alone cannot distinguish. Record the
+    # resolved tactic both as a breadcrumb keyed to the sequence number and as
+    # a per-tactic counter, so the dump header alone shows whether peers
+    # disagreed.
+    if hang_trace.active():
+        hang_trace.record("ar_tactic",
+                          hang_trace.counters().get("allreduce", -1),
+                          best_tactic, input.numel(), op)
+        hang_trace.bump(f"ar_tactic{best_tactic}")
 
     return allreduce_runner(
         [input, residual, norm_weight, scale, bias, workspace],

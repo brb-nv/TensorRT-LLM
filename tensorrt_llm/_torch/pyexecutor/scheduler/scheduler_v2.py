@@ -15,6 +15,7 @@
 
 import enum
 import os
+import time
 from typing import Optional
 
 from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy, ContextChunkingPolicy
@@ -218,6 +219,78 @@ class KVCacheV2Scheduler(RequestScheduler):
         # pressure. See _schedule_loop.
         self._prioritize_first_token_gen = (
             os.environ.get("TLLM_DISAGG_GEN_PRIORITIZE_FIRST_TOKEN", "0") == "1"
+        )
+
+        # Throttle state for the admission/stall diagnostics below. These fire
+        # at warning level because a worker that has silently stopped admitting
+        # work is exactly the case where the default log level is all we get,
+        # but under sustained pressure they would fire every iteration — so
+        # emit at most one of each per interval and report the suppressed
+        # count. Independent budgets so a noisy decline cannot mask a stall.
+        self._diag_interval_s = float(os.environ.get("TLLM_SCHED_DIAG_INTERVAL_S", "5.0"))
+        self._diag_last_s: dict[str, float] = {"admission": 0.0, "stall": 0.0}
+        self._diag_suppressed: dict[str, int] = {"admission": 0, "stall": 0}
+
+    # ---- Admission / stall diagnostics ----
+
+    def _kv_pages_str(self) -> str:
+        """``free/evictable/locked`` GPU pages, or ``"N/A"``."""
+        page_occupancy = getattr(self.kv_cache_manager, "page_occupancy_str", None)
+        if page_occupancy is None:
+            return "N/A"
+        return page_occupancy()
+
+    def _throttled(self, kind: str) -> Optional[int]:
+        """Rate-limit gate. Returns the suppressed count to report, or None.
+
+        ``None`` means "stay quiet"; an int means "emit now, and mention that
+        many suppressed messages".
+        """
+        now = time.monotonic()
+        if now - self._diag_last_s[kind] < self._diag_interval_s:
+            self._diag_suppressed[kind] += 1
+            return None
+        suppressed = self._diag_suppressed[kind]
+        self._diag_suppressed[kind] = 0
+        self._diag_last_s[kind] = now
+        return suppressed
+
+    def _warn_admission_declined(self, req: LlmRequest, stage: str, tokens: int) -> None:
+        """Report a KV admission refusal for a context request.
+
+        ``prepare_context`` and ``resize_context`` both return False with no
+        output (``prepare_context`` logs at debug; ``resize_context`` logs
+        nothing), so a worker that stops admitting prefills is
+        indistinguishable in the logs from one that has nothing to do. Those
+        are opposite diagnoses.
+        """
+        suppressed = self._throttled("admission")
+        if suppressed is None:
+            return
+        blocks_needed = -(-tokens // self.tokens_per_block) if self.tokens_per_block else 0
+        tail = f" ({suppressed} similar suppressed)" if suppressed else ""
+        logger.warning(
+            f"KV admission declined by {stage} for context request {req.py_request_id}: "
+            f"tokens={tokens}, blocks_needed={blocks_needed}, "
+            f"kv_pages(free/evictable/locked)={self._kv_pages_str()}{tail}"
+        )
+
+    def _warn_schedule_stall(self, num_ctx_candidates: int) -> None:
+        """Report an iteration that scheduled nothing while work was pending.
+
+        The deadlock detector below is generation-gated, so it can never fire
+        on a prefill-only (disagg context) worker. A context stall is not
+        provably terminal the way a generation stall is — the next iteration
+        gets a fresh token budget — so warn rather than raise.
+        """
+        suppressed = self._throttled("stall")
+        if suppressed is None:
+            return
+        tail = f" ({suppressed} similar suppressed)" if suppressed else ""
+        logger.warning(
+            f"V2 scheduler stall: nothing scheduled or evicted while "
+            f"{num_ctx_candidates} context request(s) were pending. "
+            f"kv_pages(free/evictable/locked)={self._kv_pages_str()}{tail}"
         )
 
     def schedule_request(
@@ -442,8 +515,24 @@ class KVCacheV2Scheduler(RequestScheduler):
                     f"evicted. KV cache pool is likely exhausted with no "
                     f"host cache tier for suspend/resume offload. "
                     f"Configure kv_cache_config.host_cache_size or increase "
-                    f"kv_cache_config.max_tokens."
+                    f"kv_cache_config.max_tokens. "
+                    f"kv_pages(free/evictable/locked)={self._kv_pages_str()}"
                 )
+            # Context-side equivalent. The check above needs a generation
+            # candidate, so a disagg context worker — which never holds
+            # generation requests — cannot trip it however wedged it gets.
+            # Progress on disagg gen init still counts as progress, so an
+            # iteration that produced disagg candidates is not a stall.
+            # scheduled_encoder is checked explicitly: the outer condition
+            # ignores it, so on an encoder-decoder model a productive
+            # encoder-only iteration would otherwise look like a stall.
+            if (
+                pending_ctx
+                and not evicted
+                and not disagg_candidates
+                and not scheduled_encoder
+            ):
+                self._warn_schedule_stall(len(pending_ctx))
 
         return (
             scheduled_encoder,
@@ -547,7 +636,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         # Prepare first so block reuse updates context_remaining_length
         # before budget check.
         if not self.kv_cache_manager.prepare_context(req):
-            logger.debug(f"prepare_context failed for context request {req.py_request_id}")
+            self._warn_admission_declined(req, "prepare_context", pre_prepare_context_tokens)
             return ScheduleAction.STOP, 0, False
 
         context_tokens = req.context_remaining_length
@@ -564,6 +653,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         # V2 resizes KV cache directly in the scheduler (no separate
         # prepareResources for main cache), so include draft tokens.
         if not self.kv_cache_manager.resize_context(req, context_tokens + draft_len):
+            self._warn_admission_declined(req, "resize_context", context_tokens + draft_len)
             return ScheduleAction.SKIP, 0, False
 
         cross_action = self._try_schedule_cross_context(req)
@@ -596,7 +686,9 @@ class KVCacheV2Scheduler(RequestScheduler):
 
         # Prepare context (create _KVCache, block reuse, resume — no resize)
         if not self.kv_cache_manager.prepare_context(req):
-            logger.debug(f"prepare_context failed for chunked context request {req.py_request_id}")
+            self._warn_admission_declined(
+                req, "prepare_context (chunked)", pre_prepare_context_remaining
+            )
             return ScheduleAction.SKIP, 0, False
 
         # Calculate chunk size from remaining budget
@@ -666,6 +758,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         # V2 resizes KV cache directly in the scheduler, so include
         # draft tokens for last chunk.
         if not self.kv_cache_manager.resize_context(req, resize_tokens):
+            self._warn_admission_declined(req, "resize_context (chunked)", resize_tokens)
             return ScheduleAction.SKIP, 0, False
 
         cross_action = self._try_schedule_cross_context(req)

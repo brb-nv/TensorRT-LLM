@@ -67,6 +67,7 @@ from .executor_request_queue import ExecutorRequestQueue, RequestQueueItem
 from .guided_decoder import GuidedDecoder
 from .handle_additional_outputs import HandleAdditionalOutputs
 from .handle_logits import HandleLogits
+from . import hang_trace
 from .hang_detector import HangDetector, propagate_hard_kill
 from .kv_cache_manager_v2 import KVCacheManagerV2
 from .kv_cache_stats import append_kv_cache_iteration_stats
@@ -397,6 +398,11 @@ class AsyncTransferManager:
         def __init__(self, block_id: Optional[int]):
             self.block_id = block_id
             self.counter = 0
+            # Start of the first transfer for this request, for the
+            # oldest-transfer age on the iteration log line. Distinct from
+            # LlmRequest.py_kv_transfer_start_time, which is only populated
+            # when kv_transfer_timeout_ms is configured.
+            self.started_at = time.monotonic()
 
         def start_transfer(self):
             self.counter += 1
@@ -427,6 +433,25 @@ class AsyncTransferManager:
 
     def requests_in_transfer(self) -> Dict[int, LlmRequest]:
         return self._requests_in_transfer
+
+    def occupancy_str(self) -> str:
+        """`count(oldest=Ns)` for the iteration log.
+
+        A transfer-parked request still owns its KV blocks but has already
+        released its sequence slot and is no longer scheduled (see
+        start_transfer), so it is invisible to both `num_scheduled_requests`
+        and `seq_slots` while holding the pool. This counter is what separates
+        "the pool leaked" from "the pool is held by requests awaiting
+        transfer", and the age separates a busy transfer queue from a stalled
+        one.
+        """
+        count = len(self._requests_in_transfer)
+        if count == 0:
+            return "0"
+        oldest = time.monotonic() - min(
+            metadata.started_at
+            for metadata in self._request_transfer_metadata.values())
+        return f"{count}(oldest={oldest:.1f}s)"
 
     def start_transfer(self, request: LlmRequest):
         """
@@ -846,6 +871,10 @@ class PyExecutor:
 
         self.hang_detector = HangDetector(timeout=hang_detection_timeout,
                                           on_detected=on_detected)
+        hang_trace.set_rank(self.global_rank)
+        # Runs on the main thread, which is where signal registration has to
+        # happen; the executor loop itself lives on a worker thread.
+        hang_trace.install()
 
         # request fetcher initialization
         self._set_global_steady_clock_offset()
@@ -1766,16 +1795,30 @@ class PyExecutor:
                     else:
                         prev_device_step_time_str = f"{prev_device_step_time}ms"
                     kv_util_str = "N/A"
+                    kv_pages_str = "N/A"
                     if self.kv_cache_manager is not None:
                         kv_stats = self.kv_cache_manager.get_kv_cache_stats()
                         if kv_stats.max_num_blocks > 0:
                             kv_util_str = f"{1.0 - kv_stats.free_num_blocks / kv_stats.max_num_blocks:.3f}"
+                        # V2 only. kv_cache_util counts evictable pages as
+                        # free, so it cannot distinguish held from retained
+                        # from leaked; this breakdown can.
+                        page_occupancy = getattr(self.kv_cache_manager,
+                                                 "page_occupancy_str", None)
+                        if page_occupancy is not None:
+                            kv_pages_str = page_occupancy()
                     seq_slot_str = "N/A"
                     seq_slot_manager = self.resource_manager.get_resource_manager(
                         ResourceManagerType.SEQ_SLOT_MANAGER)
                     if seq_slot_manager is not None:
                         seq_slot_str = seq_slot_manager.slot_manager.occupancy_str(
                         )
+                    in_transfer_str = "N/A"
+                    async_transfer_manager = getattr(self,
+                                                     "async_transfer_manager",
+                                                     None)
+                    if async_transfer_manager is not None:
+                        in_transfer_str = async_transfer_manager.occupancy_str()
                     formatted_timestamp = datetime.datetime.now().strftime(
                         "%Y-%m-%d %H:%M:%S")
                     logger.info(
@@ -1783,8 +1826,11 @@ class PyExecutor:
                         f"global_rank = {self.global_rank}, "
                         f"rank = {self.dist.rank}, "
                         f"num_scheduled_requests = {self.num_scheduled_requests}, "
+                        f"queued_requests = {len(self.waiting_queue)}, "
                         f"kv_cache_util = {kv_util_str}, "
+                        f"kv_pages_free_evictable_locked = {kv_pages_str}, "
                         f"seq_slots = {seq_slot_str}, "
+                        f"requests_in_transfer = {in_transfer_str}, "
                         f"currank_total_requests = {self.num_fetch_requests_cur_rank}/"
                         f"{self.num_fetch_requests}, "
                         f"host_step_time = {host_step_time}ms, "
@@ -6310,6 +6356,18 @@ class PyExecutor:
 
         num_ctx_tokens = sum(req.context_chunk_size
                              for req in scheduled_requests.context_requests)
+
+        # Batch shape is what selects the piecewise-CUDA-graph bucket and the
+        # draft length, so peers that disagree here will issue different
+        # collective sequences downstream. Stamping it per iteration lets the
+        # hang dump separate "ranks disagreed on the batch" from "ranks agreed
+        # and one still fell behind".
+        if hang_trace.active():
+            hang_trace.set_iteration(self.iter_counter)
+            hang_trace.record("fwd_step", scheduled_requests.num_context_requests,
+                              scheduled_requests.num_generation_requests,
+                              num_ctx_tokens,
+                              getattr(self.model_engine, "runtime_draft_len", None))
 
         @nvtx_range(
             f"[Executor] _forward_step {self.iter_counter}: {scheduled_requests.num_context_requests} ctx reqs, {num_ctx_tokens} ctx tokens, {scheduled_requests.num_generation_requests} gen reqs"

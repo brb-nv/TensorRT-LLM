@@ -11,6 +11,7 @@ from tensorrt_llm.mapping import Mapping
 
 from ..attention_backend import AttentionMetadata
 from ..model_config import ModelConfig
+from ..pyexecutor import hang_trace
 from ..pyexecutor.llm_request import LlmRequest
 from ..pyexecutor.mamba_cache_manager import MambaHybridCacheManager
 from ..pyexecutor.resource_manager import BaseResourceManager, SlotManager
@@ -1074,15 +1075,23 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         all_rank_num_tokens = self._get_step_all_rank_num_tokens(
             spec_metadata, step_idx)
 
-        if self.is_mtp_eagle:
-            hidden_states = draft_model.mtp_layers[0](
-                embed_tokens=draft_model.embed_tokens,
-                all_rank_num_tokens=all_rank_num_tokens,
-                **inputs)
-            return hidden_states, None
+        # ``all_rank_num_tokens`` is recorded because every rank must agree on
+        # it: it feeds the padding and bucket choices downstream, so a
+        # disagreement here is exactly how ranks would end up issuing
+        # different collective sequences within a draft step.
+        with hang_trace.phase(f"draft{step_idx}"):
+            if hang_trace.active():
+                hang_trace.record("draft_step", step_idx, all_rank_num_tokens)
 
-        inputs["all_rank_num_tokens"] = all_rank_num_tokens
-        hidden_states, hidden_states_to_save = draft_model.model(**inputs)
+            if self.is_mtp_eagle:
+                hidden_states = draft_model.mtp_layers[0](
+                    embed_tokens=draft_model.embed_tokens,
+                    all_rank_num_tokens=all_rank_num_tokens,
+                    **inputs)
+                return hidden_states, None
+
+            inputs["all_rank_num_tokens"] = all_rank_num_tokens
+            hidden_states, hidden_states_to_save = draft_model.model(**inputs)
         return hidden_states, hidden_states_to_save
 
     def _prepare_flash_mla_generation_layout(self, attn_metadata, num_contexts,

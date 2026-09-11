@@ -23,6 +23,7 @@ from ..speculative.interface import SpecMetadata
 from ..speculative.spec_sampler_base import SampleStateTensorsSpec
 from ..speculative.utils import get_draft_kv_cache_manager
 from ..utils import make_weak_ref, piecewise_cuda_graph
+from . import hang_trace
 from .llm_request import LlmRequest, get_draft_token_length
 from .resource_manager import (BaseResourceManager, ResourceManager,
                                ResourceManagerType)
@@ -345,6 +346,13 @@ class CUDAGraphRunner:
         key = self.get_graph_key(batch, new_tensors_device,
                                  spec_resource_manager, spec_metadata)
 
+        # The key encodes the padded batch size and seq-len mode, i.e. which
+        # captured graph will run. Ranks that pick different keys execute
+        # different graphs and therefore different collective sequences, so
+        # this is recorded even on paths where graphs are expected to be off.
+        if hang_trace.active():
+            hang_trace.record("graph_key", key, key in self.graph_metadata)
+
         if key in self.graph_metadata:
             return self.graph_metadata[key][
                 "attn_metadata"], self.graph_metadata[key]["spec_metadata"], key
@@ -485,6 +493,8 @@ class CUDAGraphRunner:
     def replay(self, key: KeyType,
                current_inputs: Dict[str, Any]) -> Optional[torch.Tensor]:
         """Replays a previously captured graph."""
+        if hang_trace.active():
+            hang_trace.record("graph_replay", key)
         stored_meta = self.graph_metadata[key]
         assert current_inputs["attn_metadata"] is stored_meta["attn_metadata"]
         if stored_meta["spec_metadata"] is not None:

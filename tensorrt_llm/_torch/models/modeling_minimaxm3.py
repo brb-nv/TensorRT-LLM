@@ -65,6 +65,7 @@ from ..modules.linear import (
 )
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
+from ..pyexecutor import hang_trace
 from ..speculative import SpecMetadata
 from ..utils import (
     ActivationType,
@@ -725,16 +726,31 @@ class MiniMaxM3MoE(nn.Module):
         all_rank_num_tokens = attn_metadata.all_rank_num_tokens
 
         def _compute_routed_output():
+            # Split around the gate because a wedged rank has been caught
+            # sitting in the gate GEMM itself, which is a plain linear with no
+            # collective -- distinguishing "stalled before routing" from
+            # "stalled inside the expert dispatch" narrows it a long way.
+            if hang_trace.active():
+                hang_trace.record("gate_enter", hidden_states.shape[0],
+                                  all_rank_num_tokens)
             router_logits = self.gate(hidden_states)
-            return self.experts(
+            if hang_trace.active():
+                hang_trace.record("experts_enter")
+            out = self.experts(
                 hidden_states,
                 router_logits,
                 all_rank_num_tokens=all_rank_num_tokens,
                 use_dp_padding=False,
             )
+            if hang_trace.active():
+                hang_trace.record("routed_done")
+            return out
 
         def _compute_shared_output():
-            return self.shared_experts(hidden_states)
+            out = self.shared_experts(hidden_states)
+            if hang_trace.active():
+                hang_trace.record("shared_done")
+            return out
 
         if self.shared_experts is None:
             routed_output = _compute_routed_output()
@@ -2512,6 +2528,13 @@ class MiniMaxM3DecoderLayer(DecoderLayer):
         # TLLM_LLMAPI_ENABLE_NVTX=1) is set; otherwise they are no-ops.
         attn_kind = "sparse_attn" if self.self_attn.is_sparse_attention_layer else "dense_attn"
 
+        # One breadcrumb per layer entry gives the dump a position for every
+        # rank, so a peer that stopped advancing is visible even when it wedged
+        # somewhere without a probe of its own. attn_kind is included because
+        # sparse and dense layers issue different collectives.
+        if hang_trace.active():
+            hang_trace.record("layer_enter", self.layer_idx, attn_kind)
+
         # Layer-0 prologue only. For every subsequent layer the input_layernorm
         # (an add+RMSNorm at the layer boundary) was already applied by the
         # previous layer as its next_layer_layernorm, so residual is not None
@@ -2536,6 +2559,8 @@ class MiniMaxM3DecoderLayer(DecoderLayer):
                 all_reduce_params=attn_all_reduce_params,
                 **kwargs,
             )
+        if hang_trace.active():
+            hang_trace.record("attn_done", self.layer_idx)
 
         if self.block_sparse_moe is not None:
             hidden_states, residual = self.forward_MoE(hidden_states, attn_metadata, residual)
@@ -2623,12 +2648,21 @@ class MiniMaxM3DecoderLayer(DecoderLayer):
         with nvtx_range_debug(f"layer{self.layer_idx}.post_attention_layernorm"):
             hidden_states, residual = self._apply_pre_feed_forward_norm(hidden_states, residual)
 
+        # Brackets the block every observed prefill wedge has stopped inside,
+        # so the dump shows which layer each rank reached and whether it got
+        # past the MoE. Paired enter/exit rather than one marker: the gap
+        # between a rank's last enter and a peer's exit is what says the two
+        # stopped agreeing.
+        if hang_trace.active():
+            hang_trace.record("moe_enter", self.layer_idx)
         with nvtx_range_debug(f"layer{self.layer_idx}.moe"):
             hidden_states = self.block_sparse_moe(
                 hidden_states,
                 attn_metadata,
                 final_all_reduce_params=self._feed_forward_all_reduce_params(),
             )
+        if hang_trace.active():
+            hang_trace.record("moe_exit", self.layer_idx)
 
         with nvtx_range_debug(f"layer{self.layer_idx}.next_layer_layernorm"):
             hidden_states, residual = self._apply_next_layer_layernorm(hidden_states, residual)

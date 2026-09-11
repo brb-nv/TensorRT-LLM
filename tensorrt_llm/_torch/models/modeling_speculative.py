@@ -30,6 +30,7 @@ try:
         flashinfer_apply_rope_with_cos_sin_cache_inplace as _flashinfer_rope
 except ImportError:
     _flashinfer_rope = None
+from ..pyexecutor import hang_trace
 from ..pyexecutor.guided_decoder import CapturableGuidedDecoder
 from ..speculative import (SpecMetadata, get_spec_worker,
                            should_use_separate_draft_kv_cache)
@@ -2015,14 +2016,18 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
         resource_manager=None,
         **kwargs,
     ) -> torch.Tensor:
-        hidden_states = self.model(
-            input_ids=input_ids,
-            attn_metadata=attn_metadata,
-            position_ids=position_ids,
-            inputs_embeds=inputs_embeds,
-            spec_metadata=spec_metadata,
-            **kwargs,
-        )
+        # Disabling speculation is the one change that stops the hang, so the
+        # dump has to say whether a rank stopped in the target forward or in a
+        # draft step. Everything the target model records is tagged here.
+        with hang_trace.phase("target"):
+            hidden_states = self.model(
+                input_ids=input_ids,
+                attn_metadata=attn_metadata,
+                position_ids=position_ids,
+                inputs_embeds=inputs_embeds,
+                spec_metadata=spec_metadata,
+                **kwargs,
+            )
         if spec_metadata is not None and spec_metadata.is_layer_capture(
                 self.layer_idx):
             spec_metadata.maybe_capture_hidden_states(self.layer_idx,

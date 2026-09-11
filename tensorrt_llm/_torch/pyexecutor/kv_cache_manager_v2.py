@@ -3144,6 +3144,22 @@ class KVCacheManagerV2(BaseResourceManager):
 
         return kv_cache_stats
 
+    def page_occupancy_str(self) -> str:
+        """``free/evictable/locked`` GPU page counts, for the iteration log.
+
+        ``kv_cache_util`` is derived from ``free_num_blocks``, which is
+        ``free + evictable`` (see ``StorageStatistics.available``), so it can
+        only ever report *locked* pages: blocks retained for reuse are counted
+        as free by that metric. A pool saturated by live sequences is therefore
+        indistinguishable from one saturated by retained blocks or by a leak.
+        Report the three classes separately so the distinction is readable.
+        """
+        pool_group_stats = self._get_storage_statistics(GPU_LEVEL)
+        free = sum(stat.free for stat in pool_group_stats)
+        evictable = sum(stat.evictable for stat in pool_group_stats)
+        locked = sum(stat.unavailable for stat in pool_group_stats)
+        return f"{free}/{evictable}/{locked}"
+
     def flush_iteration_events(self):
         if self.event_manager is not None:
             self.event_manager.flush_iteration_events()
