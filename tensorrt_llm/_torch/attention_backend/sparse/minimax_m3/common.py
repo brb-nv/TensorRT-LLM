@@ -44,6 +44,9 @@ class MiniMaxM3SparseParams(SparseParams):
     implementation: Literal["triton", "msa"] = "triton"
     indexer_kv_dtype: Literal["bf16", "fp8"] = "bf16"
     fuse_qkv_index_projection: bool = False
+    enable_sparse_kv_hot_window: bool = False
+    # ``None`` -> resolved by the cache manager to 2 * topk.
+    sparse_kv_hot_window_blocks: Optional[int] = None
 
     @property
     def indices_block_size(self) -> int:

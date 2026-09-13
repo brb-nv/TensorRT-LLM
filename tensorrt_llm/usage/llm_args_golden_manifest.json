@@ -1409,6 +1409,13 @@
       "path": "sparse_attention_config.enable_heuristic_topk"
     },
     {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "sparse_attention_config.enable_sparse_kv_hot_window"
+    },
+    {
       "allowed_values": [
         "triton",
         "msa"
@@ -1566,6 +1573,13 @@
       "converter": "",
       "kind": "value",
       "path": "sparse_attention_config.sparse_init_blocks"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[int]",
+      "converter": "",
+      "kind": "value",
+      "path": "sparse_attention_config.sparse_kv_hot_window_blocks"
     },
     {
       "allowed_values": [],

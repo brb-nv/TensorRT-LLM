@@ -764,6 +764,25 @@ class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
         "the fmha_sm100 package, and sparse_block_size == 128.",
         status="prototype",
     )
+    enable_sparse_kv_hot_window: bool = Field(
+        default=False,
+        description=
+        "Opt-in HiSparse decode residency: keep only a bounded per-request "
+        "window of sparse main-KV blocks resident on device (host->device "
+        "swap-in of the per-step top-k blocks), parking the full history on a "
+        "pinned host pool. Sparse index-K and dense KV stay fully resident, and "
+        "prefix / prefill behavior is unchanged. Requires the 'msa' "
+        "implementation and FP8/plain (non-NVFP4) sparse main KV.",
+        status="prototype",
+    )
+    sparse_kv_hot_window_blocks: Optional[int] = Field(
+        default=None,
+        description=
+        "Number of sparse main-KV blocks kept GPU-resident per request when "
+        "enable_sparse_kv_hot_window=True (the swap-in hot-buffer size). Must be "
+        ">= sparse_topk_blocks. When unset, defaults to 2 * sparse_topk_blocks.",
+        status="prototype",
+    )
 
     @model_validator(mode="after")
     def _validate_msa_block_size(self):
@@ -782,6 +801,25 @@ class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
             raise ValueError(
                 "MiniMax-M3 fuse_qkv_index_projection=True currently requires "
                 "the 'msa' implementation.")
+        if self.enable_sparse_kv_hot_window:
+            if self.implementation != "msa":
+                raise ValueError(
+                    "MiniMax-M3 enable_sparse_kv_hot_window=True currently "
+                    "requires the 'msa' implementation.")
+            if self.sparse_kv_hot_window_blocks is not None:
+                if self.sparse_kv_hot_window_blocks <= 0:
+                    raise ValueError(
+                        "MiniMax-M3 sparse_kv_hot_window_blocks must be positive, "
+                        f"got {self.sparse_kv_hot_window_blocks}.")
+                if self.sparse_kv_hot_window_blocks < self.sparse_topk_blocks:
+                    raise ValueError(
+                        "MiniMax-M3 sparse_kv_hot_window_blocks "
+                        f"({self.sparse_kv_hot_window_blocks}) must be >= "
+                        f"sparse_topk_blocks ({self.sparse_topk_blocks}).")
+        elif self.sparse_kv_hot_window_blocks is not None:
+            raise ValueError(
+                "MiniMax-M3 sparse_kv_hot_window_blocks is only valid when "
+                "enable_sparse_kv_hot_window=True.")
         return self
 
     def supports_backend(self, backend: str) -> bool:
@@ -806,6 +844,8 @@ class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
             implementation=self.implementation,
             indexer_kv_dtype=self.indexer_kv_dtype,
             fuse_qkv_index_projection=self.fuse_qkv_index_projection,
+            enable_sparse_kv_hot_window=self.enable_sparse_kv_hot_window,
+            sparse_kv_hot_window_blocks=self.sparse_kv_hot_window_blocks,
         )
 
     def to_sparse_metadata_params(self, **kwargs):
