@@ -34,7 +34,7 @@ per window size) without any of them being special cases.
 """
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import torch
 
@@ -134,6 +134,18 @@ class KvCacheLayout:
 
     tokens_per_block: int
     groups: Tuple[KvCacheLayerGroupLayout, ...]
+    #: Size of one GPU pool mapping, or None if it could not be determined.
+    #:
+    #: V2 builds each GPU pool by reserving a virtual span and mapping one
+    #: ``cuMemCreate`` handle per ``pool_size_granularity`` bytes into it. A
+    #: connector that hands these addresses to an RDMA NIC has to respect that
+    #: boundary: a dma-buf memory region cannot span two mappings, so both
+    #: registrations and the individual buffers of a transfer must stay inside
+    #: one. Mappings tile from the reservation base, which the driver aligns,
+    #: so the boundaries are the multiples of this value.
+    #:
+    #: Irrelevant to connectors that only read these buffers from the device.
+    gpu_pool_mapping_bytes: Optional[int] = None
 
     def group(self, layer_group_id: int) -> KvCacheLayerGroupLayout:
         for group in self.groups:
@@ -242,4 +254,28 @@ def build_kv_cache_layout_v2(manager: "KVCacheManagerV2") -> KvCacheLayout:
     return KvCacheLayout(
         tokens_per_block=int(manager.tokens_per_block),
         groups=tuple(groups),
+        gpu_pool_mapping_bytes=_gpu_pool_mapping_bytes(impl),
     )
+
+
+#: GPU is cache level 0; host and disk follow. Spelled out rather than imported
+#: so building a layout does not pull in the manager's internals.
+_GPU_CACHE_LEVEL = 0
+
+
+def _gpu_pool_mapping_bytes(impl: Any) -> Optional[int]:
+    """The GPU level's pool mapping size, or None if it cannot be read.
+
+    Taken from the storage rather than recomputed from the quota: the quota is
+    itself rounded to this value, so deriving one from the other risks landing
+    a power of two away and handing a connector a boundary the pools do not
+    have. Returns None rather than guessing when the attribute is absent, since
+    a wrong value is worse than no value -- a caller can fall back to treating
+    the pools as unsplit, which is what it did before this existed.
+    """
+    try:
+        storage = impl._storage._levels[_GPU_CACHE_LEVEL].storage
+        mapping_bytes = int(storage.pool_size_granularity)
+    except (AttributeError, IndexError, TypeError, ValueError):
+        return None
+    return mapping_bytes if mapping_bytes > 0 else None

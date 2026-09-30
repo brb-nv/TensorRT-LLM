@@ -25,11 +25,47 @@ from the allocator's own aggregation. `bytes_per_page` goes into
 the key namespace to keep a geometry change from being read as a valid page.
 """
 
-from typing import Dict, Iterable, List, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 from ..kv_cache_layout import KvCacheLayout, KvCacheRegion
 
-__all__ = ["PageAddressing", "merge_intervals"]
+__all__ = ["PageAddressing", "merge_intervals", "split_at_boundaries"]
+
+
+def split_at_boundaries(start: int, size: int, boundary: Optional[int]) -> List[Tuple[int, int]]:
+    """Cut `[start, start + size)` wherever it crosses a multiple of `boundary`.
+
+    V2's GPU pools are virtual spans with one physical mapping per
+    `KvCacheLayout.gpu_pool_mapping_bytes`, and an RDMA memory region cannot
+    cover two of them. Both the ranges handed to `register_buffer` and the
+    individual buffers of a transfer therefore have to stay inside one mapping:
+    a buffer that crosses a boundary resolves to the region holding its start
+    and then runs past the end of it.
+
+    Splitting a byte range into consecutive pieces leaves the bytes and their
+    order untouched, so a page's payload is the same concatenation either way
+    and a pool stays readable across the change.
+
+    Args:
+        start: First byte.
+        size: Length in bytes.
+        boundary: Mapping size, or None to leave the range whole.
+
+    Returns:
+        Consecutive `(address, size)` pieces covering the input exactly.
+    """
+    if not boundary or size <= 0:
+        return [(start, size)]
+    pieces: List[Tuple[int, int]] = []
+    address, remaining = start, size
+    while remaining > 0:
+        # Distance to the next boundary at or above `address`.
+        to_boundary = boundary - (address % boundary)
+        take = min(remaining, to_boundary)
+        pieces.append((address, take))
+        address += take
+        remaining -= take
+    return pieces
 
 
 def merge_intervals(intervals: Iterable[Tuple[int, int]]) -> List[Tuple[int, int]]:
@@ -85,6 +121,11 @@ class PageAddressing:
         return self._layout
 
     @property
+    def mapping_bytes(self) -> Optional[int]:
+        """Size of one GPU pool mapping, or None when the layout omits it."""
+        return self._layout.gpu_pool_mapping_bytes
+
+    @property
     def layer_group_ids(self) -> Tuple[int, ...]:
         """Layer group ids covered, in layout order."""
         return tuple(group.layer_group_id for group in self._layout.groups)
@@ -105,6 +146,11 @@ class PageAddressing:
     def buffers(self, layer_group_id: int, page_index: int) -> Tuple[List[int], List[int]]:
         """Addresses and sizes of one page, in the order they concatenate.
 
+        A region whose bytes for this page cross a GPU pool mapping boundary
+        contributes several buffers rather than one, since no memory region
+        covers two mappings. The payload is unchanged: the pieces are
+        consecutive and stay in region order.
+
         Args:
             layer_group_id: Layer group the page index is scoped to.
             page_index: Page slot index within that group.
@@ -119,8 +165,14 @@ class PageAddressing:
                 f"page index {page_index} out of range [0, {num_slots}) for layer "
                 f"group {layer_group_id}"
             )
-        addresses = [region.base + region.stride * page_index for region in regions]
-        sizes = [region.size for region in regions]
+        boundary = self._layout.gpu_pool_mapping_bytes
+        addresses: List[int] = []
+        sizes: List[int] = []
+        for region in regions:
+            start = region.base + region.stride * page_index
+            for address, size in split_at_boundaries(start, region.size, boundary):
+                addresses.append(address)
+                sizes.append(size)
         return addresses, sizes
 
     def registration_ranges(self) -> List[Tuple[int, int]]:
@@ -130,13 +182,31 @@ class PageAddressing:
         is the whole span from the first slot to the end of the last. Registering
         the span is what makes every slot's address valid for RDMA, and merging
         keeps a shared pool from being registered once per region.
+
+        Merged spans are then cut at GPU pool mapping boundaries, because a
+        registration covering two mappings is refused: the pools are virtual
+        spans with one physical mapping per
+        `KvCacheLayout.gpu_pool_mapping_bytes`, and a dma-buf memory region
+        describes one of them. This costs one call per mapping, which measures
+        at roughly a millisecond each, and buys registration without
+        `nvidia_peermem` -- whose `ibv_reg_mr` walks page tables and so has no
+        equivalent limit.
         """
         spans: List[Tuple[int, int]] = []
         for regions in self._regions.values():
             for region in regions:
                 span_end = region.base + region.stride * (region.num_slots - 1) + region.size
                 spans.append((region.base, span_end))
-        return merge_intervals(spans)
+        merged = merge_intervals(spans)
+
+        boundary = self._layout.gpu_pool_mapping_bytes
+        if not boundary:
+            return merged
+        return [
+            (address, address + size)
+            for start, end in merged
+            for address, size in split_at_boundaries(start, end - start, boundary)
+        ]
 
     def describe(self) -> str:
         """A one-line summary for startup logs."""

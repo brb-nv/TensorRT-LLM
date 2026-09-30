@@ -31,7 +31,9 @@ scheduler reports such a request as saving asynchronously, which keeps its pages
 pinned until `get_finished` says the writes landed.
 """
 
+import os
 import threading
+import time
 import traceback
 from collections import defaultdict
 from queue import Queue
@@ -39,7 +41,7 @@ from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 import torch
 
-from tensorrt_llm._utils import mpi_rank, mpi_world_size
+from tensorrt_llm._utils import mpi_rank, mpi_world_size, nvtx_range
 from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 from tensorrt_llm.logger import logger
 
@@ -47,6 +49,7 @@ from ..kv_cache_connector import KvCacheConnectorWorker
 from ..kv_cache_layout import KvCacheLayout
 from .addressing import PageAddressing
 from .config import CONFIG_PATH_ENV, MooncakeStoreConnectorConfig
+from .gpudirect import REGISTRATION_DEBUG_ENV, format_diagnosis
 from .keys import KeyNamespace
 from .metadata import MooncakeStoreMetadata, RequestTransfers
 from .staging import (
@@ -149,6 +152,80 @@ def _stream_handle(stream) -> int:
     return int(getattr(stream, "cuda_stream", stream))
 
 
+#: Seconds between onboarding summaries. Loads run on the executor thread, so a
+#: per-call log would be one line per iteration; the summary reports the same
+#: cost aggregated. Set to 0 to report nothing but the per-call debug lines.
+LOAD_STATS_INTERVAL_ENV = "TRTLLM_MOONCAKE_STORE_LOAD_STATS_INTERVAL_S"
+_DEFAULT_LOAD_STATS_INTERVAL_S = 60.0
+_GIB = float(1 << 30)
+
+
+class _LoadStats:
+    """Accumulates onboarding cost between summaries.
+
+    `start_load_kv` blocks the executor thread, so its wall time is time the
+    forward pass is not running. The fraction of the reporting window spent
+    there is the number worth watching; the phase split says whether it is the
+    pool read or the staging scatter that costs it.
+    """
+
+    __slots__ = ("_interval", "_window_start", "_durations", "_pages", "_bytes",
+                 "_resolve_s", "_fetch_s", "_scatter_s")
+
+    def __init__(self, interval_s: float) -> None:
+        self._interval = interval_s
+        self._reset(time.perf_counter())
+
+    def _reset(self, now: float) -> None:
+        self._window_start = now
+        self._durations: List[float] = []
+        self._pages = 0
+        self._bytes = 0
+        self._resolve_s = 0.0
+        self._fetch_s = 0.0
+        self._scatter_s = 0.0
+
+    def record(self, pages: int, nbytes: int, total_s: float, resolve_s: float,
+               fetch_s: float, scatter_s: float) -> None:
+        self._durations.append(total_s)
+        self._pages += pages
+        self._bytes += nbytes
+        self._resolve_s += resolve_s
+        self._fetch_s += fetch_s
+        self._scatter_s += scatter_s
+
+    def report(self, rank: int) -> None:
+        """Log a summary once the reporting window has elapsed."""
+        if self._interval <= 0 or not self._durations:
+            return
+        now = time.perf_counter()
+        window = now - self._window_start
+        if window < self._interval:
+            return
+
+        ordered = sorted(self._durations)
+        calls = len(ordered)
+        # Guards the rates below; a window with recorded calls cannot really
+        # have taken no time, but telemetry must not be able to raise.
+        blocked = max(sum(ordered), 1e-9)
+
+        def pct(fraction: float) -> float:
+            return ordered[min(calls - 1, int(calls * fraction))] * 1e3
+
+        logger.info(
+            f"mooncake-store rank {rank} onboarding over {window:.1f}s: "
+            f"{calls} loads, {self._pages} pages, {self._bytes / _GIB:.1f} GiB; "
+            f"blocked {blocked:.2f}s ({100 * blocked / window:.1f}% of the window), "
+            f"{self._bytes / _GIB / blocked:.1f} GiB/s while loading; "
+            f"per load mean {1e3 * blocked / calls:.1f}ms "
+            f"p50 {pct(0.5):.1f}ms p90 {pct(0.9):.1f}ms p99 {pct(0.99):.1f}ms "
+            f"max {ordered[-1] * 1e3:.1f}ms; "
+            f"phases resolve {self._resolve_s:.2f}s / fetch {self._fetch_s:.2f}s / "
+            f"scatter {self._scatter_s:.2f}s"
+        )
+        self._reset(now)
+
+
 class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
     """Moves KV pages between this rank's GPU cache and the Mooncake pool."""
 
@@ -196,6 +273,9 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         # stay pinned until we report them back through `get_finished`.
         self._closed_requests: Set[int] = set()
         self._save_error: Optional[BaseException] = None
+        self._load_stats = _LoadStats(
+            float(os.getenv(LOAD_STATS_INTERVAL_ENV, _DEFAULT_LOAD_STATS_INTERVAL_S))
+        )
 
         global _LOCAL_WORKER
         _LOCAL_WORKER = self
@@ -239,17 +319,36 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         if self._config.stage_through_host:
             self._open_staging(addressing)
         else:
-            for start, end in addressing.registration_ranges():
+            ranges = addressing.registration_ranges()
+            logger.info(
+                f"mooncake-store rank {self._rank} registering {len(ranges)} range(s) "
+                f"covering {sum(end - start for start, end in ranges) / _GIB:.1f} GiB, "
+                f"cut at {addressing.mapping_bytes} B pool mapping boundaries"
+            )
+            # Every way this fails arrives as one status code from a library
+            # several layers down, so the driver's own view of the pools is
+            # what makes the cause legible. Reported up front only on request,
+            # since it is one line per range and there is one range per mapping.
+            if os.getenv(REGISTRATION_DEBUG_ENV):
+                logger.info(
+                    format_diagnosis(ranges, self._rank, addressing.mapping_bytes)
+                )
+            for start, end in ranges:
                 status = self._store.register_buffer(start, end - start)
                 if status != 0:
+                    # Collected after the failure rather than before it so the
+                    # common path pays nothing, and reported with the error
+                    # because a separate log line would be far from it.
                     raise RuntimeError(
                         f"MooncakeDistributedStore.register_buffer failed with status "
                         f"{status} for [{start:#x}, {end:#x}). Without registration "
                         "the store cannot read or write these pages. Registering "
-                        "device memory needs GPUDirect RDMA (nvidia_peermem or "
-                        "dma-buf); where that is unavailable, set "
-                        "stage_through_host to pass pages through pinned host "
-                        "memory instead."
+                        "device memory needs GPUDirect RDMA, either nvidia_peermem "
+                        "(Mooncake's default, selected unless WITH_NVIDIA_PEERMEM=0) "
+                        "or dma-buf, which cannot cover a range spanning several of "
+                        "KVCacheManagerV2's pool mappings. Set stage_through_host to "
+                        "pass pages through pinned host memory instead.\n"
+                        f"{format_diagnosis(ranges, self._rank, addressing.mapping_bytes)}"
                     )
 
         self._addressing = addressing
@@ -397,49 +496,76 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
             return
         self._reraise_save_error()
 
+        started = time.perf_counter()
         keys, addresses, sizes, total_pages = self._resolve(metadata.loads)
         if not keys:
             return
+        resolve_s = time.perf_counter() - started
+        total_bytes = sum(sum(page_sizes) for page_sizes in sizes)
 
         staging = self._load_staging
         handle = _stream_handle(stream) if staging is not None else 0
+        fetch_s = 0.0
+        scatter_s = 0.0
 
-        for batch in zip(
-            _batched(keys, self._batch_size),
-            _batched(addresses, self._batch_size),
-            _batched(sizes, self._batch_size),
-        ):
-            batch_keys, batch_addresses, batch_sizes = batch
-            if staging is None:
-                target_addresses, target_sizes = list(batch_addresses), list(batch_sizes)
-            else:
-                target_addresses, target_sizes = describe_batch_for_get(staging, batch_sizes)
-            results = self._store.batch_get_into_multi_buffers(
-                list(batch_keys), target_addresses, target_sizes
-            )
-            failed = [
-                key
-                for key, result in zip(batch_keys, results)
-                if not isinstance(result, int) or result < 0
-            ]
-            if failed or len(results) != len(batch_keys):
-                # The runtime already counted these tokens as computed, so a
-                # partial load leaves the forward pass reading uninitialized KV
-                # and silently producing wrong tokens. Fail loudly instead.
-                raise RuntimeError(
-                    f"mooncake-store failed to load {len(failed) or len(batch_keys)} of "
-                    f"{len(batch_keys)} pages; the affected KV slots were already "
-                    f"reported as computed. First failure: {failed[:1]}"
+        with nvtx_range(f"mooncake_load {total_pages}p", color="orange"):
+            for batch in zip(
+                _batched(keys, self._batch_size),
+                _batched(addresses, self._batch_size),
+                _batched(sizes, self._batch_size),
+            ):
+                batch_keys, batch_addresses, batch_sizes = batch
+                if staging is None:
+                    target_addresses, target_sizes = list(batch_addresses), list(batch_sizes)
+                else:
+                    target_addresses, target_sizes = describe_batch_for_get(staging, batch_sizes)
+                mark = time.perf_counter()
+                results = self._store.batch_get_into_multi_buffers(
+                    list(batch_keys), target_addresses, target_sizes
                 )
-            if staging is not None:
-                # Only reached once every page in the batch landed, so no slot
-                # holding a failed read is copied over a device page.
-                unstage_batch_after_get(staging, batch_addresses, batch_sizes, handle)
-                # The next batch reuses the slots and the forward pass reads
-                # these pages, so the scatter has to complete before either.
-                _sync_stream(handle)
+                fetch_s += time.perf_counter() - mark
+                failed = [
+                    key
+                    for key, result in zip(batch_keys, results)
+                    if not isinstance(result, int) or result < 0
+                ]
+                if failed or len(results) != len(batch_keys):
+                    # The runtime already counted these tokens as computed, so a
+                    # partial load leaves the forward pass reading uninitialized KV
+                    # and silently producing wrong tokens. Fail loudly instead.
+                    raise RuntimeError(
+                        f"mooncake-store failed to load {len(failed) or len(batch_keys)} of "
+                        f"{len(batch_keys)} pages; the affected KV slots were already "
+                        f"reported as computed. First failure: {failed[:1]}"
+                    )
+                if staging is not None:
+                    mark = time.perf_counter()
+                    # Only reached once every page in the batch landed, so no slot
+                    # holding a failed read is copied over a device page.
+                    unstage_batch_after_get(staging, batch_addresses, batch_sizes, handle)
+                    # The next batch reuses the slots and the forward pass reads
+                    # these pages, so the scatter has to complete before either.
+                    _sync_stream(handle)
+                    scatter_s += time.perf_counter() - mark
 
-        logger.debug(f"mooncake-store rank {self._rank} loaded {total_pages} pages")
+        total_s = time.perf_counter() - started
+        # INFO rather than DEBUG, and per call rather than sampled: a load only
+        # happens on an iteration that matched something in the pool, so this is
+        # bounded by pool read activity rather than by iteration count. On a
+        # 3-prefill-server run that is under 4 lines/s/rank, a few MiB over an
+        # hour, against the ~1GB/hour a context server's per-iteration log
+        # already writes. The summary below gives the distribution; these lines
+        # are what let a slow load be tied back to the iteration it stalled.
+        logger.info(
+            f"mooncake-store rank {self._rank} loaded {total_pages} pages "
+            f"({total_bytes / _GIB:.3f} GiB) in {total_s * 1e3:.1f}ms "
+            f"(resolve {resolve_s * 1e3:.1f}ms, fetch {fetch_s * 1e3:.1f}ms, "
+            f"scatter {scatter_s * 1e3:.1f}ms)"
+        )
+        self._load_stats.record(
+            total_pages, total_bytes, total_s, resolve_s, fetch_s, scatter_s
+        )
+        self._load_stats.report(self._rank)
 
     def wait_for_layer_load(self, layer_idx: int, stream: torch.cuda.Stream):
         """No-op: loads complete in `start_load_kv`.
