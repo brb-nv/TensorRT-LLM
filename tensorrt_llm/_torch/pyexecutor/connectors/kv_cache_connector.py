@@ -335,6 +335,13 @@ class KvCacheConnectorWorker(ABC):
         """
         return []
 
+    def shutdown(self) -> None:
+        """Release whatever this worker holds, once the executor is done with it.
+
+        Called once, after the executor's worker thread has joined, so no
+        transfer can start afterwards. Implementations must be idempotent.
+        """
+
 
 class KvCacheConnectorScheduler(ABC):
     def __init__(self, llm_args: TorchLlmArgs):
@@ -1384,8 +1391,11 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
             self._finish_load(request, is_async=load.is_async)
 
     def shutdown(self) -> None:
-        if self._prefix_completion_tracker is not None:
-            self._prefix_completion_tracker.close()
+        try:
+            self.worker.shutdown()
+        finally:
+            if self._prefix_completion_tracker is not None:
+                self._prefix_completion_tracker.close()
 
     def _finish_load(self, request: LlmRequest, is_async: bool) -> None:
         if request.request_id in self._deferred_load_terminations:
