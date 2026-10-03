@@ -267,6 +267,7 @@ def make_manager(connector, num_extra_kv_tokens=0, is_draft=False):
     manager._request_stats_enabled_ids = set()
     manager._fresh_pages_filled = {}
     manager._disagg_receive_ready = {}
+    manager._pending_preemption = {}
     manager._early_freed_index_requests = set()
     manager.impl = Mock()
     manager.index_mapper = Mock()
