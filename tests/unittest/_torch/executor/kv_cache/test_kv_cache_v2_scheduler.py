@@ -1332,6 +1332,34 @@ def _out_of_pages_for(request_id):
     return lambda req, n: req.py_request_id != request_id
 
 
+# Request lists for the eligibility table below; one case needs the cache map.
+
+
+def _blocked_and_victim(mgr):
+    """A first chunk out of pages, behind a victim nothing disqualifies."""
+    return [make_ctx_request(0, 100), make_ctx_request(99, 100, is_first_context_chunk=False)]
+
+
+def _generation_then_blocked_context(mgr):
+    """gen0 commits in phase 1, then ctx1 runs out of pages."""
+    return [make_gen_request(0), make_ctx_request(1, 100)]
+
+
+def _only_the_request_that_ran_out(mgr):
+    return [make_ctx_request(0, 100, is_first_context_chunk=False)]
+
+
+def _blocked_first_chunk_and_suspended(mgr):
+    """A first chunk holds no pages worth taking; a suspended one frees nothing."""
+    suspended = make_ctx_request(99, 100, is_first_context_chunk=False)
+    mgr.kv_cache_map[suspended.py_request_id].is_active = False
+    return [
+        make_ctx_request(0, 100),
+        make_ctx_request(98, 100, is_first_context_chunk=True),
+        suspended,
+    ]
+
+
 #: What the executor passes to reset_for_recompute. Its choice, not the
 #: scheduler's, so the exact value does not matter here.
 UNBOUNDED_MAX_INPUT_LEN = 0x7FFFFFFF
@@ -1430,31 +1458,82 @@ class TestContextPreemption:
         assert 0 in ids(second.context_requests)
         victim.reset_for_recompute.assert_called_once()
 
-    def test_disagg_generation_worker_never_preempts(self):
-        """It received its context KV, so it cannot replay a prefill."""
-        mgr = make_kv_cache_manager(
-            resize_context_fn=_out_of_pages_for(0),
-            has_cache_tier_below_gpu=False,
-        )
-        sched = make_scheduler(mgr, max_num_tokens=1000, enable_recompute_pause=False)
-        victim = make_ctx_request(99, 100, is_first_context_chunk=False)
+    @pytest.mark.parametrize(
+        ("manager", "scheduler", "build_requests", "inflight", "expected"),
+        [
+            pytest.param(
+                {},
+                {"enable_recompute_pause": False},
+                _blocked_and_victim,
+                set(),
+                {},
+                id="a_disagg_generation_worker_received_its_context_kv",
+            ),
+            pytest.param(
+                {"has_cache_tier_below_gpu": True},
+                {},
+                _blocked_and_victim,
+                set(),
+                # Skipped rather than released: suspension keeps the pages.
+                {"context_requests": [99]},
+                id="a_cache_tier_exists_below_gpu",
+            ),
+            pytest.param(
+                {"resize_context_fn": _out_of_pages_for(1)},
+                {},
+                _generation_then_blocked_context,
+                set(),
+                # Taking gen0's pages would undo a phase this pass committed.
+                {"generation_requests": [0]},
+                id="the_candidate_was_scheduled_earlier_in_this_pass",
+            ),
+            pytest.param(
+                {"resize_context_fn": lambda req, n: False},
+                {},
+                _only_the_request_that_ran_out,
+                set(),
+                {},
+                id="the_candidate_is_the_request_that_ran_out",
+            ),
+            pytest.param(
+                {},
+                {},
+                _blocked_and_victim,
+                {99},
+                {},
+                id="the_candidate_has_a_transfer_in_flight",
+            ),
+            pytest.param(
+                {},
+                {},
+                _blocked_first_chunk_and_suspended,
+                set(),
+                {},
+                id="the_candidates_are_a_first_chunk_and_a_suspended_request",
+            ),
+        ],
+    )
+    def test_what_disqualifies_a_preemption_victim(
+        self, manager, scheduler, build_requests, inflight, expected
+    ):
+        """Every row withdraws one eligibility condition from the preempting pass.
 
-        sched.schedule_request([make_ctx_request(0, 100), victim], set())
+        `test_out_of_pages_preempts_started_request` is the control.
+        """
+        mgr = make_kv_cache_manager(
+            **{
+                "resize_context_fn": _out_of_pages_for(0),
+                "has_cache_tier_below_gpu": False,
+                **manager,
+            }
+        )
+        sched = make_scheduler(mgr, max_num_tokens=1000, **scheduler)
+
+        out = sched.schedule_request(build_requests(mgr), inflight)
 
         mgr.preempt_request.assert_not_called()
-
-    def test_preempted_victim_not_scheduled_in_the_same_pass(self):
-        """Re-admitting the victim would spend the pages it just released."""
-        mgr = make_kv_cache_manager(
-            resize_context_fn=_out_of_pages_for(0),
-            has_cache_tier_below_gpu=False,
-        )
-        sched = make_scheduler(mgr, max_num_tokens=1000)
-        victim = make_ctx_request(99, 100, is_first_context_chunk=False)
-
-        out = sched.schedule_request([make_ctx_request(0, 100), victim], set())
-
-        assert ids(out.context_requests) == []
+        for attribute, request_ids in expected.items():
+            assert ids(getattr(out, attribute)) == request_ids
 
     def test_freed_pages_are_reserved_for_the_request_that_preempted(self):
         """No later context request may spend them first."""
@@ -1505,76 +1584,6 @@ class TestContextPreemption:
         assert ids(out.generation_requests) == [0]
         assert ids(out.recompute_paused_requests) == [99]
         assert ids(out.context_requests) == []
-
-    def test_skipped_when_a_cache_tier_exists_below_gpu(self):
-        mgr = make_kv_cache_manager(
-            resize_context_fn=_out_of_pages_for(0),
-            has_cache_tier_below_gpu=True,
-        )
-        sched = make_scheduler(mgr, max_num_tokens=1000)
-        victim = make_ctx_request(99, 100, is_first_context_chunk=False)
-
-        out = sched.schedule_request([make_ctx_request(0, 100), victim], set())
-
-        mgr.preempt_request.assert_not_called()
-        # Suspension is cheaper and keeps the pages, so the request is
-        # simply skipped.
-        assert ids(out.context_requests) == [99]
-
-    def test_never_preempts_a_scheduled_request(self):
-        mgr = make_kv_cache_manager(
-            resize_context_fn=_out_of_pages_for(1),
-            has_cache_tier_below_gpu=False,
-        )
-        sched = make_scheduler(mgr, max_num_tokens=1000)
-        # gen0 is scheduled in phase 1; ctx1 then runs out of pages and must
-        # not take the pages out from under it.
-        reqs = [make_gen_request(0), make_ctx_request(1, 100)]
-
-        out = sched.schedule_request(reqs, set())
-
-        assert ids(out.generation_requests) == [0]
-        mgr.preempt_request.assert_not_called()
-
-    def test_never_preempts_itself(self):
-        mgr = make_kv_cache_manager(
-            resize_context_fn=lambda req, n: False,
-            has_cache_tier_below_gpu=False,
-        )
-        sched = make_scheduler(mgr, max_num_tokens=1000)
-        req = make_ctx_request(0, 100, is_first_context_chunk=False)
-
-        sched.schedule_request([req], set())
-
-        mgr.preempt_request.assert_not_called()
-
-    def test_never_preempts_an_inflight_request(self):
-        mgr = make_kv_cache_manager(
-            resize_context_fn=_out_of_pages_for(0),
-            has_cache_tier_below_gpu=False,
-        )
-        sched = make_scheduler(mgr, max_num_tokens=1000)
-        victim = make_ctx_request(99, 100, is_first_context_chunk=False)
-
-        sched.schedule_request([make_ctx_request(0, 100), victim], {99})
-
-        mgr.preempt_request.assert_not_called()
-
-    def test_never_preempts_a_first_chunk_or_suspended_request(self):
-        mgr = make_kv_cache_manager(
-            resize_context_fn=_out_of_pages_for(0),
-            has_cache_tier_below_gpu=False,
-        )
-        sched = make_scheduler(mgr, max_num_tokens=1000)
-        # First chunk: holds no pages worth taking.
-        first_chunk = make_ctx_request(98, 100, is_first_context_chunk=True)
-        # Already suspended: preempting it frees nothing extra.
-        suspended = make_ctx_request(99, 100, is_first_context_chunk=False)
-        mgr.kv_cache_map[suspended.py_request_id].is_active = False
-
-        sched.schedule_request([make_ctx_request(0, 100), first_chunk, suspended], set())
-
-        mgr.preempt_request.assert_not_called()
 
     def test_chunked_context_out_of_pages_preempts(self):
         mgr = make_kv_cache_manager(

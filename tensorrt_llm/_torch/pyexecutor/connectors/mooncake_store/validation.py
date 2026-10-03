@@ -45,7 +45,7 @@ NODE_BUDGET_RESERVE_BYTES = 32 * _GIB
 
 def validate_llm_args(llm_args: TorchLlmArgs) -> None:
     """Reject parallel and model configurations this connector cannot serve."""
-    if getattr(llm_args, "context_parallel_size", 1) > 1:
+    if llm_args.context_parallel_size > 1:
         raise NotImplementedError(
             "The mooncake-store connector does not support context parallelism. "
             "A stored page is keyed by the tokens it holds, but under context "
@@ -54,7 +54,7 @@ def validate_llm_args(llm_args: TorchLlmArgs) -> None:
             "different ranks."
         )
 
-    if getattr(llm_args, "pipeline_parallel_size", 1) > 1:
+    if llm_args.pipeline_parallel_size > 1:
         raise NotImplementedError(
             "The mooncake-store connector does not support pipeline parallelism. "
             "Keys are namespaced per rank, so each stage would store only its own "
@@ -62,7 +62,8 @@ def validate_llm_args(llm_args: TorchLlmArgs) -> None:
             "is untested. Run with tensor parallelism only."
         )
 
-    sparse_config = getattr(llm_args, "sparse_attention_config", None)
+    # Only configs with an index-V cache declare the setting.
+    sparse_config = llm_args.sparse_attention_config
     if sparse_config is not None and not getattr(sparse_config, "sparse_disable_index_value", True):
         raise NotImplementedError(
             "The mooncake-store connector requires "

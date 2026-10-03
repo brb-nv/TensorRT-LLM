@@ -150,15 +150,15 @@ def _batched(items: Sequence, size: int):
         yield items[start : start + size]
 
 
-def _stream_handle(stream) -> int:
-    """The raw CUDA stream handle behind a torch stream, or a handle as given.
+def _stream_handle(stream: Optional[torch.cuda.Stream]) -> int:
+    """The raw CUDA stream handle behind a torch stream.
 
     `None` maps to 0, the default stream, which is what the runtime passes when
     it has no stream of its own to offer.
     """
     if stream is None:
         return 0
-    return int(getattr(stream, "cuda_stream", stream))
+    return int(stream.cuda_stream)
 
 
 class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
@@ -172,7 +172,8 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         # Where this rank records the segment it mounts. `None` when the
         # deployment named no directory, which only makes the run
         # unreportable; see `ledger.record_segment`.
-        self._run_dir = getattr(pool_config(llm_args), "run_dir", None)
+        pool = pool_config(llm_args)
+        self._run_dir = pool.run_dir if pool is not None else None
         self._rank = mpi_rank()
         self._world_size = mpi_world_size()
         self._model_key = self._config.resolve_model_key(llm_args.model)

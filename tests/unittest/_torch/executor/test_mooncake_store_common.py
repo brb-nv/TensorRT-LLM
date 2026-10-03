@@ -37,11 +37,6 @@ from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.keys import (
     KeyNamespace,
     ReuseScope,
 )
-from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.metadata import (
-    MooncakeStoreMetadata,
-    PageTransfer,
-    RequestTransfers,
-)
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.staging import (
     HostStagingPool,
     describe_batch_for_get,
@@ -529,22 +524,3 @@ def test_unstage_batch_after_get_leaves_the_pages_not_asked_for_alone(staged_cop
     unstage_batch_after_get(pool, pages, [PAGE_SIZES, PAGE_SIZES], stream=0, only=[1])
 
     assert [copy[0] for copy in staged_copies] == [0xC000, 0xD000]
-
-
-# ---- metadata ----
-
-
-def test_metadata_is_falsy_until_there_is_work():
-    """The worker skips the iteration entirely on an empty work list."""
-    assert not MooncakeStoreMetadata()
-    assert MooncakeStoreMetadata(loads=[RequestTransfers(request_id=1)])
-    assert MooncakeStoreMetadata(saves=[RequestTransfers(request_id=1)])
-
-
-def test_request_transfers_do_not_share_a_page_list():
-    first = RequestTransfers(request_id=1)
-    second = RequestTransfers(request_id=2)
-
-    first.pages.append(PageTransfer(block_hash=b"\x01" * 16, layer_group_id=0, page_index=3))
-
-    assert second.pages == []

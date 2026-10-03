@@ -1393,6 +1393,7 @@ class _ContextRequest:
     is_first_context_chunk: bool = True
     is_last_context_chunk: bool = True
     is_disagg_generation_init_state: bool = False
+    is_generation_only_request: bool = False
     is_dummy_request: bool = False
     return_perf_metrics: bool = False
     context_current_position: int = 0
@@ -1680,6 +1681,8 @@ def test_preemption_waits_for_a_connector_still_reading_the_victims_pages(
     connector = SimpleNamespace(
         request_finished=lambda *_args: True,
         prefix_reservations_enabled=False,
+        # Declining keeps the allocation hooks out of a preemption test.
+        should_add_sequence=lambda _req: False,
         release_unstarted_prefix_loads=lambda _req: None,
         has_pending_load=lambda _req: False,
         release_prefix_reservation=lambda _req: None,
