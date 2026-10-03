@@ -37,7 +37,7 @@ import subprocess  # nosec B404
 import tempfile
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 from tensorrt_llm.logger import logger
 
@@ -53,6 +53,9 @@ from .config import (
     StoreRole,
     parse_size,
 )
+
+if TYPE_CHECKING:
+    from tensorrt_llm.llmapi.llm_args import KvCacheConnectorConfig, MooncakeStoreConfig
 
 __all__ = [
     "POOL_MANIFEST_NAME",
@@ -411,7 +414,9 @@ def wait_for_master(
     return elapsed
 
 
-def _client_config(pool: Any, manifest: PoolManifest, device_name: str) -> Dict[str, Any]:
+def _client_config(
+    pool: "MooncakeStoreConfig", manifest: PoolManifest, device_name: str
+) -> Dict[str, Any]:
     """Render the Mooncake client config for this server.
 
     The schema is vLLM's, so one pool can serve both engines. Sizes are
@@ -751,7 +756,7 @@ def claim_run_dir(run_dir: str, role: str) -> None:
     )
 
 
-def _adopt_inherited_settings(pool: Any, path: str) -> None:
+def _adopt_inherited_settings(pool: "MooncakeStoreConfig", path: str) -> None:
     """Restate `pool` as the client config at `path` leaves it.
 
     An inherited `MOONCAKE_CONFIG_PATH` decides what every rank opens its store
@@ -785,7 +790,7 @@ def _adopt_inherited_settings(pool: Any, path: str) -> None:
         ("transfer_batch_size", effective.transfer_batch_size),
         ("stage_through_host", effective.stage_through_host),
     ):
-        if value is None or not hasattr(pool, setting) or value == getattr(pool, setting):
+        if value is None or value == getattr(pool, setting):
             continue
         setattr(pool, setting, value)
         restated[setting] = value
@@ -798,7 +803,9 @@ def _adopt_inherited_settings(pool: Any, path: str) -> None:
 
 
 @contextlib.contextmanager
-def provision_pool(pool: Any, run_dir: Optional[str] = None) -> Iterator[Optional[str]]:
+def provision_pool(
+    pool: "MooncakeStoreConfig", run_dir: Optional[str] = None
+) -> Iterator[Optional[str]]:
     """Join the pool `pool` names and point this process's ranks at it.
 
     Yields the path of the client config written, or `None` when an inherited
@@ -821,7 +828,7 @@ def provision_pool(pool: Any, run_dir: Optional[str] = None) -> Iterator[Optiona
         yield None
         return
 
-    run_dir = run_dir or getattr(pool, "run_dir", None)
+    run_dir = run_dir or pool.run_dir
     keep_run_dir = bool(run_dir)
     run_dir = run_dir or tempfile.mkdtemp(prefix="trtllm-mooncake-")
     os.makedirs(run_dir, exist_ok=True)
@@ -835,7 +842,7 @@ def provision_pool(pool: Any, run_dir: Optional[str] = None) -> Iterator[Optiona
             "external launcher started also need in order to find this config"
         )
 
-    timeout = float(getattr(pool, "master_timeout", DEFAULT_MASTER_TIMEOUT))
+    timeout = float(pool.master_timeout)
     exported = False
     try:
         manifest = resolve_pool(pool.pool, timeout)
@@ -881,7 +888,9 @@ def provision_pool(pool: Any, run_dir: Optional[str] = None) -> Iterator[Optiona
 
 
 @contextlib.contextmanager
-def maybe_provision_pool(kv_connector_config: Any) -> Iterator[None]:
+def maybe_provision_pool(
+    kv_connector_config: Optional["KvCacheConnectorConfig"],
+) -> Iterator[None]:
     """Provision the pool if this deployment asked the server to.
 
     A no-op for every other connector, and for a `mooncake-store` config that

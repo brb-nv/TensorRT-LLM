@@ -217,13 +217,15 @@ def test_the_signal_is_reported_only_after_the_master_is_reaped(master):
     assert master.resource.released
 
 
-@pytest.mark.parametrize("flag", ["--telemetry", "--no-telemetry"])
-def test_the_opt_out_the_group_documents_is_accepted(master, flag):
-    """Without the option Click rejects the flag as a usage error instead."""
+def test_the_opt_out_the_group_documents_is_accepted(master):
+    """Without the option Click rejects the flag as a usage error instead.
+
+    One form is enough: both come from the same paired declaration.
+    """
     signal_on_idle(master, signal.SIGTERM)
 
     with pytest.raises(_telemetry.SignalExit):
-        master.run(flag)
+        master.run("--no-telemetry")
 
     assert master.resource.released
 

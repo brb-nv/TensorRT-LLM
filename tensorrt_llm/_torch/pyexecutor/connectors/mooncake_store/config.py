@@ -28,7 +28,10 @@ import os
 import re
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
+
+if TYPE_CHECKING:
+    from tensorrt_llm.llmapi.llm_args import MooncakeStoreConfig, TorchLlmArgs
 
 __all__ = [
     "CLIENT_CONFIG_NAME",
@@ -176,14 +179,14 @@ def parse_size(value: Any, *, strict_units: bool = False) -> int:
     return int(float(magnitude) * scale)
 
 
-def pool_config(llm_args: Any) -> Optional[Any]:
+def pool_config(llm_args: "TorchLlmArgs") -> Optional["MooncakeStoreConfig"]:
     """The `mooncake_store` block of `llm_args`, if the deployment set one.
 
     Every rank parses the same worker config, so this is how a rank reaches
     settings the process that rendered the client config could not pass it.
     """
-    connector = getattr(llm_args, "kv_connector_config", None)
-    return getattr(connector, "mooncake_store", None) if connector is not None else None
+    connector = llm_args.kv_connector_config
+    return connector.mooncake_store if connector is not None else None
 
 
 def provisioned_config_path(run_dir: Optional[str]) -> Optional[str]:
@@ -276,7 +279,7 @@ class MooncakeStoreConnectorConfig:
         )
 
     @staticmethod
-    def resolve(llm_args: Any) -> "MooncakeStoreConnectorConfig":
+    def resolve(llm_args: "TorchLlmArgs") -> "MooncakeStoreConnectorConfig":
         """The client config this rank should open, read from wherever it is.
 
         An inherited `MOONCAKE_CONFIG_PATH` wins, since it names a pool the
@@ -284,7 +287,7 @@ class MooncakeStoreConnectorConfig:
         server rendered into `mooncake_store.run_dir`.
         """
         pool = pool_config(llm_args)
-        run_dir = getattr(pool, "run_dir", None) if pool is not None else None
+        run_dir = pool.run_dir if pool is not None else None
         path = os.getenv(CONFIG_PATH_ENV) or provisioned_config_path(run_dir)
         if not path:
             raise ValueError(
