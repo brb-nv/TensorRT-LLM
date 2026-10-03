@@ -22,17 +22,24 @@ reports, per-rank namespacing under tensor parallelism, and the scheduler
 interaction when a request is preempted while the connector is still reading
 its pages.
 
-Each test starts its own master and pool, so nothing is shared between tests or
-with anything else on the machine.
+One master and pool serve the whole module and nothing else on the machine.
+Each test gets a key namespace of its own; see `mooncake_pool`.
 """
 
+import contextlib
+import json
 import math
+import os
 import socket
 from types import SimpleNamespace
 
 import pytest
 
 from tensorrt_llm import LLM, SamplingParams
+from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.config import (
+    MooncakeStoreConnectorConfig,
+    parse_size,
+)
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.ledger import read_segments
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.master import (
     POOL_MANIFEST_NAME,
@@ -48,7 +55,8 @@ from ..conftest import llm_models_root
 from .test_llm_api_connector import E2E_MIN_TOKEN_AGREEMENT
 
 MODEL_PATH = "Qwen3/Qwen3-0.6B"
-#: Small enough to pass the node budget check wherever this runs.
+#: What the fixture lends the pool. Small enough to pass the node budget check
+#: wherever this runs.
 SEGMENT_SIZE = "2GiB"
 
 # Long enough to cover several KV blocks. A prefix shorter than one block is
@@ -103,22 +111,72 @@ def assert_tokens_agree(reference, replayed, *, context: str) -> None:
     )
 
 
-@pytest.fixture
-def mooncake_pool(tmp_path):
-    """A live master and a rendered client config, torn down with the test.
+@contextlib.contextmanager
+def pool_capacity(config_path: str, segment_size):
+    """Lend the pool named by `config_path` a segment for the body's duration.
+
+    The engines lend nothing, so this is the pool's whole capacity and every
+    object lands here. An engine's own segment would go when the engine does,
+    making cross-engine reuse depend on where the pool placed its objects.
+
+    Closed before its master goes down, so the segment is unmounted rather
+    than abandoned.
+    """
+    from mooncake.store import MooncakeDistributedStore
+
+    config = MooncakeStoreConnectorConfig.from_file(config_path)
+    store = MooncakeDistributedStore()
+    status = store.setup(
+        socket.gethostbyname(socket.gethostname()),
+        config.metadata_server,
+        parse_size(segment_size, strict_units=True),
+        config.local_buffer_size,
+        config.protocol,
+        config.device_name,
+        config.master_server_address,
+    )
+    if status != 0:
+        raise RuntimeError(
+            f"the test fixture could not lend the pool a segment: "
+            f"MooncakeDistributedStore.setup failed with status {status} "
+            f"(master={config.master_server_address!r})"
+        )
+    try:
+        yield
+    finally:
+        store.close()
+
+
+def _set_namespace(config_path: str, namespace: str) -> None:
+    """Point the rendered client config at `namespace`, renaming into place."""
+    with open(config_path) as handle:
+        config = json.load(handle)
+    config["namespace"] = namespace
+    staging = f"{config_path}.partial"
+    with open(staging, "w") as handle:
+        json.dump(config, handle, indent=2)
+    os.replace(staging, config_path)
+
+
+@pytest.fixture(scope="module")
+def _mooncake_pool_for_module(tmp_path_factory):
+    """One master, one rendered client config and one lent segment.
 
     The `LLM` API does not provision a pool itself, only `trtllm-serve` calls
-    `maybe_provision_pool`, so the test does it. That also puts
-    `MOONCAKE_CONFIG_PATH` in the environment before any worker process is
-    spawned, and therefore inherited by all of them.
+    `maybe_provision_pool`, so the test does it. That also exports
+    `MOONCAKE_CONFIG_PATH`, which is how a worker process finds the pool.
+
+    The engines lend nothing; this fixture holds the pool's only segment. See
+    `pool_capacity`.
 
     Host staging rather than the zero-copy default, because registering device
     memory with the transfer engine needs GPUDirect support this node may not
-    have. The byte-for-byte equivalence of the two paths is covered by
-    `tests/unittest/_torch/executor/test_mooncake_store_real_pool.py`.
+    have. `tests/unittest/_torch/executor/test_mooncake_store_real_pool.py`
+    covers the two paths' equivalence.
     """
-    master_dir = tmp_path / "master"
-    client_dir = tmp_path / "client"
+    root = tmp_path_factory.mktemp("mooncake")
+    master_dir = root / "master"
+    client_dir = root / "client"
     master_dir.mkdir()
     client_dir.mkdir()
 
@@ -131,12 +189,34 @@ def mooncake_pool(tmp_path):
         store_config = MooncakeStoreConfig(
             pool=f"file://{master_dir / POOL_MANIFEST_NAME}",
             model_key=MODEL_PATH,
-            segment_size=SEGMENT_SIZE,
+            segment_size=0,
             stage_through_host=True,
             run_dir=str(client_dir),
         )
-        with provision_pool(store_config, run_dir=str(client_dir)):
-            yield SimpleNamespace(config=store_config, run_dir=str(client_dir))
+        with provision_pool(store_config, run_dir=str(client_dir)) as config_path:
+            with pool_capacity(config_path, SEGMENT_SIZE):
+                yield SimpleNamespace(
+                    config=store_config,
+                    run_dir=str(client_dir),
+                    config_path=config_path,
+                )
+
+
+@pytest.fixture
+def mooncake_pool(_mooncake_pool_for_module, request):
+    """The module's pool, under a key namespace of this test's own.
+
+    Not a pool per test: a worker process can outlive the test it was spawned
+    for and still resolve the `MOONCAKE_CONFIG_PATH` it was born with, by
+    which time a per-test master has stopped accepting connections. One master
+    per module keeps every path a worker might hold pointing at a live pool.
+
+    Keys begin with `<namespace>/<model key>`, so the namespace is what keeps
+    the tests apart. Rewritten in the shared config rather than rendered per
+    test, so a worker reading the path late still gets the current test's.
+    """
+    _set_namespace(_mooncake_pool_for_module.config_path, f"trtllm-{request.node.name}")
+    yield _mooncake_pool_for_module
 
 
 def llm_kwargs(pool, **overrides) -> dict:
@@ -240,7 +320,7 @@ def test_mooncake_e2e_prefix_reuse_across_tensor_parallel_ranks(mooncake_pool):
     the others never saved.
 
     The leader runs in a spawned process here, so its matched-token answers are
-    not observable. What is observable is that both ranks mounted a segment and
+    not observable. What is observable is that both ranks joined the pool and
     that the replayed tokens agree, and a rank whose saves failed reports the
     error on the next connector call rather than silently writing nothing.
     """
@@ -255,10 +335,10 @@ def test_mooncake_e2e_prefix_reuse_across_tensor_parallel_ranks(mooncake_pool):
 
     segments = read_segments(mooncake_pool.run_dir)
     assert {record.rank for record in segments} == {0, 1}, (
-        "Both ranks should have contributed a segment to the pool, but the ledger "
-        f"records ranks {sorted(record.rank for record in segments)}. A rank that "
-        "mounted nothing stores no shard, and every prefix it is asked about reads "
-        "as a miss."
+        "Both ranks should have joined the pool, but the ledger records ranks "
+        f"{sorted(record.rank for record in segments)}. A rank that never opened a "
+        "store handle stores no shard, and every prefix it is asked about reads as "
+        "a miss."
     )
 
     warm = LLM(**kwargs)
@@ -330,6 +410,7 @@ def test_mooncake_e2e_chunked_prefill_survives_a_small_cache(mooncake_pool):
     finally:
         reference.shutdown()
 
+    segments_before = len(read_segments(mooncake_pool.run_dir))
     llm = LLM(
         **llm_kwargs(
             mooncake_pool,
@@ -355,11 +436,12 @@ def test_mooncake_e2e_chunked_prefill_survives_a_small_cache(mooncake_pool):
     assert stats, "The engine returned no iteration statistics to assert on."
 
     # The assertions below are about the scheduler, so a connector that did
-    # nothing at all would satisfy them. Its worker mounting a segment is the
-    # evidence that the pool was really in the loop.
-    assert read_segments(mooncake_pool.run_dir), (
-        "No rank recorded a segment, so the connector never opened the store and "
-        "no save was ever in flight for a preemption to wait on."
+    # nothing would satisfy them. This run's own rank reaching the ledger is
+    # the evidence that the pool was in the loop, counted against a reading
+    # from before the engine started because the ledger outlives one test.
+    assert len(read_segments(mooncake_pool.run_dir)) > segments_before, (
+        "This run's rank recorded nothing, so the connector never opened the store "
+        "and no save was ever in flight for a preemption to wait on."
     )
 
     for index, (reference_output, output) in enumerate(zip(reference_outputs, outputs)):
