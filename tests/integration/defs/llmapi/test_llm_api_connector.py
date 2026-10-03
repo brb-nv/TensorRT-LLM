@@ -117,6 +117,7 @@ def model_with_connector(use_kv_cache_manager_v2):
         mock_worker = MagicMock()
         mock_scheduler.request_finished.return_value = False
         mock_worker.get_finished.return_value = [], []
+        mock_worker.capacity_only = False
 
         importlib_mock.import_module.return_value.KvConnectorScheduler.return_value = mock_scheduler
         importlib_mock.import_module.return_value.KvConnectorWorker.return_value = mock_worker
@@ -349,8 +350,10 @@ def test_connector_runs_on_kv_cache_manager_v2(enforce_single_worker,
                 "tensorrt_llm._torch.pyexecutor.py_executor_creator.importlib"
         ) as importlib_mock:
             connector_module = importlib_mock.import_module.return_value
+            mock_worker = MagicMock()
+            mock_worker.capacity_only = False
             connector_module.KvConnectorScheduler.return_value = MagicMock()
-            connector_module.KvConnectorWorker.return_value = MagicMock()
+            connector_module.KvConnectorWorker.return_value = mock_worker
 
             try:
                 llm = LLM(

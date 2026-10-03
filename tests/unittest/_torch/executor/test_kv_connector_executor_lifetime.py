@@ -470,7 +470,7 @@ def _preemption_executor() -> PyExecutor:
     executor = _executor()
     executor.kv_cache_manager = _PreemptionBookkeeping(executor.kv_connector_manager)
     executor.perf_manager = Mock()
-    executor.disagg = Mock()
+    executor._disagg_coordinator = Mock()
     executor.model_engine = None
     executor.iter_counter = 1
     executor._free_request_resources = Mock()
