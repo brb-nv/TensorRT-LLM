@@ -1679,6 +1679,7 @@ def test_preemption_waits_for_a_connector_still_reading_the_victims_pages(
     # deferral depends on; the rest is what free_resources reaches for.
     connector = SimpleNamespace(
         request_finished=lambda *_args: True,
+        prefix_reservations_enabled=False,
         release_unstarted_prefix_loads=lambda _req: None,
         has_pending_load=lambda _req: False,
         release_prefix_reservation=lambda _req: None,
