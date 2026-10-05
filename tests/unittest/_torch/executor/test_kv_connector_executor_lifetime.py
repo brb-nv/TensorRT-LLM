@@ -42,6 +42,7 @@ def _executor() -> PyExecutor:
     executor.kv_cache_transceiver = None
     executor.active_requests = []
     executor.canceled_req_ids = []
+    executor.waiting_queue = Mock()
     executor.dist = SimpleNamespace(rank=0)
     executor._disagg_pp_termination_handler = None
     executor._do_terminate_request = Mock()
@@ -461,6 +462,11 @@ class _PreemptionBookkeeping:
     def get_page_indices_by_layer_group(self, req):
         return [[1, 2, 3]]
 
+    def get_cache_indices(self, req):
+        # This double is not a `KVCacheManagerV2` instance, so the connector
+        # handshake reads the flat list rather than the grouped one above.
+        return [1, 2, 3]
+
     def free_resources(self, req):
         self.released.append(req.py_request_id)
 
@@ -586,3 +592,131 @@ def test_a_finished_request_still_takes_the_transfer_release() -> None:
     executor._release_transfer.assert_called_once_with(request)
     executor._free_request_resources.assert_not_called()
     request.reset_for_recompute.assert_not_called()
+
+
+def test_a_cancellation_waits_for_a_deferred_preemption() -> None:
+    """Cancelling a parked victim now would be undone by its own completion.
+
+    The completion that ends a deferred preemption releases the victim's pages
+    and puts it back in context state to be re-prefilled, which is the one
+    thing a cancelled request must not do. Held, the cancellation outlives the
+    completion and is applied to the request it hands back.
+    """
+    executor = _preemption_executor()
+    victim = _preemption_victim()
+    executor.active_requests = [victim]
+    executor.canceled_req_ids = [victim.py_request_id]
+    connector = executor.kv_connector_manager
+    connector.request_finished.return_value = True
+
+    assert executor.kv_cache_manager.preempt_request(victim) is False
+    victim.is_finished = True
+
+    executor._handle_canceled_requests()
+
+    # Still queued, so the next pass tries again.
+    assert executor.canceled_req_ids == [victim.py_request_id]
+    victim.finish_by_reason.assert_not_called()
+    assert executor.kv_cache_manager.has_pending_preemption()
+
+    # Its saves retire, and the preemption completes as it would have.
+    connector.get_finished.return_value = [victim]
+    executor._kv_connector_terminate_requests()
+    victim.reset_for_recompute.assert_called_once()
+    assert not executor.kv_cache_manager.has_pending_preemption()
+
+    # Only now does the cancellation land, on a request that is schedulable
+    # again rather than on one halfway out of the KV cache. Its pages are
+    # already in the pool, so the connector has nothing left to hold.
+    connector.get_finished.return_value = []
+    connector.request_finished.return_value = False
+    executor._handle_canceled_requests()
+    victim.finish_by_reason.assert_called_once_with(FinishReason.CANCELLED)
+    assert executor.canceled_req_ids == []
+
+
+# ---- cancellation with a save in flight ----
+
+
+def _cancelling_executor() -> PyExecutor:
+    """An executor with the pieces `_handle_canceled_requests` reads."""
+    executor = _executor()
+    executor.async_transfer_manager = Mock()
+    executor.kv_cache_manager.get_cache_indices.return_value = [1, 2, 3]
+    return executor
+
+
+def test_a_cancelled_request_keeps_its_pages_until_its_saves_land() -> None:
+    """A request cancelled mid-prefill can have a save reading its blocks.
+
+    The response pass frees a request's pages as soon as it reads as finished,
+    so cancellation has to offer the connector the same handshake a finished
+    request gets. Without it the next request allocated those pages overwrites
+    bytes a transfer is still reading.
+    """
+    executor = _cancelling_executor()
+    request = _request()
+    executor.active_requests = [request]
+    executor.canceled_req_ids = [request.py_request_id]
+    connector = executor.kv_connector_manager
+    connector.request_finished.return_value = True
+
+    executor._handle_canceled_requests()
+
+    request.finish_by_reason.assert_called_once_with(FinishReason.CANCELLED)
+    connector.request_finished.assert_called_once_with(request, [1, 2, 3], None)
+    executor.async_transfer_manager.start_transfer.assert_called_once_with(request)
+    assert executor.canceled_req_ids == []
+
+
+def test_a_cancelled_request_the_connector_declines_is_freed_at_once() -> None:
+    """Nothing is reading its pages, so holding them would only cost capacity."""
+    executor = _cancelling_executor()
+    request = _request()
+    executor.active_requests = [request]
+    executor.canceled_req_ids = [request.py_request_id]
+    executor.kv_connector_manager.request_finished.return_value = False
+
+    executor._handle_canceled_requests()
+
+    request.finish_by_reason.assert_called_once_with(FinishReason.CANCELLED)
+    executor.async_transfer_manager.start_transfer.assert_not_called()
+
+
+# ---- shutdown ----
+
+
+def test_shutdown_drains_the_connector_before_the_pools_it_reads_are_freed() -> None:
+    """A connector save reads the KV pools a resource manager owns.
+
+    Freeing those pools first takes the memory out from under a transfer in
+    flight, so the connector has to be given its chance to drain while they
+    are still allocated.
+    """
+    executor = _executor()
+    order = []
+    executor.kv_connector_manager.shutdown.side_effect = lambda: order.append("connector")
+    pools = Mock()
+    pools.shutdown.side_effect = lambda: order.append("kv pools")
+
+    executor.executor_request_queue = Mock()
+    executor.shutdown_event = Mock()
+    executor._profile_manager = Mock()
+    executor.hang_detector = Mock()
+    executor.hang_detector.detected.return_value = False
+    executor.worker_thread = Mock()
+    executor.dist = SimpleNamespace(rank=0, pp_size=1)
+    executor._shutdown_sleep_wakeup_listeners = Mock()
+    executor.worker_started = True
+    executor.model_engine = None
+    executor.draft_model_engine = None
+    executor.resource_manager = SimpleNamespace(resource_managers={"kv_cache": pools})
+    executor.virtual_memory_pools = None
+    executor.sampler = Mock()
+    executor.dwdp_manager = None
+
+    executor.shutdown()
+
+    # The worker thread first: it is the one still handing the connector work.
+    executor.worker_thread.join.assert_called_once_with()
+    assert order == ["connector", "kv pools"]
