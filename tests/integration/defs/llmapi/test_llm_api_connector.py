@@ -67,7 +67,7 @@ CONNECTOR_V1_ONLY_KV_CACHE_MANAGER_METHODS = (
     # `PyExecutor._maybe_init_kv_connector_manager`.
     "get_unique_primary_pool",
     # `KvCacheConnectorSchedulerOutputRequest.update_and_build_data` and
-    # `PyExecutor.kv_connector_request_finished`.
+    # `PyExecutor._start_connector_async_save`.
     "get_cache_indices",
     # `update_and_build_data`, for `RequestData.block_hashes`.
     "commit_and_get_block_hashes",
@@ -299,7 +299,7 @@ def test_v2_connector_contract_does_not_reuse_the_v1_methods():
 
     # The other half of the contract: what V2 offers instead. Every connector
     # path on V2 goes through this one accessor - `update_and_build_data`,
-    # `kv_connector_request_finished` and `_run_kv_connector_hooks` each call it
+    # `_start_connector_async_save` and `_run_kv_connector_hooks` each call it
     # and derive the flat list from `[0]` when there is a single layer group.
     assert hasattr(KVCacheManagerV2, "get_page_indices_by_layer_group"), (
         "KVCacheManagerV2.get_page_indices_by_layer_group is the V2 "
