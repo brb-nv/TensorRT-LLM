@@ -4785,6 +4785,10 @@ class PyExecutor:
             for req in self.kv_connector_manager.take_finished_load_terminations(
             ):
                 self._finish_connector_load_termination(req)
+            failed = (
+                self.kv_connector_manager.take_failed_async_load_requests())
+            if failed:
+                self._recover_failed_async_loads(failed)
         except Exception as exc:
             if not self.enable_attention_dp or not synchronize:
                 raise
@@ -4850,6 +4854,37 @@ class PyExecutor:
             ]
         if not defer_termination:
             self._terminate_request(request)
+
+    def _recover_failed_async_loads(self, failed_ids: Set[int]) -> None:
+        """Restart parked requests whose asynchronous prefix load lost a page.
+
+        The same outcome as `_recover_failed_connector_loads`, reached from a
+        different place: the request sat outside the batch while its pages
+        were fetched, `get_finished` has just put it back in context state,
+        and the bytes it was skipped past are not all there. Its allocation
+        and progress go before the scheduler can admit it, which is why this
+        runs in the same pass that released it.
+        """
+        draft_kv_cache_manager = self.resource_manager.get_resource_manager(
+            ResourceManagerType.DRAFT_KV_CACHE_MANAGER)
+        restarted = []
+        for request_id in failed_ids:
+            req = self.kv_connector_manager.finished_async_loading_requests.pop(
+                request_id, None)
+            if req is None:
+                # Finished or cancelled while parked, which released the
+                # allocation already.
+                continue
+            self.kv_cache_manager.drop_context_allocation(req)
+            if isinstance(draft_kv_cache_manager, KVCacheManagerV2):
+                draft_kv_cache_manager.free_resources(req)
+            self.kv_connector_manager.forget_request(req)
+            restarted.append(request_id)
+        if restarted:
+            logger.warning(
+                f"kv connector: {len(restarted)} parked context request(s) "
+                f"restarted after a failed asynchronous prefix load: {restarted}"
+            )
 
     def _is_preemption_pending(self, request: LlmRequest) -> bool:
         """True while *request* is a preemption victim awaiting its connector.

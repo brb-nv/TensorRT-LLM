@@ -2633,6 +2633,21 @@ class MooncakeStoreConfig(StrictBaseModel):
         "under, for peers to reach them at. Derived by default from the "
         "interface that routes to the master. One value covers every rank, so "
         "only set it on a server whose ranks share a node.")
+    async_load: bool = Field(
+        False,
+        telemetry=False,
+        description="Load a served prefix on a background thread while the "
+        "runtime parks the request, so the transfer does not sit inside the "
+        "executor iteration that every attention-DP rank waits on. The "
+        "request rejoins the batch once its pages have landed. Requires "
+        "attention DP or a single rank: each owner loads its own whole pages.")
+    async_load_workers: PositiveInt = Field(
+        1,
+        telemetry=False,
+        description="Threads serving asynchronous loads, each with its own "
+        "CUDA stream and staging slots, which the pinned-memory budget is "
+        "split across. Requests are taken from one queue by the first free "
+        "worker, so several parked requests transfer at once.")
     run_dir: Optional[str] = Field(
         None,
         telemetry=False,

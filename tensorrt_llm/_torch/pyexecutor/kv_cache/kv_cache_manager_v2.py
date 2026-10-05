@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import contextlib
 import math
 import os
 import sys
@@ -3254,6 +3255,15 @@ class KVCacheManagerV2(BaseResourceManager):
             return self._allocation_stream.cuda_stream
         return self._stream.cuda_stream
 
+    def _allocation_stream_context(self, request_id: int):
+        """Make the stream that orders *request_id*'s allocation current."""
+        if not isinstance(self._stream, torch.cuda.Stream):
+            # Tests stand in a fake for the execution stream.
+            return contextlib.nullcontext()
+        if request_id in self._on_allocation_stream:
+            return torch.cuda.stream(self._allocation_stream)
+        return torch.cuda.stream(self._stream)
+
     def _place_on_allocation_stream(self, req: LlmRequest, kv_cache: _KVCache | None) -> None:
         """Allocate a connector-served context cache on the side stream.
 
@@ -4465,7 +4475,12 @@ class KVCacheManagerV2(BaseResourceManager):
             # because a page index is scoped to a group.
             by_group = self.get_page_indices_by_layer_group(request)
             flat = by_group[0] if len(by_group) == 1 else []
-            self.kv_connector_manager.update_state_after_alloc(request, flat, by_group)
+            # A connector may start an asynchronous load from this hook, which
+            # writes the pages off any CUDA stream. Making the stream that
+            # orders this allocation current lets it fence that write behind
+            # earlier GPU work on recycled pages without blocking the executor.
+            with self._allocation_stream_context(request.py_request_id):
+                self.kv_connector_manager.update_state_after_alloc(request, flat, by_group)
 
         if served_any:
             # A served prefix can carry a request past its last chunk boundary,

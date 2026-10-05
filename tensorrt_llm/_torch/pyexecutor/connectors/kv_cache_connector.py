@@ -386,6 +386,20 @@ class KvCacheConnectorWorker(ABC):
         """
         return 0
 
+    def take_failed_async_load_requests(self) -> Set[int]:
+        """Parked requests whose asynchronous load could not fetch every page.
+
+        These are reported complete by `get_finished` like any other load, so
+        the request leaves its parked state; this is how the executor learns
+        to restart it rather than run it. Implementations clear the set on
+        return.
+
+        Returns:
+            The affected request IDs. Empty by default, which is what a
+            connector that loads synchronously has to report.
+        """
+        return set()
+
     def shutdown(self) -> None:
         """Release whatever this worker holds, once the executor is done with it.
 
@@ -1495,6 +1509,13 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         them.
         """
         return self.worker.take_failed_load_requests()
+
+    def take_failed_async_load_requests(self) -> Set[int]:
+        """Parked requests the worker could not load every offered page for.
+
+        See `PyExecutor._recover_failed_async_loads` for what happens to them.
+        """
+        return self.worker.take_failed_async_load_requests()
 
     def forget_request(self, req: LlmRequest) -> None:
         """Drop everything keyed to a request that is about to restart from scratch.
