@@ -58,17 +58,15 @@ def _framed(*parts: bytes) -> bytes:
 class ReuseScope:
     """What, besides the tokens, decides whose KV a block hash names.
 
-    A LoRA adapter rewrites every layer's weights, and a multimodal placeholder
-    token carries the same id whichever image stands behind it, so two requests
-    differing only in either one would otherwise hash alike and read each
-    other's pages. Everything here is a property of the whole request, so it
-    seeds the chain rather than being mixed into each block.
+    A multimodal placeholder token carries the same id whichever image stands
+    behind it, so two requests differing only in their media would otherwise
+    hash alike and read each other's pages. Everything here is a property of
+    the whole request, so it seeds the chain rather than being mixed into each
+    block.
     """
 
     #: `LlmRequest.cache_salt`: the caller's own partition of the cache.
     cache_salt: Optional[str] = None
-    #: `LlmRequest.lora_task_id`.
-    lora_task_id: Optional[int] = None
     #: Content digest per multimodal item, in prompt order. Seeding with the
     #: whole set means a request whose media differ diverges from its first
     #: block, so sharing only a media prefix is a miss rather than a wrong page.
@@ -79,9 +77,6 @@ class ReuseScope:
         return _digest(
             _framed(
                 b"" if self.cache_salt is None else str(self.cache_salt).encode(),
-                b""
-                if self.lora_task_id is None
-                else int(self.lora_task_id).to_bytes(8, "little", signed=True),
                 *self.multimodal_digests,
             )
         )

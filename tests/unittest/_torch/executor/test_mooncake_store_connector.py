@@ -799,20 +799,34 @@ def test_scheduler_isolates_requests_by_cache_salt(store_config):
     assert scheduler._worker.queries[0] != scheduler._worker.queries[1]
 
 
-def test_scheduler_isolates_requests_by_lora_adapter(store_config):
-    """Same prompt, different adapter, different keys.
+def test_scheduler_bypasses_requests_carrying_a_lora_adapter(store_config):
+    """An adapter id gets neither a lookup nor a save.
 
-    Sharing them would serve one adapter's KV to the other, which is a wrong
-    answer rather than a slow one.
+    The id is assigned by whoever submitted the request, so two servers sharing
+    a pool can name different weights by the same id. A page keyed by it would
+    be served against the wrong weights, which is a wrong answer rather than a
+    slow one.
     """
-    scheduler = make_scheduler(store_config, hit_blocks=1)
+    scheduler = make_scheduler(store_config, hit_blocks=2)
     tokens = list(range(3 * TOKENS_PER_BLOCK))
-    scheduler.get_num_new_matched_tokens(make_request(1, tokens), 0)
-    scheduler.get_num_new_matched_tokens(make_request(2, tokens, lora_task_id=0), 0)
-    scheduler.get_num_new_matched_tokens(make_request(3, tokens, lora_task_id=1), 0)
+    # Adapter 0 is a real adapter, so the bypass turns on presence rather than
+    # on the id being truthy.
+    request = make_request(1, tokens, lora_task_id=0)
 
-    queries = scheduler._worker.queries
-    assert len({tuple(query) for query in queries}) == 3
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (0, False)
+    assert scheduler._worker.queries == []
+
+    metadata = scheduler.build_connector_meta(
+        SchedulerOutput(new_requests=[request_data(1, tokens, [7, 8, 9])])
+    )
+    assert metadata.loads == []
+    assert metadata.saves == []
+    assert scheduler.request_finished(request, [7, 8, 9]) is False
+
+    # A request without one is served as before, so the bypass is scoped to the
+    # requests it cannot key rather than to the deployment.
+    scheduler.get_num_new_matched_tokens(make_request(2, tokens), 0)
+    assert len(scheduler._worker.queries) == 1
 
 
 def test_scheduler_isolates_requests_by_multimodal_content(store_config):

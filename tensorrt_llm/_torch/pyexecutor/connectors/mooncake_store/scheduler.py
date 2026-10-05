@@ -67,15 +67,31 @@ def _multimodal_item_digests(request: LlmRequest) -> Optional[Tuple[bytes, ...]]
 
 
 def _reuse_scope(request: LlmRequest) -> Optional[ReuseScope]:
-    """The scope *request*'s block hashes belong in, or None to skip it."""
+    """The scope *request*'s block hashes belong in, or None to leave it alone.
+
+    None for a request whose pages no key can name without naming someone
+    else's. The caller gives such a request neither a lookup nor a save.
+    """
+    if request.lora_task_id is not None:
+        logger.warning_once(
+            "mooncake-store is bypassing requests that carry a LoRA adapter: an "
+            "adapter id is assigned by whoever submitted the request, so the "
+            "same id names different weights on two servers sharing a pool and "
+            "a page keyed by it would be served against the wrong weights.",
+            key="mooncake-store-lora",
+        )
+        return None
     digests = _multimodal_item_digests(request)
     if digests is None:
+        logger.warning_once(
+            "mooncake-store is bypassing requests whose multimodal content "
+            "carries no hashes: their prompt tokens do not identify the media "
+            "behind them, so a stored page could be served to a different "
+            "request.",
+            key="mooncake-store-unhashed-multimodal",
+        )
         return None
-    return ReuseScope(
-        cache_salt=request.cache_salt,
-        lora_task_id=request.lora_task_id,
-        multimodal_digests=digests,
-    )
+    return ReuseScope(cache_salt=request.cache_salt, multimodal_digests=digests)
 
 
 class _RequestState:
@@ -144,13 +160,6 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
         if scope is None:
             # Leaving it without a `_RequestState` suppresses its saves too,
             # since `build_connector_meta` skips requests it has no state for.
-            logger.warning_once(
-                "mooncake-store is bypassing requests whose multimodal content "
-                "carries no hashes: their prompt tokens do not identify the "
-                "media behind them, so a stored page could be served to a "
-                "different request.",
-                key="mooncake-store-unhashed-multimodal",
-            )
             return 0, False
 
         tokens = request.get_tokens(0)
