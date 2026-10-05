@@ -3741,6 +3741,22 @@ class KVCacheManagerV2(BaseResourceManager):
             kv_cache.suspend()
         return True
 
+    def drop_context_allocation(self, req: LlmRequest) -> None:
+        """Give up a context request's allocation and progress so it restarts from scratch.
+
+        For a request skipped past a connector prefix whose pages then could not
+        be filled: those positions already count as computed, so the only
+        correct outcome is to recompute them. The scheduler re-admits the
+        request from whatever the radix tree still holds, and the connector is
+        queried again. That last part is why the release goes through
+        `_release_preempted`: it clears the memoised connector offer
+        (`py_connector_prefix_*`, and `free_resources` clears
+        `py_connector_allocation_reported`), so the request is not sent back
+        into the same dead prefix every iteration.
+        """
+        self._release_preempted(req)
+        rewind_context_after_cache_drop(req, self.tokens_per_block)
+
     def _set_page_index_bufs(self, request_id: int, kv_cache: _KVCache) -> None:
         assert kv_cache.beam_width <= self.max_beam_width
         index = self.index_mapper.get_index(request_id)
