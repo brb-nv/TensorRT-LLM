@@ -16,7 +16,7 @@
 
 Two seams: the signal that ends `mooncake_master`, which has to release the
 master before the telemetry boundary reports it, and the provisioning a server
-is wrapped in, which has to describe the pool its ranks will actually join.
+is wrapped in, which has to leave an externally managed pool in charge.
 
 Runs without a Mooncake installation and without a GPU. The master process the
 command holds is a context manager that records its own release, and the signal
@@ -238,60 +238,17 @@ def test_the_pool_report_accepts_the_same_opt_out(monkeypatch, tmp_path):
     command.run("--no-telemetry")
 
 
-def test_an_inherited_config_restates_the_settings_it_supersedes(monkeypatch, tmp_path):
-    """What `mooncake_store` asked for is not what an inherited pool gives.
+def test_an_inherited_config_is_left_in_charge(monkeypatch, tmp_path):
+    """`MOONCAKE_CONFIG_PATH` names a pool the deployment provisioned itself.
 
-    `MOONCAKE_CONFIG_PATH` wins, so the ranks join as that file says. The block
-    is read afterwards by the usage report the LLM constructor sends, which
-    would otherwise record a server lending 16 GiB as `both`.
+    Nothing is rendered over it, and the settings its ranks then join as are
+    restated by `settings.apply_effective_settings`.
     """
     inherited = tmp_path / "external.json"
-    inherited.write_text(
-        json.dumps(
-            {
-                "master_server_address": "10.0.0.7:50051",
-                "role": "capacity",
-                "global_segment_size": "32GiB",
-                "namespace": "external",
-                "model_key": "their-checkpoint",
-                "transfer_batch_size": 128,
-                "stage_through_host": True,
-            }
-        )
-    )
+    inherited.write_text(json.dumps({"master_server_address": "10.0.0.7:50051"}))
     monkeypatch.setenv(CONFIG_PATH_ENV, str(inherited))
 
-    pool = MooncakeStoreConfig(
-        pool="file:///shared/pool.json",
-        model_key="our-checkpoint",
-        role="both",
-        segment_size="16GiB",
-    )
-    with provision_pool(pool) as rendered:
-        # Nothing was rendered: the inherited config is left in charge.
-        assert rendered is None
-        assert pool.role == "capacity"
-        assert pool.segment_size == 32 * (1 << 30)
-        assert pool.namespace == "external"
-        assert pool.model_key == "their-checkpoint"
-        assert pool.transfer_batch_size == 128
-        assert pool.stage_through_host is True
-
-    # How to reach the pool and where this run's files go are the server's
-    # own, so an inherited config has nothing to say about them.
-    assert pool.pool == "file:///shared/pool.json"
-
-
-def test_an_unreadable_inherited_config_leaves_the_block_alone(monkeypatch, tmp_path):
-    """The workers report a bad config; this path only describes one."""
-    inherited = tmp_path / "truncated.json"
-    inherited.write_text("{not json")
-    monkeypatch.setenv(CONFIG_PATH_ENV, str(inherited))
-
-    pool = MooncakeStoreConfig(
-        pool="file:///shared/pool.json", model_key="our-checkpoint", segment_size="16GiB"
-    )
+    pool = MooncakeStoreConfig(pool="file:///shared/pool.json", model_key="our-checkpoint")
     with provision_pool(pool) as rendered:
         assert rendered is None
-    assert pool.role == "both"
-    assert pool.segment_size == "16GiB"
+    assert os.environ[CONFIG_PATH_ENV] == str(inherited)

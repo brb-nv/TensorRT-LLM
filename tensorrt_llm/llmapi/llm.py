@@ -436,6 +436,15 @@ class BaseLLM:
         finally:
             logger.set_level(log_level)  # restore the log level
 
+        # Before the ranks these args go to are spawned and before the usage
+        # report reads them, so that one description of the deployment reaches
+        # both. Imported behind the check so a deployment that configured no
+        # connector does not load the package.
+        if self.args.kv_connector_config is not None:
+            from .._torch.pyexecutor.connectors.mooncake_store.settings import \
+                apply_effective_settings
+            apply_effective_settings(self.args)
+
         logger_debug(f"LLM.args.mpi_session: {self.args.mpi_session}\n",
                      "yellow")
         self.mpi_session = self.args.mpi_session

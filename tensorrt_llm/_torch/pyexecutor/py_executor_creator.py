@@ -445,42 +445,6 @@ def create_encoder_executor(
     )
 
 
-def _disable_native_kv_offload(kv_cache_config: KvCacheConfig) -> None:
-    """Turn off this engine's own host and disk cache tiers for Mooncake.
-
-    The pool is the deployment's offload tier, and its pages live in host
-    memory the ranks have already lent it. A native tier alongside it claims a
-    second share of the same node's DRAM, which the connector's node budget
-    check cannot account for because the KV cache manager provisions it later.
-    That applies to every role, capacity included.
-
-    Both fields are pinned to 0 rather than left unset, since a host_cache_size
-    of None asks KVCacheManagerV2 to size a host tier automatically. Call this
-    before the KV cache manager is built, which reads both to decide its tiers.
-    """
-    explicit = {
-        name: value
-        for name, value in (("host_cache_size",
-                             kv_cache_config.host_cache_size),
-                            ("disk_cache_size",
-                             kv_cache_config.disk_cache_size)) if value
-    }
-    if explicit:
-        requested = ", ".join(f"{name}={value}"
-                              for name, value in explicit.items())
-        logger.warning(
-            f"Ignoring kv_cache_config {requested}: the mooncake-store "
-            "connector is this deployment's offload tier. Put the memory into "
-            "mooncake_store.segment_size instead, where every server on the "
-            "node can reuse what any of them stored.")
-    else:
-        logger.info(
-            "Native KV cache offloading is off: the mooncake-store connector "
-            "provides the offload tier.")
-    kv_cache_config.host_cache_size = 0
-    kv_cache_config.disk_cache_size = 0
-
-
 def log_memory_usage(stage: str):
     GB = 1 << 30
     torch.cuda.empty_cache()
@@ -1105,10 +1069,6 @@ def _create_py_executor(
             logger.error(f"Error instantiating connector: {e}")
             raise e
 
-        uses_mooncake = uses_connector(kv_connector_config, "mooncake-store")
-        if uses_mooncake:
-            _disable_native_kv_offload(kv_cache_config)
-
         if not kv_connector_manager.capacity_only:
             if (scheduler_config.capacity_scheduler_policy
                     != CapacitySchedulerPolicy.GUARANTEED_NO_EVICT
@@ -1119,15 +1079,18 @@ def _create_py_executor(
                     "kv_cache_config.use_kv_cache_manager_v2=True to use another policy."
                 )
 
-            # The KV cache manager is built after this and reads the result.
-            if uses_mooncake and kv_cache_config.enable_partial_reuse:
-                logger.warning(
-                    "Disabling partial reuse: the mooncake-store connector addresses "
-                    "whole blocks, so a partial match leaves the matched length off a "
-                    "block boundary and the connector declines the lookup, trading part "
-                    "of one block for every stored block of the remaining prefix."
-                )
-                kv_cache_config.enable_partial_reuse = False
+        if uses_connector(kv_connector_config, "mooncake-store"):
+            # Imported here because `registry.py` leaves a connector package to
+            # the importlib call above, off every other deployment's path.
+            from .connectors.mooncake_store import settings as mooncake_settings
+
+            # `BaseLLM.__init__` settles both for the usage report and the
+            # ranks alike; this covers a caller that reached an executor
+            # without the constructor, and a role it could not resolve. The KV
+            # cache manager is built after this and reads the result.
+            mooncake_settings.disable_native_kv_offload(kv_cache_config)
+            if not kv_connector_manager.capacity_only:
+                mooncake_settings.disable_partial_reuse(kv_cache_config)
     else:
         kv_connector_manager = None
 
