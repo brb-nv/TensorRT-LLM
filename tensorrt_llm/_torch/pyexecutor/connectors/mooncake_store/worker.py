@@ -26,7 +26,11 @@ Saves are asynchronous and gated on a CUDA event, since the pages are complete
 only once the forward pass that wrote them has retired and blocking the
 executor loop on an RDMA write is the cost the store exists to avoid. The
 scheduler reports such a request as saving asynchronously, which keeps its
-pages pinned until `get_finished` says the writes landed.
+pages pinned until `get_finished` says the writes landed. A save that fails is
+logged and dropped: a write that did not land costs a future cache miss and
+nothing else, so the request retires either way. Only the save thread failing
+to start is fatal, because that would strand every request behind pages
+nothing will release.
 
 A capacity-only worker opens its handle and stops there, with no layout, no
 buffer registration and no save thread, so a node can lend host memory to the
@@ -221,7 +225,10 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         # Requests the runtime has told us are done producing KV. Their pages
         # stay pinned until we report them back through `get_finished`.
         self._closed_requests: Set[int] = set()
-        self._save_error: Optional[BaseException] = None
+        # Why the save thread never reached its transfer loop, read back by
+        # `register_kv_cache_layout`. A failure inside the loop is dropped
+        # there instead.
+        self._save_startup_error: Optional[BaseException] = None
 
         global _LOCAL_WORKER
         _LOCAL_WORKER = self
@@ -329,7 +336,7 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
             # here, or its requests stay pinned on saves nothing will consume.
             self._save_started.wait()
             with self._save_lock:
-                startup_error, self._save_error = self._save_error, None
+                startup_error, self._save_startup_error = self._save_startup_error, None
             if startup_error is not None:
                 raise RuntimeError(
                     f"mooncake-store: the save thread for rank {self._rank} "
@@ -458,7 +465,6 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         metadata: Optional[MooncakeStoreMetadata] = self.get_connector_meta()
         if metadata is None or not metadata.loads:
             return
-        self._reraise_save_error()
 
         keys, addresses, sizes, total_pages = self._resolve(metadata.loads)
         if not keys:
@@ -525,7 +531,6 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         metadata: Optional[MooncakeStoreMetadata] = self.get_connector_meta()
         if metadata is None or not metadata.saves or not self._config.role.saves:
             return
-        self._reraise_save_error()
 
         # The pages are written by kernels still queued on this stream, so the
         # event is the handoff: the thread reads GPU memory only after the
@@ -554,7 +559,6 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
             Requests that have finished saving, and requests that have finished
             loading.
         """
-        self._reraise_save_error()
         with self._save_lock:
             self._closed_requests.update(finished_gen_req_ids)
             finished_saving = [
@@ -580,17 +584,17 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
                 # executor's work.
                 self._save_stream = torch.cuda.Stream()
         except Exception as exc:
-            # The same thread boundary and handoff as the transfer loop below.
-            # A thread that died here would leave every later save outstanding
-            # against nothing, so the requests holding those pages would never
-            # retire and the worker would look merely slow.
+            # Fatal, unlike a failure in the transfer loop below: a thread that
+            # died here leaves every later save outstanding against nothing, so
+            # the requests holding those pages never retire and the worker
+            # looks merely slow.
             logger.error(
                 f"mooncake-store save thread failed to start on rank {self._rank}: "
                 f"{type(exc).__name__}: {exc}"
             )
             with self._save_lock:
-                if self._save_error is None:
-                    self._save_error = exc
+                if self._save_startup_error is None:
+                    self._save_startup_error = exc
             return
         finally:
             self._save_started.set()
@@ -603,15 +607,13 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
                 event.synchronize()
                 self._put(transfers)
             except Exception as exc:
-                # Broad on purpose: this is the thread boundary. Anything that
-                # escapes here would be lost, so it is stashed and re-raised on
-                # the executor thread at the next connector call.
+                # Broad on purpose: this is the thread boundary. The batch is
+                # dropped and the request retired by the `finally` below, the
+                # same policy `_put` applies to a negative store status.
                 logger.error(
-                    f"mooncake-store save failed on rank {self._rank}: {type(exc).__name__}: {exc}"
+                    f"mooncake-store dropped a save batch on rank {self._rank}: "
+                    f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}"
                 )
-                with self._save_lock:
-                    if self._save_error is None:
-                        self._save_error = exc
             finally:
                 with self._save_lock:
                     for entry in transfers:
@@ -698,13 +700,6 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
                 sizes.append(page_sizes)
                 pages += 1
         return keys, addresses, sizes, pages
-
-    def _reraise_save_error(self) -> None:
-        with self._save_lock:
-            error = self._save_error
-            self._save_error = None
-        if error is not None:
-            raise RuntimeError("mooncake-store background save failed") from error
 
     def shutdown(self) -> None:
         """Stop the save thread, then release what it was reading. Idempotent."""

@@ -395,6 +395,40 @@ def test_worker_reports_a_request_finished_once_its_saves_drain(store_config, fa
         assert worker.get_finished([], []) == ([], [])
 
 
+def test_a_save_that_raises_is_dropped_and_its_request_still_retires(
+    store_config, fake_store, monkeypatch
+):
+    """A write that did not land costs a cache miss, not the server.
+
+    Failing the batch instead would also strand the request whose pages it was
+    pinned on, which is what a thread that stops draining its queue leaves
+    behind.
+    """
+
+    def refuse(_keys):
+        raise RuntimeError("store RPC failed")
+
+    with make_worker(fake_store, layout=make_layout()) as worker:
+        monkeypatch.setattr(fake_store, "batch_is_exist", refuse)
+
+        # What `wait_for_save` hands the thread, minus the CUDA event this host
+        # has no device for.
+        with worker._save_lock:
+            worker._outstanding_saves[42] += 1
+        worker._save_queue.put(
+            (
+                SimpleNamespace(synchronize=lambda: None),
+                [RequestTransfers(42, [PageTransfer(b"\x01" * 16, 0, 1)])],
+            )
+        )
+
+        deadline = time.monotonic() + 5.0
+        while worker._outstanding_saves.get(42) and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+        assert worker.get_finished([42], []) == ([42], [])
+
+
 # ---- host staging ----
 
 
