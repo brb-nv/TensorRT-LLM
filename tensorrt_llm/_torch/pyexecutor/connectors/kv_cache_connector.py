@@ -745,8 +745,10 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         self.worker = worker
         self.scheduler = scheduler
         #: Whether the attached connector moves KV at all; see
-        #: `KvCacheConnectorWorker.capacity_only`.
-        self.capacity_only = bool(worker.capacity_only)
+        #: `KvCacheConnectorWorker.capacity_only`. Compared against True
+        #: because this disables most of the per-request path, which is too
+        #: much to infer from a merely truthy value.
+        self.capacity_only = worker.capacity_only is True
 
         # Requests that haven't yet been passed into get_finished.
         self.new_async_requests = AsyncRequests(dict(), dict())
@@ -1020,6 +1022,12 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         ``KVCacheManagerV2`` holds the Python subclass where it is a method, so
         no single spelling of the check reads correctly in both.
         """
+        if self.capacity_only:
+            # No page of this cache is registered, so nothing can be loaded
+            # into it, and the query would cost the leader broadcast below on
+            # every request.
+            return 0, False
+
         num_tokens, load_kv_async = self._run_on_leader(
             lambda: self.scheduler.get_num_new_matched_tokens(request, num_computed_tokens)
         )
@@ -1281,6 +1289,10 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
 
         if req.request_id in self.finished_async_loading_requests:
             del self.finished_async_loading_requests[req.request_id]
+
+        if self.capacity_only:
+            # Nothing is registered for a save to read.
+            return False
 
         # A caller with no per-group view of the cache leaves this unset, and the
         # flat list is the whole description. Every per-group caller passes one

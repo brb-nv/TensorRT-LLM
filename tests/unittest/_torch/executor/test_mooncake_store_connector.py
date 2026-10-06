@@ -829,6 +829,29 @@ def test_scheduler_bypasses_requests_carrying_a_lora_adapter(store_config):
     assert len(scheduler._worker.queries) == 1
 
 
+def test_scheduler_does_no_per_request_work_for_a_capacity_only_role(store_config):
+    """It transfers nothing, so a request costs it nothing.
+
+    No hash chain is built, nothing is looked up, and the request is left
+    without the state a save would be planned from.
+    """
+    set_pool_setting(store_config, role="capacity")
+    scheduler = make_scheduler(store_config, hit_blocks=2)
+    tokens = list(range(3 * TOKENS_PER_BLOCK))
+    request = make_request(1, tokens)
+
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (0, False)
+    assert scheduler._worker.queries == []
+    assert scheduler._requests == {}
+
+    metadata = scheduler.build_connector_meta(
+        SchedulerOutput(new_requests=[request_data(1, tokens, [7, 8, 9])])
+    )
+    assert metadata.loads == []
+    assert metadata.saves == []
+    assert scheduler.request_finished(request, [7, 8, 9]) is False
+
+
 def test_scheduler_isolates_requests_by_multimodal_content(store_config):
     """Two images behind the same placeholder tokens are two prefixes."""
     scheduler = make_scheduler(store_config, hit_blocks=1)
