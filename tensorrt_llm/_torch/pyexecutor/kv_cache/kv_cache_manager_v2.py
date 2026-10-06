@@ -3958,7 +3958,13 @@ class KVCacheManagerV2(BaseResourceManager):
         and publish them under a valid hash. Callers must not count on the
         pages until :meth:`try_complete_preemption` has run.
         """
-        if self.kv_connector_manager is None or self.is_draft:
+        # A capacity-only connector has no save to wait for, so the victim's
+        # pages go back now, without the page index gather below.
+        if (
+            self.kv_connector_manager is None
+            or self.is_draft
+            or self.kv_connector_manager.capacity_only
+        ):
             self._release_preempted(req)
             return True
 
@@ -4086,7 +4092,10 @@ class KVCacheManagerV2(BaseResourceManager):
         # KV pages are allocated in `KVCacheV2Scheduler`, so by this point every
         # scheduled request already has them and its page indices are readable.
         # That is what makes this the place to drive the connector.
-        if self.kv_connector_manager is not None:
+        #
+        # A capacity-only connector cannot reach those pages, so reporting them
+        # would cost a page index gather per context request for nothing.
+        if self.kv_connector_manager is not None and not self.kv_connector_manager.capacity_only:
             self._run_kv_connector_hooks(scheduled_batch)
         self._publish_sparse_metadata()
 
@@ -4237,6 +4246,10 @@ class KVCacheManagerV2(BaseResourceManager):
     def _connector_may_serve(self, req: LlmRequest) -> bool:
         """Whether the connector is allowed to serve a prefix for ``req``."""
         if self.kv_connector_manager is None or self.is_draft:
+            return False
+        if self.kv_connector_manager.capacity_only:
+            # It can serve nothing, so both the reservation path and the
+            # query-and-commit path would run over an empty offer.
             return False
         if req.is_dummy:
             # A dummy request has no prompt to serve.

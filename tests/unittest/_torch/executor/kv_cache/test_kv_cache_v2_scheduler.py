@@ -4427,7 +4427,7 @@ def test_connector_credit_admits_another_request(chunked: bool) -> None:
     def run_with_offer(offered_tokens: int) -> tuple[object, list[int], Mock]:
         mgr = make_kv_cache_manager(tokens_per_block=32, enable_block_reuse=True)
         mgr.is_draft = False
-        connector = Mock(prefix_reservations_enabled=True)
+        connector = Mock(prefix_reservations_enabled=True, capacity_only=False)
         connector.should_add_sequence.return_value = True
         connector.reserve_prefix.side_effect = lambda req, local_end: (
             SimpleNamespace(start=local_end, end=local_end + offered_tokens)

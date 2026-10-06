@@ -410,6 +410,28 @@ def test_scheduler_output_block_hashes_read_through():
         assert call.args == (req, )
 
 
+class _MinimalWorker(KvCacheConnectorWorker):
+    """A worker satisfying the ABC and nothing more."""
+
+    def register_kv_caches(self, kv_cache_tensor):
+        pass
+
+    def start_load_kv(self, stream):
+        pass
+
+    def wait_for_layer_load(self, layer_idx, stream):
+        pass
+
+    def save_kv_layer(self, layer_idx, stream):
+        pass
+
+    def wait_for_save(self, stream):
+        pass
+
+    def get_finished(self, finished_gen_req_ids, started_loading_req_ids):
+        return [], []
+
+
 class _FlatOnlyScheduler(KvCacheConnectorScheduler):
     """A connector written against the flat API."""
 
@@ -531,6 +553,108 @@ def test_a_capacity_only_connector_is_asked_nothing_per_request():
 
     assert manager.request_finished(req, [], [[], []]) is False
     assert scheduler.finished == []
+
+
+def test_a_capacity_only_connector_serves_generation_only_requests():
+    """A disaggregated generation server is what the capacity role is for.
+
+    Every request there is generation-only, which this entry point otherwise
+    refuses outright, so the capacity check has to come first.
+    """
+    scheduler = _FlatOnlyScheduler()
+    worker = MagicMock()
+    worker.capacity_only = True
+    manager = KvCacheConnectorManager(worker, scheduler)
+
+    req = MagicMock()
+    req.request_id = 8
+    req.is_generation_only_request = True
+
+    assert manager.get_num_new_matched_tokens(req, 0) == 0
+
+
+def test_a_capacity_only_connector_polls_no_completion():
+    """Nothing was offered asynchronously, so nothing can be in flight.
+
+    Agreeing on completion is an allgather, and it runs once per iteration --
+    inter-token latency on the generation server this role is for.
+    """
+    worker = MagicMock()
+    worker.capacity_only = True
+    manager = KvCacheConnectorManager(worker, _FlatOnlyScheduler())
+
+    assert manager.get_finished() == []
+    worker.get_finished.assert_not_called()
+
+
+def test_a_capacity_only_connector_keeps_no_per_request_bookkeeping():
+    """Only `build_scheduler_output` consumes these, and this role skips it.
+
+    An entry recorded here would be carried until the allocation dies, and the
+    pending-load rebuild would walk the batch once per iteration.
+    """
+    worker = MagicMock()
+    worker.capacity_only = True
+    manager = KvCacheConnectorManager(worker, _FlatOnlyScheduler())
+
+    req = MagicMock()
+    req.request_id = 9
+
+    manager.commit_new_matched_tokens(req, 16, True)
+    assert manager.scheduler_output_manager.external_loads == {}
+    assert manager.new_async_requests.loading == {}
+
+    scheduled_batch = ScheduledRequests()
+    scheduled_batch.context_requests_last_chunk = [req]
+    manager.take_scheduled_requests_pending_load(scheduled_batch)
+    assert scheduled_batch.context_requests_last_chunk == [req]
+
+
+def test_a_capacity_only_connector_is_told_of_no_allocation():
+    """It holds no address, so a page list is nothing it can use."""
+    scheduler = _FlatOnlyScheduler()
+    worker = MagicMock()
+    worker.capacity_only = True
+    manager = KvCacheConnectorManager(worker, scheduler)
+
+    req = MagicMock()
+    req.request_id = 12
+
+    manager.update_state_after_alloc(req, [1, 2, 3], [[1, 2, 3]])
+    assert scheduler.allocs == []
+
+
+def test_prefix_reservations_stay_off_for_a_capacity_only_connector():
+    """It has no prefix to reserve, and reserving is a broadcast per request.
+
+    Leaving the protocol off also spares it the duplicated communicator the
+    completion tracker holds and the poll that tracker runs each iteration.
+    """
+
+    class _ReservingScheduler(_FlatOnlyScheduler):
+
+        def reserve_prefix(self, request, local_end, reservation_id):
+            raise AssertionError("a capacity-only role must not reserve")
+
+        def release_prefix_reservation(self, request, reservation_id, start,
+                                       end):
+            raise AssertionError("a capacity-only role reserves nothing")
+
+    class _ReportingWorker(_MinimalWorker):
+
+        capacity_only = True
+
+        def get_finished_prefix_loads(self):
+            return []
+
+    manager = KvCacheConnectorManager(_ReportingWorker(llm_args=None),
+                                      _ReservingScheduler())
+    manager.configure_prefix_reservations(True)
+
+    assert manager.prefix_reservations_enabled is False
+    assert manager._prefix_completion_tracker is None
+    assert manager.reserve_prefix(MagicMock(request_id=5), 0) is None
+    assert manager.take_finished_prefix_loads() == []
 
 
 def test_only_a_worker_that_says_so_is_capacity_only():

@@ -791,7 +791,14 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         return mpi_broadcast(res, root=0)
 
     def configure_prefix_reservations(self, enabled: bool) -> None:
-        """Enable reservations when both connector roles implement the protocol."""
+        """Enable reservations when both connector roles implement the protocol.
+
+        A capacity-only role has no prefix to reserve, and leaving the protocol
+        off is what keeps ``reserve_prefix`` -- a leader broadcast per context
+        request -- and the per-iteration completion poll out of its path. The
+        capability probe below still runs on every rank: it is collective, and
+        a role that reads it differently would strand the others.
+        """
         if self._prefix_capability is None:
             scheduler_methods = self._run_on_leader(
                 lambda: [
@@ -814,7 +821,9 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
                     "get_finished_prefix_loads on every worker."
                 )
             self._prefix_capability = all(capabilities)
-        self.prefix_reservations_enabled = enabled and self._prefix_capability
+        self.prefix_reservations_enabled = (
+            enabled and self._prefix_capability and not self.capacity_only
+        )
         if self.prefix_reservations_enabled and self._prefix_completion_tracker is None:
             comm = mpi_comm().Dup() if mpi_world_size() > 1 else None
             self._prefix_completion_tracker = PrefixLoadCompletionTracker(comm)
@@ -1062,6 +1071,12 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         ``cancel_load``, and a parked request carries no honoured count into
         ``build_connector_meta``.
         """
+        if self.capacity_only:
+            # Only `build_scheduler_output` consumes `external_loads`, and this
+            # role skips it, so an entry recorded here would be carried until
+            # the allocation dies.
+            return
+
         # TODO(jthomson04): This part is a bit ugly.
         # When the connector indicates that a request will be loaded
         # asynchronously, we need to suspend its execution. This is
@@ -1089,6 +1104,14 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         ``LlmRequest`` rather than the ``_torch`` subclass, so only what
         ``nanobind/batch_manager/bindings.cpp`` binds is readable below.
         """
+        if self.capacity_only:
+            # Checked ahead of the generation-only refusal, which every request
+            # on the disaggregated generation server this role is for would
+            # trip. The refusal is about a connector having no story for prompt
+            # KV that came from the context worker; one that serves nothing has
+            # nothing to refuse.
+            return 0
+
         if request.is_generation_only_request:
             raise RuntimeError("Connector API is not supported for generation-only requests!")
 
@@ -1227,6 +1250,10 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         Returns:
             The scheduled requests with the context requests that are being loaded asynchronously removed.
         """
+        if self.capacity_only:
+            # Nothing is offered asynchronously, so both lists below would be
+            # rebuilt unchanged once per iteration.
+            return
 
         prefix_loading_ids = {
             load.request_id for load in self._prefix_loads.values() if load.is_async
@@ -1344,6 +1371,12 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         Returns:
             The requests that have newly finished saving.
         """
+        if self.capacity_only:
+            # Every list below is empty, and the ranks agree on them through an
+            # allgather that runs once per iteration -- inter-token latency on
+            # the generation server this role is for.
+            return []
+
         started_loading_req_ids = list(self.new_async_requests.loading_ids)
         finished_gen_req_ids = list(self.new_async_requests.saving_ids)
 
@@ -1442,7 +1475,7 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         block_ids: List[int],
         block_ids_by_layer_group: Optional[List[List[int]]] = None,
     ):
-        if self.scheduler is None:
+        if self.scheduler is None or self.capacity_only:
             return
         # A cache that reports per layer group is reported that way, whatever
         # the group count -- including one empty list per group for a request

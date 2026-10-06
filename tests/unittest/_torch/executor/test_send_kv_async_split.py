@@ -86,7 +86,7 @@ def _finished_ctx_only_request(request_id: int = 1) -> SimpleNamespace:
 
 def _connector_executor() -> PyExecutor:
     executor = _stub_executor()
-    executor.kv_connector_manager = Mock()
+    executor.kv_connector_manager = Mock(capacity_only=False)
     executor.kv_connector_manager.request_finished.return_value = True
     executor.kv_cache_manager = Mock()
     executor.kv_cache_manager.get_cache_indices.return_value = [7]
@@ -148,7 +148,7 @@ def _dual_claim_executor() -> PyExecutor:
     transceiver.kv_transfer_timeout_ms = None
     transceiver.has_retired_send_session.return_value = False
     executor.kv_cache_transceiver = transceiver
-    executor.kv_connector_manager = Mock()
+    executor.kv_connector_manager = Mock(capacity_only=False)
     executor.disable_overlap_scheduler = True
     executor.active_requests = []
     executor.canceled_req_ids = []

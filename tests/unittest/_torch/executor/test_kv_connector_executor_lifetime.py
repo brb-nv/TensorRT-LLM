@@ -28,6 +28,10 @@ pytestmark = pytest.mark.cpu_only
 def _executor() -> PyExecutor:
     executor = object.__new__(PyExecutor)
     executor.kv_connector_manager = Mock(spec=KvCacheConnectorManager)
+    # Set explicitly: `capacity_only` is not on the spec, so a double that
+    # leaves it unset fails loudly rather than silently lifting the executor
+    # off the connector's per-request path.
+    executor.kv_connector_manager.capacity_only = False
     executor.kv_connector_manager.prefix_reservations_enabled = True
     executor.kv_connector_manager.defer_load_termination.return_value = False
     executor.kv_connector_manager.has_pending_loads.return_value = False
@@ -548,6 +552,47 @@ def test_deferred_preemption_is_not_reported_to_the_client_as_finished() -> None
     victim.create_response.assert_not_called()
     executor._enqueue_responses.assert_called_once_with([])
     executor._terminate_request.assert_not_called()
+
+
+def test_a_capacity_only_connector_defers_no_preemption() -> None:
+    """It has no save to wait for, so the victim's pages go back now.
+
+    The deferral costs a page index gather per victim and parks the request in
+    the state the finish path uses, which every response pass then has to ask
+    about.
+    """
+    executor = _preemption_executor()
+    victim = _preemption_victim()
+    connector = executor.kv_connector_manager
+    connector.capacity_only = True
+    connector.request_finished.return_value = True
+
+    assert executor.kv_cache_manager.preempt_request(victim) is True
+
+    assert executor.kv_cache_manager.released == [victim.py_request_id]
+    assert not executor.kv_cache_manager.has_pending_preemption()
+    connector.request_finished.assert_not_called()
+
+
+def test_a_capacity_only_connector_is_polled_and_waited_on_by_nothing() -> None:
+    """A role that moves no KV has nothing per-iteration to drive.
+
+    `get_finished` agrees across ranks through an allgather, and the
+    cancellation sweep that precedes it walks every active request.
+    """
+    executor = _preemption_executor()
+    connector = executor.kv_connector_manager
+    connector.capacity_only = True
+    # Not on the spec either, for the same reason `capacity_only` is not.
+    connector.worker = Mock()
+    executor.active_requests = [_request(3)]
+
+    executor._kv_connector_terminate_requests()
+    PyExecutor._kv_connector_wait_for_save(executor)
+
+    connector.get_finished.assert_not_called()
+    connector.defer_load_termination.assert_not_called()
+    connector.worker.wait_for_save.assert_not_called()
 
 
 def test_a_victim_whose_saves_retired_goes_back_to_being_schedulable() -> None:
