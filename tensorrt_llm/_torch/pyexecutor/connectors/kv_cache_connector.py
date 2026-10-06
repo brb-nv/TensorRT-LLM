@@ -1318,6 +1318,25 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
 
         return saving_async
 
+    def has_outstanding_save(self, request_id: int) -> bool:
+        """Whether a save this manager accepted for `request_id` is still open.
+
+        True from the `request_finished` that accepted the save until the
+        `get_finished` in which every rank reports it complete. A request must
+        be offered at most once over that span: `AsyncTransferManager` counts
+        transfer claims, so a second accepted offer would leave two claims
+        against the single completion that arrives and the request would never
+        terminate.
+        """
+        return any(
+            request_id in requests.saving
+            for requests in (
+                self.new_async_requests,
+                self.pending_async_requests,
+                self.local_finished_async_requests,
+            )
+        )
+
     def get_finished(self) -> List[LlmRequest]:
         """
         Process requests that have finished loading and saving.

@@ -7732,7 +7732,16 @@ class PyExecutor:
         transfer manager, which `_terminate_request` consults before it frees
         anything. Call this for every request that stops producing KV, however
         it stopped: the pages are the same memory either way.
+
+        A request the connector already holds a save for is skipped rather
+        than refused: under the overlap scheduler one cancelled during
+        `_process_previous_batch` is still in the batch
+        `_save_kv_to_connector_async` walks on the next iteration, and reads
+        as finished there.
         """
+        if self.kv_connector_manager.has_outstanding_save(req.request_id):
+            return
+
         by_layer_group = None
         try:
             # KVCacheManagerV2 has no primary-pool block list, so

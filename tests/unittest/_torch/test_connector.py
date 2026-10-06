@@ -545,6 +545,35 @@ def test_only_a_worker_that_says_so_is_capacity_only():
     assert manager.capacity_only is False
 
 
+def test_a_request_is_offered_its_save_once_until_that_save_retires():
+    """`AsyncTransferManager` counts claims, and one completion comes back.
+
+    A second accepted offer would leave two claims against that single
+    completion and the request would never terminate, which is why
+    `PyExecutor._start_connector_async_save` asks this before it offers.
+    """
+    scheduler = MagicMock()
+    scheduler.request_finished.return_value = True
+    worker = MagicMock()
+    worker.capacity_only = False
+    manager = KvCacheConnectorManager(worker, scheduler)
+
+    req = MagicMock()
+    req.request_id = 11
+
+    assert manager.request_finished(req, []) is True
+    assert manager.has_outstanding_save(11)
+
+    # Handed to the worker, which has not finished writing it yet.
+    worker.get_finished.return_value = ([], [])
+    assert manager.get_finished() == []
+    assert manager.has_outstanding_save(11)
+
+    worker.get_finished.return_value = ([11], [])
+    assert manager.get_finished() == [req]
+    assert not manager.has_outstanding_save(11)
+
+
 def test_a_per_layer_group_connector_needs_no_flat_stubs():
     """Overriding the grouped form is enough to instantiate.
 
