@@ -1084,13 +1084,13 @@ def _create_py_executor(
             # the importlib call above, off every other deployment's path.
             from .connectors.mooncake_store import settings as mooncake_settings
 
-            # `BaseLLM.__init__` settles both for the usage report and the
+            # `BaseLLM.__init__` settles these for the usage report and the
             # ranks alike; this covers a caller that reached an executor
             # without the constructor, and a role it could not resolve. The KV
             # cache manager is built after this and reads the result.
             if not kv_connector_manager.capacity_only:
-                mooncake_settings.disable_native_kv_offload(kv_cache_config)
-                mooncake_settings.disable_partial_reuse(kv_cache_config)
+                mooncake_settings.apply_transferring_role_overrides(
+                    kv_cache_config)
     else:
         kv_connector_manager = None
 

@@ -169,12 +169,6 @@ tier reassigns its GPU slot underneath the connector, so with a connector attach
   simply never runs. Rebalance suspends every active request and runs a defragmenting migration that
   reassigns the same page slots a tier eviction would.
 
-None of this applies to a [capacity-only](#2-worker-interface-kvcacheconnectorworker) worker, which
-registers no address for a migration to invalidate and so keeps its tiers. A connector may also
-override these settings rather than leave them to be rejected; see
-[Settings this connector overrides](#settings-this-connector-overrides) for the Mooncake store's
-reasons.
-
 The practical consequence is that a KV-exhausted connector deployment has no secondary tier to
 fall back on. The remedies are `kv_cache_config.max_tokens`,
 `kv_cache_config.free_gpu_memory_fraction`, or lowering `max_num_tokens` to hand memory back to the
@@ -351,8 +345,7 @@ These methods run on all workers (GPU processes) and interact with the actual GP
   * **Description**: Optional, with a no-op default. Releases whatever the worker holds — store handles, registered buffers, background threads. Called once, after the executor's worker thread has joined, so no transfer can start afterwards; implementations must be idempotent. Without it a worker's resources live as long as the process, so engines built back to back in one session accumulate them.
 
 * **`capacity_only(self) -> bool`** (property)
-  * **Description**: Optional, `False` by default. Declares a worker that contributes resources to an external store but transfers no KV of its own — for example a rank that lends host memory to a shared pool other engines read and write. Such a worker registers no page addresses, so the runtime skips what exists to protect them: no per-layer hooks, no capacity-scheduler restriction, no rejection of cache tiers below GPU, no per-iteration scheduler output, and no `get_num_new_matched_tokens` or `request_finished` query. It still takes part in construction and shutdown.
-  * **Uniformity**: the value must be the same on every rank. The runtime reads it once per worker and the paths it disables include collectives.
+  * **Description**: Optional, `False` by default. Declares a worker that contributes resources to an external store but transfers no KV of its own — for example a rank that lends host memory to a shared pool other engines read and write. Must be the same on every rank.
 
 ## Example Implementation
 
@@ -400,7 +393,7 @@ The script demonstrates:
 4. Generating text for the same prompt (Second run).
 5. Asserting that the outputs match, proving the state was correctly restored from the disk cache.
 
-## Built-in connector: Mooncake store
+## Mooncake store
 
 `connector: mooncake-store` is a connector shipped with TensorRT-LLM. It backs the KV cache with a
 [Mooncake](https://github.com/kvcache-ai/Mooncake) store: a pool of host memory, lent by the
@@ -408,16 +401,8 @@ participating ranks and addressed by content, that every server joining it can r
 prefix computed by one engine is therefore replayable by another, which block reuse alone cannot do
 because it never leaves the instance that computed it.
 
-This is a different component from the Mooncake transfer engine the C++ cache transceiver uses.
-That one moves KV point-to-point between two known peers; this one publishes pages into a pool. The
-two compose: a context server can write pages here and still hand off over NIXL.
-
-It needs the Mooncake Python bindings, which the C++ transfer engine built into the container does
-not provide:
-
-```bash
-pip install mooncake-transfer-engine
-```
+The Python bindings it needs come from `mooncake-transfer-engine-cuda13`, pinned in
+`requirements.txt` and installed with TensorRT-LLM.
 
 ### Starting the pool
 
@@ -502,27 +487,15 @@ settings. A `capacity` server keeps both as configured.
 Checked at startup, before any request is admitted, because each one's failure mode is KV replayed
 without all of the state it was computed with — a wrong answer rather than a slow one.
 
-| Configuration | Behavior |
-|---|---|
-| KV cache manager V1 | Rejected. Set `kv_cache_config.use_kv_cache_manager_v2=True`; this connector keys pages per layer group from a hash chain of its own, which V1's single flat block space cannot describe. |
-| Context parallelism | Rejected. A rank holds a slice of the sequence rather than whole blocks of it, so one key would name different bytes on different ranks. |
-| Pipeline parallelism | Rejected. Keys are namespaced per rank, so each stage would store only its own layers and a prefix hit would require every stage to agree. |
-| Sliding-window attention | Rejected. A page's validity then depends on where the window sits, which is a property of the request that read it rather than of the tokens it holds. |
-| `sparse_attention_config` with an index-V cache | Rejected unless `sparse_disable_index_value=True`. That cache lives outside the paged pools, so a replayed prefix would carry index-K from the store alongside stale index-V. |
-| A request carrying a LoRA adapter | Bypassed per request, with the rest of the deployment served. An adapter id is assigned by whoever submitted the request, so two servers sharing a pool can name different weights by the same id. |
-| A request whose multimodal content carries no hashes | Bypassed per request. Its prompt tokens do not identify the media behind them. |
+Beyond beam search, attention data parallelism, speculative decoding and Mamba/hybrid models, which
+are rejected for [every connector](#a-page-slot-must-not-be-reassigned-underneath-the-connector),
+this one also rejects KV cache manager V1, context parallelism, pipeline parallelism,
+sliding-window attention, and `sparse_attention_config` with an index-V cache unless
+`sparse_disable_index_value=True`; it bypasses individual requests that carry a LoRA adapter or
+multimodal content without hashes, leaving the rest of the deployment served.
 
-Beam search, attention data parallelism, speculative decoding and Mamba/hybrid models are rejected
-for every connector; see [A page slot must not be reassigned underneath the connector](#a-page-slot-must-not-be-reassigned-underneath-the-connector).
+### Without GPUDirect RDMA
 
-### Operational notes
-
-* **A failed save is dropped, not fatal.** A write that did not land costs a future cache miss, so
-  it is logged and the request retires normally. Loads are the opposite: the runtime has already
-  counted those tokens as computed, so a failed load fails the request.
-* **Addresses.** Each rank registers its segment under the address of the interface that routes to
-  the master. Pin `mooncake_store.local_hostname` where that is not the interface the pool's
-  traffic should take.
-* **Without GPUDirect RDMA.** Set `stage_through_host: true` to copy pages through a pinned host
-  buffer instead of registering the KV pools with Mooncake. It costs a copy each way. A `capacity`
-  server needs neither, registering no pages at all.
+Set `stage_through_host: true` to copy pages through a pinned host buffer instead of registering the
+KV pools with Mooncake. It costs a copy each way. A `capacity` server needs neither, registering no
+pages at all.

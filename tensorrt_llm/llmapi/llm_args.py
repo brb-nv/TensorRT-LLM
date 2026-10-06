@@ -2505,41 +2505,31 @@ class DecodingBaseConfig(StrictBaseModel):
 class MooncakeStoreConfig(StrictBaseModel):
     """How this server joins a Mooncake store pool.
 
-    The pool itself is described by the master that owns it, in the manifest
-    `pool` names. What is left here belongs to this server alone: how much
-    memory each of its ranks lends, and what it then does with the pool.
-
-    Setting this makes `trtllm-serve` render the Mooncake client config and
-    export `MOONCAKE_CONFIG_PATH` itself. An inherited `MOONCAKE_CONFIG_PATH`
-    wins, so an externally managed pool stays reachable.
+    The settings every participant shares come from the master named by
+    `pool`; what is left here is per-server. Setting this makes
+    `trtllm-serve` render the Mooncake client config and export
+    `MOONCAKE_CONFIG_PATH`; an inherited `MOONCAKE_CONFIG_PATH` wins.
     """
     pool: str = Field(
         ...,
-        description="The pool to join: file://<path> naming the manifest a "
-        "'trtllm-serve mooncake_master --pool_file' published, or a master's "
-        "host:port. The manifest form is how to reach a master whose host a "
-        "scheduler chose, and it carries the settings every participant has "
-        "to agree on, so they are stated once rather than per server.")
+        description="The pool to join: 'file://<path>' naming a manifest "
+        "published by 'trtllm-serve mooncake_master --pool_file', or a "
+        "master's 'host:port'. The manifest form also carries the settings "
+        "every participant must agree on.")
     role: Literal["both", "producer", "consumer", "capacity"] = Field(
         "both",
         description="What this server does with the pool. 'both' reads and "
-        "writes, and is what a context server wants. 'capacity' does neither: "
-        "the ranks lend their memory and never touch the pool, which is what a "
-        "generation server wants, since prompt KV reaches it over the cache "
-        "transceiver instead. A capacity-only server registers no KV cache "
-        "with Mooncake, so it needs no GPUDirect RDMA.")
+        "writes, 'producer' only writes, 'consumer' only reads, and "
+        "'capacity' does neither: its ranks lend memory without registering "
+        "any KV cache, so it needs no GPUDirect RDMA.")
     segment_size: Union[int, str] = Field(
         "16GiB",
         description="Host memory each of this server's ranks contributes to "
-        "the pool. Capacity is the sum over every participating rank, so keep "
-        "it the same on every server; the run's summary reports the distinct "
-        "values seen. A node's demand is ranks_on_node x segment_size, "
-        "checked against available memory at startup. Write binary sizes "
-        "('16GiB') or byte counts: 'GB' means a power of 1000 here and a "
-        "power of 1024 to vLLM, so it is refused in a file both engines may "
-        "read. Zero lends nothing: the server joins the pool and uses capacity "
-        "its peers hold, so a pool whose every participant lends nothing has "
-        "nowhere to put a page.")
+        "the pool, as a binary size ('16GiB') or a byte count; ambiguous "
+        "units such as 'GB' are refused. A node's demand is ranks_on_node x "
+        "segment_size, checked against available memory at startup. Zero "
+        "lends nothing, leaving the server to use only capacity its peers "
+        "hold.")
     transfer_batch_size: PositiveInt = Field(
         64, telemetry=False, description="Page keys per store call.")
     namespace: Optional[str] = Field(
@@ -2552,54 +2542,42 @@ class MooncakeStoreConfig(StrictBaseModel):
         telemetry=False,
         description="What the pool keys identify this checkpoint by. Two "
         "engines share cache only when they agree on it, and two that "
-        "disagree read each other's pages as their own, so it has no default. "
-        "A model path is a poor choice, since 'org-a/model' and 'org-b/model' "
-        "share a directory name while meaning different weights.")
+        "disagree read each other's pages as their own, so it has no default "
+        "and must be unique per checkpoint.")
     stage_through_host: bool = Field(
         False,
         telemetry=False,
         description="Copy pages through a pinned host buffer instead of "
-        "registering the KV pools with Mooncake. An escape hatch for a host "
-        "whose HCA cannot pin GPU pages; costs a copy each way. Ignored when "
-        "role is 'capacity', which registers no pages at all.")
+        "registering the KV pools with Mooncake. For a host whose HCA cannot "
+        "pin GPU pages; costs a copy each way. Ignored when role is "
+        "'capacity'.")
     local_hostname: Optional[str] = Field(
         None,
         telemetry=False,
         description="Address this server's ranks register their segments "
-        "under, for peers to reach them at. Each rank derives it by default "
-        "from the interface that routes to the master, which is right for "
-        "almost every deployment; pin it where that interface is not the one "
-        "the pool's traffic should take, or where the master address is not "
-        "in host:port form. One value covers every rank, so only set it on a "
-        "server whose ranks share a node.")
+        "under, for peers to reach them at. Derived by default from the "
+        "interface that routes to the master. One value covers every rank, so "
+        "only set it on a server whose ranks share a node.")
     run_dir: Optional[str] = Field(
         None,
         telemetry=False,
         description="Where this server keeps the Mooncake client config it "
-        "renders and the record each of its ranks writes of the segment it "
-        "mounted. Required when a launcher starts one task per rank, as "
-        "trtllm-llmapi-launch does, since those ranks cannot inherit the path "
-        "from the process that rendered it. Give each server its own: two "
-        "sharing a directory render one client config between them. Defaults "
-        "to a temporary directory removed at shutdown, which loses the "
-        "records the pool report reads.")
+        "renders and each rank's record of the segment it mounted. Required "
+        "when a launcher starts one task per rank, as trtllm-llmapi-launch "
+        "does, and must not be shared between servers. Defaults to a "
+        "temporary directory removed at shutdown.")
     master_timeout: float = Field(
         60.0,
         telemetry=False,
         description="Seconds to wait for the pool manifest to appear and the "
-        "master to accept connections. Raise it when the wait spans container "
-        "start on another node. Expiring fails the server at startup, which "
-        "is the intent: an unreachable master otherwise fails inside every "
-        "rank after the model has loaded, as a bare status code.")
+        "master to accept connections. Raise it when the wait spans a "
+        "container start on another node. Expiring fails the server at "
+        "startup.")
 
     @field_validator("segment_size", mode="after")
     @classmethod
     def _check_segment_size(cls, value):
-        """Reject a size here rather than in every rank after bringup.
-
-        The connector parses it, so a typo would otherwise surface as a
-        per-rank failure with the model already loading.
-        """
+        """Reject a bad size here rather than in every rank after bringup."""
         from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.config import \
             parse_size
         try:
