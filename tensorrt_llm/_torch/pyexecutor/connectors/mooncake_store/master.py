@@ -37,7 +37,7 @@ import subprocess  # nosec B404
 import tempfile
 import time
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Optional, Sequence
 
 from tensorrt_llm.logger import logger
 
@@ -50,7 +50,9 @@ from .config import (
     DEFAULT_NAMESPACE,
     RUN_DIR_OWNER_NAME,
     StoreRole,
+    local_address,
     parse_size,
+    split_address,
 )
 
 if TYPE_CHECKING:
@@ -101,26 +103,6 @@ def _log_tail(path: str, lines: int = LOG_TAIL_LINES) -> str:
         )
     quoted = "\n  ".join(tail)
     return f" The last {len(tail)} lines of {path}:\n  {quoted}"
-
-
-def local_address() -> str:
-    """The address this host is known by inside the pool.
-
-    Derived the same way as the connector worker's own hostname, so the master
-    and the segments registering with it agree on which host they are on.
-    """
-    try:
-        return socket.gethostbyname(socket.gethostname())
-    except OSError:
-        return "127.0.0.1"
-
-
-def _split_address(address: str) -> Optional[Tuple[str, int]]:
-    """Split `host:port`, or return `None` if it is not in that form."""
-    host, separator, port = address.rpartition(":")
-    if not separator or not port.isdigit():
-        return None
-    return host.strip("[]"), int(port)
 
 
 @dataclass(frozen=True)
@@ -400,7 +382,7 @@ def wait_for_master(
     Returns how long it took, or `None` when the address is not in `host:port`
     form and cannot be checked.
     """
-    endpoint = _split_address(master_address)
+    endpoint = split_address(master_address)
     if endpoint is None:
         logger.warning(
             f"mooncake-store: cannot parse master_server_address="
@@ -432,6 +414,10 @@ def _client_config(
         "device_name": device_name,
         # ---- this server's ----
         "model_key": pool.model_key,
+        # Omitted unless pinned, so that each rank derives its own address
+        # rather than taking this process's. The ranks of one server can sit
+        # on different nodes.
+        **({"local_hostname": pool.local_hostname} if pool.local_hostname else {}),
         "global_segment_size": parse_size(pool.segment_size, strict_units=True),
         "local_buffer_size": DEFAULT_LOCAL_BUFFER_SIZE,
         "role": StoreRole(pool.role).value,

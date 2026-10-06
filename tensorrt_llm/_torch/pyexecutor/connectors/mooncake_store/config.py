@@ -26,9 +26,10 @@ merges the two into the file this reads back.
 import json
 import os
 import re
+import socket
 from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Optional, Tuple
 
 if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import MooncakeStoreConfig, TorchLlmArgs
@@ -39,9 +40,11 @@ __all__ = [
     "MooncakeStoreConnectorConfig",
     "SEGMENTS_DIR_NAME",
     "StoreRole",
+    "local_address",
     "parse_size",
     "pool_config",
     "provisioned_config_path",
+    "split_address",
 ]
 
 #: Mooncake's own variable for the client config path, read by the vLLM
@@ -101,6 +104,63 @@ _BINARY_SPELLING = {
     "tb": "TiB",
 }
 _SIZE_RE = re.compile(r"^\s*([0-9]+(?:\.[0-9]+)?)\s*([a-zA-Z]*)\s*$")
+
+#: Stands in for "somewhere off this host" when there is no peer to route to.
+#: RFC 5737 reserves it for documentation, so it names no real destination.
+#: That costs nothing: connecting a datagram socket consults the routing table
+#: without sending a packet.
+_ROUTE_PROBE_ENDPOINT = ("192.0.2.1", 9)
+
+
+def split_address(address: str) -> Optional[Tuple[str, int]]:
+    """Split `host:port`, or return `None` if it is not in that form."""
+    host, separator, port = address.rpartition(":")
+    if not separator or not port.isdigit():
+        return None
+    return host.strip("[]"), int(port)
+
+
+def local_address(peer: Optional[str] = None) -> str:
+    """This host's address as something else on the pool's network reaches it.
+
+    Every segment is registered under this address and the pool manifest names
+    the master by it, so peers dial whatever comes back here. That rules out
+    `gethostbyname(gethostname())`, which answers `127.0.1.1` on a host whose
+    `/etc/hosts` maps its own name to loopback, as Ubuntu's default does. Such
+    an answer leaves a multi-node pool unreachable while a single-node run
+    keeps working.
+
+    Args:
+        peer: `host:port` of something this address has to be reachable from,
+            usually the master. The route to it names the interface to report.
+            The master itself has no peer to measure against and passes
+            nothing, which falls back to the route off this host.
+
+    Returns:
+        A dotted-quad address, or the hostname lookup when there is no route
+        at all. A deployment whose address cannot be derived this way pins it
+        with `mooncake_store.local_hostname`.
+    """
+    endpoints = []
+    if peer:
+        endpoint = split_address(peer)
+        if endpoint is not None:
+            endpoints.append(endpoint)
+    endpoints.append(_ROUTE_PROBE_ENDPOINT)
+    for endpoint in endpoints:
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+                probe.connect(endpoint)
+                address = probe.getsockname()[0]
+        except OSError:
+            # No route to it, or it is not an IPv4 address: try the next.
+            continue
+        if address and not address.startswith("127."):
+            return address
+    try:
+        return socket.gethostbyname(socket.gethostname())
+    except OSError:
+        return "127.0.0.1"
 
 
 class StoreRole(Enum):

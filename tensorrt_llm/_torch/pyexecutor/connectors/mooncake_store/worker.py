@@ -52,7 +52,7 @@ from tensorrt_llm.logger import logger
 from ..kv_cache_connector import KvCacheConnectorWorker
 from ..kv_cache_layout import KvCacheLayout
 from .addressing import PageAddressing
-from .config import CONFIG_PATH_ENV, MooncakeStoreConnectorConfig, pool_config
+from .config import CONFIG_PATH_ENV, MooncakeStoreConnectorConfig, local_address, pool_config
 from .keys import KeyNamespace
 from .ledger import record_segment
 from .metadata import MooncakeStoreMetadata, RequestTransfers
@@ -115,7 +115,7 @@ def _open_store(config: MooncakeStoreConnectorConfig):
         ) from exc
 
     store = MooncakeDistributedStore()
-    hostname = config.local_hostname or _default_hostname()
+    hostname = config.local_hostname or local_address(config.master_server_address)
     setup_kwargs = {}
     if config.tenant_id:
         setup_kwargs["tenant_id"] = config.tenant_id
@@ -141,12 +141,6 @@ def _open_store(config: MooncakeStoreConnectorConfig):
             f"claimed one. Check the config named by {CONFIG_PATH_ENV}."
         )
     return store, hostname
-
-
-def _default_hostname() -> str:
-    import socket
-
-    return socket.gethostbyname(socket.gethostname())
 
 
 def _batched(items: Sequence, size: int):

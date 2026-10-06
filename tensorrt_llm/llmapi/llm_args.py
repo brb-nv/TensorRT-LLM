@@ -2562,6 +2562,16 @@ class MooncakeStoreConfig(StrictBaseModel):
         "registering the KV pools with Mooncake. An escape hatch for a host "
         "whose HCA cannot pin GPU pages; costs a copy each way. Ignored when "
         "role is 'capacity', which registers no pages at all.")
+    local_hostname: Optional[str] = Field(
+        None,
+        telemetry=False,
+        description="Address this server's ranks register their segments "
+        "under, for peers to reach them at. Each rank derives it by default "
+        "from the interface that routes to the master, which is right for "
+        "almost every deployment; pin it where that interface is not the one "
+        "the pool's traffic should take, or where the master address is not "
+        "in host:port form. One value covers every rank, so only set it on a "
+        "server whose ranks share a node.")
     run_dir: Optional[str] = Field(
         None,
         telemetry=False,

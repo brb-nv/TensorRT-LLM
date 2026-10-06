@@ -15,8 +15,8 @@
 """Unit tests for the Mooncake store pieces every deployment shares.
 
 Covers how a block of tokens becomes a store key, how the JSON config is read,
-and the pinned host slots pages pass through where GPUDirect RDMA is
-unavailable.
+the address a rank registers its segment under, and the pinned host slots
+pages pass through where GPUDirect RDMA is unavailable.
 
 Runs without a Mooncake installation: the store handle is replaced by an
 in-process fake that records what it was handed.
@@ -27,10 +27,13 @@ from types import SimpleNamespace
 
 import pytest
 
+from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store import config as config_module
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store import staging as staging_module
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.config import (
     MooncakeStoreConnectorConfig,
     StoreRole,
+    local_address,
+    split_address,
 )
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.keys import (
     BlockHashChain,
@@ -355,6 +358,102 @@ def test_config_requires_an_explicit_model_key(store_config, tmp_path, monkeypat
 # The connector itself, the registry preset that selects it, and the startup
 # gates on parallelism and index-V caching land with the KV cache manager V2
 # support they depend on.
+
+
+# ---- the address this host is known by ----
+
+
+class FakeRoutes:
+    """A routing table: which local address each destination is reached from.
+
+    Stands in for `socket.socket`, since what an address is derived from is a
+    property of the host the test runs on and single-node CI cannot tell a
+    loopback answer from a routable one.
+    """
+
+    def __init__(self, routes):
+        self.routes = routes
+        self.asked = []
+
+    def __call__(self, family, kind):
+        return self
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        return False
+
+    def connect(self, endpoint):
+        self.asked.append(endpoint)
+        if endpoint[0] not in self.routes:
+            raise OSError("ENETUNREACH")
+
+    def getsockname(self):
+        return (self.routes[self.asked[-1][0]], 45678)
+
+
+@pytest.fixture
+def routes(monkeypatch):
+    """Install a routing table, and report what was asked of it."""
+
+    def install(**by_destination):
+        table = FakeRoutes(by_destination)
+        monkeypatch.setattr(config_module.socket, "socket", table)
+        return table
+
+    return install
+
+
+def test_local_address_comes_from_the_route_to_the_master(routes):
+    """What peers dial has to be an address reachable from the pool."""
+    table = routes(**{"10.0.0.7": "10.0.0.42"})
+
+    assert local_address("10.0.0.7:50051") == "10.0.0.42"
+    assert table.asked == [("10.0.0.7", 50051)]
+
+
+def test_local_address_skips_a_loopback_route(monkeypatch, routes):
+    """The host's own name resolving to 127.0.1.1 is Ubuntu's default.
+
+    Registering a segment under it leaves a multi-node pool unreachable while
+    a single-node run keeps working, so a loopback answer is never taken while
+    any other is available.
+    """
+    routes(**{"10.0.0.7": "127.0.1.1", "192.0.2.1": "10.0.0.42"})
+
+    assert local_address("10.0.0.7:50051") == "10.0.0.42"
+
+
+def test_local_address_falls_back_to_the_route_off_this_host(routes):
+    """The master publishing its own address has no peer to measure against."""
+    table = routes(**{"192.0.2.1": "10.0.0.42"})
+
+    assert local_address() == "10.0.0.42"
+    assert [host for host, _port in table.asked] == ["192.0.2.1"]
+
+
+@pytest.mark.parametrize("master", ["10.0.0.7:50051", "not-host-port", None])
+def test_local_address_falls_back_to_the_hostname_with_no_route_at_all(monkeypatch, routes, master):
+    """A single host with no route out, which every CPU-only test is."""
+    routes()
+    monkeypatch.setattr(config_module.socket, "gethostbyname", lambda _name: "127.0.1.1")
+
+    assert local_address(master) == "127.0.1.1"
+
+
+@pytest.mark.parametrize(
+    "address, expected",
+    [
+        ("10.0.0.7:50051", ("10.0.0.7", 50051)),
+        ("[fe80::1]:50051", ("fe80::1", 50051)),
+        ("file:///shared/pool.json", None),
+        ("10.0.0.7", None),
+        ("10.0.0.7:fifty", None),
+    ],
+)
+def test_split_address(address, expected):
+    assert split_address(address) == expected
 
 
 # ---- host staging ----
