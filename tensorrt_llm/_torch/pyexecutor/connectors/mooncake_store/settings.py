@@ -72,26 +72,38 @@ def apply_effective_settings(llm_args: "TorchLlmArgs") -> None:
     kv_cache_config = llm_args.kv_cache_config
     if kv_cache_config is None:
         return
-    disable_native_kv_offload(kv_cache_config)
-    # A capacity-only deployment keeps partial reuse, having no lookup for a
-    # partial match to spoil. Its role comes from the client config where there
-    # is one to read, and from the block otherwise; a pool `trtllm-serve` has
-    # yet to provision offers neither, and is settled in `create_py_executor`
-    # against the worker it built.
+    # Both overrides belong to a role that moves KV; see each for why. The
+    # role comes from the client config where there is one to read, and from
+    # the block otherwise; a pool `trtllm-serve` has yet to provision offers
+    # neither, and is settled in `create_py_executor` against the worker it
+    # built.
     role = effective.role if effective is not None else None
     if role is None and pool is not None:
         role = StoreRole(pool.role)
     if role is not None and role.transfers:
+        disable_native_kv_offload(kv_cache_config)
         disable_partial_reuse(kv_cache_config)
 
 
 def disable_native_kv_offload(kv_cache_config: "KvCacheConfig") -> None:
-    """Turn off this engine's own host and disk cache tiers, for every role.
+    """Turn off this engine's own host and disk cache tiers.
 
-    Pool pages live in host memory the ranks have already lent, so a native
-    tier beside it claims a second share of the same node's DRAM, which the
-    connector's node budget check cannot account for because the KV cache
-    manager provisions it later.
+    For a role that transfers KV only. Such a rank holds device addresses for
+    its pages, and evicting one to another tier reassigns its GPU slot
+    underneath the pool, which is why `PyExecutor` rejects a non-GPU tier for
+    any transferring connector. Pool pages also live in host memory the ranks
+    have already lent, so a native tier beside it claims a second share of the
+    same node's DRAM.
+
+    A capacity-only rank has neither problem and keeps the tiers it was
+    configured with, including the host tier `KVCacheManagerV2`
+    auto-provisions from an unset `host_cache_size`. That tier is where the V2
+    `MAX_UTILIZATION` scheduler suspends pages, and a disaggregated generation
+    server, which the `capacity` role is meant for, has recompute-pause off
+    and no other reclaim path. Its size does not double-count against the
+    segment: the segment is mounted in the worker's constructor before the
+    manager reads `MemAvailable` to size the tier, which takes at most half of
+    what is left per rank.
 
     Both fields are pinned to 0 rather than left unset, since a host_cache_size
     of None asks KVCacheManagerV2 to size a host tier automatically. Call this

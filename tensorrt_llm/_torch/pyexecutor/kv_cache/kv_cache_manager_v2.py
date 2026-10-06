@@ -1516,7 +1516,8 @@ class KVCacheManagerV2(BaseResourceManager):
 
         cache_tiers: List[CacheTierConfig] = [GpuCacheTierConfig(quota=int(quota))]
         # A capacity-only connector registers nothing for migration to
-        # invalidate, so it keeps the tier the scheduler spills to.
+        # invalidate, so it keeps the tier the scheduler spills to. The
+        # rejection of non-GPU tiers in `PyExecutor` exempts it to match.
         connector_registers_pages = (
             kv_connector_manager is not None and not kv_connector_manager.capacity_only
         )

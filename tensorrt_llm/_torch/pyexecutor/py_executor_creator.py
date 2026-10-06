@@ -1088,8 +1088,8 @@ def _create_py_executor(
             # ranks alike; this covers a caller that reached an executor
             # without the constructor, and a role it could not resolve. The KV
             # cache manager is built after this and reads the result.
-            mooncake_settings.disable_native_kv_offload(kv_cache_config)
             if not kv_connector_manager.capacity_only:
+                mooncake_settings.disable_native_kv_offload(kv_cache_config)
                 mooncake_settings.disable_partial_reuse(kv_cache_config)
     else:
         kv_connector_manager = None

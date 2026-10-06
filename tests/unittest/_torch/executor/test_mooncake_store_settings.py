@@ -176,18 +176,44 @@ def test_the_pool_replaces_this_engines_own_offload_tiers(monkeypatch, tmp_path)
     assert args.kv_cache_config.enable_partial_reuse is False
 
 
-def test_a_capacity_role_keeps_partial_reuse(monkeypatch, tmp_path):
-    """It looks nothing up in the pool, so it has no lookup to spoil."""
+def test_a_capacity_role_keeps_what_it_was_configured_with(monkeypatch, tmp_path):
+    """It transfers nothing, so neither override has anything to protect.
+
+    No page of its cache is registered with the pool, so a tier migration
+    invalidates no address, and it looks nothing up, so it has no lookup for a
+    partial match to spoil.
+    """
     monkeypatch.setenv(
         CONFIG_PATH_ENV,
         str(write_client_config(tmp_path / "external.json", role="capacity")),
     )
-    args = llm_args(pool=mooncake_store_config(), enable_partial_reuse=True)
+    args = llm_args(
+        pool=mooncake_store_config(),
+        host_cache_size=4 * GIB,
+        enable_partial_reuse=True,
+    )
 
     settings.apply_effective_settings(args)
 
-    assert args.kv_cache_config.host_cache_size == 0
+    assert args.kv_cache_config.host_cache_size == 4 * GIB
     assert args.kv_cache_config.enable_partial_reuse is True
+
+
+def test_a_capacity_role_still_leaves_its_host_tier_to_be_sized(monkeypatch, tmp_path):
+    """An unset `host_cache_size` is what asks for the auto host tier.
+
+    That tier is where the V2 `MAX_UTILIZATION` scheduler suspends pages, and
+    a generation server, which this role is for, has no other reclaim path.
+    """
+    monkeypatch.setenv(
+        CONFIG_PATH_ENV,
+        str(write_client_config(tmp_path / "external.json", role="capacity")),
+    )
+    args = llm_args(pool=mooncake_store_config())
+
+    settings.apply_effective_settings(args)
+
+    assert args.kv_cache_config.host_cache_size is None
 
 
 def test_the_tiers_go_off_before_any_pool_has_been_provisioned():
@@ -204,7 +230,7 @@ def test_a_settled_deployment_is_restated_without_a_word(monkeypatch, tmp_path):
     """Every caller is free to apply these, so a repeat has to be quiet."""
     monkeypatch.setenv(
         CONFIG_PATH_ENV,
-        str(write_client_config(tmp_path / "external.json", role="capacity")),
+        str(write_client_config(tmp_path / "external.json", role="producer")),
     )
     pool = mooncake_store_config(role="both")
     args = llm_args(pool=pool, host_cache_size=4 * GIB)
@@ -216,7 +242,7 @@ def test_a_settled_deployment_is_restated_without_a_word(monkeypatch, tmp_path):
     settings.apply_effective_settings(args)
 
     assert logged == []
-    assert pool.role == "capacity"
+    assert pool.role == "producer"
     assert args.kv_cache_config.host_cache_size == 0
 
 
@@ -239,7 +265,7 @@ def test_the_llm_constructor_settles_them_before_it_spawns_its_ranks(monkeypatch
         CONFIG_PATH_ENV,
         str(
             write_client_config(
-                tmp_path / "external.json", role="capacity", global_segment_size="32GiB"
+                tmp_path / "external.json", role="both", global_segment_size="32GiB"
             )
         ),
     )
@@ -266,13 +292,13 @@ def test_the_llm_constructor_settles_them_before_it_spawns_its_ranks(monkeypatch
         gpus_per_node=1,
         kv_connector_config=KvCacheConnectorConfig(
             connector="mooncake-store",
-            mooncake_store=mooncake_store_config(role="both", segment_size="16GiB"),
+            mooncake_store=mooncake_store_config(role="capacity", segment_size="16GiB"),
         ),
         kv_cache_config=KvCacheConfig(host_cache_size=4 * GIB),
     )
     try:
         assert at_spawn == {
-            "role": "capacity",
+            "role": "both",
             "segment_size": 32 * GIB,
             "host_cache_size": 0,
         }
