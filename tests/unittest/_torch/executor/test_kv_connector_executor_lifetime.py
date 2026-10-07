@@ -34,6 +34,7 @@ def _executor() -> PyExecutor:
     executor.kv_connector_manager.capacity_only = False
     executor.kv_connector_manager.prefix_reservations_enabled = True
     executor.kv_connector_manager.defer_load_termination.return_value = False
+    executor.kv_connector_manager.has_outstanding_save.return_value = False
     executor.kv_connector_manager.has_pending_loads.return_value = False
     executor.kv_connector_manager.get_finished.return_value = []
     executor.kv_connector_manager.take_finished_load_terminations.return_value = []
@@ -58,6 +59,7 @@ def _executor() -> PyExecutor:
 def _request(request_id: int = 1) -> SimpleNamespace:
     response = SimpleNamespace(result=SimpleNamespace(cached_tokens=0))
     request = SimpleNamespace(
+        request_id=request_id,
         py_request_id=request_id,
         is_child=False,
         is_dummy_request=False,

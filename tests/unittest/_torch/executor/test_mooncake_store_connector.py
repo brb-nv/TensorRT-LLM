@@ -332,24 +332,6 @@ def test_worker_load_raises_when_a_page_is_missing(store_config, fake_store):
             worker.start_load_kv(None)
 
 
-def test_worker_load_addresses_the_requested_page(store_config, fake_store):
-    layout = make_layout(regions_per_group=2)
-    with make_worker(fake_store, layout=layout) as worker:
-        block_hash = b"\x00" * 16
-        key = worker._namespaces[0].key(block_hash)
-        fake_store.objects.add(key)
-
-        transfers = RequestTransfers(7, [PageTransfer(block_hash, 0, 3)])
-        worker.bind_connector_meta(SimpleNamespace(loads=[transfers], saves=[]))
-        worker.start_load_kv(None)
-
-        (keys, addresses, sizes) = fake_store.get_calls[0]
-        expected_addresses, expected_sizes = PageAddressing(layout).buffers(0, 3)
-        assert keys == [key]
-        assert addresses == [expected_addresses]
-        assert sizes == [expected_sizes]
-
-
 def test_worker_reports_a_request_finished_once_its_saves_drain(store_config, fake_store):
     with make_worker(fake_store, layout=make_layout()) as worker:
         # One submission outstanding: the request is closed but must not be released.
@@ -485,7 +467,8 @@ def test_staging_get_scatters_back_to_the_device_regions(store_config, fake_stor
 
         device_addresses, device_sizes = PageAddressing(layout).buffers(0, 5)
         slot = worker._load_staging.slot_address(0)
-        (_keys, addresses, sizes) = fake_store.get_calls[0]
+        (keys, addresses, sizes) = fake_store.get_calls[0]
+        assert keys == [worker._namespaces[0].key(block_hash)]
         assert addresses == [[slot]]
         assert sizes == [[sum(device_sizes)]]
 
@@ -559,7 +542,7 @@ def test_a_save_thread_that_cannot_start_fails_registration(
 
 
 def test_shutdown_leaves_the_store_open_under_a_save_still_reading(
-    store_config, fake_store, monkeypatch
+    store_config, fake_store, staged_copies, monkeypatch
 ):
     """A timed join is not evidence that the thread stopped.
 
