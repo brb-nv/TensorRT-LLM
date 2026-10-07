@@ -172,7 +172,7 @@ def validate_node_budget(
         remedy = (
             f"Lending nothing would not be enough: the {staging_claim / _GIB:.1f} "
             f"GiB of pinned staging buffers alone overruns the budget. Run fewer "
-            f"ranks per node, or turn off stage_through_host."
+            f"ranks per node."
         )
     raise ValueError(
         f"mooncake-store: this node cannot afford what the pool is configured "

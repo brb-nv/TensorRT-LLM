@@ -2520,8 +2520,8 @@ class MooncakeStoreConfig(StrictBaseModel):
         "both",
         description="What this server does with the pool. 'both' reads and "
         "writes, 'producer' only writes, 'consumer' only reads, and "
-        "'capacity' does neither: its ranks lend memory without registering "
-        "any KV cache, so it needs no GPUDirect RDMA.")
+        "'capacity' does neither: its ranks lend memory without moving any "
+        "KV, so they pin no staging buffers and pay no per-request cost.")
     segment_size: Union[int, str] = Field(
         "16GiB",
         description="Host memory each of this server's ranks contributes to "
@@ -2545,12 +2545,12 @@ class MooncakeStoreConfig(StrictBaseModel):
         "disagree read each other's pages as their own, so it has no default "
         "and must be unique per checkpoint.")
     stage_through_host: bool = Field(
-        False,
+        True,
         telemetry=False,
         description="Copy pages through a pinned host buffer instead of "
-        "registering the KV pools with Mooncake. For a host whose HCA cannot "
-        "pin GPU pages; costs a copy each way. Ignored when role is "
-        "'capacity'.")
+        "registering the KV pools with Mooncake. The only transfer path "
+        "supported today, so 'false' is ignored with a warning. Costs a copy "
+        "each way and needs no GPUDirect RDMA.")
     local_hostname: Optional[str] = Field(
         None,
         telemetry=False,
@@ -2573,6 +2573,17 @@ class MooncakeStoreConfig(StrictBaseModel):
         "master to accept connections. Raise it when the wait spans a "
         "container start on another node. Expiring fails the server at "
         "startup.")
+
+    @field_validator("stage_through_host", mode="after")
+    @classmethod
+    def _force_host_staging(cls, value):
+        """Say here what the workers would otherwise each say after bringup."""
+        if not value:
+            logger.warning(
+                "Ignoring mooncake_store.stage_through_host=False: pages pass "
+                "through pinned host memory, which is the only transfer path "
+                "this connector supports today.")
+        return True
 
     @field_validator("segment_size", mode="after")
     @classmethod

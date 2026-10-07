@@ -241,8 +241,7 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
             logger.warning(
                 f"mooncake-store worker rank {self._rank}: capacity-only. Its "
                 "memory is in the pool and its KV cache is not: no lookups, no "
-                "loads, no saves, and no KV registration, so this rank needs no "
-                "GPUDirect RDMA."
+                "loads, no saves, and no staging buffers pinned for them."
             )
 
     # ---- registration ----
@@ -303,9 +302,8 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
                         f"{status} for [{start:#x}, {end:#x}). Without registration "
                         "the store cannot read or write these pages. Registering "
                         "device memory needs GPUDirect RDMA (nvidia_peermem or "
-                        "dma-buf); where that is unavailable, set "
-                        "stage_through_host to pass pages through pinned host "
-                        "memory instead."
+                        "dma-buf) and one registration per pool mapping, since "
+                        "neither path accepts a range that crosses two of them."
                     )
 
         self._addressing = addressing

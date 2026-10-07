@@ -233,7 +233,6 @@ def open_worker(
     pool,
     *,
     buffer: torch.Tensor,
-    stage_through_host: bool,
     model_key: str = MODEL_KEY,
 ) -> Iterator[MooncakeStoreConnectorWorker]:
     """A worker holding a real store handle, with `buffer` as its KV cache.
@@ -246,7 +245,6 @@ def open_worker(
         pool=pool.pool,
         model_key=model_key,
         segment_size=WORKER_SEGMENT_SIZE,
-        stage_through_host=stage_through_host,
         run_dir=pool.run_dir,
     )
     with provision_pool(store_config, run_dir=pool.run_dir):
@@ -291,28 +289,26 @@ def save_page(worker: MooncakeStoreConnectorWorker, request_id: int, page_index:
 
 def load_page(worker: MooncakeStoreConnectorWorker, request_id: int, page_index: int) -> None:
     """Pull a page into `page_index`, as the executor does before a forward pass."""
-    # Zero copy lands bytes by RDMA, outside this stream's ordering, so work
-    # the test queued against the KV buffer has to have retired first.
+    # The load lands bytes outside this stream's ordering, so work the test
+    # queued against the KV buffer has to have retired first.
     torch.cuda.current_stream().synchronize()
     worker.bind_connector_meta(MooncakeStoreMetadata(loads=_page_transfers(request_id, page_index)))
     worker.start_load_kv(torch.cuda.current_stream())
     torch.cuda.current_stream().synchronize()
 
 
-@pytest.mark.parametrize("stage_through_host", [False, True], ids=["zero_copy", "host_staged"])
-def test_a_saved_page_comes_back_byte_identical(mooncake_pool, stage_through_host):
+def test_a_saved_page_comes_back_byte_identical(mooncake_pool):
     """Save a page, lose it, load it back, and compare the bytes.
 
     The buffer is zeroed between the two halves, so a load that transfers
-    nothing fails instead of passing on leftover memory. Host staging adds a
-    gather and a scatter through pinned buffers, and its whole point is to be
-    indistinguishable from the zero-copy path.
+    nothing fails instead of passing on leftover memory. The gather and
+    scatter through pinned host slots have to leave the page as it was.
     """
     buffer = _device_buffer(filled=True)
     page_index = 3
     expected = _snapshot(buffer, page_index)
 
-    with open_worker(mooncake_pool, buffer=buffer, stage_through_host=stage_through_host) as worker:
+    with open_worker(mooncake_pool, buffer=buffer) as worker:
         save_page(worker, request_id=1, page_index=page_index)
         buffer.zero_()
         load_page(worker, request_id=2, page_index=page_index)
@@ -341,11 +337,11 @@ def test_a_page_written_by_one_worker_is_read_back_by_another(mooncake_pool):
     writer_buffer = _device_buffer(filled=True)
     expected = _snapshot(writer_buffer, writer_page)
 
-    with open_worker(mooncake_pool, buffer=writer_buffer, stage_through_host=True) as writer:
+    with open_worker(mooncake_pool, buffer=writer_buffer) as writer:
         save_page(writer, request_id=1, page_index=writer_page)
 
     reader_buffer = _device_buffer(filled=False)
-    with open_worker(mooncake_pool, buffer=reader_buffer, stage_through_host=True) as reader:
+    with open_worker(mooncake_pool, buffer=reader_buffer) as reader:
         assert reader.count_prefix_hit([BLOCK_HASH]) == 1, (
             "The second worker did not find the block the first one published, so "
             "nothing written by a previous engine would ever be reused."
@@ -373,7 +369,7 @@ def test_a_prefix_counts_only_once_every_rank_has_its_shard(mooncake_pool, monke
     monkeypatch.setattr(worker_module, "mpi_world_size", lambda: 2)
 
     buffer = _device_buffer(filled=True)
-    with open_worker(mooncake_pool, buffer=buffer, stage_through_host=True) as rank_zero:
+    with open_worker(mooncake_pool, buffer=buffer) as rank_zero:
         save_page(rank_zero, request_id=1, page_index=0)
         assert rank_zero.count_prefix_hit([BLOCK_HASH]) == 0, (
             "A block with only rank 0's shard in the pool was offered for reuse. "
@@ -381,7 +377,7 @@ def test_a_prefix_counts_only_once_every_rank_has_its_shard(mooncake_pool, monke
         )
 
     monkeypatch.setattr(worker_module, "mpi_rank", lambda: 1)
-    with open_worker(mooncake_pool, buffer=buffer, stage_through_host=True) as rank_one:
+    with open_worker(mooncake_pool, buffer=buffer) as rank_one:
         save_page(rank_one, request_id=2, page_index=0)
         assert rank_one.count_prefix_hit([BLOCK_HASH]) == 1, (
             "Both ranks' shards are in the pool and the block was still not "
@@ -400,22 +396,16 @@ def test_a_different_model_key_shares_nothing(mooncake_pool):
     rather than a page the pool lost: the `model-a` hit would fail first.
     """
     buffer = _device_buffer(filled=True)
-    with open_worker(
-        mooncake_pool, buffer=buffer, stage_through_host=True, model_key="model-a"
-    ) as writer:
+    with open_worker(mooncake_pool, buffer=buffer, model_key="model-a") as writer:
         save_page(writer, request_id=1, page_index=0)
 
     other_buffer = _device_buffer(filled=False)
-    with open_worker(
-        mooncake_pool, buffer=other_buffer, stage_through_host=True, model_key="model-b"
-    ) as reader:
+    with open_worker(mooncake_pool, buffer=other_buffer, model_key="model-b") as reader:
         assert reader.count_prefix_hit([BLOCK_HASH]) == 0, (
             "A block saved under one model key was offered to a different model."
         )
 
-    with open_worker(
-        mooncake_pool, buffer=other_buffer, stage_through_host=True, model_key="model-a"
-    ) as same_model:
+    with open_worker(mooncake_pool, buffer=other_buffer, model_key="model-a") as same_model:
         assert same_model.count_prefix_hit([BLOCK_HASH]) == 1, (
             "The block is gone from the pool under the key it was saved with, "
             "so the miss asserted above says nothing about model keys."

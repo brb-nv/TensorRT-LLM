@@ -169,10 +169,8 @@ def _mooncake_pool_for_module(tmp_path_factory):
     The engines lend nothing; this fixture holds the pool's only segment. See
     `pool_capacity`.
 
-    Host staging rather than the zero-copy default, because registering device
-    memory with the transfer engine needs GPUDirect support this node may not
-    have. `tests/unittest/_torch/executor/test_mooncake_store_real_pool.py`
-    covers the two paths' equivalence.
+    Pages pass through pinned host memory, which needs nothing of this node's
+    hardware beyond what the fixture already assumes.
     """
     root = tmp_path_factory.mktemp("mooncake")
     master_dir = root / "master"

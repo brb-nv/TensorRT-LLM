@@ -456,7 +456,7 @@ says only what the engine then does with the pool.
 | `both` | yes | yes | An aggregated server, or a context server in a disaggregated deployment |
 | `producer` | no | yes | A server that fills the pool for others |
 | `consumer` | yes | no | A server that only replays what others stored |
-| `capacity` | no | no | A generation server: it lends memory and needs no GPUDirect RDMA |
+| `capacity` | no | no | A generation server: it lends memory and moves no KV |
 
 `capacity` is the right role for a disaggregated generation server. Generated tokens are rarely a
 reused prefix, and prompt KV reaches decode over the cache transceiver rather than through the
@@ -494,8 +494,9 @@ sliding-window attention, and `sparse_attention_config` with an index-V cache un
 `sparse_disable_index_value=True`; it bypasses individual requests that carry a LoRA adapter or
 multimodal content without hashes, leaving the rest of the deployment served.
 
-### Without GPUDirect RDMA
+### How pages reach the pool
 
-Set `stage_through_host: true` to copy pages through a pinned host buffer instead of registering the
-KV pools with Mooncake. It costs a copy each way. A `capacity` server needs neither, registering no
-pages at all.
+Every page passes through a pinned host buffer. `stage_through_host` defaults to `true` and is the
+only supported value today, so `false` is ignored with a warning; registering the KV pools with
+Mooncake instead is planned for a later release. Staging costs a copy each way and needs no
+GPUDirect RDMA. A `capacity` server stages nothing, holding no KV in the pool.
