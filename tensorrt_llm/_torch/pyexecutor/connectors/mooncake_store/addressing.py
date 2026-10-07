@@ -25,30 +25,11 @@ allocator's own aggregation. `bytes_per_page` goes into the key namespace so a
 geometry change cannot be read as a valid page.
 """
 
-from typing import Dict, Iterable, List, Sequence, Tuple
+from typing import Dict, List, Sequence, Tuple
 
 from ..kv_cache_layout import KvCacheLayout, KvCacheRegion
 
-__all__ = ["PageAddressing", "merge_intervals"]
-
-
-def merge_intervals(intervals: Iterable[Tuple[int, int]]) -> List[Tuple[int, int]]:
-    """Collapse `(start, end)` byte ranges into a minimal disjoint cover.
-
-    A range may not be registered twice, but several regions routinely live
-    inside one pool allocation: sliding-window layer groups share it, and a
-    non-uniform slot such as MiniMax-M3's index-K beside K/V splits one pool
-    into several regions. Merging first spares the caller that distinction.
-    """
-    ordered = sorted((int(start), int(end)) for start, end in intervals if end > start)
-    merged: List[Tuple[int, int]] = []
-    for start, end in ordered:
-        if merged and start <= merged[-1][1]:
-            previous_start, previous_end = merged[-1]
-            merged[-1] = (previous_start, max(previous_end, end))
-        else:
-            merged.append((start, end))
-    return merged
+__all__ = ["PageAddressing"]
 
 
 class PageAddressing:
@@ -120,20 +101,6 @@ class PageAddressing:
         addresses = [region.base + region.stride * page_index for region in regions]
         sizes = [region.size for region in regions]
         return addresses, sizes
-
-    def registration_ranges(self) -> List[Tuple[int, int]]:
-        """Byte ranges to hand to `register_buffer`, deduplicated and merged.
-
-        A region's slots are strided rather than packed, so its range spans
-        from the first slot to the end of the last. Registering the whole span
-        is what makes every slot's address valid for RDMA.
-        """
-        spans: List[Tuple[int, int]] = []
-        for regions in self._regions.values():
-            for region in regions:
-                span_end = region.base + region.stride * (region.num_slots - 1) + region.size
-                spans.append((region.base, span_end))
-        return merge_intervals(spans)
 
     def describe(self) -> str:
         """A one-line summary for startup logs."""

@@ -46,10 +46,7 @@ from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_layout import (
 )
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store import staging as staging_module
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store import worker as worker_module
-from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.addressing import (
-    PageAddressing,
-    merge_intervals,
-)
+from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.addressing import PageAddressing
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.keys import BlockHashChain
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.metadata import (
     PageTransfer,
@@ -261,23 +258,6 @@ IMAGE_B_HASH = [1, 2, 3, 4, 5, 6, 7, 9]
 # ---- addressing ----
 
 
-@pytest.mark.parametrize(
-    "intervals,expected",
-    [
-        ([], []),
-        ([(0, 10)], [(0, 10)]),
-        ([(0, 10), (10, 20)], [(0, 20)]),
-        ([(0, 10), (5, 20)], [(0, 20)]),
-        ([(0, 10), (20, 30)], [(0, 10), (20, 30)]),
-        ([(20, 30), (0, 10)], [(0, 10), (20, 30)]),
-        ([(0, 100), (10, 20)], [(0, 100)]),
-        ([(0, 0), (5, 10)], [(5, 10)]),
-    ],
-)
-def test_merge_intervals(intervals, expected):
-    assert merge_intervals(intervals) == expected
-
-
 def test_page_addressing_resolves_every_region_of_a_page():
     layout = make_layout(regions_per_group=3, num_slots=4)
     addressing = PageAddressing(layout)
@@ -295,19 +275,6 @@ def test_page_addressing_rejects_out_of_range_page():
         addressing.buffers(0, 4)
     with pytest.raises(IndexError):
         addressing.buffers(0, -1)
-
-
-def test_page_addressing_registration_covers_every_slot_once():
-    layout = make_layout(num_groups=2, regions_per_group=2, num_slots=4)
-    ranges = PageAddressing(layout).registration_ranges()
-
-    # Regions were laid out back to back, so the whole span merges into one.
-    all_regions = [region for group in layout.groups for region in group.regions]
-    lowest = min(region.base for region in all_regions)
-    highest = max(
-        region.base + region.stride * (region.num_slots - 1) + region.size for region in all_regions
-    )
-    assert ranges == [(lowest, highest)]
 
 
 def test_page_addressing_rejects_mixed_slot_counts():

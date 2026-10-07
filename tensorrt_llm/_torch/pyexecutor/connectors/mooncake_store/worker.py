@@ -108,10 +108,11 @@ def _open_store(config: MooncakeStoreConnectorConfig):
         from mooncake.store import MooncakeDistributedStore
     except ImportError as exc:
         raise ImportError(
-            "The mooncake-store connector needs the Mooncake Python bindings "
-            "(`pip install mooncake-transfer-engine`). The C++ transfer engine "
-            "built into the container is a different component and does not "
-            "provide MooncakeDistributedStore."
+            "The mooncake-store connector needs the Mooncake Python bindings, "
+            "which `tensorrt-llm` pulls in as `mooncake-transfer-engine-cuda13`, "
+            "so reinstall that package if this environment dropped it. The C++ "
+            "transfer engine built into the container is a different component "
+            "and does not provide MooncakeDistributedStore."
         ) from exc
 
     store = MooncakeDistributedStore()
@@ -291,20 +292,9 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         # executor thread; the save thread would otherwise see device 0.
         if torch.cuda.is_available():
             self._device_index = torch.cuda.current_device()
-        if self._config.stage_through_host:
-            self._open_staging(addressing)
-        else:
-            for start, end in addressing.registration_ranges():
-                status = self._store.register_buffer(start, end - start)
-                if status != 0:
-                    raise RuntimeError(
-                        f"MooncakeDistributedStore.register_buffer failed with status "
-                        f"{status} for [{start:#x}, {end:#x}). Without registration "
-                        "the store cannot read or write these pages. Registering "
-                        "device memory needs GPUDirect RDMA (nvidia_peermem or "
-                        "dma-buf) and one registration per pool mapping, since "
-                        "neither path accepts a range that crosses two of them."
-                    )
+        # Host staging is the only transfer path, which is why
+        # stage_through_host is forced True upstream rather than read here.
+        self._open_staging(addressing)
 
         self._addressing = addressing
         for layer_group_id in addressing.layer_group_ids:

@@ -197,6 +197,9 @@ class KvCacheConnectorWorker(ABC):
         below GPU are refused, and per-layer hooks are installed. A worker that
         registers nothing needs none of them, so overriding this leaves its
         engine alone. It still participates in construction and shutdown.
+
+        Must answer the same on every rank. The ranks are gathered at startup
+        and a deployment whose ranks disagree is rejected there.
         """
         return False
 
@@ -797,7 +800,8 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         off is what keeps ``reserve_prefix`` -- a leader broadcast per context
         request -- and the per-iteration completion poll out of its path. The
         capability probe below still runs on every rank: it is collective, and
-        a role that reads it differently would strand the others.
+        a role that reads it differently would strand the others. The probe
+        carries capacity_only, which must agree for the same reason.
         """
         if self._prefix_capability is None:
             scheduler_methods = self._run_on_leader(
@@ -809,10 +813,25 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
                 ]
             )
             worker_method = getattr(type(self.worker), "get_finished_prefix_loads", None)
-            worker_capabilities = mpi_allgather(
-                worker_method is not None
-                and worker_method is not KvCacheConnectorWorker.get_finished_prefix_loads
+            probe = mpi_allgather(
+                (
+                    worker_method is not None
+                    and worker_method is not KvCacheConnectorWorker.get_finished_prefix_loads,
+                    self.capacity_only,
+                )
             )
+            worker_capabilities = [reports_prefix_loads for reports_prefix_loads, _ in probe]
+            capacity_only_ranks = [
+                rank for rank, (_, capacity_only) in enumerate(probe) if capacity_only
+            ]
+            if capacity_only_ranks and len(capacity_only_ranks) != len(probe):
+                raise ValueError(
+                    "KV connector capacity_only must be the same on every rank, but "
+                    f"only rank(s) {capacity_only_ranks} of {len(probe)} report it. "
+                    "It gates collectives the other ranks still enter, such as the "
+                    "get_finished allgather, so a split hangs rather than fails. "
+                    "Give every rank of this server the same connector role."
+                )
             capabilities = scheduler_methods + worker_capabilities
             if any(capabilities) and not all(capabilities):
                 raise ValueError(

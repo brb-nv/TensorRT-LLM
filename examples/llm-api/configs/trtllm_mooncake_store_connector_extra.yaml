@@ -1,7 +1,8 @@
 # Extra LLM API options for trtllm-serve with the Mooncake store KV connector.
 #
 # Prerequisites:
-#   - mooncake installed: pip install mooncake-transfer-engine
+#   - The Mooncake Python bindings, which tensorrt-llm pulls in as
+#     mooncake-transfer-engine-cuda13 (pinned in requirements.txt)
 #   - A master owning the pool, started first:
 #       trtllm-serve mooncake_master --pool_file /shared/pool.json
 #   - PyTorch backend
