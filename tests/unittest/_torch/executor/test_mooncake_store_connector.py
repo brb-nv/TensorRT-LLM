@@ -412,17 +412,37 @@ def staged_copies(monkeypatch):
     return copies
 
 
+class StubStagingPool:
+    """Stands in for `HostStagingPool` where no device backs its slots.
+
+    The real pool page-locks its buffer whenever a device is reported, which
+    is the one claim `fake_cuda` cannot make true.
+    """
+
+    def __init__(self, *, slot_bytes, num_slots, store, label):
+        self.slot_bytes = slot_bytes
+        self.num_slots = num_slots
+        self.label = label
+
+    def close(self) -> None:
+        pass
+
+
 @pytest.fixture
 def fake_cuda(monkeypatch):
     """Present a CUDA device on a host that has none, recording set_device calls.
 
-    Only safe for paths that do not allocate or launch, and exists to exercise
-    the device bookkeeping around the save thread.
+    The device bookkeeping around the save thread is control flow, so testing
+    it should not need a GPU. The two things that path does need one for, the
+    staging slots registration pins and the stream the thread opens over them,
+    are stood in for, so claiming a device cannot reach a real allocation.
     """
     recorded = []
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 3)
     monkeypatch.setattr(torch.cuda, "set_device", lambda index: recorded.append(index))
+    monkeypatch.setattr(torch.cuda, "Stream", lambda *_args, **_kwargs: SimpleNamespace())
+    monkeypatch.setattr(worker_module, "HostStagingPool", StubStagingPool)
     return recorded
 
 
