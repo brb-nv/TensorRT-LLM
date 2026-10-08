@@ -34,6 +34,7 @@ import socket
 from types import SimpleNamespace
 
 import pytest
+from test_common.mooncake_utils import running_master_on_free_ports
 
 from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.config import (
@@ -44,7 +45,6 @@ from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.ledger import read
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.master import (
     POOL_MANIFEST_NAME,
     provision_pool,
-    running_master,
 )
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.scheduler import (
     MooncakeStoreConnectorScheduler,
@@ -69,12 +69,6 @@ PROMPT = (
     "and automotive applications. It is also a dominant supplier of artificial intelligence "
     "hardware and software. Tell me about the company."
 )
-
-
-def _free_port() -> int:
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
 
 
 def _common_prefix(left, right) -> int:
@@ -178,12 +172,7 @@ def _mooncake_pool_for_module(tmp_path_factory):
     master_dir.mkdir()
     client_dir.mkdir()
 
-    with running_master(
-        str(master_dir),
-        rpc_port=_free_port(),
-        metrics_port=_free_port(),
-        protocol="tcp",
-    ):
+    with running_master_on_free_ports(str(master_dir), protocol="tcp"):
         store_config = MooncakeStoreConfig(
             pool=f"file://{master_dir / POOL_MANIFEST_NAME}",
             model_key=MODEL_PATH,

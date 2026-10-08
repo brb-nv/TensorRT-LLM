@@ -29,13 +29,13 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
-import socket
 import time
 from collections.abc import Iterator
 from types import SimpleNamespace
 
 import pytest
 import torch
+from test_common.mooncake_utils import running_master_on_free_ports
 
 from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_layout import (
     KvCacheBufferRef,
@@ -52,7 +52,6 @@ from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.config import (
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.master import (
     POOL_MANIFEST_NAME,
     provision_pool,
-    running_master,
 )
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.metadata import (
     MooncakeStoreMetadata,
@@ -91,12 +90,6 @@ WORKER_SEGMENT_SIZE = 0
 BLOCK_HASH = hashlib.sha256(b"mooncake-real-pool-test/block-0").digest()
 
 SAVE_TIMEOUT_SECONDS = 60.0
-
-
-def _free_port() -> int:
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
 
 
 def _region_offset(group_id: int, region_id: int) -> int:
@@ -205,12 +198,7 @@ def mooncake_pool(tmp_path, monkeypatch):
 
     # TCP rather than RDMA, since a CI node need not have a usable NIC and the
     # transport is not what these tests are about.
-    with running_master(
-        str(master_dir),
-        rpc_port=_free_port(),
-        metrics_port=_free_port(),
-        protocol="tcp",
-    ) as master:
+    with running_master_on_free_ports(str(master_dir), protocol="tcp") as master:
         keeper, _ = _open_store(
             MooncakeStoreConnectorConfig(
                 master_server_address=master.address,
