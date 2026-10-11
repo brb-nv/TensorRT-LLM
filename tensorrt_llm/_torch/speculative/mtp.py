@@ -81,7 +81,9 @@ class MTPHiddenStatesManager(BaseResourceManager):
         for req in context_batch:
             if req.is_first_context_chunk:
                 # A padding dummy (e.g. the attention-DP idle-rank dummy) may
-                # already hold a slot from add_dummy_requests -- reuse it
+                # already hold a slot from add_dummy_requests, and a request
+                # that was loaded asynchronously re-enters the batch still on
+                # its first context chunk, already holding its slot. Reuse it
                 # instead of re-adding, which SlotManager.add_slot only
                 # tolerates for the CUDA-graph dummy id.
                 slot_id = self.slot_manager.get_slot(req.request_id)
