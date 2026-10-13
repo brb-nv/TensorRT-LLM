@@ -1021,6 +1021,11 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         # cannot reconstruct it.
         self.py_served_prefix_end = 0
 
+        # Set once a connector failed to fill an offered prefix. The request is
+        # then served from the local cache alone, so a store that keeps
+        # advertising pages it cannot read cannot restart it indefinitely.
+        self.py_connector_load_failed = False
+
         self.py_result = PyResult(
             prompt_len=self.py_prompt_len,
             max_new_tokens=self.py_max_new_tokens,

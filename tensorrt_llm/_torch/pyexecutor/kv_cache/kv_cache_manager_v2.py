@@ -3761,10 +3761,14 @@ class KVCacheManagerV2(BaseResourceManager):
         queried again. That last part is why the release goes through
         `_release_preempted`: it clears the memoised connector offer
         (`py_connector_prefix_*`, and `free_resources` clears
-        `py_connector_allocation_reported`), so the request is not sent back
-        into the same dead prefix every iteration.
+        `py_connector_allocation_reported`). The connector is still asked, so
+        it keeps tracking the request for saves, but `py_connector_load_failed`
+        makes the manager honour none of its offer: a store that reports pages
+        present and then fails to read them would otherwise restart the
+        request every time.
         """
         self._release_preempted(req)
+        req.py_connector_load_failed = True
         rewind_context_after_cache_drop(req, self.tokens_per_block)
 
     def _set_page_index_bufs(self, request_id: int, kv_cache: _KVCache) -> None:
@@ -4637,6 +4641,11 @@ class KVCacheManagerV2(BaseResourceManager):
         num_tokens, load_async = self.kv_connector_manager.query_num_new_matched_tokens(
             req, local_end
         )
+        if getattr(req, "py_connector_load_failed", False):
+            # This request already lost a load from this connector; trust only
+            # the local match from now on. The asynchronous flag still passes
+            # through, as for any offer honoured for nothing.
+            num_tokens = 0
         offered_end = min(local_end + num_tokens, req.prompt_len - 1)
 
         position = local_end

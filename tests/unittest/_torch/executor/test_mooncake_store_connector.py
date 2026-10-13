@@ -1648,12 +1648,14 @@ def test_async_load_separates_the_failure_from_the_success(store_config, fake_st
 
 
 def test_async_load_stats_summarise_the_interval(store_config, fake_store, monkeypatch):
-    monkeypatch.setattr(worker_module, "ASYNC_STATS_INTERVAL", 0.0)
     with make_async_worker(fake_store, store_config) as worker:
         block_hash = b"\x17" * 16
         fake_store.objects.add(worker._namespaces[0].key(block_hash))
         worker.start_async_load(15, RequestTransfers(15, [PageTransfer(block_hash, 0, 1)]))
+        # get_finished also emits the summary, so the interval may only lapse
+        # once the load is reported, or the polling consumes the line.
         wait_for_async_load(worker, 15)
+        monkeypatch.setattr(worker_module, "ASYNC_STATS_INTERVAL", 0.0)
 
         line = worker._maybe_log_async_stats()
         assert line is not None
@@ -2135,6 +2137,32 @@ def test_scheduler_stops_an_async_load_where_the_pages_run_out(store_config):
 
     (_request_id, transfers) = scheduler._worker.async_loads[0]
     assert [page.page_index for page in transfers.pages] == [10, 11]
+
+
+@pytest.mark.parametrize("async_load", [False, True])
+def test_scheduler_offers_nothing_to_a_request_whose_load_failed(store_config, async_load):
+    """A restarted request runs from the local match, but its saves are still tracked.
+
+    A store that reports a key present while its reads fail would otherwise
+    offer the same prefix on every admission, restarting the request forever.
+    """
+    factory = make_async_scheduler if async_load else make_scheduler
+    scheduler = factory(store_config, hit_blocks=2)
+    tokens = list(range(5 * TOKENS_PER_BLOCK))
+    pages = [10, 11, 12, 13, 14]
+    request = make_request(1, tokens)
+    request.py_connector_load_failed = True
+
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (0, False)
+    scheduler.update_state_after_alloc_by_layer_group(request, [pages])
+    if async_load:
+        assert scheduler._worker.async_loads == []
+
+    metadata = scheduler.build_connector_meta(
+        SchedulerOutput(new_requests=[request_data(1, tokens, pages)])
+    )
+    assert metadata.loads == []
+    assert [page.page_index for page in metadata.saves[0].pages] == pages
 
 
 def test_scheduler_does_not_write_back_an_asynchronously_loaded_prefix(store_config):

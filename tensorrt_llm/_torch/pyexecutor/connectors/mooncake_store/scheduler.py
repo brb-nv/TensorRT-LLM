@@ -197,6 +197,14 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
 
         if not self._config.role.loads:
             return 0, False
+        if getattr(request, "py_connector_load_failed", False):
+            # The executor restarted this request after a page offered to it
+            # could not be read. The state above keeps its saves tracked, but
+            # it is served from the local cache alone: a store that keeps
+            # reporting a key it cannot read would otherwise restart it
+            # forever. Answering here rather than having the runtime decline
+            # the offer keeps any load, synchronous or not, from starting.
+            return 0, False
 
         # A partial local match means the boundary block is half computed on
         # device. Overwriting it with a stored page would discard tokens the

@@ -101,6 +101,7 @@ class FakeRequest:
         self.py_num_connector_matched_tokens = 0
         self.py_connector_allocation_reported = False
         self.py_served_prefix_end = 0
+        self.py_connector_load_failed = False
         self.py_ctx_pre_resize_cap = None
         self.py_draft_tokens = []
         self._context_chunk_size = prompt_len
@@ -912,6 +913,65 @@ class TestReEntryAfterAServe:
         assert manager.prepare_context(req)
 
         assert req.context_current_position == 0
+
+
+class TestFailedLoadRestart:
+    """A request restarted after a failed load is not served a prefix again.
+
+    A store whose lookup keeps reporting a key present while its reads fail
+    would otherwise offer the same prefix on every admission, and the request
+    would restart forever without computing a token.
+    """
+
+    @staticmethod
+    def restart(manager, req):
+        manager.free_resources = lambda request: None
+        manager.drop_context_allocation(req)
+
+    def test_the_restart_rewinds_the_request_and_forgets_the_offer(self):
+        connector = FakeConnectorManager(num_matched=64)
+        manager = make_manager(connector)
+        req = FakeRequest()
+
+        assert serve(manager, req, FakeKvCache(committed=0, capacity=PROMPT_LEN))
+        assert req.context_current_position == 64
+        self.restart(manager, req)
+
+        assert req.py_connector_load_failed
+        assert req.context_current_position == 0
+        assert req.prepopulated_prompt_len == 0
+        assert req.context_chunk_size == PROMPT_LEN
+        assert req.py_num_connector_matched_tokens == 0
+
+    def test_the_restarted_request_runs_from_the_local_match(self):
+        connector = FakeConnectorManager(num_matched=64)
+        manager = make_manager(connector)
+        req = FakeRequest()
+
+        assert serve(manager, req, FakeKvCache(committed=0, capacity=PROMPT_LEN))
+        for _ in range(2):
+            self.restart(manager, req)
+            kv_cache = FakeKvCache(committed=0, capacity=PROMPT_LEN)
+
+            assert not serve(manager, req, kv_cache)
+            assert req.context_current_position == 0
+
+        # Still asked, so the connector keeps tracking the request for saves,
+        # but every later offer is honoured for nothing.
+        assert connector.queries == [(0, 0)] * 3
+        assert connector.commits == [(0, 64, False), (0, 0, False), (0, 0, False)]
+
+    def test_the_local_match_still_applies(self):
+        connector = FakeConnectorManager(num_matched=64)
+        manager = make_manager(connector)
+        req = FakeRequest()
+
+        serve(manager, req, FakeKvCache(committed=0, capacity=PROMPT_LEN))
+        self.restart(manager, req)
+
+        assert not serve(manager, req, FakeKvCache(committed=32, capacity=PROMPT_LEN))
+        assert req.context_current_position == 32
+        assert connector.commits[-1] == (0, 0, False)
 
 
 class TestSwaScratchReuse:
