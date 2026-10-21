@@ -1250,30 +1250,12 @@ class PyExecutor:
                     "list has no notion of beams, so non-leading beams would "
                     "save and restore the wrong KV state.")
 
-            if self.enable_attention_dp:
-                raise NotImplementedError(
-                    "KV Cache Connector is not supported with attention data "
-                    "parallelism (enable_attention_dp). Dummy requests "
-                    "inserted for cross-DP balancing flow through the "
-                    "connector scheduler / worker hooks and are not "
-                    "distinguished from real requests.")
-
             if self.kv_cache_manager is None:
                 raise ValueError(
                     "KV Cache Connector requires a KV Cache Manager.")
 
             is_kv_cache_manager_v2 = isinstance(self.kv_cache_manager,
                                                 KVCacheManagerV2)
-
-            if is_kv_cache_manager_v2 and self.max_draft_len > 0:
-                raise NotImplementedError(
-                    "KV Cache Connector is not supported with speculative "
-                    "decoding. Rejected draft tokens "
-                    "shrink a request's page list, and the freed slot goes to "
-                    "whichever request allocates next. The connector is only "
-                    "told about pages appended since the last report, so it "
-                    "would keep addressing a slot another request now owns. "
-                    "Disable speculative decoding to run a connector.")
 
             scheduler_config = getattr(self.llm_args, 'scheduler_config', None)
             capacity_scheduler_policy = getattr(scheduler_config,

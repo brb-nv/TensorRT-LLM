@@ -1025,16 +1025,6 @@ def _create_py_executor(
         # manager that was actually built.
         v2_selection = kv_cache_config.use_kv_cache_manager_v2
 
-        # Rejected draft tokens shrink a request's page list, and the freed slot
-        # goes to whichever request allocates next. The connector is only told
-        # about pages appended since the last report, so it would keep
-        # addressing a slot another request now owns.
-        if (spec_config is not None and spec_config.max_draft_len > 0
-                and v2_selection is True):
-            raise NotImplementedError(
-                "KV connector is not supported with speculative decoding. "
-                "Disable speculative decoding to run a connector.")
-
         # V1 registers a single pool. V2 checks its resolved layer groups
         # during executor initialization.
         max_attention_window = kv_cache_config.max_attention_window
@@ -1044,11 +1034,6 @@ def _create_py_executor(
                 "KV connector is not supported with VSWA (Variable Sliding Window Attention) "
                 "in this configuration. Use KVCacheManagerV2 with a connector "
                 "that implements the per-layer-group APIs, or use a single attention window."
-            )
-
-        if mapping.enable_attention_dp:
-            raise NotImplementedError(
-                "KV connector is not supported with attention data parallelism (enable_attention_dp=True)."
             )
 
         try:
