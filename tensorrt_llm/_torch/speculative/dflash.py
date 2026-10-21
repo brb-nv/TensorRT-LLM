@@ -544,11 +544,13 @@ def dflash_allocated_ctx_limit(
     ``_refresh_ctx_block_tables`` clamped to 0 -- another request's block. A
     silent cross-request write, not a fault.
 
-    Per-request only on the ``python`` V2 backend, which propagates
-    ``BAD_PAGE_INDEX``. The default ``cpp`` one maps it to 0
-    (kvCacheManagerV2Utils.cu), every row counts full, and this degenerates to
-    the block-table-width bound upstream already applied. Do not read a
-    per-request guarantee into it there.
+    ``block_counts`` is the extent of each request's allocation (last valid
+    table entry + 1), not the number of valid entries: a sliding window's
+    evicted pages precede its live tail. Per-request only on the ``python`` V2
+    backend, which propagates ``BAD_PAGE_INDEX``. The default ``cpp`` one maps
+    it to 0 (kvCacheManagerV2Utils.cu), every row spans its full width, and this
+    degenerates to the block-table-width bound upstream already applied. Do not
+    read a per-request guarantee into it there.
     """
     return (block_counts * page_size - block_size).clamp(min=0)
 
@@ -994,9 +996,11 @@ class DFlashWorker(SpecWorkerBase):
         self._saved_ctx_base = None
         self._saved_ctx_base_host = None
         self._ctx_block_indptr = None
-        # Pages the manager handed this request, per batch row. Saturates at
-        # the table width on the default backend -- dflash_allocated_ctx_limit.
+        # Pages the manager's allocation spans for this request (last valid
+        # entry + 1), per batch row. Saturates at the table width on the
+        # default backend -- dflash_allocated_ctx_limit.
         self._ctx_block_counts = None
+        self._ctx_block_cols = None  # 1..max_blocks_per_seq, for the extent
         # Width of the draft block table last decoded, and whether every row of
         # it counts full (see _host_ctx_alloc): then the per-request allocation
         # the prefill store caps at is known on the host, with no device sync.
@@ -1302,6 +1306,7 @@ class DFlashWorker(SpecWorkerBase):
             0, (num_slots + 1) * max_blocks, max_blocks, dtype=torch.int32, device="cuda"
         )
         self._ctx_block_counts = torch.zeros(num_slots, dtype=torch.long, device="cuda")
+        self._ctx_block_cols = torch.arange(1, max_blocks + 1, dtype=torch.long, device="cuda")
         self._ctx_counts_full_row = _block_counts_are_full_rows(mgr)
         logger.info(
             f"DFlash: ctx block tables {tuple(self._ctx_block_tables.shape)}, "
@@ -1352,9 +1357,14 @@ class DFlashWorker(SpecWorkerBase):
         encoded = src[self._ctx_pool_idx, :num_seqs, 0].to(torch.int64).clone()
         # Per-layer tables address the pool origin; get_buffers() starts at this layer's K.
         encoded.sub_(self._ctx_block_offset)
-        # Before the clamp erases the placeholders. Informative only on the
+        # Before the clamp erases the placeholders: the allocation's extent,
+        # i.e. last valid entry + 1. Not the number of valid entries -- a
+        # sliding-window layer's evicted pages are placeholders BEFORE its live
+        # tail (per-layer tables of a unified cache), so a count stops at the
+        # window and caps every longer context there. Informative only on the
         # python V2 backend; the cpp one already mapped BAD_PAGE_INDEX to 0.
-        self._ctx_block_counts[:num_seqs].copy_((encoded >= 0).sum(dim=1))
+        valid_cols = (encoded >= 0) * self._ctx_block_cols[: encoded.size(1)]
+        self._ctx_block_counts[:num_seqs].copy_(valid_cols.amax(dim=1))
         decoded = encoded.clamp_(min=0).div_(self._ctx_block_divisor, rounding_mode="floor")
         self._ctx_block_tables[:num_seqs].copy_(decoded.to(torch.int32))
         return True
@@ -1395,6 +1405,7 @@ class DFlashWorker(SpecWorkerBase):
         self._ctx_block_tables = None
         self._ctx_block_tables_read = None
         self._ctx_block_counts = None
+        self._ctx_block_cols = None
         # Worker-owned and allocated once, then reused for every later batch
         # shape. With enable_full_slot_arena it spans num_seq_slots, the
         # surviving proxy for the pre-graph capacity after max_num_requests is
