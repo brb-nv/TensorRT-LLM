@@ -14,8 +14,8 @@
 # limitations under the License.
 """Leader side of the Mooncake store KV cache connector.
 
-Runs only on rank 0, deciding what to load and what to save while the workers
-do the moving. That needs two pieces of per-request bookkeeping:
+Runs on every attention-DP owner, or only on rank 0 for TP, deciding what to
+load and what to save while the local worker does the moving. That needs two pieces of per-request bookkeeping:
 
 * a hash chain, since `KVCacheManagerV2` reports `RequestData.block_hashes`
   empty and a block has no content identity otherwise;
@@ -124,7 +124,9 @@ class _RequestState:
 class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
     """Chooses which pages the Mooncake pool serves and which it receives."""
 
-    def __init__(self, llm_args: TorchLlmArgs):
+    supports_attention_dp = True
+
+    def __init__(self, llm_args: TorchLlmArgs) -> None:
         super().__init__(llm_args)
 
         validate_llm_args(llm_args)

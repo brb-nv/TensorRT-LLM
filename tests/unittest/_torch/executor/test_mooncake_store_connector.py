@@ -286,11 +286,14 @@ def set_pool_setting(store_config, **settings):
     store_config.write_text(json.dumps(raw))
 
 
-def make_llm_args(*, run_dir: str | None = None) -> SimpleNamespace:
+def make_llm_args(
+    *, run_dir: str | None = None, enable_attention_dp: bool = False
+) -> SimpleNamespace:
     return SimpleNamespace(
         model="/models/test-model",
         kv_cache_config=SimpleNamespace(tokens_per_block=TOKENS_PER_BLOCK),
         tensor_parallel_size=1,
+        enable_attention_dp=enable_attention_dp,
         pipeline_parallel_size=1,
         context_parallel_size=1,
         sparse_attention_config=None,
@@ -324,6 +327,7 @@ def make_worker(
     *,
     layout: KvCacheLayout | None = None,
     run_dir: str | None = None,
+    enable_attention_dp: bool = False,
 ) -> Iterator[MooncakeStoreConnectorWorker]:
     """Build a worker and shut it down before the test call phase ends.
 
@@ -331,7 +335,9 @@ def make_worker(
     pytest-threadleak snapshots threads around the call phase only, so
     fixture teardown would run too late to keep it quiet.
     """
-    worker = MooncakeStoreConnectorWorker(make_llm_args(run_dir=run_dir))
+    worker = MooncakeStoreConnectorWorker(
+        make_llm_args(run_dir=run_dir, enable_attention_dp=enable_attention_dp)
+    )
     fake_store.workers.append(worker)
     if layout is not None:
         worker.register_kv_cache_layout(layout)
@@ -1551,3 +1557,59 @@ def test_scheduler_bypasses_multimodal_requests_it_cannot_identify(store_config)
     assert metadata.saves == []
     # Nothing was handed to a save thread, so nothing pins its pages either.
     assert scheduler.request_finished(request, [7, 8, 9]) is False
+
+
+# ---- attention data parallelism ----
+
+
+@pytest.mark.parametrize("producer_rank,consumer_rank", [(0, 3), (3, 1), (1, 0)])
+def test_adp_owners_share_one_namespace(
+    store_config,
+    fake_store,
+    mapped_pool,
+    monkeypatch: pytest.MonkeyPatch,
+    producer_rank: int,
+    consumer_rank: int,
+) -> None:
+    """Under attention DP a full prefix needs one copy per layer group, whoever wrote it."""
+    mapped_pool()
+    monkeypatch.setattr(worker_module, "mpi_world_size", lambda: 4)
+    monkeypatch.setattr(worker_module, "mpi_rank", lambda: producer_rank)
+    hashes = BlockHashChain(TOKENS_PER_BLOCK).extend(list(range(2 * TOKENS_PER_BLOCK)))
+    with make_worker(fake_store, layout=make_pool_layout(), enable_attention_dp=True) as producer:
+        for namespace in producer._namespaces.values():
+            fake_store.objects.add(namespace.key(hashes[0]))
+        monkeypatch.setattr(worker_module, "mpi_rank", lambda: consumer_rank)
+        with make_worker(
+            fake_store, layout=make_pool_layout(), enable_attention_dp=True
+        ) as consumer:
+            assert consumer._namespaces == producer._namespaces
+            assert all(len(peers) == 1 for peers in consumer._peer_namespaces.values())
+            assert consumer.count_prefix_hit(hashes) == 1
+            assert len(fake_store.exist_calls[-1]) == len(hashes) * len(consumer._namespaces)
+
+
+def test_tp_lookup_still_requires_all_attention_shards(
+    store_config, fake_store, mapped_pool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    mapped_pool()
+    monkeypatch.setattr(worker_module, "mpi_world_size", lambda: 4)
+    monkeypatch.setattr(worker_module, "mpi_rank", lambda: 0)
+    block_hash = BlockHashChain(TOKENS_PER_BLOCK).extend(list(range(TOKENS_PER_BLOCK)))[0]
+    with make_worker(fake_store, layout=make_pool_layout()) as worker:
+        for namespace in worker._namespaces.values():
+            fake_store.objects.add(namespace.key(block_hash))
+        assert worker.count_prefix_hit([block_hash]) == 0
+        for namespaces in worker._peer_namespaces.values():
+            assert len(namespaces) == 4
+            for namespace in namespaces:
+                fake_store.objects.add(namespace.key(block_hash))
+        assert worker.count_prefix_hit([block_hash]) == 1
+        with make_worker(fake_store, layout=make_pool_layout(), enable_attention_dp=True) as adp:
+            # TP shards are keyed apart from the unsharded attention-DP copy.
+            assert adp.count_prefix_hit([block_hash]) == 0
+
+
+def test_mooncake_declares_adp_support() -> None:
+    assert MooncakeStoreConnectorScheduler.supports_attention_dp
+    assert MooncakeStoreConnectorWorker.supports_attention_dp

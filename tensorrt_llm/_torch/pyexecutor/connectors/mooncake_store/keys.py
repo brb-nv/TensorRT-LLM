@@ -141,9 +141,9 @@ class KeyNamespace:
 
     namespace: str
     model_key: str
-    #: Global rank of the shard whose KV these bytes are, and the world size it
-    #: was produced under. Both are needed: rank 3 of 8 holds different heads
-    #: than rank 3 of 4.
+    #: Attention shard rank and count. Under attention DP every owner uses rank
+    #: 0 of 1, since each holds complete attention KV. TP keeps distinct shard
+    #: keys: rank 3 of 8 can hold different heads than rank 3 of 4.
     rank: int
     world_size: int
     layer_group_id: int
