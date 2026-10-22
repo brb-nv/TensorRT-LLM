@@ -1,8 +1,8 @@
 diff --git a/python/fmha_sm100/api.py b/python/fmha_sm100/api.py
-index b02f747..47dea78 100644
+index b02f747..9b2e1b2 100644
 --- a/python/fmha_sm100/api.py
 +++ b/python/fmha_sm100/api.py
-@@ -17,6 +17,8 @@ __all__ = [
+@@ -17,8 +17,34 @@ __all__ = [
  ]
  
  import numpy as np
@@ -10,8 +10,34 @@ index b02f747..47dea78 100644
 +_SS_VERIFY_ZERO = _ss_os0.environ.get("TLLM_FMHA_PLAN_SS_VERIFY", "0") == "1"
  import torch
  
++
++def _m3_gate_ccs(env_name, default_blackwell):
++    """Compute capabilities a MiniMax-M3 gate first enabled on SM107 runs on: (10, 7), plus the SM100 / SM103 that
++    ``env_name`` lists (comma-separated SM numbers such as "100,103,107"; ``default_blackwell`` when unset), unless
++    TRTLLM_M3_BLACKWELL_RUBIN_OPTS=0. Read once at import."""
++    raw = _ss_os0.environ.get(env_name)
++    if raw is None:
++        listed = set(default_blackwell)
++    else:
++        listed = {int(item.strip().lower().replace("sm_", "").rstrip("af"))
++                  for item in raw.replace(";", ",").split(",") if item.strip()}
++    if _ss_os0.environ.get("TRTLLM_M3_BLACKWELL_RUBIN_OPTS", "1") == "0":
++        listed = set()
++    return frozenset({(10, 7)} | {(sm // 10, sm % 10) for sm in listed & {100, 103}})
++
++
++def _m3_proxy_auto_kv_splits_sms():
++    """The SM100 / SM103 that run the segmented split-KV indexer proxy (TRTLLM_MSA_PROXY_AUTO_KV_SPLITS_ARCHS, default
++    "100,103" as in TRT-LLM's msa_backend): the default Blackwell set of the plan paths that only pay off with its
++    adaptive plans."""
++    raw = _ss_os0.environ.get("TRTLLM_MSA_PROXY_AUTO_KV_SPLITS_ARCHS", "100,103")
++    return tuple(int(item.strip().lower().replace("sm_", "").rstrip("af"))
++                 for item in raw.replace(";", ",").split(",") if item.strip())
++
  from .jit import _dlpack_dtype_code, _PACK_FACTORS, get_fmha_variant, get_reduction_module, get_plan_fn, get_sparse_topk_module
-@@ -91,6 +93,8 @@ def _get_workspace_buf(tag, device):
+ from .sparse_fmha_adapter import sparse_fmha, sparse_fmha_plan
+ 
+@@ -91,6 +117,8 @@ def _get_workspace_buf(tag, device):
      return _workspace_cache[device_id][tag]
  
  def _alloc_perplan_buf(tag, size, device, dtype):
@@ -20,11 +46,12 @@ index b02f747..47dea78 100644
      # global _workspace_cache
      # device_id = torch.device(device).index
      # buf = _workspace_cache[-1][device_id][tag]
-@@ -482,6 +486,72 @@ def _make_plan_info(
+@@ -482,6 +510,76 @@ def _make_plan_info(
      })
  
  
-+# ---- MiniMax-M3 (SM107 only): DEFERRED split decision (exact). The adaptive plan's split decision (plan_cost[0] = split,
++# ---- MiniMax-M3 (SM107, and the SM100 / SM103 of _PLAN_DEFER_READ_CCS): DEFERRED split decision (exact).
++# The adaptive plan's split decision (plan_cost[0] = split,
 +# [1] = predicted speedup) is read back with plan_cost.tolist() in prepare(); its single-CTA plan kernel waits for an SM
 +# under the previous step's kernels, so that read stalls the prepare thread (~1 ms per ctx-bearing step) and costs the
 +# overlap scheduler its run-ahead. Deferred: the same plan kernel, its 2 floats copied to a pinned per-plan buffer with
@@ -33,6 +60,9 @@ index b02f747..47dea78 100644
 +# Never resolved under stream capture (asserted). Kill: TLLM_FMHA_PLAN_DEFER_READ=0. TLLM_FMHA_PLAN_DECISION_LOG=<path>
 +# appends one line per adaptive plan (split, speedup, max_kv_splits, total_qo) on either path, for the trace gate.
 +_PLAN_DEFER_READ = _ss_os0.environ.get("TLLM_FMHA_PLAN_DEFER_READ", "1") != "0"
++# SM107, plus the SM100 / SM103 of TLLM_FMHA_PLAN_DEFER_READ_ARCHS. Unset, that follows the segmented indexer proxy
++# (TRTLLM_MSA_PROXY_AUTO_KV_SPLITS_ARCHS), the only source of adaptive plans there.
++_PLAN_DEFER_READ_CCS = _m3_gate_ccs("TLLM_FMHA_PLAN_DEFER_READ_ARCHS", _m3_proxy_auto_kv_splits_sms())
 +_PLAN_DECISION_LOG = _ss_os0.environ.get("TLLM_FMHA_PLAN_DECISION_LOG")
 +_SPLIT_KEYS = frozenset((
 +    "kv_tile_begin_indices", "kv_tile_end_indices", "kv_split_indices", "num_kv_splits", "workspace_o",
@@ -93,7 +123,7 @@ index b02f747..47dea78 100644
  def _call_plan(qo_segment_offsets, qo_segment_lens, kv_segment_lens,
                 packed_work_range, packed_work_info,
                 qo_tile_size, kv_tile_size, num_qo_heads, num_ctas, causal,
-@@ -507,7 +577,7 @@ def _call_plan(qo_segment_offsets, qo_segment_lens, kv_segment_lens,
+@@ -507,7 +605,7 @@ def _call_plan(qo_segment_offsets, qo_segment_lens, kv_segment_lens,
          pack_factor,
      )
  
@@ -102,7 +132,7 @@ index b02f747..47dea78 100644
      qo_segment_lens: torch.Tensor,
      kv_segment_lens: torch.Tensor,
      num_qo_heads: int,
-@@ -532,9 +602,8 @@ def _fmha_sm100_plan(
+@@ -532,9 +630,8 @@ def _fmha_sm100_plan(
  
      if kv_block_num > 0 and (sparse_kernel_mode == 'prefill' or (sparse_kernel_mode == 'auto' and max_qo_len_orig > _prefill_qlen_threshold(True))):
          # print("Nv-Prefill")
@@ -114,27 +144,38 @@ index b02f747..47dea78 100644
          return sparse_fmha_plan(qo_segment_lens=qo_segment_lens, kv_segment_lens=kv_segment_lens,
                  num_qo_heads=num_qo_heads, causal=causal, qo_offset=qo_offset,
                  num_kv_splits=num_kv_splits, page_size=page_size, output_maxscore=output_maxscore,
-@@ -652,7 +721,10 @@ def _fmha_sm100_plan(
+@@ -652,7 +749,11 @@ def _fmha_sm100_plan(
              kv_tile_end_indices = _alloc_perplan_buf(_BuffTag.kv_tile_end_indices, max_work_items, device, torch.int32)
              kv_split_indices = _alloc_perplan_buf(_BuffTag.kv_split_indices, max_work_items, device, torch.int32)
              num_kv_splits_per_row = _alloc_perplan_buf(_BuffTag.num_kv_splits_per_row, total_qo_len, device, torch.int32)
 -            plan_cost = _alloc_workspace_buf(_BuffTag.plan_cost, 2, device, dtype=torch.float32)
-+            defer = _PLAN_DEFER_READ and _ss_is_sm107(device) and not torch.cuda.is_current_stream_capturing()
++            defer = (_PLAN_DEFER_READ and _ss_cc(device) in _PLAN_DEFER_READ_CCS
++                     and not torch.cuda.is_current_stream_capturing())
 +            # A deferred read owns its plan_cost (the shared one may be rewritten by a later plan on another stream).
 +            plan_cost = (torch.empty(2, dtype=torch.float32, device=device) if defer
 +                         else _alloc_workspace_buf(_BuffTag.plan_cost, 2, device, dtype=torch.float32))
  
              lse_total_size = max_kv_splits * total_qo_len * num_qo_heads
              workspace_lse = _alloc_perplan_buf(_BuffTag.workspace_lse, lse_total_size, device, torch.float32)
-@@ -669,7 +741,32 @@ def _fmha_sm100_plan(
+@@ -669,7 +770,42 @@ def _fmha_sm100_plan(
                  chunk_size, plan_cost, num_kv_splits_per_row, workspace_lse, lse_total_size,
                  pack_factor, cuda_stream)
  
 +            if defer:
 +                host_cost = torch.empty(2, dtype=torch.float32, pin_memory=True)
-+                host_cost.copy_(plan_cost, non_blocking=True)
 +                cost_ready = torch.cuda.Event()
-+                cost_ready.record()
++                # The copy and its event follow the plan kernel on the stream it ran on (a caller's stream= may differ
++                # from the current one).
++                plan_stream = (torch.cuda.ExternalStream(cuda_stream)
++                               if cuda_stream is not None and cuda_stream != torch.cuda.current_stream().cuda_stream
++                               else None)
++                if plan_stream is None:
++                    host_cost.copy_(plan_cost, non_blocking=True)
++                    cost_ready.record()
++                else:
++                    with torch.cuda.stream(plan_stream):
++                        host_cost.copy_(plan_cost, non_blocking=True)
++                        cost_ready.record()
 +                info = _make_plan_info(
 +                    packed_work_range=packed_work_range, packed_work_info=packed_work_info,
 +                    kv_tile_begin_indices=kv_tile_begin_indices, kv_tile_end_indices=kv_tile_end_indices,
@@ -159,7 +200,7 @@ index b02f747..47dea78 100644
              do_split = _cost[0] > 0
              predicted_speedup = _cost[1]
  
-@@ -747,6 +844,164 @@ def _fmha_sm100_plan(
+@@ -747,6 +883,172 @@ def _fmha_sm100_plan(
  
  
  
@@ -176,6 +217,10 @@ index b02f747..47dea78 100644
 +import time as _ss_time
 +
 +_SS_ON = _ss_os.environ.get("TLLM_FMHA_PLAN_SIDE_STREAM", "1") != "0"
++# SM107, plus the SM100 / SM103 of TLLM_FMHA_PLAN_SS_ARCHS. Unset, that follows the segmented indexer proxy
++# (TRTLLM_MSA_PROXY_AUTO_KV_SPLITS_ARCHS): a fixed-split plan has no blocking read to hide, so elsewhere the side
++# stream would only add its stream waits.
++_SS_CCS = _m3_gate_ccs("TLLM_FMHA_PLAN_SS_ARCHS", _m3_proxy_auto_kv_splits_sms())
 +_SS_STREAMS = {}
 +_SS_SIG = _ss_inspect.signature(_fmha_sm100_plan_impl)
 +_SS_STATS = {"n": 0, "waits": [], "logged": False, "vn": 0, "vbad": 0, "tl": []}
@@ -194,12 +239,16 @@ index b02f747..47dea78 100644
 +    return d.index if d.index is not None else torch.cuda.current_device()
 +
 +
-+def _ss_is_sm107(device):
++def _ss_cc(device):
 +    idx = _ss_index(device)
 +    cc = _SS_CC.get(idx)
 +    if cc is None:
 +        cc = _SS_CC[idx] = torch.cuda.get_device_capability(idx)
-+    return cc == (10, 7)
++    return cc
++
++
++def _ss_is_sm107(device):
++    return _ss_cc(device) == (10, 7)
 +
 +
 +def _ss_stream(device):
@@ -254,8 +303,8 @@ index b02f747..47dea78 100644
 +
 +def _ss_eligible(b):
 +    a = b.arguments
-+    if not _ss_is_sm107(a.get("device")):
-+        return False  # validated on SM107 only: SM100 / SM103 keep the stock current-stream plan
++    if _ss_cc(a.get("device")) not in _SS_CCS:
++        return False  # SM107, and the SM100 / SM103 of _SS_CCS: other devices keep the stock current-stream plan
 +    for name in ("qo_segment_lens", "kv_segment_lens", "qo_offset"):
 +        v = a.get(name)
 +        if isinstance(v, torch.Tensor) and v.is_cuda:
@@ -324,7 +373,7 @@ index b02f747..47dea78 100644
  def _fmha_sm100(
      q: torch.Tensor,
      k: torch.Tensor,
-@@ -941,6 +1196,62 @@ def _fmha_sm100(
+@@ -941,6 +1243,62 @@ def _fmha_sm100(
      return out, max_score
  
  
@@ -387,7 +436,7 @@ index b02f747..47dea78 100644
  def fmha_sm100_plan(
      qo_segment_lens: torch.Tensor,
      kv_segment_lens: torch.Tensor,
-@@ -973,9 +1284,11 @@ def fmha_sm100_plan(
+@@ -973,9 +1331,11 @@ def fmha_sm100_plan(
          ``kv_segment_lens - qo_segment_lens`` for bottom-right causal masking.
          A tensor must have shape ``[batch_size]``.
      split_prefill_decode : bool, optional
@@ -402,7 +451,7 @@ index b02f747..47dea78 100644
      **kwargs
          Planner options forwarded to ``_fmha_sm100_plan``.  Common options are
          ``num_kv_heads``, ``num_kv_splits``, ``page_size``,
-@@ -985,8 +1298,13 @@ def fmha_sm100_plan(
+@@ -985,8 +1345,13 @@ def fmha_sm100_plan(
      Returns
      -------
      tuple
@@ -418,7 +467,7 @@ index b02f747..47dea78 100644
      """
  
      # assert qo_segment_lens.device.type == 'cpu' \
-@@ -997,31 +1315,23 @@ def fmha_sm100_plan(
+@@ -997,31 +1362,23 @@ def fmha_sm100_plan(
          qo_offset = kv_segment_lens - qo_segment_lens
      elif isinstance(qo_offset, int):
          qo_offset = torch.full_like(qo_segment_lens, qo_offset)
@@ -463,7 +512,7 @@ index b02f747..47dea78 100644
                                      qo_offset=qo_offset, **kwargs)
          return (False, 0, batch_size, plan, None)
  
-@@ -1081,16 +1391,23 @@ def fmha_sm100(
+@@ -1081,16 +1438,23 @@ def fmha_sm100(
      -------
      tuple[torch.Tensor | None, torch.Tensor | None]
          ``(out, max_score)``.  Either item may be ``None`` if the corresponding
@@ -492,7 +541,7 @@ index b02f747..47dea78 100644
          is_paged = kv_indices is not None
          nnz_qo = q.shape[0]
          num_qo_heads = q.shape[1]
-@@ -1101,10 +1418,12 @@ def fmha_sm100(
+@@ -1101,10 +1465,12 @@ def fmha_sm100(
          if is_paged:
              k_decode, v_decode = k, v
              k_prefill, v_prefill = k, v
@@ -509,7 +558,7 @@ index b02f747..47dea78 100644
              decode_kv_indices = kv_indices[:kv_page_split]
              prefill_kv_indices = kv_indices[kv_page_split:]
          else:
-@@ -1129,27 +1448,35 @@ def fmha_sm100(
+@@ -1129,27 +1495,35 @@ def fmha_sm100(
              decode_qo_offset = None
              prefill_qo_offset = None
  
@@ -6615,7 +6664,7 @@ index 21c777e..fa48c96 100644
              v_q.global_scale,
              k2q_row_ptr,
 diff --git a/python/fmha_sm100/jit.py b/python/fmha_sm100/jit.py
-index fa63a02..2d2aa2b 100644
+index fa63a02..b90bafc 100644
 --- a/python/fmha_sm100/jit.py
 +++ b/python/fmha_sm100/jit.py
 @@ -1,4 +1,5 @@
@@ -6638,7 +6687,7 @@ index fa63a02..2d2aa2b 100644
  import logging
  import os
  import shutil
-@@ -22,11 +24,54 @@ import jinja2
+@@ -22,11 +24,79 @@ import jinja2
  
  logger = logging.getLogger(__name__)
  
@@ -6651,12 +6700,36 @@ index fa63a02..2d2aa2b 100644
 +_CUTLASS_UTIL_INCLUDE = _CUTLASS_DIR / "tools" / "util" / "include"
 +
 +
-+def _device_is_sm107() -> bool:
-+    """Whether the current CUDA device is SM107 (compute capability 10.7)."""
++def _device_cc():
++    """The current CUDA device's compute capability, or None without one."""
 +    import torch
 +
-+    return torch.cuda.is_available() and torch.cuda.get_device_capability() == (10, 7)
++    return tuple(torch.cuda.get_device_capability()) if torch.cuda.is_available() else None
 +
++
++def _parse_sms(raw):
++    return {int(item.strip().lower().replace("sm_", "").rstrip("af"))
++            for item in raw.replace(";", ",").split(",") if item.strip()}
++
++
++def _m3_gate_ccs(env_name, default_blackwell):
++    """Compute capabilities a MiniMax-M3 gate first enabled on SM107 runs on: (10, 7), plus the SM100 / SM103 that
++    ``env_name`` lists (comma-separated SM numbers such as "100,103,107"; ``default_blackwell`` when unset), unless
++    TRTLLM_M3_BLACKWELL_RUBIN_OPTS=0. Read once at import."""
++    raw = os.environ.get(env_name)
++    listed = set(default_blackwell) if raw is None else _parse_sms(raw)
++    if os.environ.get("TRTLLM_M3_BLACKWELL_RUBIN_OPTS", "1") == "0":
++        listed = set()
++    return frozenset({(10, 7)} | {(sm // 10, sm % 10) for sm in listed & {100, 103}})
++
++
++# The OnlyScore K-split kernels these modes change run only for the segmented indexer proxy's 128-token query tiles,
++# so on SM100 / SM103 they follow it (TRTLLM_MSA_PROXY_AUTO_KV_SPLITS_ARCHS, default "100,103" as in TRT-LLM's
++# msa_backend) unless TLLM_FMHA_PROXY_MODE_ARCHS lists the SMs itself. Changing the modes changes the JIT cache directory (a full fmha variant recompile on first use per
++# cache root), so a Blackwell deployment that enables them should pre-warm or share MINFER_FMHA_CACHE_DIR.
++_PROXY_MODE_CCS = _m3_gate_ccs(
++    "TLLM_FMHA_PROXY_MODE_ARCHS", _parse_sms(os.environ.get("TRTLLM_MSA_PROXY_AUTO_KV_SPLITS_ARCHS", "100,103"))
++)
 +
 +_proxy_modes_cache = None
 +
@@ -6667,21 +6740,22 @@ index fa63a02..2d2aa2b 100644
 +    By default they skip the per-tile softmax -> correction -> MMA handshake (kSkipPerTileCorrection in
 +    sm100_fmha_fwd_mainloop_tma_warpspecialized.hpp) and double-buffer S in the O TMEM columns (kSDoubleBuf, which
 +    requires the skip); TLLM_FMHA_PROXY_CORRECTION_CHAIN=1 / TLLM_FMHA_PROXY_S_DOUBLE_BUFFER=0 keep the stock
-+    behaviour, each in its own cache directory. Both are SM107-only: every other device compiles the stock mainloop
-+    (the kill knobs' defines and cache directory). Resolved on first use, not at import, so importing this module
-+    never initializes CUDA (a parent that later forks workers must not hold a CUDA context).
++    behaviour, each in its own cache directory. Both run on SM107 and on the SM100 / SM103 of _PROXY_MODE_CCS: every
++    other device compiles the stock mainloop (the kill knobs' defines and cache directory). Resolved on first use, not
++    at import, so importing this module never initializes CUDA (a parent that later forks workers must not hold a
++    CUDA context).
 +    """
 +    global _proxy_modes_cache
 +    if _proxy_modes_cache is None:
-+        sm107 = _device_is_sm107()
-+        chain = os.environ.get("TLLM_FMHA_PROXY_CORRECTION_CHAIN", "0") == "1" or not sm107
-+        single_s = os.environ.get("TLLM_FMHA_PROXY_S_DOUBLE_BUFFER", "1") == "0" or not sm107
++        enabled = _device_cc() in _PROXY_MODE_CCS
++        chain = os.environ.get("TLLM_FMHA_PROXY_CORRECTION_CHAIN", "0") == "1" or not enabled
++        single_s = os.environ.get("TLLM_FMHA_PROXY_S_DOUBLE_BUFFER", "1") == "0" or not enabled
 +        logger.warning(
 +            "fmha_sm100: OnlyScore K-split per-tile correction handshake %s (TLLM_FMHA_PROXY_CORRECTION_CHAIN=%s), "
 +            "S double buffer %s (TLLM_FMHA_PROXY_S_DOUBLE_BUFFER=%s)%s",
 +            "kept" if chain else "skipped", "1" if chain else "0",
 +            "off" if (single_s or chain) else "on", "0" if single_s else "1",
-+            "" if sm107 else "; stock mainloop, the device is not SM107",
++            "" if enabled else "; stock mainloop on this device (TLLM_FMHA_PROXY_MODE_ARCHS)",
 +        )
 +        _proxy_modes_cache = (chain, single_s)
 +    return _proxy_modes_cache
@@ -6696,7 +6770,7 @@ index fa63a02..2d2aa2b 100644
      # Different build configs get separate cache dirs to avoid conflicts
      suffix = ""
      if os.environ.get("GPU_TRACE") is not None:
-@@ -35,12 +80,58 @@ def _compute_cache_base():
+@@ -35,12 +105,58 @@ def _compute_cache_base():
          suffix += "_sm_timing"
      if os.environ.get("FMHA_GMEM_CHECK") is not None:
          suffix += "_gmem_check"
@@ -6709,7 +6783,7 @@ index fa63a02..2d2aa2b 100644
 +    if suffix and not explicit:
          base = base.parent / (base.name + suffix)
 -    return base
-+
+ 
 +    # Hash templates, bindings and headers together; jit.py also covers changes
 +    # to dispatch and compiler flags. Use relative names so installs share keys.
 +    digest = hashlib.sha256()
@@ -6728,9 +6802,8 @@ index fa63a02..2d2aa2b 100644
 +        "diagnostic modes require recompilation)", cache_base,
 +    )
 +    return cache_base
- 
- 
--CACHE_BASE = _compute_cache_base()
++
++
 +class _LazyCacheBase:
 +    """The cache root, computed on first use: its suffix depends on the device (see _proxy_modes)."""
 +
@@ -6749,7 +6822,8 @@ index fa63a02..2d2aa2b 100644
 +
 +    def __str__(self):
 +        return str(self._resolve())
-+
+ 
+-CACHE_BASE = _compute_cache_base()
 +    def __getattr__(self, name):
 +        return getattr(self._resolve(), name)
 +
@@ -6758,7 +6832,7 @@ index fa63a02..2d2aa2b 100644
  
  
  def _acquire_file_lock(lock_path):
-@@ -55,13 +146,6 @@ def _release_file_lock(fd):
+@@ -55,13 +171,6 @@ def _release_file_lock(fd):
      os.close(fd)
  
  
@@ -6772,7 +6846,7 @@ index fa63a02..2d2aa2b 100644
  
  _PACK_FACTORS = [1,2,4,6,8,16]
  # _PACK_FACTORS = [1, 6]
-@@ -187,7 +271,8 @@ def _get_cuda_home():
+@@ -187,7 +296,8 @@ def _get_cuda_home():
      raise RuntimeError("Cannot find CUDA toolkit. Set CUDA_HOME.")
  
  
@@ -6782,7 +6856,7 @@ index fa63a02..2d2aa2b 100644
  
  def _get_nvcc_flags(cache_dir, fmha=True):
      tvm_include = _get_tvm_ffi_include()
-@@ -199,6 +284,9 @@ def _get_nvcc_flags(cache_dir, fmha=True):
+@@ -199,6 +309,9 @@ def _get_nvcc_flags(cache_dir, fmha=True):
          "--expt-relaxed-constexpr", "--expt-extended-lambda",
          "-gencode=arch=compute_100a,code=sm_100a",
          "-gencode=arch=compute_103a,code=sm_103a",
@@ -6792,7 +6866,7 @@ index fa63a02..2d2aa2b 100644
          "-static-global-template-stub=false",
          "-DFLASHINFER_ENABLE_BF16",
          "-DFLASHINFER_ENABLE_FP8_E4M3",
-@@ -225,6 +313,11 @@ def _get_nvcc_flags(cache_dir, fmha=True):
+@@ -225,6 +338,11 @@ def _get_nvcc_flags(cache_dir, fmha=True):
          nvcc_flags.append("-DSM_TIMING_ENABLED")
      if os.environ.get("FMHA_GMEM_CHECK") is not None:
          nvcc_flags.append("-DFMHA_GMEM_BOUNDS_CHECK")
@@ -6804,7 +6878,7 @@ index fa63a02..2d2aa2b 100644
      return " ".join(nvcc_flags)
  
  class _VariantWrapper:
-@@ -257,9 +350,10 @@ class FMHAVariantManager:
+@@ -257,9 +375,10 @@ class FMHAVariantManager:
      def _ensure_all_module(self):
          if not self._all_module_checked:
              self._all_module_checked = True
