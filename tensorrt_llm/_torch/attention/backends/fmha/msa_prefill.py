@@ -52,11 +52,9 @@ _NVFP4_SPARSE_OUT_IN_PLACE_ARCHS = gate_archs("TRTLLM_MSA_NVFP4_OUT_IN_PLACE_ARC
 # fmha_sm100.
 _DENSE_PREFILL_FA4 = os.environ.get("TRTLLM_MSA_DISABLE_DENSE_FA4", "0") != "1"
 # FA4 rounds differently from fmha_sm100 (deterministic, not bitwise), so the Blackwell SMs it runs on are chosen
-# explicitly: TRTLLM_MSA_DENSE_FA4_ARCHS (default 100,103 with SM107; "107" keeps fmha_sm100 on Blackwell; see
-# blackwell_rubin_opts). SM103 runs the same hardware-ex2 FP8 variant as SM107; SM100 runs FA4's ex2-emulation variant,
-# which on GB200 stays inside fmha_sm100's fp64 error band (equal max error on both test cases, deterministic) at
-# 1.10-1.38x over fmha_sm100 for the TP1/TP2/TP4 head counts at 8k-80k context (bench_dense_prefill_fa4.py).
-_DENSE_FA4_ARCHS = gate_archs("TRTLLM_MSA_DENSE_FA4_ARCHS")
+# explicitly: TRTLLM_MSA_DENSE_FA4_ARCHS (default 103 with SM107; see blackwell_rubin_opts). SM103 runs the same
+# hardware-ex2 FP8 variant as SM107; SM100 runs FA4's ex2-emulation variant, so it is opt-in (add 100).
+_DENSE_FA4_ARCHS = gate_archs("TRTLLM_MSA_DENSE_FA4_ARCHS", default_blackwell=(103,))
 # The FA4 shape this path serves: TMA page loads need the page to equal FA4's 128-wide n tile.
 _DENSE_FA4_HEAD_DIM = 128
 _DENSE_FA4_PAGE_SIZE = 128

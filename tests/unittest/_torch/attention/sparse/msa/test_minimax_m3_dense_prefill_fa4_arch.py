@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""MiniMax-M3 FP8 dense prefill: FA4 engages on SM107 and the SMs of TRTLLM_MSA_DENSE_FA4_ARCHS (default SM100, SM103)
+"""MiniMax-M3 FP8 dense prefill: FA4 engages on SM107 and the SMs of TRTLLM_MSA_DENSE_FA4_ARCHS (default SM103)
 (CPU-level; FA4 itself is stubbed)."""
 
 import os
@@ -42,7 +42,7 @@ def test_dense_prefill_fa4_default_archs() -> None:
     from tensorrt_llm._torch import blackwell_rubin_opts
 
     if blackwell_rubin_opts.UMBRELLA_ON and "TRTLLM_MSA_DENSE_FA4_ARCHS" not in os.environ:
-        assert msa_prefill._DENSE_FA4_ARCHS == {100, 103, 107}
+        assert msa_prefill._DENSE_FA4_ARCHS == {103, 107}
     assert 107 in msa_prefill._DENSE_FA4_ARCHS
 
 
