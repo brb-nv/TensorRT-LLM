@@ -128,21 +128,52 @@ def _load_with_capability(monkeypatch, root: str, cap: tuple, calls: list):
     return modules
 
 
+_BLACKWELL_ARCH_ENVS = (
+    "TRTLLM_M3_BLACKWELL_RUBIN_OPTS",
+    "TRTLLM_MSA_PROXY_AUTO_KV_SPLITS_ARCHS",
+    "TLLM_FMHA_PROXY_MODE_ARCHS",
+)
+
+
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("cap", [(10, 7), (10, 0), (10, 3)], ids=["sm107", "sm100", "sm103"])
 @pytest.mark.parametrize("chain, dbuf, r2kill", [("0", "1", "0"), ("1", "1", "1"), ("0", "0", "0")])
-def test_proxy_modes_and_r2_store_engage_on_sm107_only(monkeypatch, cap, chain, dbuf, r2kill):
+@pytest.mark.parametrize(
+    "arch_env, proxy_mode_sms",
+    [
+        ({}, ()),
+        ({"TRTLLM_MSA_PROXY_AUTO_KV_SPLITS_ARCHS": "100,103"}, (100, 103)),
+        ({"TLLM_FMHA_PROXY_MODE_ARCHS": "103"}, (103,)),
+        (
+            {
+                "TRTLLM_MSA_PROXY_AUTO_KV_SPLITS_ARCHS": "100,103",
+                "TRTLLM_M3_BLACKWELL_RUBIN_OPTS": "0",
+            },
+            (),
+        ),
+    ],
+    ids=["stock", "with_segmented_proxy", "explicit_sm103", "umbrella_off"],
+)
+def test_proxy_modes_and_r2_store_engage_on_listed_archs(
+    monkeypatch, cap, chain, dbuf, r2kill, arch_env, proxy_mode_sms
+):
     root = _fmha_sm100_dir()
     monkeypatch.setenv("TLLM_FMHA_PROXY_CORRECTION_CHAIN", chain)
     monkeypatch.setenv("TLLM_FMHA_PROXY_S_DOUBLE_BUFFER", dbuf)
     monkeypatch.setenv("TRTLLM_MSA_DISABLE_R2STORE", r2kill)
+    for name in _BLACKWELL_ARCH_ENVS:
+        monkeypatch.delenv(name, raising=False)
+    for name, value in arch_env.items():
+        monkeypatch.setenv(name, value)
     calls = []
     jit, aot = _load_with_capability(monkeypatch, root, cap, calls)
     # Importing either module queries no device (no CUDA initialization before a worker fork).
     assert calls == []
     sm107 = cap == (10, 7)
-    want_chain = chain == "1" or not sm107
-    want_single = dbuf == "0" or not sm107
+    # The proxy modes: SM107, and the SM100 / SM103 that follow the segmented proxy or are listed themselves.
+    modes_on = sm107 or cap[0] * 10 + cap[1] in proxy_mode_sms
+    want_chain = chain == "1" or not modes_on
+    want_single = dbuf == "0" or not modes_on
     jit._get_tvm_ffi_include = lambda: "/stub/tvm_ffi/include"  # flags only; nothing is compiled
     flags = jit._get_nvcc_flags(jit.CACHE_BASE)
     assert tuple(jit._proxy_modes()) == (want_chain, want_single)
