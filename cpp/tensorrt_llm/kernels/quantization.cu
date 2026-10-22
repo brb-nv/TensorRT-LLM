@@ -15,6 +15,7 @@
  */
 
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/blackwellRubinOpts.h"
 #include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaTypeUtils.cuh"
 #include "tensorrt_llm/common/cudaUtils.h"
@@ -194,8 +195,31 @@ void invokeFP4Quantization(int b, int m, int n, T const* input, float const* SFS
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 // MXFP8 Quantization
 
-// Kill switch for the SM107 quantize_mxfp8_rows path of invokeMxFP8Quantization.
+// Kill switch for the quantize_mxfp8_rows path of invokeMxFP8Quantization.
 constexpr bool kMxfp8QuantSm107Rows = true;
+// SM100/SM103 take the rows path from this many rows (TRTLLM_MXFP8_QUANT_ROWS_MIN_M overrides it): it shrinks the
+// grid of decode-sized quantizes, which stay on the stock kernel there. SM107 takes it at every M.
+constexpr int kMxfp8QuantRowsBlackwellMinM = 1024;
+
+// The fewest rows that take quantize_mxfp8_rows on this device, or -1 where it is off: SM107 always (0); SM100/SM103
+// where TRTLLM_MXFP8_QUANT_ROWS_ARCHS lists them (default 100,103; TRTLLM_M3_BLACKWELL_RUBIN_OPTS=0 drops them).
+inline int mxfp8QuantRowsMinM()
+{
+    static int const minM = []
+    {
+        int const sm = tensorrt_llm::common::getSMVersion();
+        if (!tensorrt_llm::common::blackwell_rubin_opts::gateOn("TRTLLM_MXFP8_QUANT_ROWS_ARCHS", {100, 103}, sm))
+        {
+            return -1;
+        }
+        if (sm == tensorrt_llm::common::blackwell_rubin_opts::kRubinSm)
+        {
+            return 0;
+        }
+        return tensorrt_llm::common::getIntEnv("TRTLLM_MXFP8_QUANT_ROWS_MIN_M").value_or(kMxfp8QuantRowsBlackwellMinM);
+    }();
+    return minM;
+}
 
 template <typename T, int SF_VEC_SIZE, int SF_OUTPUT_VEC_SIZE>
 void invokeMxFP8Quantization(int b, int m, int n, int padded_n, T const* input, int64_t* output, int32_t* SFOuput,
@@ -210,13 +234,14 @@ void invokeMxFP8Quantization(int b, int m, int n, int padded_n, T const* input, 
         return;
     }
 
-    // SM107: one unpadded matrix with swizzled K32 scales runs quantize_mxfp8_rows (same math, one column chunk per
-    // thread, 8 rows in flight); bitwise the same output.
+    // SM107 / SM100 / SM103: one unpadded matrix with swizzled K32 scales runs quantize_mxfp8_rows (same math, one
+    // column chunk per thread, 8 rows in flight); bitwise the same output.
     if constexpr (SF_VEC_SIZE == 32 && SF_OUTPUT_VEC_SIZE == 32)
     {
         int const colThreads = n / CVT_ELTS_PER_THREAD;
-        if (kMxfp8QuantSm107Rows && tensorrt_llm::common::getSMVersion() == 107 && b == 1 && n == padded_n
-            && layout == QuantizationSFLayout::SWIZZLED && n % 128 == 0 && colThreads <= 1024 && colThreads % 32 == 0)
+        int const rowsMinM = kMxfp8QuantSm107Rows ? mxfp8QuantRowsMinM() : -1;
+        if (rowsMinM >= 0 && m >= rowsMinM && b == 1 && n == padded_n && layout == QuantizationSFLayout::SWIZZLED
+            && n % 128 == 0 && colThreads <= 1024 && colThreads % 32 == 0)
         {
             constexpr int kRows = 8;
             int const ctasPerSm = colThreads > 512 ? 1 : 2;
