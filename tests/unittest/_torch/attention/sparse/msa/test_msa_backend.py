@@ -2441,14 +2441,33 @@ def test_nvfp4_scatter_writes_physical_p32_data_and_scale_layouts():
 
 
 @pytest.mark.parametrize(
-    "sm_version,enabled,expected",
-    [(107, True, True), (107, False, False), (103, True, False), (100, True, False)],
+    "sm_version,enabled,archs,expected",
+    [
+        (107, True, (107,), True),
+        (107, False, (107,), False),
+        (103, True, (107,), False),
+        (100, True, (107,), False),
+        (103, True, (100, 103, 107), True),
+        (100, True, (100, 103, 107), True),
+        (103, False, (100, 103, 107), False),
+        (90, True, (100, 103, 107), False),
+    ],
 )
-def test_proxy_segmented_only_on_sm107(monkeypatch, sm_version, enabled, expected):
-    """The segmented, split indexer proxy runs on SM107 only, behind its constant."""
+def test_proxy_segmented_on_listed_archs(monkeypatch, sm_version, enabled, archs, expected):
+    """The segmented, split indexer proxy runs on SM107 and on the SM100/SM103 that
+    TRTLLM_MSA_PROXY_AUTO_KV_SPLITS_ARCHS opts in (none by default), behind its constant."""
     monkeypatch.setattr(msa_backend_module, "get_sm_version", lambda: sm_version)
     monkeypatch.setattr(msa_backend_module, "_SM107_PROXY_AUTO_KV_SPLITS", enabled)
+    monkeypatch.setattr(msa_backend_module, "_PROXY_AUTO_KV_SPLITS_ARCHS", frozenset(archs))
     assert msa_backend_module._proxy_segmented() is expected
+
+
+def test_proxy_segmented_default_is_rubin_only():
+    """Without TRTLLM_MSA_PROXY_AUTO_KV_SPLITS_ARCHS the Blackwell SMs keep the unsegmented proxy."""
+    import os
+
+    if "TRTLLM_MSA_PROXY_AUTO_KV_SPLITS_ARCHS" not in os.environ:
+        assert msa_backend_module._PROXY_AUTO_KV_SPLITS_ARCHS == {107}
 
 
 def test_proxy_segment_rows_keep_each_tokens_causal_range():
