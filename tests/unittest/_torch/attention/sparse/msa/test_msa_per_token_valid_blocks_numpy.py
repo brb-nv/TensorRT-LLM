@@ -23,8 +23,11 @@ from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels import msa
 
 
 def _both(monkeypatch, *args, **kwargs):
-    # The NumPy pass is SM107-only: these CPU checks pose as SM107 to compare the two paths.
-    monkeypatch.setattr(msa_utils, "get_sm_version", lambda: 107)
+    # The NumPy pass runs on SM107 and SM100/SM103: these CPU checks pose as SM103 to compare the two paths.
+    monkeypatch.setattr(msa_utils, "get_sm_version", lambda: 103)
+    monkeypatch.setattr(
+        msa_utils, "_PER_TOKEN_VALID_BLOCKS_NUMPY_ARCHS", frozenset((100, 103, 107))
+    )
     monkeypatch.setattr(msa_utils, "_PER_TOKEN_VALID_BLOCKS_NUMPY", False)
     ref = msa_utils.per_token_valid_blocks(*args, **kwargs)
     monkeypatch.setattr(msa_utils, "_PER_TOKEN_VALID_BLOCKS_NUMPY", True)
@@ -74,3 +77,23 @@ def test_kill_env_name_unchanged():
     import inspect
 
     assert '"TRTLLM_MSA_PTVB_NUMPY", "1"' in inspect.getsource(msa_utils)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "sm, archs, numpy_taken",
+    [(107, (107,), True), (103, (107,), False), (90, (100, 103, 107), False)],
+)
+def test_numpy_pass_arch_gate(monkeypatch, sm, archs, numpy_taken):
+    calls = []
+    monkeypatch.setattr(msa_utils, "get_sm_version", lambda: sm)
+    monkeypatch.setattr(msa_utils, "_PER_TOKEN_VALID_BLOCKS_NUMPY", True)
+    monkeypatch.setattr(msa_utils, "_PER_TOKEN_VALID_BLOCKS_NUMPY_ARCHS", frozenset(archs))
+    real = msa_utils._per_token_valid_blocks_numpy
+    monkeypatch.setattr(
+        msa_utils, "_per_token_valid_blocks_numpy", lambda *a, **k: calls.append(1) or real(*a, **k)
+    )
+    msa_utils.per_token_valid_blocks(
+        torch.tensor([3]), torch.tensor([300]), None, causal=True, block_size=128
+    )
+    assert bool(calls) is numpy_taken
