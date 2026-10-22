@@ -1808,10 +1808,32 @@ def test_scheduler_never_offers_the_whole_prompt(store_config):
     assert matched == 2 * TOKENS_PER_BLOCK
 
 
-def test_scheduler_declines_partial_local_matches(store_config):
-    scheduler = make_scheduler(store_config, hit_blocks=2)
+def test_scheduler_declines_an_unaligned_match_it_can_only_complete(store_config):
+    # Only the boundary block is stored: loading it would supply less than a
+    # block of new tokens.
+    scheduler = make_scheduler(store_config, hit_blocks=1)
     request = make_request(1, list(range(5 * TOKENS_PER_BLOCK)))
-    assert scheduler.get_num_new_matched_tokens(request, TOKENS_PER_BLOCK + 1) == (0, False)
+    assert scheduler.get_num_new_matched_tokens(request, 2 * TOKENS_PER_BLOCK - 1) == (0, False)
+
+
+def test_scheduler_serves_an_unaligned_local_match_from_its_boundary_block(store_config):
+    # A speculative-decoding reuse backoff leaves the local match one token
+    # short of a block boundary; the offer starts at that boundary block.
+    scheduler = make_scheduler(store_config, hit_blocks=3)
+    tokens = list(range(5 * TOKENS_PER_BLOCK))
+    request = make_request(1, tokens)
+    local = 2 * TOKENS_PER_BLOCK - 1
+    matched, _ = scheduler.get_num_new_matched_tokens(request, local)
+    # Blocks 1, 2 and 3 come from the store, so the request resumes at block 4.
+    assert matched == 4 * TOKENS_PER_BLOCK - local
+    full_chain = list(BlockHashChain(TOKENS_PER_BLOCK).extend(tokens))
+    assert scheduler._worker.queries[0] == full_chain[1:4]
+
+    output = SchedulerOutput(new_requests=[request_data(1, tokens, [10, 11, 12, 13, 14])])
+    metadata = scheduler.build_connector_meta(output)
+    # The boundary block's private page is overwritten by its stored copy.
+    assert [page.page_index for page in metadata.loads[0].pages] == [11, 12, 13]
+    assert [page.page_index for page in metadata.saves[0].pages] == [14]
 
 
 def test_scheduler_skips_local_prefix_when_looking_up(store_config):
@@ -1847,7 +1869,7 @@ def test_scheduler_counts_lookups_and_saves(store_config):
     scheduler.build_connector_meta(
         SchedulerOutput(new_requests=[request_data(1, tokens, [10, 11, 12, 13, 14])])
     )
-    # An unaligned local match is declined before any probe.
+    # An unaligned local match is probed from its boundary block.
     scheduler.get_num_new_matched_tokens(make_request(2, tokens), 1)
     # A local match covering every candidate leaves nothing to probe.
     scheduler.get_num_new_matched_tokens(make_request(3, tokens), 4 * TOKENS_PER_BLOCK)
@@ -1856,11 +1878,11 @@ def test_scheduler_counts_lookups_and_saves(store_config):
     assert stats.lookups == 3
     assert stats.unaligned == 1
     assert stats.no_candidates == 1
-    assert stats.probed == 1
-    assert stats.with_hit == 1
+    assert stats.probed == 2
+    assert stats.with_hit == 2
     assert stats.blocks_local == 4
-    assert stats.blocks_probed == 4
-    assert stats.blocks_hit == 2
+    assert stats.blocks_probed == 8
+    assert stats.blocks_hit == 4
     assert stats.save_requests == 1
     assert stats.blocks_saved == 3
 

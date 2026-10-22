@@ -277,14 +277,18 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
         stats.touch()
         stats.maybe_log(self._tokens_per_block)
 
-        # A partial local match means the boundary block is half computed on
-        # device. Overwriting it with a stored page would discard tokens the
-        # runtime already counted, so only whole-block offers are made.
-        if num_computed_tokens % self._tokens_per_block:
-            stats.unaligned += 1
-            return 0, False
-
+        # A local match can end inside a block. KVCacheManagerV2 trims every
+        # radix match by the draft's prompt lookahead (one token for one-model
+        # Eagle3), so with speculative decoding nearly every local match is
+        # unaligned. The boundary block's page is then a private copy the
+        # runtime made of the shared one, so the offer starts at that block and
+        # its stored page replaces the copy: the target KV of the positions the
+        # runtime already counted is the same either way, and the stored page
+        # also completes the positions the backoff dropped.
         first_block = num_computed_tokens // self._tokens_per_block
+        unaligned = num_computed_tokens % self._tokens_per_block != 0
+        if unaligned:
+            stats.unaligned += 1
         # Stop one token short of the prompt: the runtime still has to run a
         # forward pass for this request, and it cannot do that with nothing left
         # to compute.
@@ -298,18 +302,20 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
         stats.probed += 1
         stats.blocks_probed += len(candidates)
         stats.blocks_hit += hit_blocks
-        if hit_blocks == 0:
+        # From an unaligned start, the boundary block alone would cost a page
+        # transfer to supply less than a block of tokens.
+        if hit_blocks < (2 if unaligned else 1):
             return 0, False
         stats.with_hit += 1
 
         state.load_first_block = first_block
         state.load_blocks = hit_blocks
+        offered = (first_block + hit_blocks) * self._tokens_per_block - num_computed_tokens
         logger.debug(
-            f"mooncake-store matched {hit_blocks} blocks "
-            f"({hit_blocks * self._tokens_per_block} tokens) "
-            f"for request {request.request_id}"
+            f"mooncake-store matched {hit_blocks} blocks from block {first_block} "
+            f"({offered} new tokens) for request {request.request_id}"
         )
-        return hit_blocks * self._tokens_per_block, self._async_load
+        return offered, self._async_load
 
     def update_state_after_alloc(self, request: LlmRequest, block_ids: List[int]):
         """No-op: page indices are read per layer group instead.
