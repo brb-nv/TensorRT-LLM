@@ -106,14 +106,18 @@ def _fold_ok(moe, x) -> bool:
 def test_fold_shared_refused_with_separated_routing(monkeypatch) -> None:
     tokens = 512
     monkeypatch.setattr(modeling_minimaxm3, "_FOLD_SHARED_INTO_FINALIZE", True)
-    # The fold engages on SM107 only; pin it so the routing checks below are exercised on every SM10x.
+    # The fold engages on SM107 and the SMs of TLLM_M3_MOE_FOLD_SHARED_ARCHS; pin SM107 so the routing checks below
+    # are exercised on every SM10x.
     monkeypatch.setattr(modeling_minimaxm3, "get_sm_version", lambda: 107)
     with torch.device("cuda"), torch.inference_mode():
         moe, x, logits, shared = _build(tokens)
         assert _fold_ok(moe, x), "fold must stay enabled when the kernel routes from the logits"
         for sm in (100, 103):
             monkeypatch.setattr(modeling_minimaxm3, "get_sm_version", lambda sm=sm: sm)
-            assert not _fold_ok(moe, x), f"fold must stay off on SM{sm}"
+            monkeypatch.setattr(modeling_minimaxm3, "_FOLD_SHARED_ARCHS", frozenset((sm, 107)))
+            assert _fold_ok(moe, x), f"fold must engage on a listed SM{sm}"
+            monkeypatch.setattr(modeling_minimaxm3, "_FOLD_SHARED_ARCHS", frozenset((107,)))
+            assert not _fold_ok(moe, x), f"fold must stay off on an unlisted SM{sm}"
         monkeypatch.setattr(modeling_minimaxm3, "get_sm_version", lambda: 107)
 
         monkeypatch.setattr(trtllm_gen_base, "FORCE_SEPARATED_ROUTING", True)

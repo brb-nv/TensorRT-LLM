@@ -3190,13 +3190,24 @@ def test_swiglu_mxfp8_default_arch_set() -> None:
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize("sm, expected", [(107, True), (100, False), (103, False), (90, False)])
-def test_shared_fold_into_trtllm_gen_finalize_is_sm107_only(
-    monkeypatch, sm: int, expected: bool
+@pytest.mark.parametrize(
+    "sm, archs, expected",
+    [
+        (107, (107,), True),
+        (100, (100, 103, 107), True),
+        (103, (100, 103, 107), True),
+        (100, (107,), False),
+        (103, (107,), False),
+        (90, (100, 103, 107), False),
+    ],
+)
+def test_shared_fold_into_trtllm_gen_finalize_on_listed_archs(
+    monkeypatch, sm: int, archs: tuple, expected: bool
 ) -> None:
-    # An otherwise eligible TRTLLM-gen NVFP4 MoE: the fold engages on SM107 (positive control) and, elsewhere, the
-    # shared expert keeps its separate add after the finalize.
+    # An otherwise eligible TRTLLM-gen NVFP4 MoE: the fold engages on SM107 and the Blackwell SMs of
+    # TLLM_M3_MOE_FOLD_SHARED_ARCHS and, elsewhere, the shared expert keeps its separate add after the finalize.
     monkeypatch.setattr(modeling_minimaxm3, "_FOLD_SHARED_INTO_FINALIZE", True)
+    monkeypatch.setattr(modeling_minimaxm3, "_FOLD_SHARED_ARCHS", frozenset(archs))
     monkeypatch.setattr(modeling_minimaxm3, "get_sm_version", lambda: sm)
     monkeypatch.setattr(modeling_minimaxm3, "ctx_eager_only", lambda: True)
     hidden = 64
