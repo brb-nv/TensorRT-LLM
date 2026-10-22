@@ -141,6 +141,9 @@ _CTX_NORM_FP4_LOGGED = False
 # weights, then adds the shared output with the ATen add_'s rounding: bitwise the same as finalize + add_, one fewer
 # full read-modify-write of the hidden states. TLLM_M3_MOE_FOLD_SHARED=0 is the kill switch.
 _FOLD_SHARED_INTO_FINALIZE = os.environ.get("TLLM_M3_MOE_FOLD_SHARED", "1") == "1"
+# SM107 always; SM100 / SM103 where TLLM_M3_MOE_FOLD_SHARED_ARCHS lists them (default 100,103; see
+# blackwell_rubin_opts). The fold is a Triton pass over the same TRTLLM-gen runner's unfinalized output.
+_FOLD_SHARED_ARCHS = gate_archs("TLLM_M3_MOE_FOLD_SHARED_ARCHS")
 # (diagnostic) With the fold on two streams, the main stream waits for the shared expert before the routed compute.
 _FOLD_WAIT_UPFRONT = os.environ.get("TLLM_M3_MOE_FOLD_WAIT_UPFRONT", "0") == "1"
 _FOLD_SHARED_LOGGED = False
@@ -1503,7 +1506,7 @@ class MiniMaxM3MoE(nn.Module):
 
         if (
             not _FOLD_SHARED_INTO_FINALIZE
-            or get_sm_version() != 107
+            or get_sm_version() not in _FOLD_SHARED_ARCHS
             or self.shared_experts is None
             or lora_params
             or not ctx_eager_only()

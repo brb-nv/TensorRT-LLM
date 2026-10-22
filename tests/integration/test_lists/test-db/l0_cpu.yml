@@ -111,7 +111,7 @@ l0_cpu:
   - unittest/_torch/models/test_minimax_m3.py::test_bcg_bucket_takes_eager_qkv
   - unittest/_torch/models/test_minimax_m3.py::test_bcg_bucket_keeps_captured_qkv_off_rubin
   - unittest/_torch/models/test_minimax_m3.py::test_swiglu_mxfp8_engages_on_listed_archs
-  - unittest/_torch/models/test_minimax_m3.py::test_shared_fold_into_trtllm_gen_finalize_is_sm107_only
+  - unittest/_torch/models/test_minimax_m3.py::test_shared_fold_into_trtllm_gen_finalize_on_listed_archs
   - unittest/_torch/models/test_minimax_m3.py::test_fused_qkv_rows_agree_between_eager_and_breakable
   - unittest/_torch/models/test_minimax_m3.py::test_ctx_boundary_norm_declines_off_listed_archs_and_off_geometry
   - unittest/_torch/models/test_minimax_m3.py::test_ctx_boundary_norm_engages_on_listed_archs
