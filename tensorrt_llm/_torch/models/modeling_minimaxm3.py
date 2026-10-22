@@ -777,13 +777,20 @@ def _minimax_m3_router_input_fp32_fake(hidden_states: torch.Tensor) -> torch.Ten
 _CTX_QKV_FUSED = os.environ.get("TRTLLM_CTX_QKV_FUSED", "1") == "1"
 _CTX_QKV_FUSED_MIN_ROWS = 1024
 # SM107 always; SM100 / SM103 only where TRTLLM_CTX_QKV_FUSED_ARCHS lists them (opt-in, see blackwell_rubin_opts). There
-# the kernel runs on the K32 SM100 MMA atom with 2-head tiles (TRTLLM_CTX_QKV_FUSED_HEADS_PER_TILE overrides the tile;
-# 1..3 fit TMEM), launches without PDL unless TRTLLM_ENABLE_PDL=1 (its TMA warp triggers dependents before the
-# epilogue stores), compiles during the AutoTuner warmup pass, and a failed compile falls back to the stock projection.
+# the kernel runs on the K32 SM100 MMA atom with 2-head tiles (TRTLLM_CTX_QKV_FUSED_HEADS_PER_TILE=1 picks 1-head
+# tiles; other values keep 2: a 3-head tile with a 128-wide MMA N never finished on GB200), launches without PDL unless
+# TRTLLM_ENABLE_PDL=1 (its TMA warp triggers dependents before the epilogue stores), compiles during the AutoTuner
+# warmup pass, and a failed compile falls back to the stock projection.
 _CTX_QKV_FUSED_ARCHS = gate_archs("TRTLLM_CTX_QKV_FUSED_ARCHS", default_blackwell=())
-_CTX_QKV_FUSED_SM10X_HEADS_PER_TILE = int(
-    os.environ.get("TRTLLM_CTX_QKV_FUSED_HEADS_PER_TILE", "2")
+_CTX_QKV_FUSED_SM10X_HEADS_PER_TILE_ENV = os.environ.get("TRTLLM_CTX_QKV_FUSED_HEADS_PER_TILE", "2")
+_CTX_QKV_FUSED_SM10X_HEADS_PER_TILE = (
+    1 if _CTX_QKV_FUSED_SM10X_HEADS_PER_TILE_ENV.strip() == "1" else 2
 )
+if _CTX_QKV_FUSED_SM10X_HEADS_PER_TILE_ENV.strip() not in ("1", "2"):
+    logger.warning(
+        f"TRTLLM_CTX_QKV_FUSED_HEADS_PER_TILE={_CTX_QKV_FUSED_SM10X_HEADS_PER_TILE_ENV!r} is not 1 or 2; the SM100 / "
+        "SM103 fused QKV GEMM + producer uses 2-head tiles"
+    )
 _CTX_QKV_FUSED_SM10X_PDL = os.environ.get("TRTLLM_ENABLE_PDL", "0") == "1"
 _CTX_QKV_FUSED_FAILED: set = set()
 # A layer whose QKV the fused producer above took runs its attention core and o_proj through _core_then_o_proj, so the
