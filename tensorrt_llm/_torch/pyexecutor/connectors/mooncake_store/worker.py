@@ -832,14 +832,15 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
                 return
             self._async_pending.add(request_id)
         fence: Optional[torch.cuda.Event] = None
-        if not self._async_stagings and torch.cuda.is_available():
-            # Zero-copy: the NIC writes the pages directly, ordered by no CUDA
-            # stream, and a recycled page may still be written by work queued
-            # before this allocation, e.g. the last token of a request that
-            # stopped there. KVCacheManagerV2 calls the alloc hook with the
-            # stream that orders the request's allocation current, so the load
-            # thread waits on an event recorded here rather than on the
-            # executor-thread fence, which would block this iteration.
+        if torch.cuda.is_available():
+            # A recycled page may still be written by work queued before this
+            # allocation, e.g. the last token of a request that stopped there.
+            # Neither the NIC (zero-copy) nor a load thread's own staging
+            # stream is ordered after that work. KVCacheManagerV2 calls the
+            # alloc hook with the stream that orders the request's allocation
+            # current, so the load thread waits on an event recorded here
+            # rather than on the executor-thread fence, which would block this
+            # iteration.
             fence = torch.cuda.Event()
             fence.record(torch.cuda.current_stream())
         self._load_queue.put((request_id, transfers, time.monotonic(), fence))
@@ -881,7 +882,12 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
             loaded_bytes = 0
             try:
                 if fence is not None:
-                    fence.synchronize()
+                    if stream is not None:
+                        # Staged: the scatter runs on this thread's stream.
+                        stream.wait_event(fence)
+                    else:
+                        # Zero-copy: the NIC is ordered by no stream.
+                        fence.synchronize()
                 keys, addresses, sizes, total_pages = self._resolve([transfers])
                 owners = [request_id] * len(keys)
                 failed_requests, num_failed_pages, first_failure, loaded_bytes = self._load_pages(

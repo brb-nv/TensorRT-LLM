@@ -1556,6 +1556,49 @@ def test_worker_rejects_async_load_under_tensor_parallelism(store_config, fake_s
 WIDE_TRANSFER_BATCH = 4 * worker_module.MIN_ASYNC_STAGING_SLOTS
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="staged async loads need a device")
+def test_staged_async_load_orders_its_scatter_after_the_allocation(
+    store_config, fake_store, staged_copies, monkeypatch
+):
+    """A recycled page may still be written by the previous pass.
+
+    The load thread scatters on its own stream, so that stream waits on an
+    event recorded where the page was allocated before the store is read.
+    """
+    waits = []
+
+    class FakeEvent:
+        def record(self, _stream=None):
+            pass
+
+        def synchronize(self):
+            waits.append(("host", len(fake_store.get_calls)))
+
+    class FakeStream:
+        cuda_stream = 0
+
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def wait_event(self, event):
+            assert isinstance(event, FakeEvent)
+            waits.append(("stream", len(fake_store.get_calls)))
+
+    monkeypatch.setattr(torch.cuda, "Event", FakeEvent)
+    monkeypatch.setattr(torch.cuda, "Stream", FakeStream)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda *_args, **_kwargs: None)
+    with make_staged_worker(
+        fake_store, store_config, layout=make_layout(), async_load=True
+    ) as worker:
+        block_hash = b"\x0c" * 16
+        fake_store.objects.add(worker._namespaces[0].key(block_hash))
+        worker.start_async_load(8, RequestTransfers(8, [PageTransfer(block_hash, 0, 1)]))
+        wait_for_async_load(worker, 8)
+        assert worker.take_failed_async_load_requests() == set()
+    assert waits == [("stream", 0)]
+    assert len(staged_copies) == 1
+
+
 def test_async_load_workers_split_the_staging_budget(store_config, fake_store, staged_copies):
     layout = make_layout(regions_per_group=2, num_slots=8)
     page_bytes = PageAddressing(layout).bytes_per_page(0)
