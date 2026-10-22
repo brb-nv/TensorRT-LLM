@@ -37,12 +37,21 @@ class _Utils:
 @pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "sm, current, owner, taken",
-    [(107, 7, 7, True), (107, 8, 7, False), (107, 8, None, True), (100, 8, None, False)],
+    [
+        (107, 7, 7, True),
+        (107, 8, 7, False),
+        (107, 8, None, True),
+        (100, 8, None, True),
+        (103, 8, None, True),
+        (103, 8, 7, False),
+        (90, 8, None, False),
+    ],
 )
 def test_the_reused_buffers_serve_one_stream(monkeypatch, sm, current, owner, taken) -> None:
-    # SM107 only: other GPUs keep the stock builder.
+    # SM107 and SM100/SM103: other GPUs keep the stock builder.
     monkeypatch.setattr(msa_prefill, "get_sm_version", lambda: sm)
     monkeypatch.setattr(msa_prefill, "_K2Q_WS", True)
+    monkeypatch.setattr(msa_prefill, "_K2Q_WS_ARCHS", frozenset((100, 103, 107)))
     monkeypatch.setattr(msa_prefill, "_k2q_ws_stream", owner)
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     monkeypatch.setattr(
