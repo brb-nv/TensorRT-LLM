@@ -3553,7 +3553,7 @@ index 10b2b1f..3b9f909 100644
  
  @dsl_user_op
 diff --git a/python/fmha_sm100/cute/src/sm100/build_k2q_csr/build_k2q_csr.cu b/python/fmha_sm100/cute/src/sm100/build_k2q_csr/build_k2q_csr.cu
-index 8ee5457..03cc690 100644
+index 8ee5457..e5aacd7 100644
 --- a/python/fmha_sm100/cute/src/sm100/build_k2q_csr/build_k2q_csr.cu
 +++ b/python/fmha_sm100/cute/src/sm100/build_k2q_csr/build_k2q_csr.cu
 @@ -27,6 +27,10 @@
@@ -3842,7 +3842,7 @@ index 8ee5457..03cc690 100644
  // ---------------------------------------------------------------------------
  // PT_smem: SMEM-staged tile prefix scan.
  // Each block handles kRowsPerBlock rows for one head h. Cooperative load
-@@ -521,6 +786,85 @@ __global__ void k2q_scatter_kernel(
+@@ -521,6 +786,86 @@ __global__ void k2q_scatter_kernel(
  // Host orchestration
  // ===========================================================================
  
@@ -3854,16 +3854,17 @@ index 8ee5457..03cc690 100644
 +// stream, so reuse is stream-ordered; a capturing stream takes the stock allocations. Same kernels, same launches.
 +// Kill: FMHA_K2Q_WS_ARENA=0.
 +// The SM versions that take the MiniMax-M3 k2q changes below: SM107 always, plus the SM100 / SM103 that
-+// FMHA_K2Q_OPT_ARCHS lists (comma-separated SM numbers, default "107": the stock pipeline on Blackwell, where the
-+// changes measured 1-5 us slower per build at the agentic shapes and up to ~60% slower on a fresh 8k ADP chunk;
-+// "100,103,107" opts Blackwell in) unless TRTLLM_M3_BLACKWELL_RUBIN_OPTS=0. Read once per process.
++// FMHA_K2Q_OPT_ARCHS lists (comma-separated SM numbers, default "103,107": GB300 takes them, ~1.06x per build on
++// host and device at the agentic shapes; GB200 keeps the stock pipeline, where they measured 1-5 us slower per build
++// and up to ~60% slower on a fresh 8k ADP chunk; "100,103,107" opts GB200 in) unless TRTLLM_M3_BLACKWELL_RUBIN_OPTS=0.
++// Read once per process.
 +static bool k2q_opt_arch(int sm) {
 +    static int const blackwell_mask = [] {
 +        int mask = 0;  // bit 0: SM100, bit 1: SM103
 +        char const* umbrella = std::getenv("TRTLLM_M3_BLACKWELL_RUBIN_OPTS");
 +        bool const umbrella_on = umbrella == nullptr || std::atoi(umbrella) != 0;
 +        char const* env = std::getenv("FMHA_K2Q_OPT_ARCHS");
-+        char const* list = env != nullptr ? env : "107";
++        char const* list = env != nullptr ? env : "103,107";
 +        for (char const* p = list; *p != '\0';) {
 +            while (*p != '\0' && (*p < '0' || *p > '9')) {
 +                ++p;
@@ -3928,7 +3929,7 @@ index 8ee5457..03cc690 100644
  template <int kTopK, int kBlockK>
  static void launch_pipeline(
      torch::Tensor q2k,
-@@ -554,15 +898,13 @@ static void launch_pipeline(
+@@ -554,15 +899,13 @@ static void launch_pipeline(
          (size_t)H * S_Q * kTopK * sizeof(int), stream));
  
      auto opts = torch::TensorOptions().dtype(torch::kInt32).device(device);
@@ -3946,7 +3947,7 @@ index 8ee5457..03cc690 100644
      if (emit_schedule) {
          AT_CUDA_CHECK(cudaMemsetAsync(work_count_ptr, 0, sizeof(int), stream));
          AT_CUDA_CHECK(cudaMemsetAsync(
-@@ -571,9 +913,40 @@ static void launch_pipeline(
+@@ -571,9 +914,40 @@ static void launch_pipeline(
      }
  
      int dev = q2k.get_device();
@@ -3989,7 +3990,7 @@ index 8ee5457..03cc690 100644
  
      // -- Pick kWarps per CTA based on SMEM budget for cursor/hist ---------
      // SMEM per CTA = kWarps * total_rows * sizeof(int) (for both H and S).
-@@ -596,26 +969,86 @@ static void launch_pipeline(
+@@ -596,26 +970,86 @@ static void launch_pipeline(
      int max_ctas_per_sm = std::max(
          1, (228 * 1024) / std::max(1, per_cta_smem_bytes));
      if (max_ctas_per_sm > 8) max_ctas_per_sm = 8;
@@ -4082,7 +4083,7 @@ index 8ee5457..03cc690 100644
      constexpr int kPtRowsPerBlock = 8;
      constexpr int kPtThreads = 256;
      auto tprefix_smem_fn = k2q_tile_prefix_smem_kernel<kPtThreads, kPtRowsPerBlock>;
-@@ -630,24 +1063,54 @@ static void launch_pipeline(
+@@ -630,24 +1064,54 @@ static void launch_pipeline(
          size_t smem_bytes = (size_t)W * per_warp_smem;
          auto hist_fn = k2q_hist_kernel<kTopK, kBlockK, W>;
          auto scat_fn = k2q_scatter_kernel<kTopK, kBlockK, W>;
@@ -4148,7 +4149,7 @@ index 8ee5457..03cc690 100644
  
          // Grid is H * blocks_per_h so each block stays within a single
          // head; flat (H*total_rows) grid would skip rows when total_rows
-@@ -656,19 +1119,26 @@ static void launch_pipeline(
+@@ -656,19 +1120,26 @@ static void launch_pipeline(
          int pt_grid = H * blocks_per_h;
          if (pt_grid < 1) pt_grid = 1;
          size_t pt_smem = (size_t)kPtRowsPerBlock * G_total * sizeof(int);

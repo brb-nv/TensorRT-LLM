@@ -232,7 +232,7 @@ def test_k2q_scratch_arena_engages_on_listed_archs():
     assert gate < arena
     assert 'std::getenv("FMHA_K2Q_OPT_ARCHS")' in src
     assert 'std::getenv("TRTLLM_M3_BLACKWELL_RUBIN_OPTS")' in src
-    assert 'char const* list = env != nullptr ? env : "107";' in src
+    assert 'char const* list = env != nullptr ? env : "103,107";' in src
     assert (
         "return sm == 107 || (sm == 100 && (blackwell_mask & 1)) || (sm == 103 && (blackwell_mask & 2));"
         in src
