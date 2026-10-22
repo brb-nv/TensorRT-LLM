@@ -61,11 +61,13 @@ _DENSE_FA4_PAGE_SIZE = 128
 _DENSE_FA4_V_TAIL_ZERO = os.environ.get("TRTLLM_MSA_DENSE_FA4_V_TAIL_ZERO", "1") != "0"
 # What the patched flash_fwd_sm100 holds for the FP8 rescale threshold.
 _DENSE_FA4_PATCH_MARKER = "0.0 if const_expr(self.q_dtype.width == 8) else"
-# SM107: the FP8-KV prefill's E4M3 query is cast from the strided query rows of the fused QKV output by one Triton pass
-# (row by row, 16-byte accesses) instead of the aten dtype-converting copy, whose strided path runs at ~1.2 TB/s. The
-# cast rounds to nearest even and saturates to +-448: the bits of the aten cast wherever that is finite. Kill:
-# TRTLLM_CTX_Q_E4M3_ROWS=0 in the deployment env (read once at import) restores the aten cast.
+# SM107 and SM100/SM103: the FP8-KV prefill's E4M3 query is cast from the strided query rows of the fused QKV output
+# by one Triton pass (row by row, 16-byte accesses) instead of the aten dtype-converting copy, whose strided path runs
+# at ~1.2 TB/s. The cast rounds to nearest even and saturates to +-448: the bits of the aten cast wherever that is
+# finite. Kill: TRTLLM_CTX_Q_E4M3_ROWS=0 in the deployment env (read once at import) restores the aten cast.
+# TRTLLM_CTX_Q_E4M3_ROWS_ARCHS picks the Blackwell SMs (default 100,103; see blackwell_rubin_opts).
 _SM107_Q_E4M3_ROWS = os.environ.get("TRTLLM_CTX_Q_E4M3_ROWS", "1") == "1"
+_Q_E4M3_ROWS_ARCHS = gate_archs("TRTLLM_CTX_Q_E4M3_ROWS_ARCHS")
 _SM107_Q_E4M3_ROWS_LOGGED = []
 
 
@@ -89,7 +91,7 @@ def _q_to_e4m3(q: torch.Tensor) -> torch.Tensor:
         and q.stride(2) == 1
         and q.stride(1) == q.shape[2]
         and q.shape[0] > 0
-        and get_sm_version() == 107
+        and get_sm_version() in _Q_E4M3_ROWS_ARCHS
     ):
         return q.to(torch.float8_e4m3fn)
     rows, width = q.shape[0], q.shape[1] * q.shape[2]
