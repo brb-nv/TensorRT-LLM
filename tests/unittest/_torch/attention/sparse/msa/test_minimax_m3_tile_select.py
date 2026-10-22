@@ -200,7 +200,8 @@ def test_tile_select_v2_kill_switch_same_tables(tmp_path):
         (107, False, 2000, 1408, (100, 103, 107)),
         (103, False, 2000, 1408, (100, 103, 107)),
         (107, True, 64, 1408, (100, 103, 107)),
-        (103, True, 64, 1408, (100, 103, 107)),
+        (103, True, 32, 1408, (100, 103, 107)),
+        (100, True, 63, 1408, (100, 103, 107)),
         (107, True, 2000, 6000, (100, 103, 107)),
         (100, True, 2000, 6000, (100, 103, 107)),
     ],
@@ -212,3 +213,12 @@ def test_tile_select_gate(monkeypatch, sm_version, enabled, total_q, num_blocks,
     monkeypatch.setattr(msa_indexer, "_TILE_SELECT_ARCHS", frozenset(archs))
     scores = torch.zeros(4, num_blocks, total_q)
     assert msa_indexer._tile_select(scores, torch.ones(total_q, dtype=torch.int32), 0, 1) is None
+
+
+@pytest.mark.parametrize("sm_version,expected", [(107, 256), (103, 64), (100, 64)])
+def test_tile_select_min_q_default(monkeypatch, sm_version, expected):
+    # Unset TRTLLM_MSA_TILE_SELECT_MIN_Q: 256 queries on SM107, 64 on SM100/SM103 (crossover measured on both).
+    if "TRTLLM_MSA_TILE_SELECT_MIN_Q" in os.environ:
+        pytest.skip("TRTLLM_MSA_TILE_SELECT_MIN_Q is set")
+    monkeypatch.setattr(msa_indexer, "get_sm_version", lambda: sm_version)
+    assert msa_indexer._tile_select_min_q() == expected

@@ -40,9 +40,18 @@ if TYPE_CHECKING:
 # blackwell_rubin_opts).
 _SM107_TILE_SELECT = os.environ.get("TRTLLM_MSA_TILE_SELECT", "1") == "1"
 _TILE_SELECT_ARCHS = gate_archs("TRTLLM_MSA_TILE_SELECT_ARCHS")
-# Below this many query rows the in-tree selector's one-CTA-per-row grid is at least as fast (256 on SM107;
-# TRTLLM_MSA_TILE_SELECT_MIN_Q overrides it, e.g. with the crossover measured on SM100/SM103).
-_SM107_TILE_SELECT_MIN_Q = int(os.environ.get("TRTLLM_MSA_TILE_SELECT_MIN_Q", "256"))
+# Below this many query rows the in-tree selector's one-CTA-per-row grid is at least as fast: 256 on SM107, 64 on
+# SM100/SM103 (gate_tile_select.py: the tile select wins from Q=64, the smallest swept, at 1-4 heads and 64k-400k KV on
+# both GB200 and GB300). TRTLLM_MSA_TILE_SELECT_MIN_Q overrides it on every SM.
+_TILE_SELECT_MIN_Q_ENV = os.environ.get("TRTLLM_MSA_TILE_SELECT_MIN_Q")
+_SM107_TILE_SELECT_MIN_Q = int(_TILE_SELECT_MIN_Q_ENV or 256)
+_BLACKWELL_TILE_SELECT_MIN_Q = int(_TILE_SELECT_MIN_Q_ENV or 64)
+
+
+def _tile_select_min_q() -> int:
+    return _SM107_TILE_SELECT_MIN_Q if get_sm_version() == 107 else _BLACKWELL_TILE_SELECT_MIN_Q
+
+
 # The op's shared-memory bound (kMinimaxM3SelectPrefillTileMaxBlocks).
 _SM107_TILE_SELECT_MAX_BLOCKS = 5856
 # The prefill proxy scores into an unfilled buffer: fmha_sm100 would allocate it with torch.full(-inf), but its
@@ -242,7 +251,7 @@ def _tile_select(
         max_score_kv.dtype != torch.float32
         or max_score_kv.dim() != 3
         or max_score_kv.stride(2) != 1
-        or max_score_kv.shape[2] < _SM107_TILE_SELECT_MIN_Q
+        or max_score_kv.shape[2] < _tile_select_min_q()
         or max_score_kv.shape[1] > _SM107_TILE_SELECT_MAX_BLOCKS
     ):
         return None
@@ -256,7 +265,7 @@ def _tile_select(
     )
     logger.info_once(
         f"MSA prefill select: tile select, 8 queries per CTA (SM{get_sm_version()}, "
-        f"min {_SM107_TILE_SELECT_MIN_Q} queries)",
+        f"min {_tile_select_min_q()} queries)",
         key="minimax_m3_sm107_tile_select",
     )
     return out
