@@ -126,6 +126,9 @@ def _moe_routed_output_is_global(experts: nn.Module) -> bool:
 # CTX prefill: fuse the boundary RMSNorm with the next MXFP8 linear's activation quantization (bitwise the same as
 # the stock two-kernel path). TRTLLM_CTX_NORM_MXFP8=0 is the kill switch.
 _CTX_NORM_MXFP8 = os.environ.get("TRTLLM_CTX_NORM_MXFP8", "1") == "1"
+# SM107 always; SM100 / SM103 where TRTLLM_CTX_NORM_MXFP8_ARCHS lists them (default 100,103; see blackwell_rubin_opts).
+# The kernel is plain SIMT CUDA built for sm_100f. Reached only with the boundary fusion on (TP > 1, no attention DP).
+_CTX_NORM_MXFP8_ARCHS = gate_archs("TRTLLM_CTX_NORM_MXFP8_ARCHS")
 _CTX_NORM_MXFP8_MIN_ROWS = 8192
 _CTX_NORM_MXFP8_LOGGED = False
 # The same kernel at the pre-MoE norm also emits the routed experts' NVFP4 fc31 input (bitwise fp4_quantize(norm,
@@ -3696,7 +3699,7 @@ class MiniMaxM3DecoderLayer(DecoderLayer):
         """Prefill-sized boundary AllReduce + residual RMSNorm that also emits the MXFP8 copy of the norm output.
 
         The plain AllReduce is followed by one kernel that does the RESIDUAL_RMS_NORM epilogue's residual add +
-        RMSNorm (the same arithmetic as the stock SM107 rows kernel) and the next MXFP8 linear's activation
+        RMSNorm (the same arithmetic as the stock rows kernel) and the next MXFP8 linear's activation
         quantization; the MXFP8 pair waits in a one-entry slot for that linear. Only for rows at or above
         _CTX_NORM_MXFP8_MIN_ROWS, where the stock AUTO strategy reduces with NCCL and normalizes with that same
         rows kernel; returns None (stock path) otherwise. With moe (the pre-MoE norm), the same kernel also writes
@@ -3704,7 +3707,7 @@ class MiniMaxM3DecoderLayer(DecoderLayer):
         """
         if (
             not _CTX_NORM_MXFP8
-            or get_sm_version() != 107
+            or get_sm_version() not in _CTX_NORM_MXFP8_ARCHS
             or hidden_states.dim() != 2
             or hidden_states.shape[0] < _CTX_NORM_MXFP8_MIN_ROWS
             # The kernel's geometry: whole 256-element MXFP8 groups per thread block of at most 1024 threads.

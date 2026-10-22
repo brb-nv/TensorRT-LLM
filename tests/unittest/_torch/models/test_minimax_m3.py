@@ -3213,13 +3213,25 @@ def test_shared_fold_into_trtllm_gen_finalize_is_sm107_only(
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize("sm, hidden", [(103, 3072), (100, 3072), (107, 384), (107, 16384)])
-def test_ctx_boundary_norm_declines_off_rubin_and_off_geometry(
-    monkeypatch, sm: int, hidden: int
+@pytest.mark.parametrize(
+    "sm, hidden, archs",
+    [
+        (90, 3072, (100, 103, 107)),
+        (103, 3072, (107,)),
+        (100, 3072, (107,)),
+        (107, 384, (107,)),
+        (107, 16384, (107,)),
+        (103, 384, (100, 103, 107)),
+    ],
+)
+def test_ctx_boundary_norm_declines_off_listed_archs_and_off_geometry(
+    monkeypatch, sm: int, hidden: int, archs: tuple
 ) -> None:
-    # The fused boundary norm + MXFP8 kernel is SM107-only and needs whole 256-element groups in at most 1024
-    # threads; anything else keeps the stock AllReduce + RMSNorm (None) before touching the layer.
+    # The fused boundary norm + MXFP8 kernel runs on SM107 and the Blackwell SMs of TRTLLM_CTX_NORM_MXFP8_ARCHS and
+    # needs whole 256-element groups in at most 1024 threads; anything else keeps the stock AllReduce + RMSNorm
+    # (None) before touching the layer.
     monkeypatch.setattr(modeling_minimaxm3, "_CTX_NORM_MXFP8", True)
+    monkeypatch.setattr(modeling_minimaxm3, "_CTX_NORM_MXFP8_ARCHS", frozenset(archs))
     monkeypatch.setattr(modeling_minimaxm3, "get_sm_version", lambda: sm)
     monkeypatch.setattr(modeling_minimaxm3, "ctx_eager_only", lambda: True)
     layer = SimpleNamespace(allreduce=Mock(side_effect=AssertionError("fused boundary norm ran")))
@@ -3233,6 +3245,39 @@ def test_ctx_boundary_norm_declines_off_rubin_and_off_geometry(
         )
         is None
     )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("sm", [100, 103, 107])
+def test_ctx_boundary_norm_engages_on_listed_archs(monkeypatch, sm: int) -> None:
+    # On a listed SM an eligible boundary (>= _CTX_NORM_MXFP8_MIN_ROWS rows, hidden 6144) reaches the plain
+    # AllReduce of the fused path.
+    monkeypatch.setattr(modeling_minimaxm3, "_CTX_NORM_MXFP8", True)
+    monkeypatch.setattr(modeling_minimaxm3, "_CTX_NORM_MXFP8_ARCHS", frozenset((100, 103, 107)))
+    monkeypatch.setattr(modeling_minimaxm3, "get_sm_version", lambda: sm)
+    monkeypatch.setattr(modeling_minimaxm3, "ctx_eager_only", lambda: True)
+    monkeypatch.setattr(
+        torch.ops.trtllm, "minimax_m3_ctx_residual_rmsnorm_mxfp8", object(), raising=False
+    )
+    layer = SimpleNamespace(allreduce=Mock(side_effect=RuntimeError("fused boundary norm ran")))
+    hidden = 6144
+    hidden_states = torch.zeros(
+        (modeling_minimaxm3._CTX_NORM_MXFP8_MIN_ROWS, hidden), dtype=torch.bfloat16
+    )
+    norm = SimpleNamespace(weight=torch.ones(hidden, dtype=torch.bfloat16), variance_epsilon=1e-6)
+    with pytest.raises(RuntimeError, match="fused boundary norm ran"):
+        modeling_minimaxm3.MiniMaxM3DecoderLayer._reduce_norm_mxfp8(
+            layer, hidden_states, hidden_states, norm
+        )
+
+
+@pytest.mark.cpu_only
+def test_ctx_boundary_norm_default_arch_set() -> None:
+    from tensorrt_llm._torch import blackwell_rubin_opts
+
+    if "TRTLLM_CTX_NORM_MXFP8_ARCHS" not in os.environ and blackwell_rubin_opts.UMBRELLA_ON:
+        assert modeling_minimaxm3._CTX_NORM_MXFP8_ARCHS == {100, 103, 107}
+    assert 107 in modeling_minimaxm3._CTX_NORM_MXFP8_ARCHS
 
 
 @pytest.mark.skipif(not _has_cuda(), reason="the embedding gather is a Triton kernel")
