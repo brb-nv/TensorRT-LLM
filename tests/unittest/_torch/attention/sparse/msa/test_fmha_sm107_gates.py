@@ -65,10 +65,21 @@ def _side_stream_eligible_args():
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize(
-    "cc, expected", [((10, 0), False), ((10, 3), False), ((10, 7), True), ((12, 0), False)]
+    "cc, ccs, expected",
+    [
+        ((10, 0), {(10, 7)}, False),
+        ((10, 3), {(10, 7)}, False),
+        ((10, 7), {(10, 7)}, True),
+        ((12, 0), {(10, 7)}, False),
+        ((10, 3), {(10, 3), (10, 7)}, True),
+        ((10, 0), {(10, 0), (10, 3), (10, 7)}, True),
+        ((12, 0), {(10, 0), (10, 3), (10, 7)}, False),
+    ],
 )
-def test_plan_side_stream_engages_on_sm107_only(api, monkeypatch, cc, expected):
+def test_plan_side_stream_engages_on_listed_archs(api, monkeypatch, cc, ccs, expected):
+    # SM107, plus the SM100 / SM103 of TLLM_FMHA_PLAN_SS_ARCHS (by default those of the segmented indexer proxy).
     monkeypatch.setattr(api, "_SS_CC", {0: cc})
+    monkeypatch.setattr(api, "_SS_CCS", frozenset(ccs))
     # The eligibility check also asks whether a CUDA graph is being captured; no GPU is needed for that here.
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     assert api._ss_eligible(_side_stream_eligible_args()) is expected
@@ -161,12 +172,40 @@ def test_k2q_scratch_arena_engages_on_sm107_only():
 
 
 @pytest.mark.cpu_only
-def test_deferred_split_read_engages_on_sm107_only(api):
-    # The adaptive plan defers its split-decision read only where _ss_is_sm107 holds (the capability check the side
-    # stream uses, covered above); SM100 / SM103 read plan_cost immediately.
+def test_deferred_split_read_engages_on_listed_archs(api):
+    # The adaptive plan defers its split-decision read only on the capabilities of _PLAN_DEFER_READ_CCS (SM107, plus
+    # the SM100 / SM103 of TLLM_FMHA_PLAN_DEFER_READ_ARCHS); other devices read plan_cost immediately.
     src = inspect.getsource(api)
-    assert (
-        "defer = _PLAN_DEFER_READ and _ss_is_sm107(device) and not torch.cuda.is_current_stream_capturing()"
-        in src
-    )
+    assert "defer = (_PLAN_DEFER_READ and _ss_cc(device) in _PLAN_DEFER_READ_CCS" in src
     assert '"TLLM_FMHA_PLAN_DEFER_READ", "1"' in src
+    assert (10, 7) in api._PLAN_DEFER_READ_CCS
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "env, expected",
+    [
+        ({}, {(10, 7)}),
+        ({"TRTLLM_MSA_PROXY_AUTO_KV_SPLITS_ARCHS": "100,103"}, {(10, 0), (10, 3), (10, 7)}),
+        ({"TLLM_FMHA_PLAN_SS_ARCHS": "103"}, {(10, 3), (10, 7)}),
+        (
+            {"TRTLLM_MSA_PROXY_AUTO_KV_SPLITS_ARCHS": "103", "TLLM_FMHA_PLAN_SS_ARCHS": "107"},
+            {(10, 7)},
+        ),
+        (
+            {"TLLM_FMHA_PLAN_SS_ARCHS": "100,103,120", "TRTLLM_M3_BLACKWELL_RUBIN_OPTS": "0"},
+            {(10, 7)},
+        ),
+    ],
+)
+def test_plan_side_stream_arch_set_from_env(api, monkeypatch, env, expected):
+    for name in (
+        "TRTLLM_MSA_PROXY_AUTO_KV_SPLITS_ARCHS",
+        "TLLM_FMHA_PLAN_SS_ARCHS",
+        "TRTLLM_M3_BLACKWELL_RUBIN_OPTS",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    got = api._m3_gate_ccs("TLLM_FMHA_PLAN_SS_ARCHS", api._m3_proxy_auto_kv_splits_sms())
+    assert got == expected
