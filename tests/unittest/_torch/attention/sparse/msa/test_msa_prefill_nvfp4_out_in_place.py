@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Gate of the SM107 in-place output of the MiniMax-M3 NVFP4 sparse prefill (msa_prefill)."""
+"""Gate of the SM107/SM100/SM103 in-place output of the MiniMax-M3 NVFP4 sparse prefill (msa_prefill)."""
 
 import types
 
@@ -35,7 +35,10 @@ def _fresh_signature_cache():
     "sm_version,enabled,takes_out,dtype,contiguous,expected",
     [
         (107, True, True, torch.bfloat16, True, True),
-        (103, True, True, torch.bfloat16, True, False),
+        (103, True, True, torch.bfloat16, True, True),
+        (100, True, True, torch.bfloat16, True, True),
+        (90, True, True, torch.bfloat16, True, False),
+        (103, False, True, torch.bfloat16, True, False),
         (107, False, True, torch.bfloat16, True, False),
         (107, True, False, torch.bfloat16, True, False),
         (107, True, True, torch.float16, True, False),
@@ -47,6 +50,7 @@ def test_out_in_place_gate(
 ):
     monkeypatch.setattr(msa_prefill, "get_sm_version", lambda: sm_version)
     monkeypatch.setattr(msa_prefill, "_SM107_NVFP4_SPARSE_OUT_IN_PLACE", enabled)
+    monkeypatch.setattr(msa_prefill, "_NVFP4_SPARSE_OUT_IN_PLACE_ARCHS", frozenset((100, 103, 107)))
     out = torch.zeros(8, 4, 16, dtype=dtype)
     if not contiguous:
         out = torch.zeros(4, 8, 16, dtype=dtype).transpose(0, 1)
@@ -54,3 +58,13 @@ def test_out_in_place_gate(
     assert ("out" in kwargs) is expected
     if expected:
         assert kwargs["out"] is out
+
+
+@pytest.mark.parametrize("sm_version", [100, 103])
+def test_out_in_place_blackwell_off_with_rubin_only_archs(monkeypatch, sm_version):
+    # TRTLLM_M3_BLACKWELL_RUBIN_OPTS=0 (or TRTLLM_MSA_NVFP4_OUT_IN_PLACE_ARCHS=107) leaves only SM107.
+    monkeypatch.setattr(msa_prefill, "get_sm_version", lambda: sm_version)
+    monkeypatch.setattr(msa_prefill, "_SM107_NVFP4_SPARSE_OUT_IN_PLACE", True)
+    monkeypatch.setattr(msa_prefill, "_NVFP4_SPARSE_OUT_IN_PLACE_ARCHS", frozenset((107,)))
+    out = torch.zeros(8, 4, 16, dtype=torch.bfloat16)
+    assert msa_prefill._nvfp4_sparse_out_kwargs(_sparse(True), out) == {}

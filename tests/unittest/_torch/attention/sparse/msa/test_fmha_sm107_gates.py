@@ -65,10 +65,21 @@ def _side_stream_eligible_args():
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize(
-    "cc, expected", [((10, 0), False), ((10, 3), False), ((10, 7), True), ((12, 0), False)]
+    "cc, ccs, expected",
+    [
+        ((10, 0), {(10, 7)}, False),
+        ((10, 3), {(10, 7)}, False),
+        ((10, 7), {(10, 7)}, True),
+        ((12, 0), {(10, 7)}, False),
+        ((10, 3), {(10, 3), (10, 7)}, True),
+        ((10, 0), {(10, 0), (10, 3), (10, 7)}, True),
+        ((12, 0), {(10, 0), (10, 3), (10, 7)}, False),
+    ],
 )
-def test_plan_side_stream_engages_on_sm107_only(api, monkeypatch, cc, expected):
+def test_plan_side_stream_engages_on_listed_archs(api, monkeypatch, cc, ccs, expected):
+    # SM107, plus the SM100 / SM103 of TLLM_FMHA_PLAN_SS_ARCHS (by default those of the segmented indexer proxy).
     monkeypatch.setattr(api, "_SS_CC", {0: cc})
+    monkeypatch.setattr(api, "_SS_CCS", frozenset(ccs))
     # The eligibility check also asks whether a CUDA graph is being captured; no GPU is needed for that here.
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     assert api._ss_eligible(_side_stream_eligible_args()) is expected
@@ -117,27 +128,89 @@ def _load_with_capability(monkeypatch, root: str, cap: tuple, calls: list):
     return modules
 
 
+_BLACKWELL_ARCH_ENVS = (
+    "TRTLLM_M3_BLACKWELL_RUBIN_OPTS",
+    "TRTLLM_MSA_PROXY_AUTO_KV_SPLITS_ARCHS",
+    "TLLM_FMHA_PROXY_MODE_ARCHS",
+    "TRTLLM_MSA_R2STORE_ARCHS",
+)
+
+
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("cap", [(10, 7), (10, 0), (10, 3)], ids=["sm107", "sm100", "sm103"])
 @pytest.mark.parametrize("chain, dbuf, r2kill", [("0", "1", "0"), ("1", "1", "1"), ("0", "0", "0")])
-def test_proxy_modes_and_r2_store_engage_on_sm107_only(monkeypatch, cap, chain, dbuf, r2kill):
+@pytest.mark.parametrize(
+    "arch_env, proxy_mode_sms",
+    [
+        ({}, (100, 103)),
+        ({"TRTLLM_MSA_PROXY_AUTO_KV_SPLITS_ARCHS": "107"}, ()),
+        ({"TRTLLM_MSA_PROXY_AUTO_KV_SPLITS_ARCHS": "100,103"}, (100, 103)),
+        ({"TLLM_FMHA_PROXY_MODE_ARCHS": "103"}, (103,)),
+        (
+            {
+                "TRTLLM_MSA_PROXY_AUTO_KV_SPLITS_ARCHS": "100,103",
+                "TRTLLM_M3_BLACKWELL_RUBIN_OPTS": "0",
+            },
+            (),
+        ),
+    ],
+    ids=["default", "proxy_rubin_only", "with_segmented_proxy", "explicit_sm103", "umbrella_off"],
+)
+def test_proxy_modes_and_r2_store_engage_on_listed_archs(
+    monkeypatch, cap, chain, dbuf, r2kill, arch_env, proxy_mode_sms
+):
     root = _fmha_sm100_dir()
     monkeypatch.setenv("TLLM_FMHA_PROXY_CORRECTION_CHAIN", chain)
     monkeypatch.setenv("TLLM_FMHA_PROXY_S_DOUBLE_BUFFER", dbuf)
     monkeypatch.setenv("TRTLLM_MSA_DISABLE_R2STORE", r2kill)
+    for name in _BLACKWELL_ARCH_ENVS:
+        monkeypatch.delenv(name, raising=False)
+    for name, value in arch_env.items():
+        monkeypatch.setenv(name, value)
     calls = []
     jit, aot = _load_with_capability(monkeypatch, root, cap, calls)
     # Importing either module queries no device (no CUDA initialization before a worker fork).
     assert calls == []
     sm107 = cap == (10, 7)
-    want_chain = chain == "1" or not sm107
-    want_single = dbuf == "0" or not sm107
+    # The proxy modes: SM107, and the SM100 / SM103 that follow the segmented proxy or are listed themselves.
+    modes_on = sm107 or cap[0] * 10 + cap[1] in proxy_mode_sms
+    want_chain = chain == "1" or not modes_on
+    want_single = dbuf == "0" or not modes_on
     jit._get_tvm_ffi_include = lambda: "/stub/tvm_ffi/include"  # flags only; nothing is compiled
     flags = jit._get_nvcc_flags(jit.CACHE_BASE)
     assert tuple(jit._proxy_modes()) == (want_chain, want_single)
     assert ("-DFMHA_ONLYSCORE_PER_TILE_CORRECTION" in flags) is want_chain
     assert ("-DFMHA_ONLYSCORE_SINGLE_S" in flags) is want_single
-    assert aot.r2_store_enabled() is (sm107 and r2kill != "1")
+    # The R2 store follows its own arch set (default 100,103), which the umbrella switch also clears.
+    r2_on = sm107 or arch_env.get("TRTLLM_M3_BLACKWELL_RUBIN_OPTS", "1") != "0"
+    assert aot.r2_store_enabled() is (r2_on and r2kill != "1")
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "cap", [(10, 7), (10, 0), (10, 3), (12, 0)], ids=["sm107", "sm100", "sm103", "sm120"]
+)
+@pytest.mark.parametrize(
+    "arch_env, r2_sms",
+    [
+        ({}, (100, 103)),
+        ({"TRTLLM_MSA_R2STORE_ARCHS": "107"}, ()),
+        ({"TRTLLM_MSA_R2STORE_ARCHS": "100,103"}, (100, 103)),
+        ({"TRTLLM_MSA_R2STORE_ARCHS": "103,120"}, (103,)),
+        ({"TRTLLM_MSA_R2STORE_ARCHS": "100,103", "TRTLLM_M3_BLACKWELL_RUBIN_OPTS": "0"}, ()),
+    ],
+    ids=["default", "rubin_only", "blackwell", "sm103_only", "umbrella_off"],
+)
+def test_r2_store_on_listed_archs(monkeypatch, cap, arch_env, r2_sms):
+    # The R2 store warpgroup: SM107, plus the SM100 / SM103 of TRTLLM_MSA_R2STORE_ARCHS (100,103 by default).
+    root = _fmha_sm100_dir()
+    monkeypatch.delenv("TRTLLM_MSA_DISABLE_R2STORE", raising=False)
+    for name in ("TRTLLM_MSA_R2STORE_ARCHS", "TRTLLM_M3_BLACKWELL_RUBIN_OPTS"):
+        monkeypatch.delenv(name, raising=False)
+    for name, value in arch_env.items():
+        monkeypatch.setenv(name, value)
+    _, aot = _load_with_capability(monkeypatch, root, cap, [])
+    assert aot.r2_store_enabled() is (cap == (10, 7) or cap[0] * 10 + cap[1] in r2_sms)
 
 
 def _k2q_csr_source() -> str:
@@ -149,24 +222,62 @@ def _k2q_csr_source() -> str:
 
 
 @pytest.mark.cpu_only
-def test_k2q_scratch_arena_engages_on_sm107_only():
+def test_k2q_scratch_arena_engages_on_listed_archs():
     # The k2q CSR build is host C++ compiled at first use, so its gate is checked in the installed source: the arena
-    # takes the runtime SM107 check, and the other devices keep the stock allocations.
+    # (and the other k2q changes) take the runtime arch check (SM107, plus the SM100 / SM103 of FMHA_K2Q_OPT_ARCHS,
+    # read once with std::getenv), and the other devices keep the stock allocations.
     src = _k2q_csr_source()
-    sm107 = src.index("sm107_state = (cc_major == 10 && cc_minor == 7) ? 1 : 2;")
-    arena = src.index("if (is_sm107 && k2q_arena_enabled()) {")
-    assert sm107 < arena
+    gate = src.index("k2q_opts_state = k2q_opt_arch(cc_major * 10 + cc_minor) ? 1 : 2;")
+    arena = src.index("if (k2q_opts && k2q_arena_enabled()) {")
+    assert gate < arena
+    assert 'std::getenv("FMHA_K2Q_OPT_ARCHS")' in src
+    assert 'std::getenv("TRTLLM_M3_BLACKWELL_RUBIN_OPTS")' in src
+    assert 'char const* list = env != nullptr ? env : "103,107";' in src
+    assert (
+        "return sm == 107 || (sm == 100 && (blackwell_mask & 1)) || (sm == 103 && (blackwell_mask & 2));"
+        in src
+    )
+    assert "is_sm107" not in src
     assert "row_counts = torch::zeros({H, total_rows}, opts);" in src
     assert 'std::getenv("FMHA_K2Q_WS_ARENA")' in src
 
 
 @pytest.mark.cpu_only
-def test_deferred_split_read_engages_on_sm107_only(api):
-    # The adaptive plan defers its split-decision read only where _ss_is_sm107 holds (the capability check the side
-    # stream uses, covered above); SM100 / SM103 read plan_cost immediately.
+def test_deferred_split_read_engages_on_listed_archs(api):
+    # The adaptive plan defers its split-decision read only on the capabilities of _PLAN_DEFER_READ_CCS (SM107, plus
+    # the SM100 / SM103 of TLLM_FMHA_PLAN_DEFER_READ_ARCHS); other devices read plan_cost immediately.
     src = inspect.getsource(api)
-    assert (
-        "defer = _PLAN_DEFER_READ and _ss_is_sm107(device) and not torch.cuda.is_current_stream_capturing()"
-        in src
-    )
+    assert "defer = (_PLAN_DEFER_READ and _ss_cc(device) in _PLAN_DEFER_READ_CCS" in src
     assert '"TLLM_FMHA_PLAN_DEFER_READ", "1"' in src
+    assert (10, 7) in api._PLAN_DEFER_READ_CCS
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "env, expected",
+    [
+        ({}, {(10, 0), (10, 3), (10, 7)}),
+        ({"TRTLLM_MSA_PROXY_AUTO_KV_SPLITS_ARCHS": "107"}, {(10, 7)}),
+        ({"TRTLLM_MSA_PROXY_AUTO_KV_SPLITS_ARCHS": "100,103"}, {(10, 0), (10, 3), (10, 7)}),
+        ({"TLLM_FMHA_PLAN_SS_ARCHS": "103"}, {(10, 3), (10, 7)}),
+        (
+            {"TRTLLM_MSA_PROXY_AUTO_KV_SPLITS_ARCHS": "103", "TLLM_FMHA_PLAN_SS_ARCHS": "107"},
+            {(10, 7)},
+        ),
+        (
+            {"TLLM_FMHA_PLAN_SS_ARCHS": "100,103,120", "TRTLLM_M3_BLACKWELL_RUBIN_OPTS": "0"},
+            {(10, 7)},
+        ),
+    ],
+)
+def test_plan_side_stream_arch_set_from_env(api, monkeypatch, env, expected):
+    for name in (
+        "TRTLLM_MSA_PROXY_AUTO_KV_SPLITS_ARCHS",
+        "TLLM_FMHA_PLAN_SS_ARCHS",
+        "TRTLLM_M3_BLACKWELL_RUBIN_OPTS",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    got = api._m3_gate_ccs("TLLM_FMHA_PLAN_SS_ARCHS", api._m3_proxy_auto_kv_splits_sms())
+    assert got == expected

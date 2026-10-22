@@ -29,15 +29,20 @@ import torch
 import triton
 import triton.language as tl
 
+from tensorrt_llm._torch.blackwell_rubin_opts import gate_archs
 from tensorrt_llm._utils import get_sm_version, mpi_rank, prefer_pinned
 from tensorrt_llm.logger import logger
 
 from .interface import FmhaPhase
 from .phased import FmhaParams, PhasedFmha
 
-# SM107: the NVFP4 sparse prefill's combine writes the layer's attention output buffer directly instead of a fresh
-# tensor that is then copied over (same kernel, same values). Kill switch: False restores the copy.
+# SM107 and SM100/SM103: the NVFP4 sparse prefill's combine writes the layer's attention output buffer directly
+# instead of a fresh tensor that is then copied over (same kernel, same values). It also unlocks the combine's MXFP8
+# o_proj input (msa_combine_mxfp8), which requires the in-place combine. Kill switch: TRTLLM_MSA_NVFP4_OUT_IN_PLACE=0
+# restores the copy. TRTLLM_MSA_NVFP4_OUT_IN_PLACE_ARCHS picks the Blackwell SMs (default 100,103; see
+# blackwell_rubin_opts).
 _SM107_NVFP4_SPARSE_OUT_IN_PLACE = os.environ.get("TRTLLM_MSA_NVFP4_OUT_IN_PLACE", "1") == "1"
+_NVFP4_SPARSE_OUT_IN_PLACE_ARCHS = gate_archs("TRTLLM_MSA_NVFP4_OUT_IN_PLACE_ARCHS")
 
 # FP8 dense prefill (MiniMax-M3's dense layers) runs FA4 (flash_attn.cute) over the paged FP8 cache in place of
 # fmha_sm100, about 1.6x faster at long context. The image's FA4 carries rescale_threshold 0.0 for FP8, so the
@@ -46,6 +51,10 @@ _SM107_NVFP4_SPARSE_OUT_IN_PLACE = os.environ.get("TRTLLM_MSA_NVFP4_OUT_IN_PLACE
 # rule 1b). An FA4 without that change is never used. Kill switch: TRTLLM_MSA_DISABLE_DENSE_FA4=1 restores
 # fmha_sm100.
 _DENSE_PREFILL_FA4 = os.environ.get("TRTLLM_MSA_DISABLE_DENSE_FA4", "0") != "1"
+# FA4 rounds differently from fmha_sm100 (deterministic, not bitwise), so the Blackwell SMs it runs on are chosen
+# explicitly: TRTLLM_MSA_DENSE_FA4_ARCHS (default 103 with SM107; see blackwell_rubin_opts). SM103 runs the same
+# hardware-ex2 FP8 variant as SM107; SM100 runs FA4's ex2-emulation variant, so it is opt-in (add 100).
+_DENSE_FA4_ARCHS = gate_archs("TRTLLM_MSA_DENSE_FA4_ARCHS", default_blackwell=(103,))
 # The FA4 shape this path serves: TMA page loads need the page to equal FA4's 128-wide n tile.
 _DENSE_FA4_HEAD_DIM = 128
 _DENSE_FA4_PAGE_SIZE = 128
@@ -56,11 +65,20 @@ _DENSE_FA4_PAGE_SIZE = 128
 _DENSE_FA4_V_TAIL_ZERO = os.environ.get("TRTLLM_MSA_DENSE_FA4_V_TAIL_ZERO", "1") != "0"
 # What the patched flash_fwd_sm100 holds for the FP8 rescale threshold.
 _DENSE_FA4_PATCH_MARKER = "0.0 if const_expr(self.q_dtype.width == 8) else"
-# SM107: the FP8-KV prefill's E4M3 query is cast from the strided query rows of the fused QKV output by one Triton pass
-# (row by row, 16-byte accesses) instead of the aten dtype-converting copy, whose strided path runs at ~1.2 TB/s. The
-# cast rounds to nearest even and saturates to +-448: the bits of the aten cast wherever that is finite. Kill:
-# TRTLLM_CTX_Q_E4M3_ROWS=0 in the deployment env (read once at import) restores the aten cast.
+# SM107 and SM100/SM103: the FP8-KV prefill's E4M3 query is cast from the strided query rows of the fused QKV output
+# by one Triton pass (row by row, 16-byte accesses) instead of the aten dtype-converting copy, whose strided path runs
+# at ~1.2 TB/s. The cast rounds to nearest even and saturates to +-448: the bits of the aten cast wherever that is
+# finite. Kill: TRTLLM_CTX_Q_E4M3_ROWS=0 in the deployment env (read once at import) restores the aten cast.
+# TRTLLM_CTX_Q_E4M3_ROWS_ARCHS picks the Blackwell SMs (default 100,103; see blackwell_rubin_opts).
 _SM107_Q_E4M3_ROWS = os.environ.get("TRTLLM_CTX_Q_E4M3_ROWS", "1") == "1"
+_Q_E4M3_ROWS_ARCHS = gate_archs("TRTLLM_CTX_Q_E4M3_ROWS_ARCHS")
+# On SM100/SM103 the row cast has a ~18-25 us floor, so it takes only queries of at least this many elements: 2^25
+# (4096 rows x 64 heads x 128, or 8192 x 32), where it measured 2.5-3.2x over aten on GB200 and GB300; at 2^24 it
+# was about break-even (0.9-1.3x), at 2^23 1.3-1.4x slower and below that up to 2.8x slower.
+# TRTLLM_CTX_Q_E4M3_ROWS_MIN_ELEMS overrides it; SM107 has no floor.
+_Q_E4M3_ROWS_BLACKWELL_MIN_ELEMS = int(
+    os.environ.get("TRTLLM_CTX_Q_E4M3_ROWS_MIN_ELEMS", str(1 << 25))
+)
 _SM107_Q_E4M3_ROWS_LOGGED = []
 
 
@@ -84,7 +102,8 @@ def _q_to_e4m3(q: torch.Tensor) -> torch.Tensor:
         and q.stride(2) == 1
         and q.stride(1) == q.shape[2]
         and q.shape[0] > 0
-        and get_sm_version() == 107
+        and get_sm_version() in _Q_E4M3_ROWS_ARCHS
+        and (get_sm_version() == 107 or q.numel() >= _Q_E4M3_ROWS_BLACKWELL_MIN_ELEMS)
     ):
         return q.to(torch.float8_e4m3fn)
     rows, width = q.shape[0], q.shape[1] * q.shape[2]
@@ -230,14 +249,14 @@ def _nvfp4_sparse_out_kwargs(sparse: Any, out: torch.Tensor) -> dict[str, torch.
     """``out=`` for sparse_atten_nvfp4_kv_func when its combine can write ``out`` in place (see the kill switch)."""
     if (
         not _SM107_NVFP4_SPARSE_OUT_IN_PLACE
-        or get_sm_version() != 107
+        or get_sm_version() not in _NVFP4_SPARSE_OUT_IN_PLACE_ARCHS
         or out.dtype != torch.bfloat16
         or not out.is_contiguous()
         or not _nvfp4_sparse_takes_out(sparse)
     ):
         return {}
     logger.info_once(
-        "MSA NVFP4 sparse prefill: combine writes the attention output in place (SM107)",
+        f"MSA NVFP4 sparse prefill: combine writes the attention output in place (SM{get_sm_version()})",
         key="minimax_m3_sm107_nvfp4_sparse_out_in_place",
     )
     return {"out": out}
@@ -261,8 +280,10 @@ def _nvfp4_sparse_takes_out(sparse: Any) -> bool:
 # hands the kernels torch.empty buffers, so the CSR and schedule are unchanged. Eager only: a capturing
 # stream takes the stock builder, and so does any stream other than the one the buffers were first built on
 # (stream order is what keeps a step's later build from overwriting buffers an earlier attention still reads).
-# SM107 only. Kill switch: TRTLLM_MSA_K2Q_WS=0.
+# SM107 and SM100/SM103 (TRTLLM_MSA_K2Q_WS_ARCHS, default 100,103; see blackwell_rubin_opts). Kill switch:
+# TRTLLM_MSA_K2Q_WS=0.
 _K2Q_WS = os.environ.get("TRTLLM_MSA_K2Q_WS", "1") != "0"
+_K2Q_WS_ARCHS = gate_archs("TRTLLM_MSA_K2Q_WS_ARCHS")
 _K2Q_WS_BLK_KV = 128
 _K2Q_WS_TOPK = (4, 8, 16, 32)
 _k2q_ws: Optional[tuple] = None  # (key, q2k, row_ptr, q_idx, schedule)
@@ -285,7 +306,7 @@ def _k2q_csr_ws(
     total_q, head_kv, topk = (int(v) for v in kv_block_indexes.shape)
     if (
         not _K2Q_WS
-        or get_sm_version() != 107
+        or get_sm_version() not in _K2Q_WS_ARCHS
         or page_size != _K2Q_WS_BLK_KV
         or topk not in _K2Q_WS_TOPK
         or kv_block_indexes.dtype != torch.int32
@@ -576,8 +597,8 @@ def dense_prefill_fa4_enabled(use_fp8: bool, head_dim: int, page_size: int) -> b
         use_fp8
         and head_dim == _DENSE_FA4_HEAD_DIM
         and page_size == _DENSE_FA4_PAGE_SIZE
-        # Rubin only: FA4 rounds differently from fmha_sm100 (deterministic, not bitwise), so other SM10x keep it.
-        and get_sm_version() == 107
+        # FA4 rounds differently from fmha_sm100 (deterministic, not bitwise): only the SMs in _DENSE_FA4_ARCHS.
+        and get_sm_version() in _DENSE_FA4_ARCHS
         and _dense_fa4_forward() is not None
     )
 

@@ -29,14 +29,19 @@ HEAD_DIM, PAGE, NUM_HEADS, NUM_KV_HEADS = 128, 128, 32, 2
 
 
 def _fa4_ready() -> bool:
-    # FA4 dense prefill engages on SM107 only (other SM10x keep fmha_sm100; see the _arch CPU test).
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7):
+    # FA4 dense prefill engages on the SMs of msa_prefill._DENSE_FA4_ARCHS (SM107, and SM103 by default; see the
+    # _arch CPU test). Its numerics are checked on whichever of those this runs on.
+    if not torch.cuda.is_available():
+        return False
+    major, minor = torch.cuda.get_device_capability()
+    if major * 10 + minor not in msa_prefill._DENSE_FA4_ARCHS:
         return False
     return msa_package_available() and msa_prefill._dense_fa4_forward() is not None
 
 
 pytestmark = pytest.mark.skipif(
-    not _fa4_ready(), reason="requires SM107, fmha_sm100 and FA4 with the FP8 rescale change"
+    not _fa4_ready(),
+    reason="requires an SM in TRTLLM_MSA_DENSE_FA4_ARCHS, fmha_sm100 and FA4 with the FP8 rescale change",
 )
 
 

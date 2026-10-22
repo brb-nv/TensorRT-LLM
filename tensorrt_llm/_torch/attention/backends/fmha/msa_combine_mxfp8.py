@@ -9,8 +9,8 @@ prequant slot (modules.linear.set_prequantized_mxfp8), so the o_proj skips its o
 It engages only where the slot is certainly consumed by an eager o_proj on exactly the combine's rows:
 - the attention module armed it (``armed()``) around an eager attention core that is followed by its o_proj;
 - a pure context step (no generation rows: the combine then covers every row of the o_proj input);
-- the in-place SM107 combine path (the combine writes the o_proj input buffer itself) and an fmha_sm100 that
-  accepts ``o_fp8``.
+- the in-place combine path (SM107, SM100/SM103; the combine writes the o_proj input buffer itself) and an
+  fmha_sm100 that accepts ``o_fp8``.
 The bf16 output is still written (``write_bf16=True``), so a slot that is not consumed only costs the extra stores;
 it is logged once as a miss (``after_o_proj``). Kill switch: TRTLLM_CTX_COMBINE_MXFP8=0.
 """

@@ -3041,13 +3041,58 @@ def test_bcg_bucket_takes_eager_qkv(
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize("sm", [90, 100, 103, 110])
+@pytest.mark.parametrize("sm", [90, 110])
 def test_bcg_bucket_keeps_captured_qkv_off_rubin(monkeypatch, sm: int) -> None:
-    # Off SM107 the fused QKV GEMM never engages, so breakable buckets keep the captured stock projection.
+    # Off SM107 / SM100 / SM103 the fused QKV GEMM never engages, so breakable buckets keep the captured stock
+    # projection (Blackwell follows TRTLLM_CTX_QKV_FUSED_ARCHS; see the next test).
     monkeypatch.setattr(modeling_minimaxm3, "_CTX_BCG_P5A", True)
     monkeypatch.setattr(modeling_minimaxm3, "_CTX_QKV_FUSED", True)
     monkeypatch.setattr(modeling_minimaxm3, "get_sm_version", lambda: sm)
     assert not modeling_minimaxm3._bcg_bucket_takes_eager_qkv(2048)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "sm, archs, expected",
+    [
+        (103, (103, 107), True),
+        (100, (100, 103, 107), True),
+        (103, (107,), False),
+        (90, (100, 103, 107), False),
+        (107, (107,), True),
+    ],
+)
+def test_bcg_bucket_follows_fused_qkv_archs(
+    monkeypatch, sm: int, archs: tuple, expected: bool
+) -> None:
+    # SM100 / SM103 take the fused QKV GEMM (and so the eager-break QKV of breakable buckets) only where
+    # TRTLLM_CTX_QKV_FUSED_ARCHS lists them (100 by default).
+    monkeypatch.setattr(modeling_minimaxm3, "_CTX_BCG_P5A", True)
+    monkeypatch.setattr(modeling_minimaxm3, "_CTX_QKV_FUSED", True)
+    monkeypatch.setattr(modeling_minimaxm3, "_CTX_QKV_FUSED_ARCHS", frozenset(archs))
+    monkeypatch.setattr(modeling_minimaxm3, "get_sm_version", lambda: sm)
+    assert modeling_minimaxm3._bcg_bucket_takes_eager_qkv(2048) is expected
+
+
+@pytest.mark.cpu_only
+def test_fused_qkv_compile_failure_falls_back_off_rubin(monkeypatch) -> None:
+    # Off SM107 a fused QKV runner that fails to compile is remembered and the caller keeps the stock path.
+    kernel_module = pytest.importorskip("tensorrt_llm._torch.kernels.rubin.m3_qkv_fusion.kernel")
+    calls = []
+
+    def failing_runner(**cfg):
+        calls.append(cfg)
+        raise RuntimeError("no such MMA atom")
+
+    monkeypatch.setattr(kernel_module, "M3QkvFusedRunner", failing_runner)
+    monkeypatch.setattr(modeling_minimaxm3, "get_sm_version", lambda: 103)
+    monkeypatch.setattr(modeling_minimaxm3, "_CTX_QKV_FUSED_RUNNERS", {})
+    monkeypatch.setattr(modeling_minimaxm3, "_CTX_QKV_FUSED_FAILED", set())
+    assert modeling_minimaxm3._ctx_qkv_fused_runner(64, 4, 4) is None
+    assert modeling_minimaxm3._ctx_qkv_fused_runner(64, 4, 4) is None
+    assert len(calls) == 1
+    assert calls[0]["heads_per_tile"] == modeling_minimaxm3._CTX_QKV_FUSED_SM10X_HEADS_PER_TILE
+    assert calls[0]["enable_pdl"] is modeling_minimaxm3._CTX_QKV_FUSED_SM10X_PDL
 
 
 @pytest.mark.cpu_only
@@ -3064,10 +3109,50 @@ def test_fused_qkv_rows_agree_between_eager_and_breakable(monkeypatch, rows: int
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize("sm, expected", [(107, True), (103, False), (100, False), (90, False)])
-def test_swiglu_mxfp8_engages_on_sm107_only(monkeypatch, sm: int, expected: bool) -> None:
-    # The fused SwiGLU + MXFP8 quantize is SM107-only; other architectures keep the stock activation and quantize.
+@pytest.mark.parametrize(
+    "sm, archs, enabled, expected",
+    [
+        (107, (107,), True, True),
+        (103, (100, 103, 107), True, True),
+        (100, (100, 103, 107), True, True),
+        (103, (107,), True, False),
+        (90, (100, 103, 107), True, False),
+        (103, (100, 103, 107), False, False),
+    ],
+)
+def test_drafter_ctx_gates_engage_on_listed_archs(
+    monkeypatch, sm: int, archs: tuple, enabled: bool, expected: bool
+) -> None:
+    # The drafter's last-row context attention and dead-row skip: SM107 and the Blackwell SMs of their arch sets
+    # (TRTLLM_M3_BLACKWELL_RUBIN_OPTS=0 leaves SM107 alone), each under its own kill switch.
+    monkeypatch.setattr(modeling_minimaxm3, "get_sm_version", lambda: sm)
+    monkeypatch.setattr(modeling_minimaxm3, "_SM107_DRAFTER_CTX_LAST_ROW", enabled)
+    monkeypatch.setattr(modeling_minimaxm3, "_SM107_DRAFTER_CTX_DEAD_ROWS", enabled)
+    monkeypatch.setattr(modeling_minimaxm3, "_DRAFTER_CTX_LAST_ROW_ARCHS", frozenset(archs))
+    monkeypatch.setattr(modeling_minimaxm3, "_DRAFTER_CTX_DEAD_ROWS_ARCHS", frozenset(archs))
+    assert modeling_minimaxm3._drafter_ctx_last_row_on() is expected
+    assert modeling_minimaxm3._drafter_ctx_dead_rows_on() is expected
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "sm, archs, expected",
+    [
+        (107, (107,), True),
+        (103, (107,), False),
+        (100, (107,), False),
+        (103, (100, 103, 107), True),
+        (100, (100, 103, 107), True),
+        (90, (100, 103, 107), False),
+    ],
+)
+def test_swiglu_mxfp8_engages_on_listed_archs(
+    monkeypatch, sm: int, archs: tuple, expected: bool
+) -> None:
+    # The fused SwiGLU + MXFP8 quantize runs on SM107 and on the Blackwell SMs that TRTLLM_CTX_SWIGLU_MXFP8_ARCHS
+    # lists (100,103 by default); other architectures keep the stock activation and quantize.
     monkeypatch.setattr(modeling_minimaxm3, "_CTX_SWIGLU_MXFP8", True)
+    monkeypatch.setattr(modeling_minimaxm3, "_CTX_SWIGLU_MXFP8_ARCHS", frozenset(archs))
     monkeypatch.setattr(modeling_minimaxm3, "get_sm_version", lambda: sm)
     monkeypatch.setattr(modeling_minimaxm3, "ctx_eager_only", lambda: True)
     method = MXFP8LinearMethod.__new__(MXFP8LinearMethod)
@@ -3077,6 +3162,28 @@ def test_swiglu_mxfp8_engages_on_sm107_only(monkeypatch, sm: int, expected: bool
     )
     x = torch.zeros((modeling_minimaxm3._CTX_NORM_MXFP8_MIN_ROWS, 3072), dtype=torch.bfloat16)
     assert modeling_minimaxm3._SwigluOaiMLP._swiglu_mxfp8_eligible(mlp, x, False) is expected
+
+
+@pytest.mark.cpu_only
+def test_fused_qkv_default_arch_set() -> None:
+    # Unset, TRTLLM_CTX_QKV_FUSED_ARCHS enables SM100 (not yet SM103) for the fused QKV producer and the
+    # identity-table serialization that follows it (the umbrella switch clears both).
+    from tensorrt_llm._torch import blackwell_rubin_opts
+    from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import msa_backend
+
+    if "TRTLLM_CTX_QKV_FUSED_ARCHS" not in os.environ and blackwell_rubin_opts.UMBRELLA_ON:
+        assert modeling_minimaxm3._CTX_QKV_FUSED_ARCHS == {100, 107}
+    assert msa_backend._IDENTITY_SERIALIZE_ARCHS == modeling_minimaxm3._CTX_QKV_FUSED_ARCHS
+
+
+@pytest.mark.cpu_only
+def test_swiglu_mxfp8_default_arch_set() -> None:
+    # Unset, TRTLLM_CTX_SWIGLU_MXFP8_ARCHS enables SM100/SM103 (the umbrella switch clears them).
+    from tensorrt_llm._torch import blackwell_rubin_opts
+
+    if "TRTLLM_CTX_SWIGLU_MXFP8_ARCHS" not in os.environ and blackwell_rubin_opts.UMBRELLA_ON:
+        assert modeling_minimaxm3._CTX_SWIGLU_MXFP8_ARCHS == {100, 103, 107}
+    assert 107 in modeling_minimaxm3._CTX_SWIGLU_MXFP8_ARCHS
 
 
 @pytest.mark.cpu_only
@@ -3142,6 +3249,36 @@ def test_embedding_gather_matches_f_embedding_for_any_id_layout() -> None:
         out = modeling_minimaxm3.minimax_m3_embedding_gather(ids, weight)
         assert out.shape == (*ids.shape, hidden)
         assert torch.equal(out, reference(ids))
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "sm, archs, enabled, expected",
+    [
+        (107, (107,), True, True),
+        (103, (100, 103, 107), True, True),
+        (100, (100, 103, 107), True, True),
+        (103, (107,), True, False),
+        (90, (100, 103, 107), True, False),
+        (100, (100, 103, 107), False, False),
+    ],
+)
+def test_embedding_gather_engages_on_listed_archs(
+    monkeypatch, sm: int, archs: tuple, enabled: bool, expected: bool
+) -> None:
+    # The fused embedding gather: SM107 and the Blackwell SMs of TRTLLM_CTX_EMBEDDING_GATHER_ARCHS, decided once at
+    # construction.
+    monkeypatch.setattr(modeling_minimaxm3, "get_sm_version", lambda: sm)
+    monkeypatch.setattr(modeling_minimaxm3, "_SM107_EMBEDDING_GATHER", enabled)
+    monkeypatch.setattr(modeling_minimaxm3, "_EMBEDDING_GATHER_ARCHS", frozenset(archs))
+    monkeypatch.setattr(
+        modeling_minimaxm3.Embedding,
+        "__init__",
+        lambda self, *a, **k: torch.nn.Module.__init__(self),
+    )
+    embedding = modeling_minimaxm3.MiniMaxM3Embedding.__new__(modeling_minimaxm3.MiniMaxM3Embedding)
+    modeling_minimaxm3.MiniMaxM3Embedding.__init__(embedding)
+    assert embedding._fused_gather is expected
 
 
 @pytest.mark.cpu_only

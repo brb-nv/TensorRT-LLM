@@ -32,6 +32,7 @@ from torch import nn
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from transformers import PretrainedConfig
 
+from tensorrt_llm._torch.blackwell_rubin_opts import gate_archs
 from tensorrt_llm._utils import get_sm_version, mpi_rank
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.functional import AllReduceStrategy, PositionEmbeddingType
@@ -577,8 +578,11 @@ def _minimax_m3_swiglu_oai(gate_up: torch.Tensor, *, alpha: float, limit: float)
 
 # CTX prefill: the SwiGLU-OAI activation of the dense / shared-expert MLPs also quantizes its output for the MXFP8
 # down_proj in the same pass (bitwise mxfp8_quantize of the stock BF16 activation); the BF16 activation is not written.
-# TRTLLM_CTX_SWIGLU_MXFP8=0 is the kill switch.
+# TRTLLM_CTX_SWIGLU_MXFP8=0 is the kill switch. SM107 always; on SM100/SM103 where TRTLLM_CTX_SWIGLU_MXFP8_ARCHS lists
+# them (default 100,103; "107" keeps the stock path on Blackwell; see blackwell_rubin_opts). bench_swiglu_mxfp8.py
+# (8k/16k rows, d 1536-12288) is bitwise and 1.54-2.54x (GB200) / 1.63-2.75x (GB300) over activation + quantize.
 _CTX_SWIGLU_MXFP8 = os.environ.get("TRTLLM_CTX_SWIGLU_MXFP8", "1") == "1"
+_CTX_SWIGLU_MXFP8_ARCHS = gate_archs("TRTLLM_CTX_SWIGLU_MXFP8_ARCHS")
 _CTX_SWIGLU_MXFP8_LOGGED = False
 
 
@@ -591,7 +595,7 @@ class _SwigluOaiMLP(GatedMLP):
         method = getattr(self.down_proj, "quant_method", None)
         return (
             _CTX_SWIGLU_MXFP8
-            and get_sm_version() == 107
+            and get_sm_version() in _CTX_SWIGLU_MXFP8_ARCHS
             and not has_lora
             and self.activation == torch.nn.functional.silu
             and x.dim() == 2
@@ -772,10 +776,34 @@ def _minimax_m3_router_input_fp32_fake(hidden_states: torch.Tensor) -> torch.Ten
 # bitwise the stock producer applied to its own BF16 GEMM output. TRTLLM_CTX_QKV_FUSED=0 is the kill switch.
 _CTX_QKV_FUSED = os.environ.get("TRTLLM_CTX_QKV_FUSED", "1") == "1"
 _CTX_QKV_FUSED_MIN_ROWS = 1024
+# SM107 always; SM100 / SM103 where TRTLLM_CTX_QKV_FUSED_ARCHS lists them (default 100; see blackwell_rubin_opts).
+# GB200 is where it was measured: bitwise to the stock path end to end (MiniMax-M3 NVFP4, TP4 greedy) and 1.30-1.55x
+# over CUTLASS + producer at M 2048-8192 (64/4/4 and 32/2/2 heads); add 103 once test_m3_qkv_fusion.py passes on GB300.
+# There the kernel runs on the K32 SM100 MMA atom with 2-head tiles (TRTLLM_CTX_QKV_FUSED_HEADS_PER_TILE=1 picks 1-head
+# tiles; other values keep 2: a 3-head tile with a 128-wide MMA N never finished on GB200), launches without PDL unless
+# TRTLLM_ENABLE_PDL=1 (its TMA warp triggers dependents before the epilogue stores), compiles during the AutoTuner
+# warmup pass, and a failed compile falls back to the stock projection.
+_CTX_QKV_FUSED_ARCHS = gate_archs("TRTLLM_CTX_QKV_FUSED_ARCHS", default_blackwell=(100,))
+_CTX_QKV_FUSED_SM10X_HEADS_PER_TILE_ENV = os.environ.get("TRTLLM_CTX_QKV_FUSED_HEADS_PER_TILE", "2")
+_CTX_QKV_FUSED_SM10X_HEADS_PER_TILE = (
+    1 if _CTX_QKV_FUSED_SM10X_HEADS_PER_TILE_ENV.strip() == "1" else 2
+)
+if _CTX_QKV_FUSED_SM10X_HEADS_PER_TILE_ENV.strip() not in ("1", "2"):
+    logger.warning(
+        f"TRTLLM_CTX_QKV_FUSED_HEADS_PER_TILE={_CTX_QKV_FUSED_SM10X_HEADS_PER_TILE_ENV!r} is not 1 or 2; the SM100 / "
+        "SM103 fused QKV GEMM + producer uses 2-head tiles"
+    )
+_CTX_QKV_FUSED_SM10X_PDL = os.environ.get("TRTLLM_ENABLE_PDL", "0") == "1"
+_CTX_QKV_FUSED_FAILED: set = set()
 # A layer whose QKV the fused producer above took runs its attention core and o_proj through _core_then_o_proj, so the
 # NVFP4 combine can also hand the o_proj its MXFP8 input (msa_combine_mxfp8, slot tag "p5a"); same o_proj input values.
 # Kill switch: TRTLLM_CTX_P5A_COMBINE_MXFP8=0 calls the o_proj on the BF16 core output.
 _CTX_P5A_COMBINE_MXFP8 = os.environ.get("TRTLLM_CTX_P5A_COMBINE_MXFP8", "1") == "1"
+
+
+def _ctx_qkv_fused_arch_ok() -> bool:
+    """Whether this device runs the fused QKV GEMM + producer (SM107, or an opted-in SM100 / SM103)."""
+    return get_sm_version() in _CTX_QKV_FUSED_ARCHS
 
 
 def _ctx_qkv_fused_takes_rows(rows: int) -> bool:
@@ -823,7 +851,7 @@ def _bcg_bucket_takes_eager_qkv(captured_rows: int) -> bool:
     return (
         _CTX_BCG_P5A
         and _CTX_QKV_FUSED
-        and get_sm_version() == 107
+        and _ctx_qkv_fused_arch_ok()
         and _ctx_qkv_fused_takes_rows(captured_rows)
     )
 
@@ -833,15 +861,38 @@ _CTX_QKV_FUSED_LOGGED = False
 
 
 def _ctx_qkv_fused_runner(num_heads_q: int, num_heads_kv: int, num_heads_index: int):
-    """The compiled fused QKV runner for one per-rank head geometry (compiled on first use, outside capture)."""
+    """The compiled fused QKV runner for one per-rank head geometry (compiled on first use, outside capture), or None
+    where its compile failed off SM107 (the caller then runs the stock projection + producer)."""
     key = (num_heads_q, num_heads_kv, num_heads_index)
     runner = _CTX_QKV_FUSED_RUNNERS.get(key)
     if runner is None:
+        if key in _CTX_QKV_FUSED_FAILED:
+            return None
         from ..kernels.rubin.m3_qkv_fusion.kernel import M3QkvFusedRunner
 
-        runner = M3QkvFusedRunner(
+        geometry = dict(
             num_heads_q=num_heads_q, num_heads_kv=num_heads_kv, num_heads_index=num_heads_index
         )
+        if get_sm_version() == 107:
+            runner = M3QkvFusedRunner(**geometry)
+        else:
+            try:
+                runner = M3QkvFusedRunner(
+                    **geometry,
+                    heads_per_tile=_CTX_QKV_FUSED_SM10X_HEADS_PER_TILE,
+                    enable_pdl=_CTX_QKV_FUSED_SM10X_PDL,
+                )
+            except Exception as exc:  # noqa: BLE001 - any compile failure keeps the stock path
+                _CTX_QKV_FUSED_FAILED.add(key)
+                logger.warning(
+                    f"MiniMax-M3 CTX fused QKV GEMM + producer: compile failed on SM{get_sm_version()} for heads "
+                    f"{key} ({exc!r}); keeping the stock projection + producer"
+                )
+                return None
+            logger.info(
+                f"MiniMax-M3 CTX fused QKV GEMM + producer compiled on SM{get_sm_version()} for heads {key} "
+                f"(heads_per_tile {_CTX_QKV_FUSED_SM10X_HEADS_PER_TILE}, PDL {_CTX_QKV_FUSED_SM10X_PDL})"
+            )
         _CTX_QKV_FUSED_RUNNERS[key] = runner
     return runner
 
@@ -898,18 +949,32 @@ def _router_tc_gen_ok(hidden_size: int) -> bool:
     return ok
 
 
-# SM107: the one-model Eagle3 drafter reads its first pass at context steps only at each context request's last row,
+# SM107 and SM100/SM103 (TRTLLM_CTX_DRAFTER_LAST_ROW_ARCHS, default 100,103; see blackwell_rubin_opts): the one-model
+# Eagle3 drafter reads its first pass at context steps only at each context request's last row,
 # so its context attention runs that row alone (DrafterLastRowContextFmha); every row still gets RoPE and its K/V
 # appended to the drafter KV cache. Kill: TRTLLM_CTX_DRAFTER_LAST_ROW=0 in the deployment env (read once at import)
 # runs the stock context attention over all rows.
 _SM107_DRAFTER_CTX_LAST_ROW = os.environ.get("TRTLLM_CTX_DRAFTER_LAST_ROW", "1") == "1"
+_DRAFTER_CTX_LAST_ROW_ARCHS = gate_archs("TRTLLM_CTX_DRAFTER_LAST_ROW_ARCHS")
 
-# SM107: at a context step the same drafter layer runs its o_proj (with its all-reduce) and its MLP only on the rows the
+# SM107 and SM100/SM103 (TRTLLM_CTX_DRAFTER_DEAD_ROWS_ARCHS, default 100,103): at a context step the same drafter
+# layer runs its o_proj (with its all-reduce) and its MLP only on the rows the
 # Eagle3 loop reads (each context request's last row, every generation row); the other rows' outputs are zeros. Every
 # row still gets its QKV, RoPE and K/V append. Kill: TRTLLM_CTX_DRAFTER_DEAD_ROWS=0 in the deployment env (read once at
 # import) runs both over all rows.
 _SM107_DRAFTER_CTX_DEAD_ROWS = os.environ.get("TRTLLM_CTX_DRAFTER_DEAD_ROWS", "1") == "1"
+_DRAFTER_CTX_DEAD_ROWS_ARCHS = gate_archs("TRTLLM_CTX_DRAFTER_DEAD_ROWS_ARCHS")
 _SM107_DRAFTER_CTX_DEAD_ROWS_LOGGED = []
+
+
+def _drafter_ctx_last_row_on() -> bool:
+    """Whether the drafter's context attention runs each context request's last row only (this device and env)."""
+    return _SM107_DRAFTER_CTX_LAST_ROW and get_sm_version() in _DRAFTER_CTX_LAST_ROW_ARCHS
+
+
+def _drafter_ctx_dead_rows_on() -> bool:
+    """Whether the drafter's o_proj and MLP skip the dead context rows (this device and env)."""
+    return _SM107_DRAFTER_CTX_DEAD_ROWS and get_sm_version() in _DRAFTER_CTX_DEAD_ROWS_ARCHS
 
 
 def _drafter_live_rows(attn_metadata, rows: int) -> Optional[torch.Tensor]:
@@ -975,11 +1040,13 @@ def mark_drafter_dead_rows(draft_model: torch.nn.Module) -> int:
     return 1
 
 
-# SM107: the token embedding (full vocabulary on every rank) is one Triton gather that writes a token's row, or zeros
+# SM107 and SM100/SM103 (TRTLLM_CTX_EMBEDDING_GATHER_ARCHS, default 100,103; see blackwell_rubin_opts): the token
+# embedding (full vocabulary on every rank) is one Triton gather that writes a token's row, or zeros
 # for an id outside the vocabulary, instead of the aten gather followed by the broadcast masked_fill of the whole
 # output (~270 us per 16K-token chunk). The same bits. Kill: TRTLLM_CTX_EMBEDDING_GATHER=0 in the deployment env (read
 # once at import) runs the stock Embedding forward.
 _SM107_EMBEDDING_GATHER = os.environ.get("TRTLLM_CTX_EMBEDDING_GATHER", "1") == "1"
+_EMBEDDING_GATHER_ARCHS = gate_archs("TRTLLM_CTX_EMBEDDING_GATHER_ARCHS")
 _SM107_EMBEDDING_GATHER_LOGGED = []
 
 
@@ -1022,15 +1089,16 @@ def _minimax_m3_embedding_gather_fake(
 
 
 class MiniMaxM3Embedding(Embedding):
-    """The token embedding; on SM107 without vocabulary parallelism, one fused gather (minimax_m3_embedding_gather)."""
+    """The token embedding; on SM107 and SM100/SM103 without vocabulary parallelism, one fused gather
+    (minimax_m3_embedding_gather)."""
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self._sm107_gather = _SM107_EMBEDDING_GATHER and get_sm_version() == 107
+        self._fused_gather = _SM107_EMBEDDING_GATHER and get_sm_version() in _EMBEDDING_GATHER_ARCHS
 
     def forward(self, input):
         if (
-            self._sm107_gather
+            self._fused_gather
             and self.tp_size == 1
             and input.is_cuda
             and self.weight.dim() == 2
@@ -2519,7 +2587,7 @@ class MiniMaxM3Attention(Attention):
         if (
             not _CTX_QKV_FUSED
             or not ctx_eager_only()
-            or get_sm_version() != 107
+            or not _ctx_qkv_fused_arch_ok()
             or hidden_states.dim() != 2
             or not hidden_states.is_contiguous()
             or not _ctx_qkv_fused_takes_rows(num_tokens)
@@ -2527,12 +2595,20 @@ class MiniMaxM3Attention(Attention):
             or not getattr(method, "use_cutlass", False)
             or getattr(proj, "bias", None) is not None
             or tuple(proj.weight.shape) != (n_total, hidden_states.shape[1])
-            or _autotuner_tuning()
         ):
+            return None
+        if _autotuner_tuning():
+            if get_sm_version() != 107:
+                # Compile in the warmup's tuning pass, not in the first served >1024-row step.
+                _ctx_qkv_fused_runner(
+                    self.num_heads, self.num_key_value_heads, self.sparse_num_index_heads
+                )
             return None
         runner = _ctx_qkv_fused_runner(
             self.num_heads, self.num_key_value_heads, self.sparse_num_index_heads
         )
+        if runner is None:
+            return None
         q = hidden_states.new_empty(
             (num_tokens, self.num_heads, self.head_dim), dtype=torch.float8_e4m3fn
         )
@@ -3972,8 +4048,7 @@ class MiniMaxM3ForCausalLM(SpecDecOneEngineForCausalLM[MiniMaxM3Model, Pretraine
             model_config.extra_attrs["draft_kv_cache_quant_algo_override"] = QuantAlgo.FP8
         super().__init__(MiniMaxM3Model(model_config), model_config)
         if (
-            _SM107_DRAFTER_CTX_LAST_ROW
-            and get_sm_version() == 107
+            _drafter_ctx_last_row_on()
             and self.draft_model is not None
             and isinstance(self.draft_model, Eagle3ForCausalLM)
         ):
@@ -3981,8 +4056,7 @@ class MiniMaxM3ForCausalLM(SpecDecOneEngineForCausalLM[MiniMaxM3Model, Pretraine
 
             mark_drafter_last_row_attention(self.draft_model)
         if (
-            _SM107_DRAFTER_CTX_DEAD_ROWS
-            and get_sm_version() == 107
+            _drafter_ctx_dead_rows_on()
             and self.draft_model is not None
             and isinstance(self.draft_model, Eagle3ForCausalLM)
         ):
