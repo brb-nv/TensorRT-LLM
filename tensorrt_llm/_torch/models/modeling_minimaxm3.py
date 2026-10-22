@@ -738,6 +738,9 @@ def split_router_weight_bf16(
 # SM107: from this many tokens the router input is cast to float32 by one vectorized Triton pass instead of the
 # aten dtype-converting copy (its unrolled path runs at ~2 TB/s). The cast is exact, so the result is bitwise the same.
 _SM107_ROUTER_FP32_CAST = True
+# SM107 always; SM100 / SM103 where TRTLLM_M3_ROUTER_FP32_CAST_ARCHS lists them (default 100,103; see
+# blackwell_rubin_opts).
+_ROUTER_FP32_CAST_ARCHS = gate_archs("TRTLLM_M3_ROUTER_FP32_CAST_ARCHS")
 _SM107_ROUTER_FP32_CAST_MIN_TOKENS = 2048
 _SM107_ROUTER_FP32_CAST_LOGGED = []
 
@@ -910,6 +913,11 @@ def _ctx_qkv_fused_runner(num_heads_q: int, num_heads_kv: int, num_heads_index: 
 # TF32 class as the cuBLAS path it replaces (the container enables TF32). TRTLLM_CTX_ROUTER_TF32_FIXED=0 is the kill
 # switch.
 _CTX_ROUTER_TF32_FIXED = os.environ.get("TRTLLM_CTX_ROUTER_TF32_FIXED", "1") == "1"
+# SM107 always; SM100 / SM103 only where TRTLLM_CTX_ROUTER_TF32_FIXED_ARCHS lists them (opt-in; see
+# blackwell_rubin_opts). Their stock router is the FP32-grade BF16-split GEMM, whose precision the TF32 tile lowers.
+_CTX_ROUTER_TF32_FIXED_ARCHS = gate_archs(
+    "TRTLLM_CTX_ROUTER_TF32_FIXED_ARCHS", default_blackwell=()
+)
 _CTX_ROUTER_TF32_LOGGED = False
 # Pure generation steps (no context rows) keep the stock router below: the fixed-tile kernel runs a 128-row tile with a
 # serial K loop, so a decode batch pays its full ~70 us per layer, which the stock cuBLAS path does in ~13 us. Context
@@ -923,6 +931,9 @@ _ROUTER_TF32_IN_GEN = os.environ.get("TRTLLM_M3_ROUTER_TF32_IN_GEN", "0") == "1"
 # Devices that cannot co-schedule 16-CTA clusters keep the stock router. Rule-1b gates passed (GSM McNemar greedy
 # p 0.839 / sampled p 0.424; natural AL at 9..16 rows dAL +0.002). Kill switch: TRTLLM_M3_ROUTER_TC_GEN=0.
 _ROUTER_TC_GEN = os.environ.get("TRTLLM_M3_ROUTER_TC_GEN", "1") == "1"
+# SM107 always; SM100 / SM103 only where TRTLLM_M3_ROUTER_TC_GEN_ARCHS lists them (opt-in; see blackwell_rubin_opts):
+# the kernel is built for sm_100a / sm_103a, but it is not bitwise the stock BF16-split router there.
+_ROUTER_TC_GEN_ARCHS = gate_archs("TRTLLM_M3_ROUTER_TC_GEN_ARCHS", default_blackwell=())
 _ROUTER_TC_GEN_MIN_ROWS = 9
 # The router_tc launch also emits the routed experts' NVFP4 input (packed e2m1 + linear block scales, bit-identical to
 # fp4_quantize(x, fc31_input_scale, 16, False, False)), which MiniMaxM3MoE hands to the experts in place of their own
@@ -1148,12 +1159,18 @@ class MiniMaxM3Gate(nn.Module):
         # ``weight`` as BF16 terms along K (split_router_weight_bf16) for the
         # tensor-core GEMM on BF16 inputs; built by ``load_weights``, else None.
         self.register_buffer("split_weight", None, persistent=False)
-        self._sm107_fp32_cast = _SM107_ROUTER_FP32_CAST and get_sm_version() == 107
+        self._sm107_fp32_cast = (
+            _SM107_ROUTER_FP32_CAST and get_sm_version() in _ROUTER_FP32_CAST_ARCHS
+        )
+        self._ctx_router_tf32 = (
+            _CTX_ROUTER_TF32_FIXED and get_sm_version() in _CTX_ROUTER_TF32_FIXED_ARCHS
+        )
         self._weight_tf32: Optional[torch.Tensor] = None
-        # SM107 generation steps of 9..16 rows: the TF32 tensor-core router (16-CTA clusters, see _router_tc_gen_ok).
+        # Generation steps of 9..16 rows on _ROUTER_TC_GEN_ARCHS: the TF32 tensor-core router (16-CTA clusters, see
+        # _router_tc_gen_ok).
         self._router_tc_gen = (
             _ROUTER_TC_GEN
-            and get_sm_version() == 107
+            and get_sm_version() in _ROUTER_TC_GEN_ARCHS
             and num_experts == 128
             and hidden_size % 1024 == 0
         )
@@ -1161,7 +1178,7 @@ class MiniMaxM3Gate(nn.Module):
     def cache_tf32_weight(self) -> None:
         """Build the TF32-rounded weight copy for the fixed-tile router (after every weight load)."""
         self._weight_tf32 = None
-        if _CTX_ROUTER_TF32_FIXED and self._sm107_fp32_cast:
+        if self._ctx_router_tf32:
             from ..moe.fused_moe.router_gemm_tf32 import prepare_router_weight_tf32
 
             self._weight_tf32 = prepare_router_weight_tf32(self.weight.float())
@@ -1179,7 +1196,7 @@ class MiniMaxM3Gate(nn.Module):
         return self._router_tc_gen or self._weight_tf32 is not None
 
     def router_tc_applies(self, hidden_states: torch.Tensor, generation_only: bool) -> bool:
-        """Whether forward() takes the TF32 tensor-core router (9..16-row generation steps on SM107).
+        """Whether forward() takes the TF32 tensor-core router (9..16-row generation steps on _ROUTER_TC_GEN_ARCHS).
 
         The device-static and compile checks come first so that a traced forward never evaluates ``generation_only``
         (a value read from ``attn_metadata``; evaluating it guards the compiled graph on ``num_contexts``)."""
