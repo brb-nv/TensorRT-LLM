@@ -32,6 +32,7 @@ from torch import nn
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from transformers import PretrainedConfig
 
+from tensorrt_llm._torch.blackwell_rubin_opts import gate_archs
 from tensorrt_llm._utils import get_sm_version, mpi_rank
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.functional import AllReduceStrategy, PositionEmbeddingType
@@ -898,18 +899,32 @@ def _router_tc_gen_ok(hidden_size: int) -> bool:
     return ok
 
 
-# SM107: the one-model Eagle3 drafter reads its first pass at context steps only at each context request's last row,
+# SM107 and SM100/SM103 (TRTLLM_CTX_DRAFTER_LAST_ROW_ARCHS, default 100,103; see blackwell_rubin_opts): the one-model
+# Eagle3 drafter reads its first pass at context steps only at each context request's last row,
 # so its context attention runs that row alone (DrafterLastRowContextFmha); every row still gets RoPE and its K/V
 # appended to the drafter KV cache. Kill: TRTLLM_CTX_DRAFTER_LAST_ROW=0 in the deployment env (read once at import)
 # runs the stock context attention over all rows.
 _SM107_DRAFTER_CTX_LAST_ROW = os.environ.get("TRTLLM_CTX_DRAFTER_LAST_ROW", "1") == "1"
+_DRAFTER_CTX_LAST_ROW_ARCHS = gate_archs("TRTLLM_CTX_DRAFTER_LAST_ROW_ARCHS")
 
-# SM107: at a context step the same drafter layer runs its o_proj (with its all-reduce) and its MLP only on the rows the
+# SM107 and SM100/SM103 (TRTLLM_CTX_DRAFTER_DEAD_ROWS_ARCHS, default 100,103): at a context step the same drafter
+# layer runs its o_proj (with its all-reduce) and its MLP only on the rows the
 # Eagle3 loop reads (each context request's last row, every generation row); the other rows' outputs are zeros. Every
 # row still gets its QKV, RoPE and K/V append. Kill: TRTLLM_CTX_DRAFTER_DEAD_ROWS=0 in the deployment env (read once at
 # import) runs both over all rows.
 _SM107_DRAFTER_CTX_DEAD_ROWS = os.environ.get("TRTLLM_CTX_DRAFTER_DEAD_ROWS", "1") == "1"
+_DRAFTER_CTX_DEAD_ROWS_ARCHS = gate_archs("TRTLLM_CTX_DRAFTER_DEAD_ROWS_ARCHS")
 _SM107_DRAFTER_CTX_DEAD_ROWS_LOGGED = []
+
+
+def _drafter_ctx_last_row_on() -> bool:
+    """Whether the drafter's context attention runs each context request's last row only (this device and env)."""
+    return _SM107_DRAFTER_CTX_LAST_ROW and get_sm_version() in _DRAFTER_CTX_LAST_ROW_ARCHS
+
+
+def _drafter_ctx_dead_rows_on() -> bool:
+    """Whether the drafter's o_proj and MLP skip the dead context rows (this device and env)."""
+    return _SM107_DRAFTER_CTX_DEAD_ROWS and get_sm_version() in _DRAFTER_CTX_DEAD_ROWS_ARCHS
 
 
 def _drafter_live_rows(attn_metadata, rows: int) -> Optional[torch.Tensor]:
@@ -3972,8 +3987,7 @@ class MiniMaxM3ForCausalLM(SpecDecOneEngineForCausalLM[MiniMaxM3Model, Pretraine
             model_config.extra_attrs["draft_kv_cache_quant_algo_override"] = QuantAlgo.FP8
         super().__init__(MiniMaxM3Model(model_config), model_config)
         if (
-            _SM107_DRAFTER_CTX_LAST_ROW
-            and get_sm_version() == 107
+            _drafter_ctx_last_row_on()
             and self.draft_model is not None
             and isinstance(self.draft_model, Eagle3ForCausalLM)
         ):
@@ -3981,8 +3995,7 @@ class MiniMaxM3ForCausalLM(SpecDecOneEngineForCausalLM[MiniMaxM3Model, Pretraine
 
             mark_drafter_last_row_attention(self.draft_model)
         if (
-            _SM107_DRAFTER_CTX_DEAD_ROWS
-            and get_sm_version() == 107
+            _drafter_ctx_dead_rows_on()
             and self.draft_model is not None
             and isinstance(self.draft_model, Eagle3ForCausalLM)
         ):
