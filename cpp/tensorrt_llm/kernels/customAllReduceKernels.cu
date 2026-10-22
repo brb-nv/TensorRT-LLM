@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,6 +15,7 @@
  */
 
 #include "customAllReduceKernels.h"
+#include "tensorrt_llm/common/blackwellRubinOpts.h"
 #include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaBf16Fallbacks.cuh"
 #include "tensorrt_llm/common/cudaTypeUtils.cuh"
@@ -443,10 +444,18 @@ __global__ void rms_norm_rows_kernel(AllReduceParams params)
 #endif
 }
 
-// Kill switch for the SM107 rms_norm_rows_kernel path of rms_norm_kernel_launcher, and the fewest rows it takes:
+// Kill switch for the rms_norm_rows_kernel path of rms_norm_kernel_launcher, and the fewest rows it takes:
 // below that the per-row kernel is as fast, so decode-sized steps keep it.
 constexpr bool kRmsNormRowsSm107 = true;
 constexpr int kRmsNormRowsSm107MinRows = 1024;
+
+// The SMs that take the rows path: SM107, plus SM100/SM103 where TRTLLM_AR_RMSNORM_ROWS_ARCHS lists them (default
+// 100,103; TRTLLM_M3_BLACKWELL_RUBIN_OPTS=0 drops them). The kernel is plain SIMT CUDA, bitwise the per-row kernel.
+inline bool rmsNormRowsArchOk()
+{
+    static bool const ok = tensorrt_llm::common::blackwell_rubin_opts::gateOn("TRTLLM_AR_RMSNORM_ROWS_ARCHS");
+    return ok;
+}
 
 template <typename T, bool Bias = false, bool Residual = false, bool Affine = false>
 __global__ void rms_pre_post_norm_kernel(AllReduceParams params) // for gemma2 pre residual + post residual norm
@@ -596,9 +605,10 @@ void rms_norm_kernel_launcher(AllReduceParams& params, cudaStream_t stream, AllR
     }
     else
     {
-        // SM107: a single-pass RMSNorm over many rows runs persistent (rms_norm_rows_kernel, bitwise the same).
+        // SM107 / SM100 / SM103: a single-pass RMSNorm over many rows runs persistent (rms_norm_rows_kernel, bitwise
+        // the same).
         if (kRmsNormRowsSm107 && fusionOp == AllReduceFusionOp::RESIDUAL_RMS_NORM && cta_num >= kRmsNormRowsSm107MinRows
-            && tensorrt_llm::common::getSMVersion() == 107)
+            && rmsNormRowsArchOk())
         {
             static int const multiProcessorCount = tensorrt_llm::common::getMultiProcessorCount();
             cudaLaunchConfig_t kernelConfig = {0};
