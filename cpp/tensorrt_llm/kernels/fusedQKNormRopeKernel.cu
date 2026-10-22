@@ -15,6 +15,7 @@
  */
 
 #include "fusedQKNormRopeKernel.h"
+#include "tensorrt_llm/common/blackwellRubinOpts.h"
 #include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/envUtils.h"
@@ -1040,11 +1041,19 @@ __global__ void minimaxM3Nvfp4QKVIndexerNormRopeKVInsertRowsKernel(__nv_bfloat16
     }
 }
 
-// Kill switch for the SM107 rows producer of launchMinimaxM3Nvfp4QKVIndexerNormRopeKVInsert, the fewest tokens it
+// Kill switch for the rows producer of launchMinimaxM3Nvfp4QKVIndexerNormRopeKVInsert, the fewest tokens it
 // takes (shorter steps keep the per-token kernel) and its tokens per warp.
 constexpr bool kNvfp4ProducerRowsSm107 = true;
 constexpr int kNvfp4ProducerRowsSm107MinTokens = 1024;
 constexpr int kNvfp4ProducerRowsTokens = 4;
+
+// The SMs that take the rows producer: SM107, plus SM100/SM103 where TRTLLM_M3_NVFP4_PRODUCER_ROWS_ARCHS lists them
+// (default 100,103; TRTLLM_M3_BLACKWELL_RUBIN_OPTS=0 drops them). Same per-element code as the per-token kernel.
+bool nvfp4ProducerRowsArchOk()
+{
+    static bool const ok = common::blackwell_rubin_opts::gateOn("TRTLLM_M3_NVFP4_PRODUCER_ROWS_ARCHS");
+    return ok;
+}
 
 } // namespace
 
@@ -1235,9 +1244,9 @@ void launchMinimaxM3Nvfp4QKVIndexerNormRopeKVInsert(void const* packed_input, vo
     constexpr int kBlockSize = 256;
     constexpr int kWarpsPerBlock = kBlockSize / 32;
     int const slotsPerToken = num_heads_q + 2 * num_heads_kv + num_heads_index + 1;
-    // SM107: long chunks run the rows producer (several tokens per warp, bitwise the same outputs).
+    // SM107 / SM100 / SM103: long chunks run the rows producer (several tokens per warp, bitwise the same outputs).
     bool const rows
-        = kNvfp4ProducerRowsSm107 && num_tokens >= kNvfp4ProducerRowsSm107MinTokens && common::getSMVersion() == 107;
+        = kNvfp4ProducerRowsSm107 && num_tokens >= kNvfp4ProducerRowsSm107MinTokens && nvfp4ProducerRowsArchOk();
     int const tokensPerWarp = rows ? kNvfp4ProducerRowsTokens : 1;
     int const totalWarps = common::divUp(num_tokens, tokensPerWarp) * slotsPerToken;
     int const gridSize = common::divUp(totalWarps, kWarpsPerBlock);
