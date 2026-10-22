@@ -3553,7 +3553,7 @@ index 10b2b1f..3b9f909 100644
  
  @dsl_user_op
 diff --git a/python/fmha_sm100/cute/src/sm100/build_k2q_csr/build_k2q_csr.cu b/python/fmha_sm100/cute/src/sm100/build_k2q_csr/build_k2q_csr.cu
-index 8ee5457..428b5a3 100644
+index 8ee5457..e5aacd7 100644
 --- a/python/fmha_sm100/cute/src/sm100/build_k2q_csr/build_k2q_csr.cu
 +++ b/python/fmha_sm100/cute/src/sm100/build_k2q_csr/build_k2q_csr.cu
 @@ -27,6 +27,10 @@
@@ -3842,17 +3842,54 @@ index 8ee5457..428b5a3 100644
  // ---------------------------------------------------------------------------
  // PT_smem: SMEM-staged tile prefix scan.
  // Each block handles kRowsPerBlock rows for one head h. Cooperative load
-@@ -521,6 +786,49 @@ __global__ void k2q_scatter_kernel(
+@@ -521,6 +786,86 @@ __global__ void k2q_scatter_kernel(
  // Host orchestration
  // ===========================================================================
  
-+// MiniMax-M3 (MSA) F2 host-cost cut (SM107 only, eager only): the pipeline's five scratch buffers (row_counts,
++// MiniMax-M3 (MSA) F2 host-cost cut (k2q_opt_arch only, eager only): the pipeline's five scratch buffers (row_counts,
 +// row_map, row_coords, tile_counts, edge_rank) are slices of one per-device int32 arena that grows on demand instead of
 +// five allocations per call (row_counts zeroed by a memset instead of torch::zeros), the SM count is read once per
 +// device, and cudaFuncSetAttribute is called only when a kernel's requested dynamic SMEM differs from the value last set
 +// (stock sets it on every call; the attribute state is the same). Every user of the arena runs on the caller's current
 +// stream, so reuse is stream-ordered; a capturing stream takes the stock allocations. Same kernels, same launches.
 +// Kill: FMHA_K2Q_WS_ARENA=0.
++// The SM versions that take the MiniMax-M3 k2q changes below: SM107 always, plus the SM100 / SM103 that
++// FMHA_K2Q_OPT_ARCHS lists (comma-separated SM numbers, default "103,107": GB300 takes them, ~1.06x per build on
++// host and device at the agentic shapes; GB200 keeps the stock pipeline, where they measured 1-5 us slower per build
++// and up to ~60% slower on a fresh 8k ADP chunk; "100,103,107" opts GB200 in) unless TRTLLM_M3_BLACKWELL_RUBIN_OPTS=0.
++// Read once per process.
++static bool k2q_opt_arch(int sm) {
++    static int const blackwell_mask = [] {
++        int mask = 0;  // bit 0: SM100, bit 1: SM103
++        char const* umbrella = std::getenv("TRTLLM_M3_BLACKWELL_RUBIN_OPTS");
++        bool const umbrella_on = umbrella == nullptr || std::atoi(umbrella) != 0;
++        char const* env = std::getenv("FMHA_K2Q_OPT_ARCHS");
++        char const* list = env != nullptr ? env : "103,107";
++        for (char const* p = list; *p != '\0';) {
++            while (*p != '\0' && (*p < '0' || *p > '9')) {
++                ++p;
++            }
++            if (*p == '\0') {
++                break;
++            }
++            char* end = nullptr;
++            long const v = std::strtol(p, &end, 10);
++            mask |= v == 100 ? 1 : (v == 103 ? 2 : 0);
++            p = end;
++            while (*p != '\0' && *p != ',' && *p != ';') {
++                ++p;  // an "a"/"f" suffix
++            }
++        }
++        if (!umbrella_on) {
++            mask = 0;
++        }
++        std::fprintf(stderr, "[fmha_sm100] k2q CSR build: MiniMax-M3 changes on SM107%s%s (FMHA_K2Q_OPT_ARCHS)\n",
++            (mask & 1) ? ", SM100" : "", (mask & 2) ? ", SM103" : "");
++        return mask;
++    }();
++    return sm == 107 || (sm == 100 && (blackwell_mask & 1)) || (sm == 103 && (blackwell_mask & 2));
++}
++
 +static bool k2q_arena_enabled() {
 +    static bool const on = [] {
 +        char const* env = std::getenv("FMHA_K2Q_WS_ARENA");
@@ -3892,7 +3929,7 @@ index 8ee5457..428b5a3 100644
  template <int kTopK, int kBlockK>
  static void launch_pipeline(
      torch::Tensor q2k,
-@@ -554,15 +862,13 @@ static void launch_pipeline(
+@@ -554,15 +899,13 @@ static void launch_pipeline(
          (size_t)H * S_Q * kTopK * sizeof(int), stream));
  
      auto opts = torch::TensorOptions().dtype(torch::kInt32).device(device);
@@ -3910,24 +3947,25 @@ index 8ee5457..428b5a3 100644
      if (emit_schedule) {
          AT_CUDA_CHECK(cudaMemsetAsync(work_count_ptr, 0, sizeof(int), stream));
          AT_CUDA_CHECK(cudaMemsetAsync(
-@@ -571,9 +877,39 @@ static void launch_pipeline(
+@@ -571,9 +914,40 @@ static void launch_pipeline(
      }
  
      int dev = q2k.get_device();
 +    // The MiniMax-M3 k2q changes below (min q per CTA, edge-rank, multi-CTA emission, row-prefix claims, the scratch
-+    // arena) are validated on SM107 only; SM100 / SM103 keep the stock pipeline and allocations. SM107 loads the sm_100
-+    // build, so this is a runtime check, resolved once per device (host code only; the device code is unchanged).
-+    static signed char sm107_by_dev[64] = {};  // 0 unknown, 1 SM107, 2 other
-+    signed char& sm107_state = sm107_by_dev[dev & 63];
-+    if (sm107_state == 0) {
++    // arena) run on SM107 and on the SM100 / SM103 of k2q_opt_arch; other devices keep the stock pipeline and
++    // allocations. Every one of them loads the sm_100 build, so this is a runtime check, resolved once per device (host
++    // code only; the device code is unchanged).
++    static signed char k2q_opts_by_dev[64] = {};  // 0 unknown, 1 the changes apply, 2 stock
++    signed char& k2q_opts_state = k2q_opts_by_dev[dev & 63];
++    if (k2q_opts_state == 0) {
 +        int cc_major = 0, cc_minor = 0;
 +        AT_CUDA_CHECK(cudaDeviceGetAttribute(&cc_major, cudaDevAttrComputeCapabilityMajor, dev));
 +        AT_CUDA_CHECK(cudaDeviceGetAttribute(&cc_minor, cudaDevAttrComputeCapabilityMinor, dev));
-+        sm107_state = (cc_major == 10 && cc_minor == 7) ? 1 : 2;
++        k2q_opts_state = k2q_opt_arch(cc_major * 10 + cc_minor) ? 1 : 2;
 +    }
-+    bool const is_sm107 = sm107_state == 1;
++    bool const k2q_opts = k2q_opts_state == 1;
 +    bool use_arena = false;
-+    if (is_sm107 && k2q_arena_enabled()) {
++    if (k2q_opts && k2q_arena_enabled()) {
 +        cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
 +        AT_CUDA_CHECK(cudaStreamIsCapturing(stream, &capture));
 +        // The arena is bound to the first stream that uses it; any other stream takes the stock allocations, so
@@ -3952,7 +3990,7 @@ index 8ee5457..428b5a3 100644
  
      // -- Pick kWarps per CTA based on SMEM budget for cursor/hist ---------
      // SMEM per CTA = kWarps * total_rows * sizeof(int) (for both H and S).
-@@ -596,26 +932,86 @@ static void launch_pipeline(
+@@ -596,26 +970,86 @@ static void launch_pipeline(
      int max_ctas_per_sm = std::max(
          1, (228 * 1024) / std::max(1, per_cta_smem_bytes));
      if (max_ctas_per_sm > 8) max_ctas_per_sm = 8;
@@ -3973,7 +4011,7 @@ index 8ee5457..428b5a3 100644
      // lower if max_ctas_per_sm < 3.
      int target_g = num_sms * std::min(max_ctas_per_sm, 3);
 -    int max_g_for_q = (S_Q + kMinQPerCta - 1) / kMinQPerCta;
-+    int const min_q_per_cta = is_sm107 ? kMinQPerCta : 256;  // SM107 only; stock 256 elsewhere
++    int const min_q_per_cta = k2q_opts ? kMinQPerCta : 256;  // k2q_opt_arch only; stock 256 elsewhere
 +    int max_g_for_q = (S_Q + min_q_per_cta - 1) / min_q_per_cta;
      int G = std::min({target_g, max_g_for_q, S_Q});
      if (G < 1) G = 1;
@@ -4000,7 +4038,7 @@ index 8ee5457..428b5a3 100644
 +                     on ? "on" : "off (stock)");
 +        return on;
 +    }();
-+    bool const kEdgeRank = is_sm107 && kEdgeRankOn && kTopK == 16 && kWarps_pick == 4 && q_per_warp <= 32;  // SM107 only
++    bool const kEdgeRank = k2q_opts && kEdgeRankOn && kTopK == 16 && kWarps_pick == 4 && q_per_warp <= 32;  // k2q_opt_arch only
 +    int G_total = kEdgeRank ? G : G * kWarps_pick;
 +
 +    torch::Tensor tile_counts, edge_rank_ws;
@@ -4041,11 +4079,11 @@ index 8ee5457..428b5a3 100644
 +                     on ? "warp-aggregated" : "per row (stock)");
 +        return on;
 +    }();
-+    auto rprefix_fn = (is_sm107 && kRowPrefixAgg) ? k2q_row_prefix_agg_kernel<1024> : k2q_row_prefix_kernel<1024>;  // SM107 only
++    auto rprefix_fn = (k2q_opts && kRowPrefixAgg) ? k2q_row_prefix_agg_kernel<1024> : k2q_row_prefix_kernel<1024>;  // k2q_opt_arch only
      constexpr int kPtRowsPerBlock = 8;
      constexpr int kPtThreads = 256;
      auto tprefix_smem_fn = k2q_tile_prefix_smem_kernel<kPtThreads, kPtRowsPerBlock>;
-@@ -630,24 +1026,54 @@ static void launch_pipeline(
+@@ -630,24 +1064,54 @@ static void launch_pipeline(
          size_t smem_bytes = (size_t)W * per_warp_smem;
          auto hist_fn = k2q_hist_kernel<kTopK, kBlockK, W>;
          auto scat_fn = k2q_scatter_kernel<kTopK, kBlockK, W>;
@@ -4091,7 +4129,7 @@ index 8ee5457..428b5a3 100644
 +                H, B, S_Q, total_rows, max_kv_blocks, q_per_cta, q_per_warp);
 +        }
  
-+        bool const par = is_sm107 && kSchedPar && emit_schedule;  // SM107 only
++        bool const par = k2q_opts && kSchedPar && emit_schedule;  // k2q_opt_arch only
          rprefix_fn<<<H, 1024, 0, stream>>>(
              row_counts.data_ptr<int>(), row_ptr.data_ptr<int>(),
              emit_schedule ? row_coords.data_ptr<int>() : nullptr,
@@ -4111,7 +4149,7 @@ index 8ee5457..428b5a3 100644
  
          // Grid is H * blocks_per_h so each block stays within a single
          // head; flat (H*total_rows) grid would skip rows when total_rows
-@@ -656,19 +1082,26 @@ static void launch_pipeline(
+@@ -656,19 +1120,26 @@ static void launch_pipeline(
          int pt_grid = H * blocks_per_h;
          if (pt_grid < 1) pt_grid = 1;
          size_t pt_smem = (size_t)kPtRowsPerBlock * G_total * sizeof(int);
