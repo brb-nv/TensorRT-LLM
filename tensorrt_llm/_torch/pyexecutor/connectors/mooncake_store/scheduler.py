@@ -409,7 +409,13 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
 
     def _saves_for(self, state: _RequestState, request_data: RequestData) -> RequestTransfers:
         transfers = RequestTransfers(request_data.request_id)
-        limit = self._addressable_blocks(state)
+        # A pass may allocate pages past the tokens it computes (a context
+        # chunk reserves the speculative extra KV tokens), and a hashed block
+        # behind such a page holds no valid KV until a later pass writes it.
+        computed_blocks = (
+            request_data.computed_position + request_data.num_scheduled_tokens
+        ) // self._tokens_per_block
+        limit = min(self._addressable_blocks(state), computed_blocks)
         for block in range(state.saved_upto, limit):
             self._append_pages(state, transfers, block)
         state.saved_upto = max(state.saved_upto, limit)

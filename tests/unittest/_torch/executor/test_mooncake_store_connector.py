@@ -1741,13 +1741,16 @@ def make_async_scheduler(store_config, hit_blocks=0, **llm_args):
     return make_scheduler(store_config, hit_blocks=hit_blocks, **llm_args)
 
 
-def request_data(request_id, new_tokens, page_indices):
+def request_data(request_id, new_tokens, page_indices, computed_position=0, num_scheduled_tokens=None):
+    """`computed_position`/`num_scheduled_tokens` default to a first pass over `new_tokens`."""
     return RequestData(
         request_id=request_id,
         new_tokens=list(new_tokens),
         new_block_ids=list(page_indices),
-        computed_position=0,
-        num_scheduled_tokens=len(new_tokens),
+        computed_position=computed_position,
+        num_scheduled_tokens=(
+            len(new_tokens) if num_scheduled_tokens is None else num_scheduled_tokens
+        ),
         # One entry per layer group, indexed by layer group id.
         new_block_ids_by_layer_group=[list(page_indices)],
     )
@@ -1807,7 +1810,54 @@ def test_scheduler_does_not_resave_blocks_across_iterations(store_config):
     # A generation step completes one more block; only that block is saved.
     more_tokens = list(range(2 * TOKENS_PER_BLOCK, 3 * TOKENS_PER_BLOCK))
     second = scheduler.build_connector_meta(
-        SchedulerOutput(cached_requests=[request_data(1, more_tokens, [6])])
+        SchedulerOutput(
+            cached_requests=[
+                request_data(
+                    1,
+                    more_tokens,
+                    [6],
+                    computed_position=3 * TOKENS_PER_BLOCK - 1,
+                    num_scheduled_tokens=1,
+                )
+            ]
+        )
+    )
+    assert [page.page_index for page in second.saves[0].pages] == [6]
+
+
+def test_scheduler_does_not_save_a_block_the_pass_does_not_compute(store_config):
+    """A chunk can be allocated a page past its last computed token.
+
+    A context chunk reserves the speculative extra KV tokens, so a
+    block-aligned chunk holds a page for the next prompt block, which is
+    already hashed. That page has no valid KV until the next chunk runs.
+    """
+    scheduler = make_scheduler(store_config, hit_blocks=0)
+    tokens = list(range(3 * TOKENS_PER_BLOCK))
+    request = make_request(1, tokens)
+    scheduler.get_num_new_matched_tokens(request, 0)
+
+    first = scheduler.build_connector_meta(
+        SchedulerOutput(
+            new_requests=[
+                request_data(1, tokens, [4, 5, 6], num_scheduled_tokens=2 * TOKENS_PER_BLOCK)
+            ]
+        )
+    )
+    assert [page.page_index for page in first.saves[0].pages] == [4, 5]
+
+    second = scheduler.build_connector_meta(
+        SchedulerOutput(
+            cached_requests=[
+                request_data(
+                    1,
+                    [],
+                    [],
+                    computed_position=2 * TOKENS_PER_BLOCK,
+                    num_scheduled_tokens=TOKENS_PER_BLOCK,
+                )
+            ]
+        )
     )
     assert [page.page_index for page in second.saves[0].pages] == [6]
 
