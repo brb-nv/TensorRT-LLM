@@ -578,8 +578,11 @@ def _minimax_m3_swiglu_oai(gate_up: torch.Tensor, *, alpha: float, limit: float)
 
 # CTX prefill: the SwiGLU-OAI activation of the dense / shared-expert MLPs also quantizes its output for the MXFP8
 # down_proj in the same pass (bitwise mxfp8_quantize of the stock BF16 activation); the BF16 activation is not written.
-# TRTLLM_CTX_SWIGLU_MXFP8=0 is the kill switch.
+# TRTLLM_CTX_SWIGLU_MXFP8=0 is the kill switch. SM107 always; on SM100/SM103 where TRTLLM_CTX_SWIGLU_MXFP8_ARCHS lists
+# them (default 100,103; "107" keeps the stock path on Blackwell; see blackwell_rubin_opts). bench_swiglu_mxfp8.py
+# (8k/16k rows, d 1536-12288) is bitwise and 1.54-2.54x (GB200) / 1.63-2.75x (GB300) over activation + quantize.
 _CTX_SWIGLU_MXFP8 = os.environ.get("TRTLLM_CTX_SWIGLU_MXFP8", "1") == "1"
+_CTX_SWIGLU_MXFP8_ARCHS = gate_archs("TRTLLM_CTX_SWIGLU_MXFP8_ARCHS")
 _CTX_SWIGLU_MXFP8_LOGGED = False
 
 
@@ -592,7 +595,7 @@ class _SwigluOaiMLP(GatedMLP):
         method = getattr(self.down_proj, "quant_method", None)
         return (
             _CTX_SWIGLU_MXFP8
-            and get_sm_version() == 107
+            and get_sm_version() in _CTX_SWIGLU_MXFP8_ARCHS
             and not has_lora
             and self.activation == torch.nn.functional.silu
             and x.dim() == 2
