@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""MiniMax-M3 SM107 prefill tile select: same top-16 tables as minimax_m3_select_blocks, and its gate."""
+"""MiniMax-M3 prefill tile select (SM107, SM100/SM103): same top-16 tables as minimax_m3_select_blocks, and its gate."""
 
 import os
 import subprocess
@@ -16,7 +16,8 @@ from tensorrt_llm._utils import get_sm_version
 PAGE = 128
 
 sm107 = pytest.mark.skipif(
-    not torch.cuda.is_available() or get_sm_version() != 107, reason="SM107 op"
+    not torch.cuda.is_available() or get_sm_version() not in (100, 103, 107),
+    reason="SM100/SM103/SM107 op",
 )
 
 
@@ -191,16 +192,23 @@ def test_tile_select_v2_kill_switch_same_tables(tmp_path):
 
 
 @pytest.mark.parametrize(
-    "sm_version,enabled,total_q,num_blocks",
+    "sm_version,enabled,total_q,num_blocks,archs",
     [
-        (103, True, 2000, 1408),
-        (107, False, 2000, 1408),
-        (107, True, 64, 1408),
-        (107, True, 2000, 6000),
+        (90, True, 2000, 1408, (100, 103, 107)),
+        (103, True, 2000, 1408, (107,)),
+        (100, True, 2000, 1408, (107,)),
+        (107, False, 2000, 1408, (100, 103, 107)),
+        (103, False, 2000, 1408, (100, 103, 107)),
+        (107, True, 64, 1408, (100, 103, 107)),
+        (103, True, 64, 1408, (100, 103, 107)),
+        (107, True, 2000, 6000, (100, 103, 107)),
+        (100, True, 2000, 6000, (100, 103, 107)),
     ],
 )
-def test_tile_select_gate(monkeypatch, sm_version, enabled, total_q, num_blocks):
+def test_tile_select_gate(monkeypatch, sm_version, enabled, total_q, num_blocks, archs):
+    # Every case is outside the gate (wrong arch, kill switch, too few queries or too many blocks): no op call.
     monkeypatch.setattr(msa_indexer, "get_sm_version", lambda: sm_version)
     monkeypatch.setattr(msa_indexer, "_SM107_TILE_SELECT", enabled)
+    monkeypatch.setattr(msa_indexer, "_TILE_SELECT_ARCHS", frozenset(archs))
     scores = torch.zeros(4, num_blocks, total_q)
     assert msa_indexer._tile_select(scores, torch.ones(total_q, dtype=torch.int32), 0, 1) is None
