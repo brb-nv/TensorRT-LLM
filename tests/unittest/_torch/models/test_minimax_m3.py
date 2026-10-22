@@ -220,6 +220,9 @@ def test_nvfp4_reload_preserves_attention_scale_storage(
 
 
 class _M3CompositionGate(nn.Module):
+    def uses_generation_only(self) -> bool:
+        return False
+
     def forward(self, hidden_states: torch.Tensor, generation_only: bool = False) -> torch.Tensor:
         return hidden_states
 
@@ -954,7 +957,7 @@ def test_piecewise_unfused_indexer_keeps_cache_write_eager(monkeypatch: pytest.M
         aux_stream=None,
         _forward_attention_core=Mock(return_value=torch.empty((4, 128), dtype=torch.bfloat16)),
         o_proj=lambda output, all_reduce_params: output,
-        _core_then_o_proj=lambda core, all_reduce_params, site, padded=False: core(),
+        _core_then_o_proj=lambda core, all_reduce_params, site, attn_metadata=None: core(),
     )
     monkeypatch.setattr(modeling_minimaxm3, "is_torch_compiling", lambda: True)
     monkeypatch.setattr(
