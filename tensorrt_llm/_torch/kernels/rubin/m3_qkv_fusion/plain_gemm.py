@@ -211,15 +211,15 @@ class M3ClcMxfp8Gemm:
         return out
 
 
-_GEMMS: Dict[Tuple[int, int], M3ClcMxfp8Gemm] = {}
+_GEMMS: Dict[Tuple[int, int, bool], M3ClcMxfp8Gemm] = {}
 
 
-def get_gemm(n: int, heads_per_tile: int) -> M3ClcMxfp8Gemm:
-    """The cached handle for (N, heads per tile); compiles on first use."""
-    key = (int(n), int(heads_per_tile))
+def get_gemm(n: int, heads_per_tile: int, enable_pdl: bool = True) -> M3ClcMxfp8Gemm:
+    """The cached handle for (N, heads per tile, PDL launch); compiles on first use."""
+    key = (int(n), int(heads_per_tile), bool(enable_pdl))
     gemm = _GEMMS.get(key)
     if gemm is None:
-        gemm = M3ClcMxfp8Gemm(n, heads_per_tile=heads_per_tile)
+        gemm = M3ClcMxfp8Gemm(n, heads_per_tile=heads_per_tile, enable_pdl=bool(enable_pdl))
         _GEMMS[key] = gemm
     return gemm
 
