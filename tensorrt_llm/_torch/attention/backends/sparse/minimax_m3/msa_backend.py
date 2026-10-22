@@ -40,6 +40,7 @@ import torch
 
 from tensorrt_llm._torch.attention.backends.interface import AttentionForwardArgs
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention, TrtllmAttentionMetadata
+from tensorrt_llm._torch.blackwell_rubin_opts import gate_archs
 from tensorrt_llm._torch.pyexecutor import h2d_cache, step_inputs
 from tensorrt_llm._torch.pyexecutor.h2d_cache import copy_h2d_if_changed, copy_h2d_pool_shared
 from tensorrt_llm._torch.pyexecutor.runtime_hooks import MsaRuntimePolicy
@@ -148,16 +149,22 @@ def _fill_unused_slots(buf: torch.Tensor, start: int) -> None:
 # while a chunk over a long cached prefix spreads across the GPU instead of a few CTAs (rows
 # longer than the 128-token query tile cannot be split at all). False keeps one row per request
 # and num_kv_splits=1.
+# SM100/SM103 are opt-in through TRTLLM_MSA_PROXY_AUTO_KV_SPLITS_ARCHS (e.g. 100,103; none by default; see
+# blackwell_rubin_opts): the SM107-only proxy mainloop changes stay off there and segmenting forces the 128-token
+# query tile, so it is enabled only where a proxy microbench shows a gain at agentic shapes.
 _SM107_PROXY_AUTO_KV_SPLITS = True
+_PROXY_AUTO_KV_SPLITS_ARCHS = gate_archs(
+    "TRTLLM_MSA_PROXY_AUTO_KV_SPLITS_ARCHS", default_blackwell=()
+)
 # fmha_sm100's 128-token query tile, the largest that admits split-KV.
 _PROXY_SEGMENT_TOKENS = 128
 
 
 def _proxy_segmented() -> bool:
     """Whether this GPU runs the prefill indexer proxy segmented and split."""
-    if _SM107_PROXY_AUTO_KV_SPLITS and get_sm_version() == 107:
+    if _SM107_PROXY_AUTO_KV_SPLITS and get_sm_version() in _PROXY_AUTO_KV_SPLITS_ARCHS:
         logger.info_once(
-            "MSA indexer proxy: segmented rows with planner-chosen split-KV (SM107)",
+            f"MSA indexer proxy: segmented rows with planner-chosen split-KV (SM{get_sm_version()})",
             key="msa_proxy_auto_kv_splits",
         )
         return True
@@ -169,8 +176,15 @@ def _proxy_segmented() -> bool:
 # 64 and leaves every CTA a long serial key range (165k cached: 175 -> 20 us per layer). The proxy
 # writes one max score per key tile, so any key split gives bitwise-identical scores. False keeps the
 # planner's choice.
+# SM100/SM103 take it only together with the segmented proxy above (_PROXY_AUTO_KV_SPLITS_ARCHS) and where
+# TRTLLM_MSA_PROXY_FEW_ROWS_KV_SPLITS_ARCHS lists them (default 100,103). There the split count is also capped at
+# _PROXY_FEW_ROWS_SPLIT_CAP and at one split per _PROXY_FEW_ROWS_MIN_SPLIT_KV keys, which bounds the plan's
+# per-split work buffers (still bitwise-identical scores).
 _SM107_PROXY_FEW_ROWS_KV_SPLITS = True
+_PROXY_FEW_ROWS_KV_SPLITS_ARCHS = gate_archs("TRTLLM_MSA_PROXY_FEW_ROWS_KV_SPLITS_ARCHS")
 _PROXY_FEW_ROWS_MAX_ROWS = 4
+_PROXY_FEW_ROWS_SPLIT_CAP = 64
+_PROXY_FEW_ROWS_MIN_SPLIT_KV = 256
 
 
 @functools.lru_cache(maxsize=None)
@@ -178,15 +192,31 @@ def _sm_count(device_index: int) -> int:
     return torch.cuda.get_device_properties(device_index).multi_processor_count
 
 
-def proxy_kv_splits(num_rows: int, device: torch.device) -> int:
-    """num_kv_splits for a proxy plan over num_rows rows: -1 (the planner's choice) unless SM107 few-row."""
+def proxy_kv_splits(
+    num_rows: int,
+    device: torch.device,
+    *,
+    max_kv_len: Optional[int] = None,
+    otherwise: int = -1,
+) -> int:
+    """num_kv_splits for a proxy plan over num_rows rows: the few-row split count where that gate holds, else
+    ``otherwise`` (-1 is the planner's choice).
+
+    Off SM107 the few-row count needs the segmented proxy too and is capped (see _PROXY_FEW_ROWS_SPLIT_CAP), using
+    max_kv_len, the longest key range of the plan's rows, when given."""
+    sm = get_sm_version()
     if (
         not _SM107_PROXY_FEW_ROWS_KV_SPLITS
-        or get_sm_version() != 107
+        or sm not in _PROXY_FEW_ROWS_KV_SPLITS_ARCHS
+        or (sm != 107 and sm not in _PROXY_AUTO_KV_SPLITS_ARCHS)
         or num_rows > _PROXY_FEW_ROWS_MAX_ROWS
     ):
-        return -1
+        return otherwise
     splits = max(1, _sm_count(device.index or 0) // max(num_rows, 1))
+    if sm != 107:
+        splits = min(splits, _PROXY_FEW_ROWS_SPLIT_CAP)
+        if max_kv_len is not None:
+            splits = min(splits, max(1, -(-int(max_kv_len) // _PROXY_FEW_ROWS_MIN_SPLIT_KV)))
     logger.info_once(
         f"[M3 dispatch] rank {mpi_rank()}: proxy_few_rows_kv_splits taken at {num_rows} rows",
         key="msa_proxy_few_rows_kv_splits",
@@ -1276,7 +1306,9 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
                 seg_kv,
                 qo_offset=seg_off,
                 page_size=page_size,
-                num_kv_splits=proxy_kv_splits(int(seg_qo.shape[0]), _cache_device(self)),
+                num_kv_splits=proxy_kv_splits(
+                    int(seg_qo.shape[0]), _cache_device(self), max_kv_len=int(seg_kv.max())
+                ),
                 causal=True,
                 **proxy_kwargs,
             )
@@ -1284,8 +1316,14 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
             proxy_rows = None if short_prefill else self._msa_proxy_plan_rows()
             self._msa_prefill_proxy_plan = plan_for(
                 proxy_rows,
+                # Unsegmented rows keep one split off SM107 unless the few-row count applies.
                 num_kv_splits=(
-                    proxy_kv_splits(proxy_rows[1] - proxy_rows[0], _cache_device(self))
+                    proxy_kv_splits(
+                        proxy_rows[1] - proxy_rows[0],
+                        _cache_device(self),
+                        max_kv_len=int(kv_lens_cpu[proxy_rows[0] : proxy_rows[1]].max()),
+                        otherwise=-1 if get_sm_version() == 107 else 1,
+                    )
                     if proxy_rows is not None and self.msa_proxy_kv_indices is not None
                     else 1
                 ),
@@ -1330,7 +1368,7 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
     def _stage_proxy_segments(self, page_size: int, needs_flat_page_table: bool) -> None:
         """Stage the segmented proxy rows and their page table, where they change anything.
 
-        Only on SM107 (see _SM107_PROXY_AUTO_KV_SPLITS) and only when some proxy row has more
+        Only where the segmented proxy is on (see _SM107_PROXY_AUTO_KV_SPLITS) and only when some proxy row has more
         query tokens than one segment: otherwise the segments are the requests themselves and
         the plain page table already serves the proxy.
 
