@@ -266,8 +266,10 @@ def _nvfp4_sparse_takes_out(sparse: Any) -> bool:
 # hands the kernels torch.empty buffers, so the CSR and schedule are unchanged. Eager only: a capturing
 # stream takes the stock builder, and so does any stream other than the one the buffers were first built on
 # (stream order is what keeps a step's later build from overwriting buffers an earlier attention still reads).
-# SM107 only. Kill switch: TRTLLM_MSA_K2Q_WS=0.
+# SM107 and SM100/SM103 (TRTLLM_MSA_K2Q_WS_ARCHS, default 100,103; see blackwell_rubin_opts). Kill switch:
+# TRTLLM_MSA_K2Q_WS=0.
 _K2Q_WS = os.environ.get("TRTLLM_MSA_K2Q_WS", "1") != "0"
+_K2Q_WS_ARCHS = gate_archs("TRTLLM_MSA_K2Q_WS_ARCHS")
 _K2Q_WS_BLK_KV = 128
 _K2Q_WS_TOPK = (4, 8, 16, 32)
 _k2q_ws: Optional[tuple] = None  # (key, q2k, row_ptr, q_idx, schedule)
@@ -290,7 +292,7 @@ def _k2q_csr_ws(
     total_q, head_kv, topk = (int(v) for v in kv_block_indexes.shape)
     if (
         not _K2Q_WS
-        or get_sm_version() != 107
+        or get_sm_version() not in _K2Q_WS_ARCHS
         or page_size != _K2Q_WS_BLK_KV
         or topk not in _K2Q_WS_TOPK
         or kv_block_indexes.dtype != torch.int32
