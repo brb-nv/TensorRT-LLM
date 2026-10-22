@@ -132,6 +132,7 @@ _BLACKWELL_ARCH_ENVS = (
     "TRTLLM_M3_BLACKWELL_RUBIN_OPTS",
     "TRTLLM_MSA_PROXY_AUTO_KV_SPLITS_ARCHS",
     "TLLM_FMHA_PROXY_MODE_ARCHS",
+    "TRTLLM_MSA_R2STORE_ARCHS",
 )
 
 
@@ -180,7 +181,9 @@ def test_proxy_modes_and_r2_store_engage_on_listed_archs(
     assert tuple(jit._proxy_modes()) == (want_chain, want_single)
     assert ("-DFMHA_ONLYSCORE_PER_TILE_CORRECTION" in flags) is want_chain
     assert ("-DFMHA_ONLYSCORE_SINGLE_S" in flags) is want_single
-    assert aot.r2_store_enabled() is (sm107 and r2kill != "1")
+    # The R2 store follows its own arch set (default 100,103), which the umbrella switch also clears.
+    r2_on = sm107 or arch_env.get("TRTLLM_M3_BLACKWELL_RUBIN_OPTS", "1") != "0"
+    assert aot.r2_store_enabled() is (r2_on and r2kill != "1")
 
 
 @pytest.mark.cpu_only
@@ -190,15 +193,16 @@ def test_proxy_modes_and_r2_store_engage_on_listed_archs(
 @pytest.mark.parametrize(
     "arch_env, r2_sms",
     [
-        ({}, ()),
+        ({}, (100, 103)),
+        ({"TRTLLM_MSA_R2STORE_ARCHS": "107"}, ()),
         ({"TRTLLM_MSA_R2STORE_ARCHS": "100,103"}, (100, 103)),
         ({"TRTLLM_MSA_R2STORE_ARCHS": "103,120"}, (103,)),
         ({"TRTLLM_MSA_R2STORE_ARCHS": "100,103", "TRTLLM_M3_BLACKWELL_RUBIN_OPTS": "0"}, ()),
     ],
-    ids=["stock", "blackwell", "sm103_only", "umbrella_off"],
+    ids=["default", "rubin_only", "blackwell", "sm103_only", "umbrella_off"],
 )
-def test_r2_store_opt_in_on_blackwell(monkeypatch, cap, arch_env, r2_sms):
-    # The R2 store warpgroup: SM107, plus the SM100 / SM103 TRTLLM_MSA_R2STORE_ARCHS opts in (none by default).
+def test_r2_store_on_listed_archs(monkeypatch, cap, arch_env, r2_sms):
+    # The R2 store warpgroup: SM107, plus the SM100 / SM103 of TRTLLM_MSA_R2STORE_ARCHS (100,103 by default).
     root = _fmha_sm100_dir()
     monkeypatch.delenv("TRTLLM_MSA_DISABLE_R2STORE", raising=False)
     for name in ("TRTLLM_MSA_R2STORE_ARCHS", "TRTLLM_M3_BLACKWELL_RUBIN_OPTS"):

@@ -2834,7 +2834,7 @@ index 4719a48..65e51be 100644
  
  
 diff --git a/python/fmha_sm100/cute/src/common/aot_cache.py b/python/fmha_sm100/cute/src/common/aot_cache.py
-index 99fd0b4..822511f 100644
+index 99fd0b4..06a15ce 100644
 --- a/python/fmha_sm100/cute/src/common/aot_cache.py
 +++ b/python/fmha_sm100/cute/src/common/aot_cache.py
 @@ -6,6 +6,12 @@
@@ -2850,7 +2850,7 @@ index 99fd0b4..822511f 100644
  Environment variables:
      MM_SPARSE_ATTN_AOT_CACHE: Override cache directory
          (default: ~/.cache/minfer/mm_sparse_attn)
-@@ -25,10 +31,110 @@ _AOT_CACHE_DIR = os.environ.get(
+@@ -25,10 +31,111 @@ _AOT_CACHE_DIR = os.environ.get(
  _AOT_DISABLE = os.environ.get("MM_SPARSE_ATTN_AOT_DISABLE", "0") == "1"
  
  _loaded_modules: dict[str, object] = {}
@@ -2914,9 +2914,10 @@ index 99fd0b4..822511f 100644
 +    return frozenset({(10, 7)} | {(sm // 10, sm % 10) for sm in listed & {100, 103}})
 +
 +
-+# SM107, plus the SM100 / SM103 that TRTLLM_MSA_R2STORE_ARCHS opts in (none by default: the 4-slot stats ring must
-+# first prove bitwise O/LSE and a speedup under SM10x timing).
-+_R2_STORE_CCS = _m3_gate_ccs("TRTLLM_MSA_R2STORE_ARCHS", ())
++# SM107, plus the SM100 / SM103 that TRTLLM_MSA_R2STORE_ARCHS lists (default "100,103"; "107" keeps the stock
++# in-softmax epilogue on Blackwell). The 4-slot stats ring gave bitwise O/LSE on GB200 and GB300 (NVFP4 KV, ADP and TP2
++# geometries, 8k-262k KV) at 1.02-1.10x (GB300) / 1.08-1.18x (GB200) on the sparse prefill kernel.
++_R2_STORE_CCS = _m3_gate_ccs("TRTLLM_MSA_R2STORE_ARCHS", (100, 103))
 +
 +
 +def r2_store_enabled() -> bool:
