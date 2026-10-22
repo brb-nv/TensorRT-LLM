@@ -429,8 +429,10 @@ def test_mxfp8_large_m_tuning_buckets(monkeypatch, max_num_tokens, expected):
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or get_sm_version() != 107,
-    reason="the native runner has small-M buckets on SM107 only",
+    not torch.cuda.is_available()
+    or get_sm_version() not in custom_ops_module._MXFP8_PY_SMALL_M_BUCKETS_ARCHS
+    or not custom_ops_module._MXFP8_PY_SMALL_M_BUCKETS_ENABLED,
+    reason="small-M buckets are on SM107 (native) and the enabled SM100/SM103 (Python) only",
 )
 def test_mxfp8_small_m_buckets_map_first_on_sm107():
     small = _get_mxfp8_small_m_buckets()
@@ -438,6 +440,67 @@ def test_mxfp8_small_m_buckets_map_first_on_sm107():
     assert _map_to_mxfp8_large_m_bucket(1) == small[0]
     assert _map_to_mxfp8_large_m_bucket(small[-1]) == small[-1]
     assert _get_mxfp8_large_m_tuning_buckets(6599) == small + (8192,)
+
+
+@pytest.mark.parametrize(
+    "sm, enabled, archs, expected",
+    [
+        (103, True, (100, 103, 107), custom_ops_module._MXFP8_PY_SMALL_M_BUCKETS),
+        (100, True, (100, 103, 107), custom_ops_module._MXFP8_PY_SMALL_M_BUCKETS),
+        (103, False, (100, 103, 107), ()),
+        (103, True, (107,), ()),
+        (90, True, (100, 103, 107), ()),
+    ],
+)
+def test_mxfp8_python_small_m_buckets_on_blackwell(monkeypatch, sm, enabled, archs, expected):
+    # The native runner reports no small-M buckets off SM107; on the enabled SM100/SM103 Python supplies them.
+    monkeypatch.setattr(custom_ops_module, "_MXFP8_SMALL_M_BUCKETS", None)
+    monkeypatch.setattr(custom_ops_module, "_MXFP8_SMALL_M_BUCKETS_FROM_PY", False)
+    monkeypatch.setattr(custom_ops_module, "_MXFP8_PY_SMALL_M_BUCKETS_ENABLED", enabled)
+    monkeypatch.setattr(custom_ops_module, "_MXFP8_PY_SMALL_M_BUCKETS_ARCHS", frozenset(archs))
+    monkeypatch.setattr(custom_ops_module, "get_sm_version", lambda: sm)
+    monkeypatch.setattr(custom_ops_module, "_native_mxfp8_small_m_buckets", lambda: ())
+    assert custom_ops_module._get_mxfp8_small_m_buckets() == expected
+    assert custom_ops_module._MXFP8_SMALL_M_BUCKETS_FROM_PY is bool(expected)
+    if expected:
+        assert _map_to_mxfp8_large_m_bucket(300) == 512
+        assert _map_to_mxfp8_large_m_bucket(6552) == 6552
+        assert _map_to_mxfp8_large_m_bucket(6553) == 8192
+
+
+def test_mxfp8_python_small_m_buckets_register_every_m(monkeypatch):
+    # With Python buckets the native cache keys M exactly, so a bucket's tactic is registered for every M it covers;
+    # the large-M bands keep one key each.
+    monkeypatch.setattr(custom_ops_module, "_MXFP8_SMALL_M_BUCKETS_FROM_PY", True)
+    native_runner = Mock()
+    monkeypatch.setattr(MXFP8GemmRunner, "runner_dict", {(torch.bfloat16, 103): native_runner})
+
+    def key(m):
+        return (
+            "trtllm::mxfp8_mxfp8_gemm_autotuned::gemm",
+            "MXFP8GemmRunner",
+            str((torch.bfloat16, 103)),
+            ((m, 6144), (-1,), (9856, 6144), (1769472,), (1,)),
+        )
+
+    cache = {
+        key(8): (0, 1, 0.1),
+        key(512): (0, 5, 0.1),
+        key(6552): (0, 7, 0.1),
+        key(8192): (0, 9, 0.1),
+    }
+    profiling_cache = Mock()
+    profiling_cache.get_specific_custom_op.return_value = cache
+    MXFP8GemmRunner.sync_all_tactic_caches(Mock(profiling_cache=profiling_cache))
+    calls = [c.args for c in native_runner.register_tactic.call_args_list]
+    by_tactic = {}
+    for m, n, k, tactic in calls:
+        assert (n, k) == (9856, 6144)
+        by_tactic.setdefault(tactic, []).append(m)
+    assert by_tactic[1] == list(range(1, 9))
+    assert by_tactic[5] == list(range(257, 513))
+    assert by_tactic[7] == list(range(4097, 6553))
+    assert by_tactic[9] == [8192]
 
 
 def test_mxfp8_large_m_cache_profile_maps_act_and_constrains_scale():

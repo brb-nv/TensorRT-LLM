@@ -28,6 +28,7 @@ import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 from tensorrt_llm import deep_gemm
 from tensorrt_llm._torch.distributed.allreduce_helper import \
     CustomAllReduceHelper
+from tensorrt_llm._torch.blackwell_rubin_opts import gate_archs
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.functional import AllReduceFusionOp, AllReduceStrategy
 from tensorrt_llm.logger import logger
@@ -590,19 +591,59 @@ _FLASHINFER_MXFP8_GEMM_AUTOTUNED_OP = (
     "trtllm::flashinfer_mxfp8_gemm_autotuned::gemm")
 
 _MXFP8_SMALL_M_BUCKETS: Optional[tuple[int, ...]] = None
+# Whether the small-M buckets come from _MXFP8_PY_SMALL_M_BUCKETS rather than the native runner. The native
+# tactic cache then keys M exactly, so sync_all_tactic_caches registers a bucket's tactic for every M it covers.
+_MXFP8_SMALL_M_BUCKETS_FROM_PY = False
+# The native runner buckets small M on SM107 only. On SM100/SM103 (TRTLLM_MXFP8_SMALL_M_BUCKETS_ARCHS, default
+# 100,103; see blackwell_rubin_opts) the same buckets come from Python. Every compiled tactic gives bitwise-identical
+# results, so this changes speed only. Kill switch: TRTLLM_MXFP8_SMALL_M_BUCKETS=0 keeps exact-M keys there.
+_MXFP8_PY_SMALL_M_BUCKETS = (8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096,
+                             6552)
+_MXFP8_PY_SMALL_M_BUCKETS_ENABLED = os.environ.get(
+    "TRTLLM_MXFP8_SMALL_M_BUCKETS", "1") != "0"
+_MXFP8_PY_SMALL_M_BUCKETS_ARCHS = gate_archs(
+    "TRTLLM_MXFP8_SMALL_M_BUCKETS_ARCHS")
+
+
+def _native_mxfp8_small_m_buckets() -> Optional[tuple[int, ...]]:
+    """The native runner's small-M tuning buckets, or None without a native MXFP8 runner."""
+    try:
+        runner = torch.classes.trtllm.MXFP8GemmRunner(torch.bfloat16)
+    except RuntimeError:
+        return None
+    return tuple(runner.get_small_m_tuning_buckets())
 
 
 def _get_mxfp8_small_m_buckets() -> tuple[int, ...]:
-    """Return the native runner's small-M tuning buckets (empty except on SM107)."""
-    global _MXFP8_SMALL_M_BUCKETS
+    """Return the small-M tuning buckets: the native runner's on SM107, the Python ones on enabled SM100/SM103,
+    else empty."""
+    global _MXFP8_SMALL_M_BUCKETS, _MXFP8_SMALL_M_BUCKETS_FROM_PY
     if _MXFP8_SMALL_M_BUCKETS is None:
-        try:
-            runner = torch.classes.trtllm.MXFP8GemmRunner(torch.bfloat16)
-        except RuntimeError:
+        native = _native_mxfp8_small_m_buckets()
+        if native is None:
             # No CUDA device or no native MXFP8 runner: keep exact-M profiles.
             return ()
-        _MXFP8_SMALL_M_BUCKETS = tuple(runner.get_small_m_tuning_buckets())
+        if (not native and _MXFP8_PY_SMALL_M_BUCKETS_ENABLED
+                and get_sm_version() in _MXFP8_PY_SMALL_M_BUCKETS_ARCHS):
+            _MXFP8_SMALL_M_BUCKETS_FROM_PY = True
+            _MXFP8_SMALL_M_BUCKETS = _MXFP8_PY_SMALL_M_BUCKETS
+            logger.info(
+                f"MXFP8 GEMM: small-M tuning buckets on SM{get_sm_version()} "
+                f"{_MXFP8_PY_SMALL_M_BUCKETS} (TRTLLM_MXFP8_SMALL_M_BUCKETS=0 "
+                "keeps exact-M keys)")
+        else:
+            _MXFP8_SMALL_M_BUCKETS = native
     return _MXFP8_SMALL_M_BUCKETS
+
+
+def _mxfp8_native_m_range(m: int) -> range:
+    """The M values whose native tactic-cache key a profiled M stands for: the whole bucket when the small-M
+    buckets come from Python (the native cache keys M exactly there), else M itself."""
+    if _MXFP8_SMALL_M_BUCKETS_FROM_PY and m in _MXFP8_PY_SMALL_M_BUCKETS:
+        index = _MXFP8_PY_SMALL_M_BUCKETS.index(m)
+        previous = _MXFP8_PY_SMALL_M_BUCKETS[index - 1] if index else 0
+        return range(previous + 1, m + 1)
+    return range(m, m + 1)
 
 
 def _map_to_mxfp8_large_m_bucket(num_tokens: int) -> int:
@@ -691,7 +732,8 @@ class MXFP8GemmRunner(TunableRunner):
                 raise ValueError(
                     f"MXFP8 autotuner cache has mismatched K dimensions: "
                     f"activation K={k}, weight K={weight_k}")
-            native_runner.register_tactic(m, n, k, tactic)
+            for native_m in _mxfp8_native_m_range(m):
+                native_runner.register_tactic(native_m, n, k, tactic)
 
     def forward(
         self,
