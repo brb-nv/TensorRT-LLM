@@ -13,6 +13,7 @@ from typing import Optional, Tuple
 import torch
 
 from tensorrt_llm._torch.attention.backends.interface import AttentionInputType
+from tensorrt_llm._torch.blackwell_rubin_opts import gate_archs
 from tensorrt_llm._utils import get_sm_version, is_sm_100f, maybe_pin_memory
 
 from .paged_cache import write_kv_slots
@@ -228,8 +229,10 @@ def build_kv_page_indices(
 
 # per_token_valid_blocks runs on every step's metadata preparation: the same integer arithmetic as one NumPy pass
 # instead of about a dozen small CPU torch ops (the same int64 values, returned as a torch.long tensor).
-# SM107 only. Kill switch: TRTLLM_MSA_PTVB_NUMPY=0.
+# SM107 and SM100/SM103 (TRTLLM_MSA_PTVB_NUMPY_ARCHS, default 100,103; see blackwell_rubin_opts). Kill switch:
+# TRTLLM_MSA_PTVB_NUMPY=0.
 _PER_TOKEN_VALID_BLOCKS_NUMPY = os.environ.get("TRTLLM_MSA_PTVB_NUMPY", "1") != "0"
+_PER_TOKEN_VALID_BLOCKS_NUMPY_ARCHS = gate_archs("TRTLLM_MSA_PTVB_NUMPY_ARCHS")
 _PER_TOKEN_VALID_BLOCKS_NUMPY_LOGGED = False
 
 
@@ -278,7 +281,7 @@ def per_token_valid_blocks(
     Expands per-request lengths and offsets to a per-token vector so block
     selection can honour each query token's own causal extent.
     """
-    if _PER_TOKEN_VALID_BLOCKS_NUMPY and get_sm_version() == 107:
+    if _PER_TOKEN_VALID_BLOCKS_NUMPY and get_sm_version() in _PER_TOKEN_VALID_BLOCKS_NUMPY_ARCHS:
         global _PER_TOKEN_VALID_BLOCKS_NUMPY_LOGGED
         if not _PER_TOKEN_VALID_BLOCKS_NUMPY_LOGGED:
             _PER_TOKEN_VALID_BLOCKS_NUMPY_LOGGED = True
