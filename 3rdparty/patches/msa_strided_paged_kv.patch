@@ -2832,7 +2832,7 @@ index 4719a48..65e51be 100644
  
  
 diff --git a/python/fmha_sm100/cute/src/common/aot_cache.py b/python/fmha_sm100/cute/src/common/aot_cache.py
-index 99fd0b4..8037d13 100644
+index 99fd0b4..822511f 100644
 --- a/python/fmha_sm100/cute/src/common/aot_cache.py
 +++ b/python/fmha_sm100/cute/src/common/aot_cache.py
 @@ -6,6 +6,12 @@
@@ -2848,7 +2848,7 @@ index 99fd0b4..8037d13 100644
  Environment variables:
      MM_SPARSE_ATTN_AOT_CACHE: Override cache directory
          (default: ~/.cache/minfer/mm_sparse_attn)
-@@ -25,10 +31,87 @@ _AOT_CACHE_DIR = os.environ.get(
+@@ -25,10 +31,110 @@ _AOT_CACHE_DIR = os.environ.get(
  _AOT_DISABLE = os.environ.get("MM_SPARSE_ATTN_AOT_DISABLE", "0") == "1"
  
  _loaded_modules: dict[str, object] = {}
@@ -2894,18 +2894,41 @@ index 99fd0b4..8037d13 100644
 +_r2_store_cache: bool | None = None
 +
 +
++def _m3_gate_ccs(env_name: str, default_blackwell) -> frozenset:
++    """Compute capabilities a MiniMax-M3 gate first enabled on SM107 runs on: (10, 7), plus the SM100 / SM103 that
++    ``env_name`` lists (comma-separated SM numbers such as "100,103,107"; ``default_blackwell`` when unset), unless
++    TRTLLM_M3_BLACKWELL_RUBIN_OPTS=0. Read once at import."""
++    raw = os.environ.get(env_name)
++    if raw is None:
++        listed = set(default_blackwell)
++    else:
++        listed = {
++            int(item.strip().lower().replace("sm_", "").rstrip("af"))
++            for item in raw.replace(";", ",").split(",")
++            if item.strip()
++        }
++    if os.environ.get("TRTLLM_M3_BLACKWELL_RUBIN_OPTS", "1") == "0":
++        listed = set()
++    return frozenset({(10, 7)} | {(sm // 10, sm % 10) for sm in listed & {100, 103}})
++
++
++# SM107, plus the SM100 / SM103 that TRTLLM_MSA_R2STORE_ARCHS opts in (none by default: the 4-slot stats ring must
++# first prove bitwise O/LSE and a speedup under SM10x timing).
++_R2_STORE_CCS = _m3_gate_ccs("TRTLLM_MSA_R2STORE_ARCHS", ())
++
++
 +def r2_store_enabled() -> bool:
 +    """Whether the NVFP4-KV sparse prefill uses the R2 store warpgroup.
 +
-+    SM107 only (resolved once from the device capability); TRTLLM_MSA_DISABLE_R2STORE=1 restores the stock
-+    in-softmax epilogue there too.
++    On the capabilities of _R2_STORE_CCS (resolved once from the device capability); TRTLLM_MSA_DISABLE_R2STORE=1
++    restores the stock in-softmax epilogue there too.
 +    """
 +    global _r2_store_cache
 +    if _r2_store_cache is None:
 +        import torch
 +
 +        _r2_store_cache = (
-+            torch.cuda.get_device_capability() == (10, 7)
++            tuple(torch.cuda.get_device_capability()) in _R2_STORE_CCS
 +            and os.environ.get("TRTLLM_MSA_DISABLE_R2STORE", "0") != "1"
 +        )
 +    return _r2_store_cache
@@ -4137,7 +4160,7 @@ index f5950f3..caad594 100644
          tOrP: cute.Tensor,
          sK: cute.Tensor,
 diff --git a/python/fmha_sm100/cute/src/sm100/fwd/atten_fwd_nvfp4_kv.py b/python/fmha_sm100/cute/src/sm100/fwd/atten_fwd_nvfp4_kv.py
-index ba930a6..25c4537 100644
+index ba930a6..4c76b86 100644
 --- a/python/fmha_sm100/cute/src/sm100/fwd/atten_fwd_nvfp4_kv.py
 +++ b/python/fmha_sm100/cute/src/sm100/fwd/atten_fwd_nvfp4_kv.py
 @@ -9,7 +9,8 @@ forward contract:
@@ -4163,8 +4186,8 @@ index ba930a6..25c4537 100644
          self.mma_warp_id = self.store_warp_base + self.warps_per_group
          self.load_warp_base = self.mma_warp_id + 1
 -        self.q_load_warp_base = self.store_warp_base
-+        # R2 store WG (SM107 only, see aot_cache.r2_store_enabled): warps 8-11 drain partial O/LSE for every q-group
-+        # while the softmax WGs move on; the Q load then runs on warp 15 (formerly empty).
++        # R2 store WG (SM107, opt-in SM100 / SM103; see aot_cache.r2_store_enabled): warps 8-11 drain partial
++        # O/LSE for every q-group while the softmax WGs move on; the Q load then runs on warp 15 (formerly empty).
 +        # TRTLLM_MSA_DISABLE_R2STORE=1, or any other device, keeps the stock in-softmax epilogue.
 +        self.r2_store = r2_store_enabled()
 +        self.q_load_warp_base = (
