@@ -217,13 +217,22 @@ def _k2q_csr_source() -> str:
 
 
 @pytest.mark.cpu_only
-def test_k2q_scratch_arena_engages_on_sm107_only():
+def test_k2q_scratch_arena_engages_on_listed_archs():
     # The k2q CSR build is host C++ compiled at first use, so its gate is checked in the installed source: the arena
-    # takes the runtime SM107 check, and the other devices keep the stock allocations.
+    # (and the other k2q changes) take the runtime arch check (SM107, plus the SM100 / SM103 of FMHA_K2Q_OPT_ARCHS,
+    # read once with std::getenv), and the other devices keep the stock allocations.
     src = _k2q_csr_source()
-    sm107 = src.index("sm107_state = (cc_major == 10 && cc_minor == 7) ? 1 : 2;")
-    arena = src.index("if (is_sm107 && k2q_arena_enabled()) {")
-    assert sm107 < arena
+    gate = src.index("k2q_opts_state = k2q_opt_arch(cc_major * 10 + cc_minor) ? 1 : 2;")
+    arena = src.index("if (k2q_opts && k2q_arena_enabled()) {")
+    assert gate < arena
+    assert 'std::getenv("FMHA_K2Q_OPT_ARCHS")' in src
+    assert 'std::getenv("TRTLLM_M3_BLACKWELL_RUBIN_OPTS")' in src
+    assert 'char const* list = env != nullptr ? env : "100,103,107";' in src
+    assert (
+        "return sm == 107 || (sm == 100 && (blackwell_mask & 1)) || (sm == 103 && (blackwell_mask & 2));"
+        in src
+    )
+    assert "is_sm107" not in src
     assert "row_counts = torch::zeros({H, total_rows}, opts);" in src
     assert 'std::getenv("FMHA_K2Q_WS_ARENA")' in src
 
