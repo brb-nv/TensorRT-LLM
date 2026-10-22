@@ -776,10 +776,25 @@ def _minimax_m3_router_input_fp32_fake(hidden_states: torch.Tensor) -> torch.Ten
 # bitwise the stock producer applied to its own BF16 GEMM output. TRTLLM_CTX_QKV_FUSED=0 is the kill switch.
 _CTX_QKV_FUSED = os.environ.get("TRTLLM_CTX_QKV_FUSED", "1") == "1"
 _CTX_QKV_FUSED_MIN_ROWS = 1024
+# SM107 always; SM100 / SM103 only where TRTLLM_CTX_QKV_FUSED_ARCHS lists them (opt-in, see blackwell_rubin_opts). There
+# the kernel runs on the K32 SM100 MMA atom with 2-head tiles (TRTLLM_CTX_QKV_FUSED_HEADS_PER_TILE overrides the tile;
+# 1..3 fit TMEM), launches without PDL unless TRTLLM_ENABLE_PDL=1 (its TMA warp triggers dependents before the
+# epilogue stores), compiles during the AutoTuner warmup pass, and a failed compile falls back to the stock projection.
+_CTX_QKV_FUSED_ARCHS = gate_archs("TRTLLM_CTX_QKV_FUSED_ARCHS", default_blackwell=())
+_CTX_QKV_FUSED_SM10X_HEADS_PER_TILE = int(
+    os.environ.get("TRTLLM_CTX_QKV_FUSED_HEADS_PER_TILE", "2")
+)
+_CTX_QKV_FUSED_SM10X_PDL = os.environ.get("TRTLLM_ENABLE_PDL", "0") == "1"
+_CTX_QKV_FUSED_FAILED: set = set()
 # A layer whose QKV the fused producer above took runs its attention core and o_proj through _core_then_o_proj, so the
 # NVFP4 combine can also hand the o_proj its MXFP8 input (msa_combine_mxfp8, slot tag "p5a"); same o_proj input values.
 # Kill switch: TRTLLM_CTX_P5A_COMBINE_MXFP8=0 calls the o_proj on the BF16 core output.
 _CTX_P5A_COMBINE_MXFP8 = os.environ.get("TRTLLM_CTX_P5A_COMBINE_MXFP8", "1") == "1"
+
+
+def _ctx_qkv_fused_arch_ok() -> bool:
+    """Whether this device runs the fused QKV GEMM + producer (SM107, or an opted-in SM100 / SM103)."""
+    return get_sm_version() in _CTX_QKV_FUSED_ARCHS
 
 
 def _ctx_qkv_fused_takes_rows(rows: int) -> bool:
@@ -827,7 +842,7 @@ def _bcg_bucket_takes_eager_qkv(captured_rows: int) -> bool:
     return (
         _CTX_BCG_P5A
         and _CTX_QKV_FUSED
-        and get_sm_version() == 107
+        and _ctx_qkv_fused_arch_ok()
         and _ctx_qkv_fused_takes_rows(captured_rows)
     )
 
@@ -837,15 +852,38 @@ _CTX_QKV_FUSED_LOGGED = False
 
 
 def _ctx_qkv_fused_runner(num_heads_q: int, num_heads_kv: int, num_heads_index: int):
-    """The compiled fused QKV runner for one per-rank head geometry (compiled on first use, outside capture)."""
+    """The compiled fused QKV runner for one per-rank head geometry (compiled on first use, outside capture), or None
+    where its compile failed off SM107 (the caller then runs the stock projection + producer)."""
     key = (num_heads_q, num_heads_kv, num_heads_index)
     runner = _CTX_QKV_FUSED_RUNNERS.get(key)
     if runner is None:
+        if key in _CTX_QKV_FUSED_FAILED:
+            return None
         from ..kernels.rubin.m3_qkv_fusion.kernel import M3QkvFusedRunner
 
-        runner = M3QkvFusedRunner(
+        geometry = dict(
             num_heads_q=num_heads_q, num_heads_kv=num_heads_kv, num_heads_index=num_heads_index
         )
+        if get_sm_version() == 107:
+            runner = M3QkvFusedRunner(**geometry)
+        else:
+            try:
+                runner = M3QkvFusedRunner(
+                    **geometry,
+                    heads_per_tile=_CTX_QKV_FUSED_SM10X_HEADS_PER_TILE,
+                    enable_pdl=_CTX_QKV_FUSED_SM10X_PDL,
+                )
+            except Exception as exc:  # noqa: BLE001 - any compile failure keeps the stock path
+                _CTX_QKV_FUSED_FAILED.add(key)
+                logger.warning(
+                    f"MiniMax-M3 CTX fused QKV GEMM + producer: compile failed on SM{get_sm_version()} for heads "
+                    f"{key} ({exc!r}); keeping the stock projection + producer"
+                )
+                return None
+            logger.info(
+                f"MiniMax-M3 CTX fused QKV GEMM + producer compiled on SM{get_sm_version()} for heads {key} "
+                f"(heads_per_tile {_CTX_QKV_FUSED_SM10X_HEADS_PER_TILE}, PDL {_CTX_QKV_FUSED_SM10X_PDL})"
+            )
         _CTX_QKV_FUSED_RUNNERS[key] = runner
     return runner
 
@@ -2540,7 +2578,7 @@ class MiniMaxM3Attention(Attention):
         if (
             not _CTX_QKV_FUSED
             or not ctx_eager_only()
-            or get_sm_version() != 107
+            or not _ctx_qkv_fused_arch_ok()
             or hidden_states.dim() != 2
             or not hidden_states.is_contiguous()
             or not _ctx_qkv_fused_takes_rows(num_tokens)
@@ -2548,12 +2586,20 @@ class MiniMaxM3Attention(Attention):
             or not getattr(method, "use_cutlass", False)
             or getattr(proj, "bias", None) is not None
             or tuple(proj.weight.shape) != (n_total, hidden_states.shape[1])
-            or _autotuner_tuning()
         ):
+            return None
+        if _autotuner_tuning():
+            if get_sm_version() != 107:
+                # Compile in the warmup's tuning pass, not in the first served >1024-row step.
+                _ctx_qkv_fused_runner(
+                    self.num_heads, self.num_key_value_heads, self.sparse_num_index_heads
+                )
             return None
         runner = _ctx_qkv_fused_runner(
             self.num_heads, self.num_key_value_heads, self.sparse_num_index_heads
         )
+        if runner is None:
+            return None
         q = hidden_states.new_empty(
             (num_tokens, self.num_heads, self.head_dim), dtype=torch.float8_e4m3fn
         )
