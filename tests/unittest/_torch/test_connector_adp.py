@@ -70,6 +70,9 @@ def _request(request_id: int, *, dummy: bool = False) -> MagicMock:
 def _manager(rank: int = 1) -> KvCacheConnectorManager:
     worker = ADPAdapterMock()
     worker.get_finished.return_value = ([], [])
+    # What a worker whose failed loads raise reports, as the ABC defaults do.
+    worker.take_failed_load_requests.return_value = set()
+    worker.take_failed_async_load_requests.return_value = set()
     scheduler = ADPAdapterMock()
     scheduler.get_num_new_matched_tokens.return_value = (4, True)
     scheduler.request_finished.return_value = True
