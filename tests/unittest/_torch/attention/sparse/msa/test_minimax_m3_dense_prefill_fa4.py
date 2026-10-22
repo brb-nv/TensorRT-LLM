@@ -29,7 +29,7 @@ HEAD_DIM, PAGE, NUM_HEADS, NUM_KV_HEADS = 128, 128, 32, 2
 
 
 def _fa4_ready() -> bool:
-    # FA4 dense prefill engages on the SMs of msa_prefill._DENSE_FA4_ARCHS (SM107, and SM103 by default; see the
+    # FA4 dense prefill engages on the SMs of msa_prefill._DENSE_FA4_ARCHS (SM107, and SM100 / SM103 by default; see the
     # _arch CPU test). Its numerics are checked on whichever of those this runs on.
     if not torch.cuda.is_available():
         return False
