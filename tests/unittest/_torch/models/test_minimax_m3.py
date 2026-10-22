@@ -3067,6 +3067,32 @@ def test_fused_qkv_rows_agree_between_eager_and_breakable(monkeypatch, rows: int
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "sm, archs, enabled, expected",
+    [
+        (107, (107,), True, True),
+        (103, (100, 103, 107), True, True),
+        (100, (100, 103, 107), True, True),
+        (103, (107,), True, False),
+        (90, (100, 103, 107), True, False),
+        (103, (100, 103, 107), False, False),
+    ],
+)
+def test_drafter_ctx_gates_engage_on_listed_archs(
+    monkeypatch, sm: int, archs: tuple, enabled: bool, expected: bool
+) -> None:
+    # The drafter's last-row context attention and dead-row skip: SM107 and the Blackwell SMs of their arch sets
+    # (TRTLLM_M3_BLACKWELL_RUBIN_OPTS=0 leaves SM107 alone), each under its own kill switch.
+    monkeypatch.setattr(modeling_minimaxm3, "get_sm_version", lambda: sm)
+    monkeypatch.setattr(modeling_minimaxm3, "_SM107_DRAFTER_CTX_LAST_ROW", enabled)
+    monkeypatch.setattr(modeling_minimaxm3, "_SM107_DRAFTER_CTX_DEAD_ROWS", enabled)
+    monkeypatch.setattr(modeling_minimaxm3, "_DRAFTER_CTX_LAST_ROW_ARCHS", frozenset(archs))
+    monkeypatch.setattr(modeling_minimaxm3, "_DRAFTER_CTX_DEAD_ROWS_ARCHS", frozenset(archs))
+    assert modeling_minimaxm3._drafter_ctx_last_row_on() is expected
+    assert modeling_minimaxm3._drafter_ctx_dead_rows_on() is expected
+
+
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("sm, expected", [(107, True), (103, False), (100, False), (90, False)])
 def test_swiglu_mxfp8_engages_on_sm107_only(monkeypatch, sm: int, expected: bool) -> None:
     # The fused SwiGLU + MXFP8 quantize is SM107-only; other architectures keep the stock activation and quantize.
