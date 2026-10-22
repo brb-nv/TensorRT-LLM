@@ -3291,6 +3291,49 @@ def test_ctx_boundary_norm_default_arch_set() -> None:
     assert 107 in modeling_minimaxm3._CTX_NORM_MXFP8_ARCHS
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "sm, archs, enabled, hpt",
+    [
+        (107, (107,), True, 2),
+        (100, (107,), False, None),
+        (103, (107,), False, None),
+        (100, (100, 107), True, 1),
+        (103, (103, 107), True, 1),
+        (90, (100, 103, 107), False, None),
+    ],
+)
+def test_ctx_clc_gemm_platform_and_shape_table(
+    monkeypatch, sm: int, archs: tuple, enabled, hpt
+) -> None:
+    # The CTX CLC MXFP8 GEMM: SM107 with its Rubin table; SM100 / SM103 only where TRTLLM_CTX_CLC_GEMM_ARCHS lists
+    # them, with the SM10x table (1-head tiles below the wide-row threshold).
+    from tensorrt_llm._torch.modules import m3_ctx_clc_gemm as clc
+
+    monkeypatch.setattr(clc, "get_sm_version", lambda: sm)
+    monkeypatch.setattr(clc, "_CTX_CLC_GEMM", True)
+    monkeypatch.setattr(clc, "_CTX_CLC_GEMM_ARCHS", frozenset(archs))
+    monkeypatch.setattr(clc, "_platform_ok", None)
+    monkeypatch.setattr(clc, "IS_CUTLASS_DSL_AVAILABLE", True)
+    monkeypatch.setattr(clc, "IS_CUTLASS_DSL_RUBIN_AVAILABLE", True)
+    assert clc.ctx_clc_gemm_enabled() is enabled
+    if enabled:
+        # TP2 o_proj (in both tables) at a narrow-tile row count; TP4 o_proj only in the SM10x table.
+        assert clc.ctx_clc_heads_per_tile(2048, 6144, 4096) == hpt
+        assert (clc.ctx_clc_heads_per_tile(2048, 6144, 2048) is None) == (sm == 107)
+        assert clc.ctx_clc_heads_per_tile(512, 6144, 4096) is None
+
+
+@pytest.mark.cpu_only
+def test_ctx_clc_gemm_default_arch_set() -> None:
+    # Unset, TRTLLM_CTX_CLC_GEMM_ARCHS keeps SM100 / SM103 on CUTLASS (opt-in).
+    from tensorrt_llm._torch.modules import m3_ctx_clc_gemm as clc
+
+    if "TRTLLM_CTX_CLC_GEMM_ARCHS" not in os.environ:
+        assert clc._CTX_CLC_GEMM_ARCHS == {107}
+    assert all(max(hpts) <= 2 for hpts in clc._CTX_CLC_GEMM_SHAPES_SM10X.values())
+
+
 @pytest.mark.skipif(not _has_cuda(), reason="the embedding gather is a Triton kernel")
 def test_embedding_gather_matches_f_embedding_for_any_id_layout() -> None:
     # The fused gather equals F.embedding with out-of-vocabulary rows zeroed, for contiguous, 2-D and strided ids.
