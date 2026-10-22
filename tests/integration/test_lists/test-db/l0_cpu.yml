@@ -101,6 +101,13 @@ l0_cpu:
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_five_way_projection_shard_geometry
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_five_way_loader_returns_exact_generic_skip
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_split_router_weight_reconstructs_fp32
+  - unittest/_torch/models/test_minimax_m3.py::test_bcg_bucket_takes_eager_qkv
+  - unittest/_torch/models/test_minimax_m3.py::test_bcg_bucket_keeps_captured_qkv_off_rubin
+  - unittest/_torch/models/test_minimax_m3.py::test_swiglu_mxfp8_engages_on_sm107_only
+  - unittest/_torch/models/test_minimax_m3.py::test_shared_fold_into_trtllm_gen_finalize_is_sm107_only
+  - unittest/_torch/models/test_minimax_m3.py::test_fused_qkv_rows_agree_between_eager_and_breakable
+  - unittest/_torch/models/test_minimax_m3.py::test_ctx_boundary_norm_declines_off_rubin_and_off_geometry
+  - unittest/_torch/models/test_minimax_m3.py::test_cutedsl_shared_fold_only_without_token_dispatch
   - unittest/_torch/models/checkpoints
   - unittest/_torch/modules
   - unittest/_torch/moe
@@ -109,6 +116,7 @@ l0_cpu:
   - unittest/_torch/speculative/hw_agnostic
   # l0_h100 selects with -m "not cpu_only", so this entry is what runs it.
   - unittest/_torch/speculative/test_spec_slot_pool_sizing.py
+  - unittest/_torch/misc/test_fp4_moe_tactic_table.py
   - unittest/_torch/test_hf_quant_config.py
   - unittest/_torch/test_mmap_utils.py
   - unittest/_torch/test_model_config.py
