@@ -383,6 +383,67 @@ def test_async_without_dummy_keeps_prepared_batch(
     assert manager.worker.start_load_kv.call_count == 2
 
 
+def test_failed_async_load_is_not_restored_without_kv(
+    forbid_connector_collectives: None,
+) -> None:
+    """A parked load that fails inside the wait leaves the batch to the scheduler.
+
+    Recovery frees the request's allocation and rewinds it while it is back in
+    context state, so it must not be put back into this pass's batch.
+    """
+    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+
+    manager = _manager()
+    parked = _request(11)
+    batch = ScheduledRequests()
+    batch.context_requests_last_chunk = [parked]
+    cache = MagicMock(spec=KVCacheManagerV2)
+    cache.get_page_indices_by_layer_group.return_value = [[5, 6]]
+    manager.get_num_new_matched_tokens(parked, 0)
+    parked.context_current_position = 4
+    parked.context_remaining_length = 4
+    parked.context_chunk_size = 4
+    manager.update_state_after_alloc(parked, [5, 6])
+    manager.build_scheduler_output(batch, cache)
+    manager.handle_metadata()
+
+    def drop_context_allocation(req: MagicMock) -> None:
+        req.py_connector_load_failed = True
+        req.context_current_position = 0
+
+    cache.drop_context_allocation.side_effect = drop_context_allocation
+    executor = object.__new__(PyExecutor)
+    _configure_recovery_controls(executor)
+    executor.kv_connector_manager = manager
+    executor.kv_cache_manager = cache
+    executor.kv_cache_transceiver = None
+    executor.active_requests = [parked]
+    executor.expected_num_active_requests = 1
+    executor.max_num_active_requests = 1
+    executor._count_schedulable_active_requests = MagicMock(return_value=0)
+    executor._should_skip_dummy_for_benchmark_disagg = MagicMock(return_value=False)
+    executor._has_adp_dummy_kv_capacity = MagicMock(return_value=False)
+    executor.resource_manager = MagicMock()
+    executor.resource_manager.prepare_resources.side_effect = AssertionError("allocation")
+    manager.worker.get_finished.side_effect = [([], []), ([], [11])]
+    manager.worker.take_failed_async_load_requests.side_effect = [set(), {11}]
+
+    with (
+        patch("torch.cuda.current_stream"),
+        patch("tensorrt_llm._torch.pyexecutor.py_executor.time.sleep") as sleep,
+    ):
+        _can_queue, has_local_compute = executor._kv_connector_start_batch(batch)
+
+    assert not has_local_compute
+    assert batch.batch_size == 0
+    cache.drop_context_allocation.assert_called_once_with(parked)
+    assert parked.state == LlmRequestState.CONTEXT_INIT
+    assert parked in executor.active_requests
+    # The prepared pass is the only load plan: nothing restarted is replanned.
+    assert manager.worker.start_load_kv.call_count == 1
+    sleep.assert_called_once_with(0.001)
+
+
 ConnectorVote = tuple[int, ...] | tuple[bool, set[int]] | str | None
 
 

@@ -4568,6 +4568,13 @@ class PyExecutor:
                         loading_context and scheduled_batch.batch_size == 0
                         and not scheduled_batch.is_attention_dp_phase_idle)
                     if waiting:
+                        # A parked request whose load failed was restarted
+                        # without KV pages; the scheduler admits it again.
+                        loading_context = [
+                            req for req in loading_context
+                            if getattr(req, "py_connector_load_failed",
+                                       False) is not True
+                        ]
                         scheduled_batch.reset_context_requests([
                             req for req in loading_context
                             if req.state == LlmRequestState.CONTEXT_INIT
@@ -4583,8 +4590,9 @@ class PyExecutor:
                                 self.resource_manager.prepare_resources(
                                     scheduled_batch,
                                     publish_connector_output=False)
-                        waiting = scheduled_batch.batch_size == 0
-                        batch_changed = not waiting
+                        waiting = (scheduled_batch.batch_size == 0
+                                   and bool(loading_context))
+                        batch_changed = scheduled_batch.batch_size > 0
                     if batch_changed and not waiting:
                         # Replace the compute plan after cancellation or restore
                         # without allocating surviving contexts' pages again.
