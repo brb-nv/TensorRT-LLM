@@ -182,6 +182,32 @@ def test_proxy_modes_and_r2_store_engage_on_listed_archs(
     assert aot.r2_store_enabled() is (sm107 and r2kill != "1")
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "cap", [(10, 7), (10, 0), (10, 3), (12, 0)], ids=["sm107", "sm100", "sm103", "sm120"]
+)
+@pytest.mark.parametrize(
+    "arch_env, r2_sms",
+    [
+        ({}, ()),
+        ({"TRTLLM_MSA_R2STORE_ARCHS": "100,103"}, (100, 103)),
+        ({"TRTLLM_MSA_R2STORE_ARCHS": "103,120"}, (103,)),
+        ({"TRTLLM_MSA_R2STORE_ARCHS": "100,103", "TRTLLM_M3_BLACKWELL_RUBIN_OPTS": "0"}, ()),
+    ],
+    ids=["stock", "blackwell", "sm103_only", "umbrella_off"],
+)
+def test_r2_store_opt_in_on_blackwell(monkeypatch, cap, arch_env, r2_sms):
+    # The R2 store warpgroup: SM107, plus the SM100 / SM103 TRTLLM_MSA_R2STORE_ARCHS opts in (none by default).
+    root = _fmha_sm100_dir()
+    monkeypatch.delenv("TRTLLM_MSA_DISABLE_R2STORE", raising=False)
+    for name in ("TRTLLM_MSA_R2STORE_ARCHS", "TRTLLM_M3_BLACKWELL_RUBIN_OPTS"):
+        monkeypatch.delenv(name, raising=False)
+    for name, value in arch_env.items():
+        monkeypatch.setenv(name, value)
+    _, aot = _load_with_capability(monkeypatch, root, cap, [])
+    assert aot.r2_store_enabled() is (cap == (10, 7) or cap[0] * 10 + cap[1] in r2_sms)
+
+
 def _k2q_csr_source() -> str:
     path = os.path.join(_fmha_sm100_dir(), "cute/src/sm100/build_k2q_csr/build_k2q_csr.cu")
     if not os.path.isfile(path):
