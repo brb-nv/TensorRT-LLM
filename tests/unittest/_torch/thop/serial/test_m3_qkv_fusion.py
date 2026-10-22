@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Gate for the SM107 fused MiniMax-M3 QKV MXFP8 GEMM + producer epilogue.
+"""Gate for the fused MiniMax-M3 QKV MXFP8 GEMM + producer epilogue (SM107, SM100, SM103).
 
 The fused kernel's debug handle writes its own bf16 GEMM output G; the stock
 ``minimax_m3_nvfp4_qkv_indexer_norm_rope_kv_insert`` producer run on G is the
@@ -9,7 +9,9 @@ index-K) must match it bitwise, including the cache bytes it must not touch.
 
 Also runnable as a script (``python3 test_m3_qkv_fusion.py --m 16384,300
 --timing``); ``M3QKV_PKG`` may name a directory holding an ``m3_qkv_fusion``
-package to test instead of the in-tree one.
+package to test instead of the in-tree one. ``M3QKV_HEADS`` sets the per-rank
+head geometry "q,kv,index" (default 32,2,2, TP2 without attention DP; the
+TP2 attention-DP ctx geometry is 64,4,4).
 """
 
 import argparse
@@ -23,21 +25,33 @@ import torch
 # tensorrt_llm is imported inside the functions that need it, so that _kernel_module() first sets
 # CUTE_DSL_ARCH (read by the CuTe DSL when it is imported) and puts any M3QKV_PKG on sys.path.
 
-HEADS_Q, HEADS_KV, HEADS_INDEX, HEAD_DIM, K_DIM = 32, 2, 2, 128, 6144
+HEADS_Q, HEADS_KV, HEADS_INDEX = (
+    int(v) for v in os.environ.get("M3QKV_HEADS", "32,2,2").split(",")
+)
+HEAD_DIM, K_DIM = 128, 6144
 N_DIM = (HEADS_Q + 2 * HEADS_KV + HEADS_INDEX + 1) * HEAD_DIM
 EPS = 1e-6
 SENTINEL_DATA, SENTINEL_SCALE, SENTINEL_INDEX, SENTINEL_Q = 0xA5, 0x5A, 0x3C, 0x77
 
 
-def _is_sm107():
-    return torch.cuda.is_available() and torch.cuda.get_device_capability() == (10, 7)
+_ARCHS = {(10, 0): "sm_100a", (10, 3): "sm_103a", (10, 7): "sm_107a"}
 
 
-pytestmark = pytest.mark.skipif(not _is_sm107(), reason="SM107 (Rubin) required")
+def _device_dsl_arch():
+    if not torch.cuda.is_available():
+        return None
+    return _ARCHS.get(tuple(torch.cuda.get_device_capability()))
+
+
+pytestmark = pytest.mark.skipif(_device_dsl_arch() is None, reason="SM100, SM103 or SM107 required")
+
+
+def _geometry():
+    return dict(num_heads_q=HEADS_Q, num_heads_kv=HEADS_KV, num_heads_index=HEADS_INDEX)
 
 
 def _kernel_module():
-    os.environ.setdefault("CUTE_DSL_ARCH", "sm_107a")
+    os.environ.setdefault("CUTE_DSL_ARCH", _device_dsl_arch())
     pkg = os.environ.get("M3QKV_PKG")
     if pkg:
         sys.path.insert(0, pkg)
@@ -195,8 +209,8 @@ def compare(got, ref):
 def gate(m, cfg, log=print):
     k = _kernel_module()
     prob = Problem(m)
-    fused = k.M3QkvFusedRunner(**cfg)
-    debug = k.M3QkvFusedRunner(**cfg, debug_gemm_out=True)
+    fused = k.M3QkvFusedRunner(**_geometry(), **cfg)
+    debug = k.M3QkvFusedRunner(**_geometry(), **cfg, debug_gemm_out=True)
     g = prob.run_debug(debug)
     torch.cuda.synchronize()
     ref = prob.reference(g)
@@ -300,7 +314,7 @@ def timing(m, cfgs, log=print, reps=21):
         f"TIME m={m} producer cold={t_prod:.1f} us; cutlass_best+producer back-to-back cold={t_both:.1f} us"
     )
     for cfg in cfgs:
-        fused = k.M3QkvFusedRunner(**cfg)
+        fused = k.M3QkvFusedRunner(**_geometry(), **cfg)
         args = prob.fused_args(fused, prob.outputs(), prob.caches())
         t_f = med(lambda: fused.run_args(args))
         t_w = med(lambda: fused.run_args(args), cold=False)
@@ -308,7 +322,7 @@ def timing(m, cfgs, log=print, reps=21):
             f"TIME m={m} fused {cfg}: cold={t_f:.1f} us warm={t_w:.1f} us  (vs {t_both:.1f}: {t_both / t_f:.3f}x)"
         )
         if os.environ.get("M3QKV_TIME_DEBUG"):
-            dbg = k.M3QkvFusedRunner(**cfg, debug_gemm_out=True)
+            dbg = k.M3QkvFusedRunner(**_geometry(), **cfg, debug_gemm_out=True)
             gout = torch.empty(m, N_DIM, dtype=torch.bfloat16, device="cuda")
             dargs = prob.fused_args(dbg, prob.outputs(), prob.caches(), gemm_out=gout)
             log(f"TIME m={m} debug-gemm-out {cfg}: cold={med(lambda: dbg.run_args(dargs)):.1f} us")

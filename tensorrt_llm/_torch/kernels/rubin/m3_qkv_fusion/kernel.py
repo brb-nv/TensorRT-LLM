@@ -86,6 +86,14 @@ MMAs, one epilogue warpgroup) are the fastest measured on SM107 at
 M=8192..16384: SMEM operand reads per SM, not L2, bound the mainloop, so
 wider tiles win; a second epilogue warpgroup caps the epilogue at 208
 registers and runs slower.
+
+SM100 / SM103 run the same kernel on the SM100 block-scaled MMA atom
+(instruction K 32, no operand collector, 512 TMEM columns, 227 KB SMEM):
+a tile wider than one MMA issues its N sets with A re-read from SMEM, the
+default tile is 2 head slots (one N256 MMA, so the accumulator fits TMEM
+next to the scale factors) and the stage count follows the smaller SMEM.
+The arch comes from the device (or ``arch=``) and is part of the compile
+key. Those tile defaults are untuned on SM100 / SM103.
 """
 
 from __future__ import annotations
@@ -100,7 +108,11 @@ import cutlass.pipeline as pipeline
 import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
-import cutlass.utils.rubin_helpers as sm107_utils
+
+try:
+    import cutlass.utils.rubin_helpers as sm107_utils
+except ImportError:  # a CUTLASS DSL without the Rubin helpers still serves SM100 / SM103
+    sm107_utils = None
 from cutlass._mlir.dialects import llvm as _llvm
 from cutlass._mlir.dialects import nvvm
 from cutlass._mlir.extras import types as _T
@@ -455,8 +467,25 @@ class S2TCopyBundle(NamedTuple):
     tSF_compact: cute.Tensor
 
 
+_ARCHS = ("sm_100", "sm_103", "sm_107")
+
+
+def device_arch() -> str:
+    """The current CUDA device as "sm_100" / "sm_103" / "sm_107" (other devices are rejected by the kernel)."""
+    import torch
+
+    major, minor = torch.cuda.get_device_capability()
+    return f"sm_{major}{minor}"
+
+
+def default_heads_per_tile(arch: str) -> int:
+    """4 head slots (two N256 MMAs sharing A in the collector) on SM107; 2 (one N256 MMA) on SM100 / SM103, where
+    4 slots of fp32 accumulator plus the scale factors do not fit 512 TMEM columns."""
+    return 4 if arch == "sm_107" else 2
+
+
 class M3QkvGemmNormRopeKvInsert:
-    """Persistent SM107 MXFP8 QKV GEMM with the M3 producer as its epilogue."""
+    """Persistent SM107 / SM100 / SM103 MXFP8 QKV GEMM with the M3 producer as its epilogue."""
 
     def __init__(
         self,
@@ -464,7 +493,7 @@ class M3QkvGemmNormRopeKvInsert:
         num_heads_q: int = 32,
         num_heads_kv: int = 2,
         num_heads_index: int = 2,
-        heads_per_tile: int = 4,
+        heads_per_tile: int | None = None,
         mma_m: int = 256,
         mma_n: int | None = None,
         num_acc_stage: int | None = None,
@@ -474,7 +503,18 @@ class M3QkvGemmNormRopeKvInsert:
         debug_gemm_out: bool = False,
         enable_pdl: bool = True,
         epi_wgs: int = 1,
+        arch: str | None = None,
     ):
+        self.arch = device_arch() if arch is None else arch
+        if self.arch not in _ARCHS:
+            raise ValueError(f"the fused QKV kernel runs on {_ARCHS}, not {self.arch}")
+        self.is_sm107 = self.arch == "sm_107"
+        if self.is_sm107 and sm107_utils is None:
+            raise RuntimeError(
+                "SM107 needs cutlass.utils.rubin_helpers (a newer nvidia-cutlass-dsl)"
+            )
+        if heads_per_tile is None:
+            heads_per_tile = default_heads_per_tile(self.arch)
         if mma_m not in (128, 256):
             raise ValueError("mma_m must be 128 (1-CTA) or 256 (2-CTA pair)")
         if heads_per_tile not in (1, 2, 3, 4):
@@ -495,7 +535,9 @@ class M3QkvGemmNormRopeKvInsert:
         if inst_n not in (128, 256) or self.tile_n % inst_n:
             raise ValueError("mma_n must be 128 or 256 and divide the tile N")
         self.n_sets = self.tile_n // inst_n
-        self.mma_inst_shape = (mma_m, inst_n, 64)
+        # Instruction K: 64 for the SM107 MXF8F6F4 atom, 32 for the SM100 one (the mainloop issues as many k-blocks
+        # per 128-K tile as the atom needs).
+        self.mma_inst_shape = (mma_m, inst_n, 64 if self.is_sm107 else 32)
         self.mma_tiler = (mma_m, self.tile_n, 128)
         self.use_2cta_instrs = mma_m == 256
         self.cta_group = tcgen05.CtaGroup.TWO if self.use_2cta_instrs else tcgen05.CtaGroup.ONE
@@ -541,7 +583,6 @@ class M3QkvGemmNormRopeKvInsert:
         self.tmem_alloc_barrier = pipeline.NamedBarrier(
             barrier_id=2, num_threads=32 * (1 + len(self.epilog_warp_id))
         )
-        self.arch = "sm_107"
         self.smem_capacity = utils.get_smem_capacity_in_bytes(self.arch)
         self.num_tmem_alloc_cols = cute.arch.get_max_tmem_alloc_cols(self.arch)
         self.requested_acc_stage = num_acc_stage
@@ -550,6 +591,9 @@ class M3QkvGemmNormRopeKvInsert:
 
     # ------------------------------------------------------------------
     def _make_tiled_mmas(self):
+        if not self.is_sm107:
+            return self._make_tiled_mmas_sm100()
+
         def make(a_op, b_op):
             mma = sm107_utils.make_blockscaled_trivial_tiled_mma(
                 self.a_dtype,
@@ -593,6 +637,27 @@ class M3QkvGemmNormRopeKvInsert:
         tiled_mma_sfb.set(tcgen05.Field.NEGATE_A, False)
         tiled_mma_sfb.set(tcgen05.Field.NEGATE_B, False)
         return (tiled_mma_first, tiled_mma_mid, tiled_mma_last), tiled_mma_sfb
+
+    def _make_tiled_mmas_sm100(self):
+        """SM100 / SM103: the K32 block-scaled atom. It has no operand collector, so every N set of a k-block
+        re-reads A from SMEM (first = mid = last)."""
+
+        def make(cta_group, inst_shape):
+            # The SM100 atom's negate fields default to off.
+            return sm100_utils.make_blockscaled_trivial_tiled_mma(
+                self.a_dtype,
+                self.b_dtype,
+                self.a_major_mode,
+                self.b_major_mode,
+                self.sf_dtype,
+                self.sf_vec_size,
+                cta_group,
+                inst_shape[:2],
+            )
+
+        tiled_mma = make(self.cta_group, self.mma_inst_shape)
+        tiled_mma_sfb = make(tcgen05.CtaGroup.ONE, self.mma_inst_shape_sfb)
+        return (tiled_mma, tiled_mma, tiled_mma), tiled_mma_sfb
 
     def _cluster_layouts(self, tiled_mma, tiled_mma_sfb):
         vmnk = cute.tiled_divide(
@@ -1754,7 +1819,7 @@ def compile(
     num_heads_q: int = 32,
     num_heads_kv: int = 2,
     num_heads_index: int = 2,
-    heads_per_tile: int = 4,
+    heads_per_tile: int | None = None,
     mma_m: int = 256,
     mma_n: int | None = None,
     num_acc_stage: int | None = None,
@@ -1764,12 +1829,18 @@ def compile(
     debug_gemm_out: bool = False,
     enable_pdl: bool = True,
     epi_wgs: int = 1,
+    arch: str | None = None,
 ):
-    """Compile one handle serving every M (and any cache geometry)."""
-    arch = os.environ.get("CUTE_DSL_ARCH")
-    if arch is not None and arch != "sm_107a":
-        raise RuntimeError("requires CUTE_DSL_ARCH=sm_107a")
+    """Compile one handle serving every M (and any cache geometry) for ``arch`` (default: the current device)."""
+    if arch is None:
+        arch = device_arch()
+    dsl_arch = os.environ.get("CUTE_DSL_ARCH")
+    if dsl_arch is not None and dsl_arch.rstrip("af") != arch:
+        raise RuntimeError(f"CUTE_DSL_ARCH={dsl_arch} does not target {arch}")
+    if heads_per_tile is None:
+        heads_per_tile = default_heads_per_tile(arch)
     key = (
+        arch,
         num_heads_q,
         num_heads_kv,
         num_heads_index,
@@ -1800,6 +1871,7 @@ def compile(
         debug_gemm_out=debug_gemm_out,
         enable_pdl=enable_pdl,
         epi_wgs=epi_wgs,
+        arch=arch,
     )
 
     from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream

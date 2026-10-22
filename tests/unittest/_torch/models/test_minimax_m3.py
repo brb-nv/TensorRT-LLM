@@ -3051,6 +3051,50 @@ def test_bcg_bucket_keeps_captured_qkv_off_rubin(monkeypatch, sm: int) -> None:
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "sm, archs, expected",
+    [
+        (103, (103, 107), True),
+        (100, (100, 103, 107), True),
+        (103, (107,), False),
+        (90, (100, 103, 107), False),
+        (107, (107,), True),
+    ],
+)
+def test_bcg_bucket_follows_fused_qkv_archs(
+    monkeypatch, sm: int, archs: tuple, expected: bool
+) -> None:
+    # SM100 / SM103 take the fused QKV GEMM (and so the eager-break QKV of breakable buckets) only where
+    # TRTLLM_CTX_QKV_FUSED_ARCHS opts them in.
+    monkeypatch.setattr(modeling_minimaxm3, "_CTX_BCG_P5A", True)
+    monkeypatch.setattr(modeling_minimaxm3, "_CTX_QKV_FUSED", True)
+    monkeypatch.setattr(modeling_minimaxm3, "_CTX_QKV_FUSED_ARCHS", frozenset(archs))
+    monkeypatch.setattr(modeling_minimaxm3, "get_sm_version", lambda: sm)
+    assert modeling_minimaxm3._bcg_bucket_takes_eager_qkv(2048) is expected
+
+
+@pytest.mark.cpu_only
+def test_fused_qkv_compile_failure_falls_back_off_rubin(monkeypatch) -> None:
+    # Off SM107 a fused QKV runner that fails to compile is remembered and the caller keeps the stock path.
+    kernel_module = pytest.importorskip("tensorrt_llm._torch.kernels.rubin.m3_qkv_fusion.kernel")
+    calls = []
+
+    def failing_runner(**cfg):
+        calls.append(cfg)
+        raise RuntimeError("no such MMA atom")
+
+    monkeypatch.setattr(kernel_module, "M3QkvFusedRunner", failing_runner)
+    monkeypatch.setattr(modeling_minimaxm3, "get_sm_version", lambda: 103)
+    monkeypatch.setattr(modeling_minimaxm3, "_CTX_QKV_FUSED_RUNNERS", {})
+    monkeypatch.setattr(modeling_minimaxm3, "_CTX_QKV_FUSED_FAILED", set())
+    assert modeling_minimaxm3._ctx_qkv_fused_runner(64, 4, 4) is None
+    assert modeling_minimaxm3._ctx_qkv_fused_runner(64, 4, 4) is None
+    assert len(calls) == 1
+    assert calls[0]["heads_per_tile"] == modeling_minimaxm3._CTX_QKV_FUSED_SM10X_HEADS_PER_TILE
+    assert calls[0]["enable_pdl"] is modeling_minimaxm3._CTX_QKV_FUSED_SM10X_PDL
+
+
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("rows", [1, 1023, 1024, 1025, 2048, 16384])
 def test_fused_qkv_rows_agree_between_eager_and_breakable(monkeypatch, rows: int) -> None:
     # A breakable bucket runs the eager QKV exactly when an eager step of the same rows takes the fused QKV GEMM +
