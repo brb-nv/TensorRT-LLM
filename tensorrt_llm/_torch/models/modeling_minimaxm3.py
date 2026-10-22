@@ -990,11 +990,13 @@ def mark_drafter_dead_rows(draft_model: torch.nn.Module) -> int:
     return 1
 
 
-# SM107: the token embedding (full vocabulary on every rank) is one Triton gather that writes a token's row, or zeros
+# SM107 and SM100/SM103 (TRTLLM_CTX_EMBEDDING_GATHER_ARCHS, default 100,103; see blackwell_rubin_opts): the token
+# embedding (full vocabulary on every rank) is one Triton gather that writes a token's row, or zeros
 # for an id outside the vocabulary, instead of the aten gather followed by the broadcast masked_fill of the whole
 # output (~270 us per 16K-token chunk). The same bits. Kill: TRTLLM_CTX_EMBEDDING_GATHER=0 in the deployment env (read
 # once at import) runs the stock Embedding forward.
 _SM107_EMBEDDING_GATHER = os.environ.get("TRTLLM_CTX_EMBEDDING_GATHER", "1") == "1"
+_EMBEDDING_GATHER_ARCHS = gate_archs("TRTLLM_CTX_EMBEDDING_GATHER_ARCHS")
 _SM107_EMBEDDING_GATHER_LOGGED = []
 
 
@@ -1037,15 +1039,16 @@ def _minimax_m3_embedding_gather_fake(
 
 
 class MiniMaxM3Embedding(Embedding):
-    """The token embedding; on SM107 without vocabulary parallelism, one fused gather (minimax_m3_embedding_gather)."""
+    """The token embedding; on SM107 and SM100/SM103 without vocabulary parallelism, one fused gather
+    (minimax_m3_embedding_gather)."""
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self._sm107_gather = _SM107_EMBEDDING_GATHER and get_sm_version() == 107
+        self._fused_gather = _SM107_EMBEDDING_GATHER and get_sm_version() in _EMBEDDING_GATHER_ARCHS
 
     def forward(self, input):
         if (
-            self._sm107_gather
+            self._fused_gather
             and self.tp_size == 1
             and input.is_cuda
             and self.weight.dim() == 2
