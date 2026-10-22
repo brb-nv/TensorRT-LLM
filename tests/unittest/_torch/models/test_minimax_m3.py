@@ -3175,6 +3175,36 @@ def test_embedding_gather_matches_f_embedding_for_any_id_layout() -> None:
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize(
+    "sm, archs, enabled, expected",
+    [
+        (107, (107,), True, True),
+        (103, (100, 103, 107), True, True),
+        (100, (100, 103, 107), True, True),
+        (103, (107,), True, False),
+        (90, (100, 103, 107), True, False),
+        (100, (100, 103, 107), False, False),
+    ],
+)
+def test_embedding_gather_engages_on_listed_archs(
+    monkeypatch, sm: int, archs: tuple, enabled: bool, expected: bool
+) -> None:
+    # The fused embedding gather: SM107 and the Blackwell SMs of TRTLLM_CTX_EMBEDDING_GATHER_ARCHS, decided once at
+    # construction.
+    monkeypatch.setattr(modeling_minimaxm3, "get_sm_version", lambda: sm)
+    monkeypatch.setattr(modeling_minimaxm3, "_SM107_EMBEDDING_GATHER", enabled)
+    monkeypatch.setattr(modeling_minimaxm3, "_EMBEDDING_GATHER_ARCHS", frozenset(archs))
+    monkeypatch.setattr(
+        modeling_minimaxm3.Embedding,
+        "__init__",
+        lambda self, *a, **k: torch.nn.Module.__init__(self),
+    )
+    embedding = modeling_minimaxm3.MiniMaxM3Embedding.__new__(modeling_minimaxm3.MiniMaxM3Embedding)
+    modeling_minimaxm3.MiniMaxM3Embedding.__init__(embedding)
+    assert embedding._fused_gather is expected
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
     "use_dp, comm, folds",
     [(False, None, True), (True, None, False), (False, object(), False)],
     ids=["local_tokens", "attention_dp", "moe_communication"],
