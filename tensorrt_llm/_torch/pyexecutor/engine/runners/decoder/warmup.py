@@ -8,6 +8,7 @@ from __future__ import annotations
 import contextlib
 import gc
 import os
+import sys
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
@@ -280,10 +281,17 @@ class DecoderWarmup:
 
     def run(self, resource_manager: ResourceManager) -> EagerWorkspaceReclaimer | None:
         """Warm up and capture graphs; return the eager workspace reclaimer to serve with."""
+        from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.m3ax_msa_prewarm import (
+            hook as msa_prewarm_hook,
+        )
+
         kv_cache_manager = resource_manager.get_resource_manager(self.kv_cache_manager_key)
-        # Retain a partial summary when a phase raises.
-        with self._warmup_timer:
-            return self._warmup_scheduled(resource_manager, kv_cache_manager)
+        # The MSA prewarm scope (a no-op unless enabled) closes after the timed warmup: its
+        # end-of-warmup sparse-decode prewarm is not part of the warmup timer's phases.
+        with msa_prewarm_hook.warmup_scope(self):
+            # Retain a partial summary when a phase raises.
+            with self._warmup_timer:
+                return self._warmup_scheduled(resource_manager, kv_cache_manager)
 
     def _get_max_shape_warmup_requests(
         self, resource_manager: ResourceManager
@@ -1464,6 +1472,13 @@ class DecoderWarmup:
         from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.cache_manager import (
             MiniMaxM3KVCacheManagerV2,
         )
+        from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.m3ax_msa_prewarm import (
+            hook as msa_prewarm_hook,
+        )
+
+        # Compiles every fmha_sm100 variant this rank's MSA plans can select and starts recording
+        # the sparse-decode call shapes (a no-op unless enabled; it applies its own MSA gating).
+        msa_prewarm_hook.before_msa_indexer_prewarm(self, kv_cache_manager, sys.modules[__name__])
 
         if not isinstance(kv_cache_manager, MiniMaxM3KVCacheManagerV2):
             return

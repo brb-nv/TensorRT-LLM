@@ -30,6 +30,13 @@ from tensorrt_llm._torch.memory_buffer_utils import get_memory_buffers
 from .msa_utils import check_decode_span_shape
 
 
+def _l1_fmha_policy():
+    """The l1-fmha virtual-SM-count policy module (imported on first use, see l1_fmha_policy)."""
+    from tensorrt_llm._torch.attention.backends.fmha import l1_fmha_policy
+
+    return l1_fmha_policy
+
+
 @functools.lru_cache(maxsize=None)
 def _counter_size(num_heads: int, max_num_requests: int, device_index: int) -> int:
     """Byte size of the multi-CTA KV counter block.
@@ -44,6 +51,9 @@ def _counter_size(num_heads: int, max_num_requests: int, device_index: int) -> i
     )
 
     multi_processor_count = torch.cuda.get_device_properties(device_index).multi_processor_count
+    # l1-fmha: room for the largest virtual SM count its table launches with (the launcher checks
+    # max(batch * heads, sm_count) counters); unchanged when l1-fmha is off or its table is empty.
+    multi_processor_count = max(int(multi_processor_count), _l1_fmha_policy().sm_eff_max())
     return int(_get_multi_ctas_kv_counter_size(num_heads, max_num_requests, multi_processor_count))
 
 
@@ -302,29 +312,37 @@ def minimax_m3_trtllm_gen_dense_decode(
     if staged_subpage_table is None or staged_subpages_per_slot != subpages_per_slot:
         staged_subpage_table = subpage_block_table(block_table, subpages_per_slot, reserve)
 
-    flashinfer.decode.trtllm_batch_decode_with_kv_cache(
-        query=q,
-        # The tuple form takes the K and V page views separately, which is what
-        # a flat sub-page pool is: both rows of the block table index into it.
-        kv_cache=(kv_pool, kv_pool),
-        workspace_buffer=workspace,
-        block_tables=staged_subpage_table,
-        seq_lens=seq_lens,
-        max_seq_len=max_seq_len,
-        bmm1_scale=sm_scale,
-        bmm2_scale=1.0,
-        window_left=-1,  # M3 dense layers are fully causal
-        out=output,
-        sinks=None,
-        kv_layout="HND",
-        enable_pdl=enable_pdl,
-        backend="trtllm-gen",
-        q_len_per_req=decode_query_len,
-        max_q_len=None,
-        cum_seq_lens_q=None,
-        kv_cache_sf=None,  # M3 stores unscaled E4M3
-        uses_shared_paged_kv_idx=False,
-        multi_ctas_kv_counter_buffer=counters,
+    # The same call, run through the l1-fmha policy, which launches it with the table's virtual SM
+    # count for this (q_len, batch) when it has one (and runs it unchanged otherwise).
+    _l1_fmha_policy().call(
+        "dense",
+        flashinfer.decode.trtllm_batch_decode_with_kv_cache,
+        batch=int(seq_lens.shape[0]),
+        q_len=int(decode_query_len),
+        kwargs=dict(
+            query=q,
+            # The tuple form takes the K and V page views separately, which is what
+            # a flat sub-page pool is: both rows of the block table index into it.
+            kv_cache=(kv_pool, kv_pool),
+            workspace_buffer=workspace,
+            block_tables=staged_subpage_table,
+            seq_lens=seq_lens,
+            max_seq_len=max_seq_len,
+            bmm1_scale=sm_scale,
+            bmm2_scale=1.0,
+            window_left=-1,  # M3 dense layers are fully causal
+            out=output,
+            sinks=None,
+            kv_layout="HND",
+            enable_pdl=enable_pdl,
+            backend="trtllm-gen",
+            q_len_per_req=decode_query_len,
+            max_q_len=None,
+            cum_seq_lens_q=None,
+            kv_cache_sf=None,  # M3 stores unscaled E4M3
+            uses_shared_paged_kv_idx=False,
+            multi_ctas_kv_counter_buffer=counters,
+        ),
     )
 
 

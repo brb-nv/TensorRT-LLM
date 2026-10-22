@@ -221,6 +221,13 @@ if IS_FLASHINFER_AVAILABLE:
 _MULTI_CTAS_KV_COUNTER_ALIGNMENT = 8
 
 
+def _l1_fmha_policy():
+    """The l1-fmha virtual-SM-count policy module (imported on first use, see l1_fmha_policy)."""
+    from . import l1_fmha_policy
+
+    return l1_fmha_policy
+
+
 def _get_multi_ctas_kv_counter_size(
     num_heads: int,
     max_num_sequences: int,
@@ -841,10 +848,12 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
 
         # One counter per head per decoder sequence; beam search expands each
         # request into ``beam_width`` sequences.
+        # l1-fmha: room for the largest virtual SM count its table launches with; unchanged when
+        # l1-fmha is off or its table is empty.
         required_counter_size = _get_multi_ctas_kv_counter_size(
             attn.num_heads,
             metadata.max_num_sequences or metadata.max_num_requests,
-            self._multi_processor_count,
+            max(self._multi_processor_count, _l1_fmha_policy().sm_eff_max()),
         )
         counter_buffer = self._multi_ctas_kv_counter_buffer
         if (
@@ -1227,32 +1236,40 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         # A layer may cap the KV split's max_seq_len per request count (a no-op unless it sets the cap).
         max_kv_len = dense_decode_max_seq_len(attn, max_kv_len, batch_beam)
 
-        flashinfer.decode.trtllm_batch_decode_with_kv_cache(
-            query=q_processed,
-            kv_cache=(kv_pool, kv_pool),
-            workspace_buffer=fmha_workspace,
-            block_tables=block_tables,
-            seq_lens=params.sequence_lengths,
-            max_seq_len=max_kv_len,
-            bmm1_scale=gen_bmm1_scale,
-            bmm2_scale=gen_bmm2_scale,
-            window_left=window_left,
-            out=params.output,
-            sinks=fwd.attention_sinks,
-            kv_layout=self._layout,
-            enable_pdl=self._enable_pdl,
-            backend="trtllm-gen",
-            q_len_per_req=q_len_per_req,
-            max_q_len=decode_max_q_len,
-            cum_seq_lens_q=decode_cu_seqlens,
-            kv_cache_sf=(kv_scale_pool, kv_scale_pool) if kv_scale_pool is not None else None,
-            uses_shared_paged_kv_idx=self.USE_SHARED_PAGED_KV_IDX,
-            bmm1_scale_log2=(
-                _get_bmm1_scale_log2(gen_bmm1_scale)
-                if isinstance(gen_bmm1_scale, torch.Tensor)
-                else None
+        # The same call, run through the l1-fmha policy, which launches it with the table's virtual
+        # SM count for this (q_len, batch) when it has one (and runs it unchanged otherwise).
+        _l1_fmha_policy().call(
+            "draft",
+            flashinfer.decode.trtllm_batch_decode_with_kv_cache,
+            batch=int(batch_beam),
+            q_len=int(q_len_per_req if q_len_per_req is not None else decode_max_q_len),
+            kwargs=dict(
+                query=q_processed,
+                kv_cache=(kv_pool, kv_pool),
+                workspace_buffer=fmha_workspace,
+                block_tables=block_tables,
+                seq_lens=params.sequence_lengths,
+                max_seq_len=max_kv_len,
+                bmm1_scale=gen_bmm1_scale,
+                bmm2_scale=gen_bmm2_scale,
+                window_left=window_left,
+                out=params.output,
+                sinks=fwd.attention_sinks,
+                kv_layout=self._layout,
+                enable_pdl=self._enable_pdl,
+                backend="trtllm-gen",
+                q_len_per_req=q_len_per_req,
+                max_q_len=decode_max_q_len,
+                cum_seq_lens_q=decode_cu_seqlens,
+                kv_cache_sf=(kv_scale_pool, kv_scale_pool) if kv_scale_pool is not None else None,
+                uses_shared_paged_kv_idx=self.USE_SHARED_PAGED_KV_IDX,
+                bmm1_scale_log2=(
+                    _get_bmm1_scale_log2(gen_bmm1_scale)
+                    if isinstance(gen_bmm1_scale, torch.Tensor)
+                    else None
+                ),
+                multi_ctas_kv_counter_buffer=self._get_multi_ctas_kv_counter_buffer(),
             ),
-            multi_ctas_kv_counter_buffer=self._get_multi_ctas_kv_counter_buffer(),
         )
 
     def run_mla_generation(

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import functools
 import os
+import time
 from types import ModuleType
 from typing import TYPE_CHECKING, Optional
 
@@ -25,6 +26,7 @@ from tensorrt_llm._torch.blackwell_rubin_opts import gate_archs
 from tensorrt_llm._utils import async_tensor_h2d, get_sm_version
 from tensorrt_llm.logger import logger
 
+from . import msa_proxy_balance as _o12a
 from .kernels.msa_utils import (
     MSA_REQUIRED_HEAD_DIM,
     MSA_REQUIRED_TOPK,
@@ -300,6 +302,20 @@ def segmented_proxy_plan(
     """
     qo_lens, qo_offsets = qo_lens_cpu.tolist(), qo_offset_cpu.tolist()
     num_kv_splits = _proxy_kv_splits(qo_lens, qo_offsets, num_index_heads)
+    # o12a: a work-balanced plan (msa_proxy_balance) where it is predicted to beat stock's; M3_O12A_PROXY_SPLIT=0
+    # skips this block, which leaves exactly the stock routing below.
+    if _o12a.config().enabled:
+        balanced = _o12a_balanced_plan(
+            fmha_sm100,
+            qo_lens,
+            qo_offsets,
+            stock_splits=num_kv_splits,
+            num_index_heads=num_index_heads,
+            page_size=page_size,
+            kv_indices=kv_indices,
+        )
+        if balanced is not None:
+            return balanced
     if num_kv_splits == 0:
         return None
     return _segmented_proxy_plan(
@@ -350,6 +366,124 @@ def prewarm_split_proxy_variants(dtype: torch.dtype, num_index_heads: int, page_
             output_o=False,
             output_maxscore=True,
         )
+    if _o12a.config().enabled:
+        _o12a_prewarm(fmha_sm100, dtype, num_index_heads, page_size)
+
+
+# o12a counters (tests and the evidence lines): steps planned balanced / left to stock, by reason.
+O12A_STATS: dict = {}
+# Run-time evidence (the prewarm line is printed once, at server start):
+# "[o12a] balanced proxy plan used n=<balanced plans so far> ..." when this process first uses a balanced plan, then
+# at most once per _O12A_EVIDENCE_EVERY_S while balanced plans keep being used. Logging only; plans are unchanged.
+_O12A_EVIDENCE_EVERY_S = 30.0
+_O12A_EVIDENCE_LAST: list = [None]
+
+
+def _o12a_evidence(decision) -> None:
+    n = O12A_STATS["used"] = O12A_STATS.get("used", 0) + 1
+    now = time.monotonic()
+    last = _O12A_EVIDENCE_LAST[0]
+    if last is not None and now - last < _O12A_EVIDENCE_EVERY_S:
+        return
+    _O12A_EVIDENCE_LAST[0] = now
+    from tensorrt_llm.logger import logger
+
+    logger.info(
+        f"[o12a] balanced proxy plan used n={n} reason={decision.reason} kept_stock={O12A_STATS.get('margin', 0)} "
+        f"pieces_max={max(decision.layout.tile_pieces) if decision.layout.tile_pieces else 1} "
+        f"predicted_iters={decision.balanced:.0f}/{decision.stock_lb:.0f}"
+    )
+
+
+def _o12a_balanced_plan(
+    fmha_sm100: ModuleType,
+    qo_lens: list[int],
+    qo_offsets: list[int],
+    *,
+    stock_splits: int,
+    num_index_heads: int,
+    page_size: int,
+    kv_indices: torch.Tensor,
+    num_ctas: Optional[int] = None,
+) -> Optional[tuple[tuple, torch.Tensor]]:
+    """Balanced proxy plan (msa_proxy_balance) and its page table, or None to keep stock's plan for these rows."""
+    api = _o12a.library_api(fmha_sm100)
+    if api is None:
+        O12A_STATS["no_api"] = O12A_STATS.get("no_api", 0) + 1
+        return None
+    if num_ctas is None:
+        num_ctas = int(api._get_num_cta(kv_indices.device))
+    decision = _o12a.decide(
+        qo_lens,
+        qo_offsets,
+        num_index_heads=num_index_heads,
+        page_size=page_size,
+        num_ctas=num_ctas,
+        stock_splits=stock_splits,
+    )
+    O12A_STATS[decision.reason] = O12A_STATS.get(decision.reason, 0) + 1
+    if not decision.use_balanced:
+        return None
+    built = _o12a.build_plan(
+        fmha_sm100,
+        decision,
+        num_index_heads=num_index_heads,
+        kv_indices=kv_indices,
+        num_ctas=num_ctas,
+    )
+    if built is None:
+        O12A_STATS["build_declined"] = O12A_STATS.get("build_declined", 0) + 1
+        return None
+    _o12a_evidence(decision)
+    return built
+
+
+def _o12a_prewarm(fmha_sm100: ModuleType, dtype: torch.dtype, num_index_heads: int, page_size: int) -> None:
+    """Load (compiling where missing) the fmha_sm100 variants balanced proxy plans add to stock's.
+
+    Balanced plans also split rows of <= 64 queries, which selects the single-softmax-warpgroup split variants
+    (and, at two index heads and <= 32 queries, the pack-factor-2 one); and they run 128-query tiles unsplit where
+    stock would. One forced plan per (segment length, split) loads each of them.
+    """
+    from tensorrt_llm.logger import logger
+
+    api = _o12a.library_api(fmha_sm100)
+    if api is None:
+        logger.warning("[o12a] fmha_sm100 lacks the plan internals o12a needs: stock proxy plans only")
+        return
+    num_sms = int(api._get_num_cta(torch.device("cuda", torch.cuda.current_device())))
+    lens = [_PROXY_SEGMENT_LEN, 64] + ([32] if _o12a.pack_factor(32, num_index_heads) > 1 else [])
+    max_kv = 16 * _o12a.KV_TILE
+    num_pages = (max_kv + page_size - 1) // page_size
+    idx_k = torch.zeros(num_pages, 1, page_size, MSA_REQUIRED_HEAD_DIM, dtype=dtype, device="cuda")
+    kv_indices = torch.arange(num_pages, dtype=torch.int32, device="cuda")
+    forced = _o12a.config()._replace(force=True)
+    variants = []
+    for qo_len in lens:
+        idx_q = torch.zeros(qo_len, num_index_heads, MSA_REQUIRED_HEAD_DIM, dtype=dtype, device="cuda")
+        # 16-iteration tiles on 4 CTAs are cut into pieces (split variant); 4-iteration tiles on every SM stay
+        # whole (the unsplit variant: no piece is shorter than min_piece = 4 iterations).
+        for num_ctas, kv_len in ((4, max_kv), (num_sms, max_kv // 4)):
+            decision = _o12a.decide(
+                [qo_len],
+                [kv_len - qo_len],
+                num_index_heads=num_index_heads,
+                page_size=page_size,
+                num_ctas=num_ctas,
+                stock_splits=0,
+                cfg=forced,
+            )
+            built = _o12a.build_plan(
+                fmha_sm100, decision, num_index_heads=num_index_heads, kv_indices=kv_indices, num_ctas=num_ctas
+            )
+            if built is None:
+                continue
+            plan, plan_kv_indices = built
+            fmha_sm100.fmha_sm100(
+                idx_q, idx_k, idx_k, plan, kv_indices=plan_kv_indices, output_o=False, output_maxscore=True
+            )
+            variants.append((qo_len, decision.pf, max(decision.layout.tile_pieces)))
+    logger.info(f"[o12a] MSA proxy balanced split on: {_o12a.config()} prewarmed (q, pack, pieces)={variants}")
 
 
 def _combined_topk_table(
