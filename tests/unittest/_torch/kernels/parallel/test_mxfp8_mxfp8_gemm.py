@@ -217,14 +217,15 @@ def test_mxfp8_native_tactic_cache_sm107_small_m_buckets():
 
 
 @pytest.mark.skipif(
-    getSMVersion() != 107,
-    reason="MXFP8 small-M tuning buckets are SM107 only. Current SM is %d." % getSMVersion(),
+    getSMVersion() not in (100, 103, 107),
+    reason="MXFP8 small-M tuning buckets are SM100/SM103/SM107 only. Current SM is %d."
+    % getSMVersion(),
 )
+@pytest.mark.parametrize("n, k", [(6144, 8192), (9856, 6144), (6144, 3072), (24576, 6144)])
 @pytest.mark.parametrize("m", [6, 300, 2114, 6552])
-def test_mxfp8_mxfp8_sm107_tactics_bitwise_equal(m: int):
+def test_mxfp8_mxfp8_sm107_tactics_bitwise_equal(m: int, n: int, k: int):
     """Bucketing may pick any tactic for an M value, so every tactic must match the fallback bitwise."""
     torch.manual_seed(0)
-    n, k = 6144, 8192
     mat_a = torch.randn((m, k), device="cuda", dtype=torch.bfloat16)
     mat_a[0] *= 3e3
     mat_a[min(1, m - 1)] = 0
