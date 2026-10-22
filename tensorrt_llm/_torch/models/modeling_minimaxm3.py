@@ -1096,12 +1096,23 @@ class MiniMaxM3Gate(nn.Module):
             # capture of a 9..16-row bucket; a device without 16-CTA clusters keeps the stock router.
             self._router_tc_gen = _router_tc_gen_ok(self.hidden_size)
 
+    def uses_generation_only(self) -> bool:
+        """Whether forward() reads ``generation_only`` at all (device-static).
+
+        Callers test this before reading ``attn_metadata.num_contexts``: under torch.compile any read of the batch
+        metadata installs a Dynamo guard on it, and on a device where no generation-only path exists that guard only
+        triggers recompiles (fullgraph + piecewise prefill graphs hit ``recompile_limit`` and fail hard)."""
+        return self._router_tc_gen or self._weight_tf32 is not None
+
     def router_tc_applies(self, hidden_states: torch.Tensor, generation_only: bool) -> bool:
-        """Whether forward() takes the TF32 tensor-core router (9..16-row generation steps on SM107)."""
+        """Whether forward() takes the TF32 tensor-core router (9..16-row generation steps on SM107).
+
+        The device-static and compile checks come first so that a traced forward never evaluates ``generation_only``
+        (a value read from ``attn_metadata``; evaluating it guards the compiled graph on ``num_contexts``)."""
         return (
-            generation_only
+            self._router_tc_gen
             and not is_torch_compiling()
-            and self._router_tc_gen
+            and generation_only
             and _ROUTER_TC_GEN_MIN_ROWS <= hidden_states.shape[0] <= _ROUTER_TC_GEN_MAX_ROWS
             and hidden_states.dtype == torch.bfloat16
             and hidden_states.dim() == 2
@@ -1472,7 +1483,11 @@ class MiniMaxM3MoE(nn.Module):
 
         def _compute_routed_output():
             global _ROUTER_TC_FP4_MOE_LOGGED
-            generation_only = getattr(attn_metadata, "num_contexts", 1) == 0
+            # Read num_contexts only where the gate has a generation-only path (SM107): under torch.compile the read
+            # alone guards the graph on the batch's context count.
+            generation_only = (
+                self.gate.uses_generation_only() and getattr(attn_metadata, "num_contexts", 1) == 0
+            )
             routed_input, routed_dtype = experts_input, output_dtype
             fp4_scale = None
             if (
@@ -3162,7 +3177,7 @@ class MiniMaxM3Attention(Attention):
                         ),
                         all_reduce_params,
                         site="p5a",
-                        padded=getattr(attn_metadata, "padded_num_tokens", None) is not None,
+                        attn_metadata=attn_metadata,
                     )
                 o = self._forward_attention_core(q, None, None, idx_q, None, attn_metadata)
                 return self.o_proj(o, all_reduce_params=all_reduce_params)
@@ -3176,7 +3191,7 @@ class MiniMaxM3Attention(Attention):
                     lambda: self._forward_attention_core(q, None, None, idx_q, None, attn_metadata),
                     all_reduce_params,
                     site="horizontal",
-                    padded=getattr(attn_metadata, "padded_num_tokens", None) is not None,
+                    attn_metadata=attn_metadata,
                 )
             main_size = self.q_size + 2 * self.kv_size
             packed_qkv, packed_idx_qk = packed.split(
@@ -3273,16 +3288,20 @@ class MiniMaxM3Attention(Attention):
             lambda: self._forward_attention_core(q, k, v, idx_q, idx_k, attn_metadata),
             all_reduce_params,
             site="general",
-            padded=getattr(attn_metadata, "padded_num_tokens", None) is not None,
+            attn_metadata=attn_metadata,
         )
 
-    def _core_then_o_proj(self, core, all_reduce_params, site, padded=False):
+    def _core_then_o_proj(self, core, all_reduce_params, site, attn_metadata=None):
         """The sparse attention core, then its o_proj. In eager prefill the core's NVFP4 combine may also write the
         o_proj input as MXFP8 into the prequant slot (msa_combine_mxfp8, TRTLLM_CTX_COMBINE_MXFP8); the o_proj takes
         it. Never armed while compiling (the slot is not taken there), nor on a padded step (an eager breakable-graph
         warmup or fallback step): the combine covers only the live rows while the o_proj input carries the pad rows,
         so the slot would not be taken and, with the bf16 store skipped, the o_proj input would be unwritten."""
-        if not ctx_eager_only() or padded:
+        # ctx_eager_only() first: a traced forward must not read padded_num_tokens (that read guards the graph on it).
+        if not ctx_eager_only() or (
+            attn_metadata is not None
+            and getattr(attn_metadata, "padded_num_tokens", None) is not None
+        ):
             return self.o_proj(core(), all_reduce_params=all_reduce_params)
         from ..attention.backends.fmha import msa_combine_mxfp8
 
