@@ -3066,7 +3066,7 @@ def test_bcg_bucket_follows_fused_qkv_archs(
     monkeypatch, sm: int, archs: tuple, expected: bool
 ) -> None:
     # SM100 / SM103 take the fused QKV GEMM (and so the eager-break QKV of breakable buckets) only where
-    # TRTLLM_CTX_QKV_FUSED_ARCHS lists them (100,103 by default).
+    # TRTLLM_CTX_QKV_FUSED_ARCHS lists them (100 by default).
     monkeypatch.setattr(modeling_minimaxm3, "_CTX_BCG_P5A", True)
     monkeypatch.setattr(modeling_minimaxm3, "_CTX_QKV_FUSED", True)
     monkeypatch.setattr(modeling_minimaxm3, "_CTX_QKV_FUSED_ARCHS", frozenset(archs))
@@ -3166,13 +3166,13 @@ def test_swiglu_mxfp8_engages_on_listed_archs(
 
 @pytest.mark.cpu_only
 def test_fused_qkv_default_arch_set() -> None:
-    # Unset, TRTLLM_CTX_QKV_FUSED_ARCHS enables SM100/SM103 for the fused QKV producer and the identity-table
-    # serialization that follows it (the umbrella switch clears both).
+    # Unset, TRTLLM_CTX_QKV_FUSED_ARCHS enables SM100 (not yet SM103) for the fused QKV producer and the
+    # identity-table serialization that follows it (the umbrella switch clears both).
     from tensorrt_llm._torch import blackwell_rubin_opts
     from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import msa_backend
 
     if "TRTLLM_CTX_QKV_FUSED_ARCHS" not in os.environ and blackwell_rubin_opts.UMBRELLA_ON:
-        assert modeling_minimaxm3._CTX_QKV_FUSED_ARCHS == {100, 103, 107}
+        assert modeling_minimaxm3._CTX_QKV_FUSED_ARCHS == {100, 107}
     assert msa_backend._IDENTITY_SERIALIZE_ARCHS == modeling_minimaxm3._CTX_QKV_FUSED_ARCHS
 
 
