@@ -24,6 +24,7 @@ load and what to save while the local worker does the moving. That needs two pie
   allocated before it is full and is savable only once it is full.
 """
 
+import time
 from typing import Dict, List, Optional, Tuple
 
 from tensorrt_llm.bindings.internal.batch_manager import LlmRequest
@@ -39,6 +40,69 @@ from .validation import validate_llm_args
 from .worker import MooncakeStoreConnectorWorker, resolve_local_worker
 
 __all__ = ["MooncakeStoreConnectorScheduler"]
+
+#: Seconds between two cumulative lookup/save statistics lines.
+LOOKUP_STATS_INTERVAL = 60.0
+
+
+class _LookupStats:
+    """Cumulative lookup and save counters of one leader, logged periodically.
+
+    The master only sees key traffic, so a store that never serves a hit reads
+    the same there as a workload without reuse. These counters say where an
+    offer was lost: no candidates past the local match, an unaligned local
+    match, a probe with no hit, or a save that was never emitted.
+    """
+
+    __slots__ = (
+        "lookups",
+        "unaligned",
+        "no_candidates",
+        "probed",
+        "with_hit",
+        "blocks_local",
+        "blocks_probed",
+        "blocks_hit",
+        "save_requests",
+        "blocks_saved",
+        "_last_log",
+        "_dirty",
+    )
+
+    def __init__(self) -> None:
+        self.lookups = 0
+        self.unaligned = 0
+        self.no_candidates = 0
+        self.probed = 0
+        self.with_hit = 0
+        self.blocks_local = 0
+        self.blocks_probed = 0
+        self.blocks_hit = 0
+        self.save_requests = 0
+        self.blocks_saved = 0
+        self._last_log = time.monotonic()
+        self._dirty = False
+
+    def touch(self) -> None:
+        self._dirty = True
+
+    def maybe_log(self, tokens_per_block: int) -> None:
+        now = time.monotonic()
+        if not self._dirty or now - self._last_log < LOOKUP_STATS_INTERVAL:
+            return
+        self._last_log = now
+        self._dirty = False
+        probed_pct = 100.0 * self.probed / self.lookups if self.lookups else 0.0
+        hit_pct = 100.0 * self.with_hit / self.probed if self.probed else 0.0
+        block_pct = 100.0 * self.blocks_hit / self.blocks_probed if self.blocks_probed else 0.0
+        logger.info(
+            f"mooncake-store lookups: lookups={self.lookups} unaligned={self.unaligned} "
+            f"no_candidates={self.no_candidates} probed={self.probed} ({probed_pct:.1f}%) "
+            f"with_hit={self.with_hit} ({hit_pct:.1f}% of probes) blocks: "
+            f"local={self.blocks_local} offered={self.blocks_probed} hit={self.blocks_hit} "
+            f"({block_pct:.1f}% of offered) saves: requests={self.save_requests} "
+            f"blocks={self.blocks_saved} tokens_per_block={tokens_per_block}"
+        )
 
 
 def _multimodal_item_digests(request: LlmRequest) -> Optional[Tuple[bytes, ...]]:
@@ -138,6 +202,7 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
         self._tokens_per_block = int(llm_args.kv_cache_config.tokens_per_block)
         self._requests: Dict[int, _RequestState] = {}
         self._worker: Optional[MooncakeStoreConnectorWorker] = None
+        self._stats = _LookupStats()
 
         # An asynchronous offer parks the request and is loaded by the worker
         # in this process; see `update_state_after_alloc_by_layer_group`.
@@ -206,10 +271,17 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
             # the offer keeps any load, synchronous or not, from starting.
             return 0, False
 
+        stats = self._stats
+        stats.lookups += 1
+        stats.blocks_local += num_computed_tokens // self._tokens_per_block
+        stats.touch()
+        stats.maybe_log(self._tokens_per_block)
+
         # A partial local match means the boundary block is half computed on
         # device. Overwriting it with a stored page would discard tokens the
         # runtime already counted, so only whole-block offers are made.
         if num_computed_tokens % self._tokens_per_block:
+            stats.unaligned += 1
             return 0, False
 
         first_block = num_computed_tokens // self._tokens_per_block
@@ -219,11 +291,16 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
         last_block = (len(tokens) - 1) // self._tokens_per_block
         candidates = state.chain.hashes[first_block:last_block]
         if not candidates:
+            stats.no_candidates += 1
             return 0, False
 
         hit_blocks = self._require_worker().count_prefix_hit(candidates)
+        stats.probed += 1
+        stats.blocks_probed += len(candidates)
+        stats.blocks_hit += hit_blocks
         if hit_blocks == 0:
             return 0, False
+        stats.with_hit += 1
 
         state.load_first_block = first_block
         state.load_blocks = hit_blocks
@@ -332,6 +409,10 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
                 if saves.pages:
                     state.emitted_saves = True
                     metadata.saves.append(saves)
+                    self._stats.save_requests += 1
+                    self._stats.blocks_saved += len(saves.pages) // max(1, len(state.pages))
+                    self._stats.touch()
+        self._stats.maybe_log(self._tokens_per_block)
         return metadata
 
     def request_finished(self, request: LlmRequest, cache_block_ids: List[int]) -> bool:

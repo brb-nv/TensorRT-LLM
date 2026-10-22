@@ -1839,6 +1839,32 @@ def test_scheduler_builds_loads_for_the_offered_blocks(store_config):
     assert [page.page_index for page in metadata.saves[0].pages] == [12, 13, 14]
 
 
+def test_scheduler_counts_lookups_and_saves(store_config):
+    scheduler = make_scheduler(store_config, hit_blocks=2)
+    tokens = list(range(5 * TOKENS_PER_BLOCK))
+    request = make_request(1, tokens)
+    scheduler.get_num_new_matched_tokens(request, 0)
+    scheduler.build_connector_meta(
+        SchedulerOutput(new_requests=[request_data(1, tokens, [10, 11, 12, 13, 14])])
+    )
+    # An unaligned local match is declined before any probe.
+    scheduler.get_num_new_matched_tokens(make_request(2, tokens), 1)
+    # A local match covering every candidate leaves nothing to probe.
+    scheduler.get_num_new_matched_tokens(make_request(3, tokens), 4 * TOKENS_PER_BLOCK)
+
+    stats = scheduler._stats
+    assert stats.lookups == 3
+    assert stats.unaligned == 1
+    assert stats.no_candidates == 1
+    assert stats.probed == 1
+    assert stats.with_hit == 1
+    assert stats.blocks_local == 4
+    assert stats.blocks_probed == 4
+    assert stats.blocks_hit == 2
+    assert stats.save_requests == 1
+    assert stats.blocks_saved == 3
+
+
 def test_scheduler_does_not_resave_blocks_across_iterations(store_config):
     scheduler = make_scheduler(store_config, hit_blocks=0)
     tokens = list(range(2 * TOKENS_PER_BLOCK))
