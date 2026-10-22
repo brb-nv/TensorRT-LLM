@@ -4093,6 +4093,25 @@
       "additionalProperties": false,
       "description": "How this server joins a Mooncake store pool.\n\nThe settings every participant shares come from the master named by\n`pool`; what is left here is per-server. Setting this makes\n`trtllm-serve` render the Mooncake client config and export\n`MOONCAKE_CONFIG_PATH`; an inherited `MOONCAKE_CONFIG_PATH` wins.",
       "properties": {
+        "async_load": {
+          "default": false,
+          "description": "Load a served prefix on a background thread while the runtime parks the request, so the transfer does not sit inside the executor iteration that every attention-DP rank waits on. The request rejoins the batch once its pages have landed. Requires attention DP or a single rank: each owner loads its own whole pages.",
+          "telemetry": {
+            "exclude": true
+          },
+          "title": "Async Load",
+          "type": "boolean"
+        },
+        "async_load_workers": {
+          "default": 1,
+          "description": "Threads serving asynchronous loads, each with its own CUDA stream and staging slots, which the pinned-memory budget is split across. Requests are taken from one queue by the first free worker, so several parked requests transfer at once.",
+          "exclusiveMinimum": 0,
+          "telemetry": {
+            "exclude": true
+          },
+          "title": "Async Load Workers",
+          "type": "integer"
+        },
         "local_hostname": {
           "anyOf": [
             {
@@ -4146,7 +4165,7 @@
         },
         "role": {
           "default": "both",
-          "description": "What this server does with the pool. 'both' reads and writes, 'producer' only writes, 'consumer' only reads, and 'capacity' does neither: its ranks lend memory without moving any KV, so they pin no staging buffers and pay no per-request cost.",
+          "description": "What this server does with the pool. 'both' reads and writes, 'producer' only writes, 'consumer' only reads, and 'capacity' does neither: its ranks lend memory without registering any KV cache, so it needs no GPUDirect RDMA.",
           "enum": [
             "both",
             "producer",
@@ -4186,8 +4205,8 @@
           "title": "Segment Size"
         },
         "stage_through_host": {
-          "default": true,
-          "description": "Copy pages through a pinned host buffer instead of registering the KV pools with Mooncake. The only transfer path supported today, so 'false' is ignored with a warning. Costs a copy each way and needs no GPUDirect RDMA.",
+          "default": false,
+          "description": "Copy pages through a pinned host buffer instead of registering the KV pools with Mooncake. For a host whose HCA cannot pin GPU pages; costs a copy each way. Ignored when role is 'capacity'.",
           "telemetry": {
             "exclude": true
           },
@@ -6299,7 +6318,7 @@
       "type": "string"
     }
   },
-  "$id": "https://nvidia.github.io/TensorRT-LLM/1.4.0rc1/_static/schemas/trtllm-serve-config.schema.json",
+  "$id": "https://nvidia.github.io/TensorRT-LLM/1.4.0rc2/_static/schemas/trtllm-serve-config.schema.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": false,
   "description": "Static YAML checks only; runtime validation remains authoritative.",
@@ -7771,6 +7790,6 @@
     }
   },
   "required": [],
-  "title": "TensorRT-LLM 1.4.0rc1 trtllm-serve --config",
+  "title": "TensorRT-LLM 1.4.0rc2 trtllm-serve --config",
   "type": "object"
 }
