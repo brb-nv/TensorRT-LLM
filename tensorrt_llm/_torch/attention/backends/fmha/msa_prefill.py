@@ -51,6 +51,10 @@ _NVFP4_SPARSE_OUT_IN_PLACE_ARCHS = gate_archs("TRTLLM_MSA_NVFP4_OUT_IN_PLACE_ARC
 # rule 1b). An FA4 without that change is never used. Kill switch: TRTLLM_MSA_DISABLE_DENSE_FA4=1 restores
 # fmha_sm100.
 _DENSE_PREFILL_FA4 = os.environ.get("TRTLLM_MSA_DISABLE_DENSE_FA4", "0") != "1"
+# FA4 rounds differently from fmha_sm100 (deterministic, not bitwise), so the Blackwell SMs it runs on are chosen
+# explicitly: TRTLLM_MSA_DENSE_FA4_ARCHS (default 103 with SM107; see blackwell_rubin_opts). SM103 runs the same
+# hardware-ex2 FP8 variant as SM107; SM100 runs FA4's ex2-emulation variant, so it is opt-in (add 100).
+_DENSE_FA4_ARCHS = gate_archs("TRTLLM_MSA_DENSE_FA4_ARCHS", default_blackwell=(103,))
 # The FA4 shape this path serves: TMA page loads need the page to equal FA4's 128-wide n tile.
 _DENSE_FA4_HEAD_DIM = 128
 _DENSE_FA4_PAGE_SIZE = 128
@@ -593,8 +597,8 @@ def dense_prefill_fa4_enabled(use_fp8: bool, head_dim: int, page_size: int) -> b
         use_fp8
         and head_dim == _DENSE_FA4_HEAD_DIM
         and page_size == _DENSE_FA4_PAGE_SIZE
-        # Rubin only: FA4 rounds differently from fmha_sm100 (deterministic, not bitwise), so other SM10x keep it.
-        and get_sm_version() == 107
+        # FA4 rounds differently from fmha_sm100 (deterministic, not bitwise): only the SMs in _DENSE_FA4_ARCHS.
+        and get_sm_version() in _DENSE_FA4_ARCHS
         and _dense_fa4_forward() is not None
     )
 
