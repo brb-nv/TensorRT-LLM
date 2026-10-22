@@ -151,13 +151,13 @@ def _fill_unused_slots(buf: torch.Tensor, start: int) -> None:
 # while a chunk over a long cached prefix spreads across the GPU instead of a few CTAs (rows
 # longer than the 128-token query tile cannot be split at all). False keeps one row per request
 # and num_kv_splits=1.
-# SM100/SM103 are opt-in through TRTLLM_MSA_PROXY_AUTO_KV_SPLITS_ARCHS (e.g. 100,103; none by default; see
-# blackwell_rubin_opts): the SM107-only proxy mainloop changes stay off there and segmenting forces the 128-token
-# query tile, so it is enabled only where a proxy microbench shows a gain at agentic shapes.
+# SM100/SM103 take it from TRTLLM_MSA_PROXY_AUTO_KV_SPLITS_ARCHS (default 100,103; "107" keeps the unsegmented
+# proxy there; see blackwell_rubin_opts). Measured bitwise on GB200 and GB300 (FP8 indexer, 4 and 1 heads): a
+# 300-2000-token chunk over a 165k cached prefix takes the proxy from ~640 us to 48-105 us per layer on GB300, and a
+# cold 8k chunk stays within noise. fmha_sm100 reads the same variable (same default) for the plan side stream, the
+# deferred split read and the OnlyScore proxy modes that follow it.
 _SM107_PROXY_AUTO_KV_SPLITS = True
-_PROXY_AUTO_KV_SPLITS_ARCHS = gate_archs(
-    "TRTLLM_MSA_PROXY_AUTO_KV_SPLITS_ARCHS", default_blackwell=()
-)
+_PROXY_AUTO_KV_SPLITS_ARCHS = gate_archs("TRTLLM_MSA_PROXY_AUTO_KV_SPLITS_ARCHS")
 # fmha_sm100's 128-token query tile, the largest that admits split-KV.
 _PROXY_SEGMENT_TOKENS = 128
 

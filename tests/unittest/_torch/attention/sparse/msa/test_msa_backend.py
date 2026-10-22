@@ -2455,19 +2455,24 @@ def test_nvfp4_scatter_writes_physical_p32_data_and_scale_layouts():
 )
 def test_proxy_segmented_on_listed_archs(monkeypatch, sm_version, enabled, archs, expected):
     """The segmented, split indexer proxy runs on SM107 and on the SM100/SM103 that
-    TRTLLM_MSA_PROXY_AUTO_KV_SPLITS_ARCHS opts in (none by default), behind its constant."""
+    TRTLLM_MSA_PROXY_AUTO_KV_SPLITS_ARCHS lists (100,103 by default), behind its constant."""
     monkeypatch.setattr(msa_backend_module, "get_sm_version", lambda: sm_version)
     monkeypatch.setattr(msa_backend_module, "_SM107_PROXY_AUTO_KV_SPLITS", enabled)
     monkeypatch.setattr(msa_backend_module, "_PROXY_AUTO_KV_SPLITS_ARCHS", frozenset(archs))
     assert msa_backend_module._proxy_segmented() is expected
 
 
-def test_proxy_segmented_default_is_rubin_only():
-    """Without TRTLLM_MSA_PROXY_AUTO_KV_SPLITS_ARCHS the Blackwell SMs keep the unsegmented proxy."""
+def test_proxy_segmented_default_includes_blackwell():
+    """Without TRTLLM_MSA_PROXY_AUTO_KV_SPLITS_ARCHS the Blackwell SMs take the segmented proxy too."""
     import os
 
-    if "TRTLLM_MSA_PROXY_AUTO_KV_SPLITS_ARCHS" not in os.environ:
-        assert msa_backend_module._PROXY_AUTO_KV_SPLITS_ARCHS == {107}
+    from tensorrt_llm._torch import blackwell_rubin_opts
+
+    if (
+        "TRTLLM_MSA_PROXY_AUTO_KV_SPLITS_ARCHS" not in os.environ
+        and blackwell_rubin_opts.UMBRELLA_ON
+    ):
+        assert msa_backend_module._PROXY_AUTO_KV_SPLITS_ARCHS == {100, 103, 107}
 
 
 def test_proxy_segment_rows_keep_each_tokens_causal_range():

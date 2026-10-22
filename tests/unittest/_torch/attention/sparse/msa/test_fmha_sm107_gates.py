@@ -141,7 +141,8 @@ _BLACKWELL_ARCH_ENVS = (
 @pytest.mark.parametrize(
     "arch_env, proxy_mode_sms",
     [
-        ({}, ()),
+        ({}, (100, 103)),
+        ({"TRTLLM_MSA_PROXY_AUTO_KV_SPLITS_ARCHS": "107"}, ()),
         ({"TRTLLM_MSA_PROXY_AUTO_KV_SPLITS_ARCHS": "100,103"}, (100, 103)),
         ({"TLLM_FMHA_PROXY_MODE_ARCHS": "103"}, (103,)),
         (
@@ -152,7 +153,7 @@ _BLACKWELL_ARCH_ENVS = (
             (),
         ),
     ],
-    ids=["stock", "with_segmented_proxy", "explicit_sm103", "umbrella_off"],
+    ids=["default", "proxy_rubin_only", "with_segmented_proxy", "explicit_sm103", "umbrella_off"],
 )
 def test_proxy_modes_and_r2_store_engage_on_listed_archs(
     monkeypatch, cap, chain, dbuf, r2kill, arch_env, proxy_mode_sms
@@ -251,7 +252,8 @@ def test_deferred_split_read_engages_on_listed_archs(api):
 @pytest.mark.parametrize(
     "env, expected",
     [
-        ({}, {(10, 7)}),
+        ({}, {(10, 0), (10, 3), (10, 7)}),
+        ({"TRTLLM_MSA_PROXY_AUTO_KV_SPLITS_ARCHS": "107"}, {(10, 7)}),
         ({"TRTLLM_MSA_PROXY_AUTO_KV_SPLITS_ARCHS": "100,103"}, {(10, 0), (10, 3), (10, 7)}),
         ({"TLLM_FMHA_PLAN_SS_ARCHS": "103"}, {(10, 3), (10, 7)}),
         (
