@@ -71,11 +71,11 @@ from .msa_indexer import MsaIndexer, cutedsl_score_runner
 
 # The short-prefill identity table is materialized with a plain copy, so the sparse prefill that follows the layer's
 # producer (which can trigger its dependents before its last Q/KV stores) never starts before those stores land.
-# Bitwise the same table. Wherever the producer runs: SM107, and the SM100 / SM103 that opt in to it
-# (TRTLLM_CTX_QKV_FUSED_ARCHS, the same arch set as the fused producer in modeling_minimaxm3). Kill switch:
+# Bitwise the same table. Wherever the producer runs: SM107, and the SM100 / SM103 of TRTLLM_CTX_QKV_FUSED_ARCHS
+# (default 100,103; the same arch set as the fused producer in modeling_minimaxm3). Kill switch:
 # TRTLLM_MSA_IDENTITY_SERIALIZE=0 returns the expanded view.
 _IDENTITY_SERIALIZE = os.environ.get("TRTLLM_MSA_IDENTITY_SERIALIZE", "1") != "0"
-_IDENTITY_SERIALIZE_ARCHS = gate_archs("TRTLLM_CTX_QKV_FUSED_ARCHS", default_blackwell=())
+_IDENTITY_SERIALIZE_ARCHS = gate_archs("TRTLLM_CTX_QKV_FUSED_ARCHS")
 
 
 def _cache_device(meta) -> torch.device:

@@ -3041,9 +3041,10 @@ def test_bcg_bucket_takes_eager_qkv(
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize("sm", [90, 100, 103, 110])
+@pytest.mark.parametrize("sm", [90, 110])
 def test_bcg_bucket_keeps_captured_qkv_off_rubin(monkeypatch, sm: int) -> None:
-    # Off SM107 the fused QKV GEMM never engages, so breakable buckets keep the captured stock projection.
+    # Off SM107 / SM100 / SM103 the fused QKV GEMM never engages, so breakable buckets keep the captured stock
+    # projection (Blackwell follows TRTLLM_CTX_QKV_FUSED_ARCHS; see the next test).
     monkeypatch.setattr(modeling_minimaxm3, "_CTX_BCG_P5A", True)
     monkeypatch.setattr(modeling_minimaxm3, "_CTX_QKV_FUSED", True)
     monkeypatch.setattr(modeling_minimaxm3, "get_sm_version", lambda: sm)
@@ -3065,7 +3066,7 @@ def test_bcg_bucket_follows_fused_qkv_archs(
     monkeypatch, sm: int, archs: tuple, expected: bool
 ) -> None:
     # SM100 / SM103 take the fused QKV GEMM (and so the eager-break QKV of breakable buckets) only where
-    # TRTLLM_CTX_QKV_FUSED_ARCHS opts them in.
+    # TRTLLM_CTX_QKV_FUSED_ARCHS lists them (100,103 by default).
     monkeypatch.setattr(modeling_minimaxm3, "_CTX_BCG_P5A", True)
     monkeypatch.setattr(modeling_minimaxm3, "_CTX_QKV_FUSED", True)
     monkeypatch.setattr(modeling_minimaxm3, "_CTX_QKV_FUSED_ARCHS", frozenset(archs))
@@ -3161,6 +3162,18 @@ def test_swiglu_mxfp8_engages_on_listed_archs(
     )
     x = torch.zeros((modeling_minimaxm3._CTX_NORM_MXFP8_MIN_ROWS, 3072), dtype=torch.bfloat16)
     assert modeling_minimaxm3._SwigluOaiMLP._swiglu_mxfp8_eligible(mlp, x, False) is expected
+
+
+@pytest.mark.cpu_only
+def test_fused_qkv_default_arch_set() -> None:
+    # Unset, TRTLLM_CTX_QKV_FUSED_ARCHS enables SM100/SM103 for the fused QKV producer and the identity-table
+    # serialization that follows it (the umbrella switch clears both).
+    from tensorrt_llm._torch import blackwell_rubin_opts
+    from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import msa_backend
+
+    if "TRTLLM_CTX_QKV_FUSED_ARCHS" not in os.environ and blackwell_rubin_opts.UMBRELLA_ON:
+        assert modeling_minimaxm3._CTX_QKV_FUSED_ARCHS == {100, 103, 107}
+    assert msa_backend._IDENTITY_SERIALIZE_ARCHS == modeling_minimaxm3._CTX_QKV_FUSED_ARCHS
 
 
 @pytest.mark.cpu_only

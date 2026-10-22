@@ -776,12 +776,14 @@ def _minimax_m3_router_input_fp32_fake(hidden_states: torch.Tensor) -> torch.Ten
 # bitwise the stock producer applied to its own BF16 GEMM output. TRTLLM_CTX_QKV_FUSED=0 is the kill switch.
 _CTX_QKV_FUSED = os.environ.get("TRTLLM_CTX_QKV_FUSED", "1") == "1"
 _CTX_QKV_FUSED_MIN_ROWS = 1024
-# SM107 always; SM100 / SM103 only where TRTLLM_CTX_QKV_FUSED_ARCHS lists them (opt-in, see blackwell_rubin_opts). There
+# SM107 always; SM100 / SM103 where TRTLLM_CTX_QKV_FUSED_ARCHS lists them (default 100,103; "107" keeps the stock
+# projection + producer on Blackwell; see blackwell_rubin_opts). On GB200 it is bitwise to the stock path end to end
+# (MiniMax-M3 NVFP4, TP4 greedy) and 1.30-1.55x over CUTLASS + producer at M 2048-8192 (64/4/4 and 32/2/2 heads). There
 # the kernel runs on the K32 SM100 MMA atom with 2-head tiles (TRTLLM_CTX_QKV_FUSED_HEADS_PER_TILE=1 picks 1-head
 # tiles; other values keep 2: a 3-head tile with a 128-wide MMA N never finished on GB200), launches without PDL unless
 # TRTLLM_ENABLE_PDL=1 (its TMA warp triggers dependents before the epilogue stores), compiles during the AutoTuner
 # warmup pass, and a failed compile falls back to the stock projection.
-_CTX_QKV_FUSED_ARCHS = gate_archs("TRTLLM_CTX_QKV_FUSED_ARCHS", default_blackwell=())
+_CTX_QKV_FUSED_ARCHS = gate_archs("TRTLLM_CTX_QKV_FUSED_ARCHS")
 _CTX_QKV_FUSED_SM10X_HEADS_PER_TILE_ENV = os.environ.get("TRTLLM_CTX_QKV_FUSED_HEADS_PER_TILE", "2")
 _CTX_QKV_FUSED_SM10X_HEADS_PER_TILE = (
     1 if _CTX_QKV_FUSED_SM10X_HEADS_PER_TILE_ENV.strip() == "1" else 2
