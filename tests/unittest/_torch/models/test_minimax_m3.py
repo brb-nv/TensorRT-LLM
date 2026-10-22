@@ -3090,10 +3090,24 @@ def test_drafter_ctx_gates_engage_on_listed_archs(
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize("sm, expected", [(107, True), (103, False), (100, False), (90, False)])
-def test_swiglu_mxfp8_engages_on_sm107_only(monkeypatch, sm: int, expected: bool) -> None:
-    # The fused SwiGLU + MXFP8 quantize is SM107-only; other architectures keep the stock activation and quantize.
+@pytest.mark.parametrize(
+    "sm, archs, expected",
+    [
+        (107, (107,), True),
+        (103, (107,), False),
+        (100, (107,), False),
+        (103, (100, 103, 107), True),
+        (100, (100, 103, 107), True),
+        (90, (100, 103, 107), False),
+    ],
+)
+def test_swiglu_mxfp8_engages_on_listed_archs(
+    monkeypatch, sm: int, archs: tuple, expected: bool
+) -> None:
+    # The fused SwiGLU + MXFP8 quantize runs on SM107 and on the Blackwell SMs that TRTLLM_CTX_SWIGLU_MXFP8_ARCHS
+    # opts in (none by default); other architectures keep the stock activation and quantize.
     monkeypatch.setattr(modeling_minimaxm3, "_CTX_SWIGLU_MXFP8", True)
+    monkeypatch.setattr(modeling_minimaxm3, "_CTX_SWIGLU_MXFP8_ARCHS", frozenset(archs))
     monkeypatch.setattr(modeling_minimaxm3, "get_sm_version", lambda: sm)
     monkeypatch.setattr(modeling_minimaxm3, "ctx_eager_only", lambda: True)
     method = MXFP8LinearMethod.__new__(MXFP8LinearMethod)
