@@ -20,7 +20,8 @@ HEADS, DIM, PAGE, SEG = 2, 128, 128, 128
 SENTINEL = 0x7FC0BEEF  # a NaN payload the kernel never writes
 
 sm107 = pytest.mark.skipif(
-    not torch.cuda.is_available() or get_sm_version() != 107, reason="SM107 op"
+    not torch.cuda.is_available() or get_sm_version() not in (100, 103, 107),
+    reason="SM100/SM103/SM107 op",
 )
 
 
