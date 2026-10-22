@@ -76,6 +76,19 @@ from .resource_manager import ResourceManager, ResourceManagerType
 from .sampler import SampleStateTensors
 from .scheduler import ScheduledRequests
 
+_DYNAMO_RECOMPILE_LIMIT = 16
+
+
+def _apply_dynamo_recompile_limit() -> None:
+    """Raise Dynamo's per-frame recompile limit for the compiled model in the calling thread.
+
+    Dynamo config overrides are thread-local (ContextVar-backed) in recent PyTorch, so a value set on the thread that
+    builds the engine is not seen by the executor thread that runs the forward. Call this on every thread that runs
+    the compiled model; it only writes when the current thread's value is lower.
+    """
+    if torch._dynamo.config.recompile_limit < _DYNAMO_RECOMPILE_LIMIT:
+        torch._dynamo.config.recompile_limit = _DYNAMO_RECOMPILE_LIMIT
+
 
 class ModelEngine(ABC):
 
@@ -532,7 +545,7 @@ class PyTorchModelEngine(ModelEngine):
                         self.model,
                         backend=self._torch_compile_backend,
                         fullgraph=torch_compile_fullgraph)
-                torch._dynamo.config.cache_size_limit = 16
+                _apply_dynamo_recompile_limit()
             else:
                 set_torch_compiling(False)
         except Exception as e:
@@ -1280,6 +1293,9 @@ class PyTorchModelEngine(ModelEngine):
                 resource_manager: Optional[ResourceManager] = None,
                 new_tensors_device: Optional[SampleStateTensors] = None,
                 cache_indirection_buffer: Optional[torch.Tensor] = None):
+        if self._torch_compile_enabled:
+            # The executor loop runs the compiled model on its own thread.
+            _apply_dynamo_recompile_limit()
         if isinstance(batch, PackedInputs):
             assert isinstance(self._runner, PackedModelRunner), (
                 "a packed batch requires a packed-batch runner")
