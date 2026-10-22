@@ -29,8 +29,8 @@ def _bits(t: torch.Tensor) -> torch.Tensor:
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or get_sm_version() != 107,
-    reason="the CTX residual RMSNorm + MXFP8 op is built for SM107",
+    not torch.cuda.is_available() or get_sm_version() not in (100, 103, 107),
+    reason="the CTX residual RMSNorm + MXFP8 op is built for SM100 / SM103 / SM107",
 )
 @pytest.mark.parametrize("rows", [8192, 8197, 16384])
 @pytest.mark.parametrize("fp4", [False, True], ids=["mxfp8", "mxfp8_nvfp4"])
