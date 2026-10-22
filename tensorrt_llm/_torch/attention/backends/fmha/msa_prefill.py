@@ -29,15 +29,20 @@ import torch
 import triton
 import triton.language as tl
 
+from tensorrt_llm._torch.blackwell_rubin_opts import gate_archs
 from tensorrt_llm._utils import get_sm_version, mpi_rank, prefer_pinned
 from tensorrt_llm.logger import logger
 
 from .interface import FmhaPhase
 from .phased import FmhaParams, PhasedFmha
 
-# SM107: the NVFP4 sparse prefill's combine writes the layer's attention output buffer directly instead of a fresh
-# tensor that is then copied over (same kernel, same values). Kill switch: False restores the copy.
+# SM107 and SM100/SM103: the NVFP4 sparse prefill's combine writes the layer's attention output buffer directly
+# instead of a fresh tensor that is then copied over (same kernel, same values). It also unlocks the combine's MXFP8
+# o_proj input (msa_combine_mxfp8), which requires the in-place combine. Kill switch: TRTLLM_MSA_NVFP4_OUT_IN_PLACE=0
+# restores the copy. TRTLLM_MSA_NVFP4_OUT_IN_PLACE_ARCHS picks the Blackwell SMs (default 100,103; see
+# blackwell_rubin_opts).
 _SM107_NVFP4_SPARSE_OUT_IN_PLACE = os.environ.get("TRTLLM_MSA_NVFP4_OUT_IN_PLACE", "1") == "1"
+_NVFP4_SPARSE_OUT_IN_PLACE_ARCHS = gate_archs("TRTLLM_MSA_NVFP4_OUT_IN_PLACE_ARCHS")
 
 # FP8 dense prefill (MiniMax-M3's dense layers) runs FA4 (flash_attn.cute) over the paged FP8 cache in place of
 # fmha_sm100, about 1.6x faster at long context. The image's FA4 carries rescale_threshold 0.0 for FP8, so the
@@ -230,14 +235,14 @@ def _nvfp4_sparse_out_kwargs(sparse: Any, out: torch.Tensor) -> dict[str, torch.
     """``out=`` for sparse_atten_nvfp4_kv_func when its combine can write ``out`` in place (see the kill switch)."""
     if (
         not _SM107_NVFP4_SPARSE_OUT_IN_PLACE
-        or get_sm_version() != 107
+        or get_sm_version() not in _NVFP4_SPARSE_OUT_IN_PLACE_ARCHS
         or out.dtype != torch.bfloat16
         or not out.is_contiguous()
         or not _nvfp4_sparse_takes_out(sparse)
     ):
         return {}
     logger.info_once(
-        "MSA NVFP4 sparse prefill: combine writes the attention output in place (SM107)",
+        f"MSA NVFP4 sparse prefill: combine writes the attention output in place (SM{get_sm_version()})",
         key="minimax_m3_sm107_nvfp4_sparse_out_in_place",
     )
     return {"out": out}
