@@ -31,10 +31,34 @@ def test_q_e4m3_rows_gate(monkeypatch, sm, archs, taken):
     monkeypatch.setattr(msa_prefill, "get_sm_version", lambda: sm)
     monkeypatch.setattr(msa_prefill, "_SM107_Q_E4M3_ROWS", True)
     monkeypatch.setattr(msa_prefill, "_Q_E4M3_ROWS_ARCHS", frozenset(archs))
+    monkeypatch.setattr(msa_prefill, "_Q_E4M3_ROWS_BLACKWELL_MIN_ELEMS", 0)
     launched = []
     monkeypatch.setattr(msa_prefill, "_rows_to_e4m3_kernel", _Recorder(launched))
     q = _strided_q(4)
     msa_prefill._q_to_e4m3(q)
+    assert bool(launched) is taken
+
+
+@pytest.mark.parametrize(
+    "sm, rows, heads, taken",
+    [
+        (103, 2048, 64, False),  # 2^24 elements: below the Blackwell floor
+        (103, 4096, 64, True),  # 2^25
+        (100, 8192, 32, True),
+        (100, 8192, 16, False),
+        (107, 4, 64, True),  # SM107 has no floor
+    ],
+)
+def test_q_e4m3_rows_blackwell_floor(monkeypatch, sm, rows, heads, taken):
+    if not torch.cuda.is_available():
+        pytest.skip("needs CUDA")
+    monkeypatch.setattr(msa_prefill, "get_sm_version", lambda: sm)
+    monkeypatch.setattr(msa_prefill, "_SM107_Q_E4M3_ROWS", True)
+    monkeypatch.setattr(msa_prefill, "_Q_E4M3_ROWS_ARCHS", frozenset((100, 103, 107)))
+    monkeypatch.setattr(msa_prefill, "_Q_E4M3_ROWS_BLACKWELL_MIN_ELEMS", 1 << 25)
+    launched = []
+    monkeypatch.setattr(msa_prefill, "_rows_to_e4m3_kernel", _Recorder(launched))
+    msa_prefill._q_to_e4m3(_strided_q(rows, heads=heads))
     assert bool(launched) is taken
 
 
@@ -57,6 +81,7 @@ class _Recorder:
 def test_q_e4m3_rows_matches_aten(monkeypatch, rows):
     monkeypatch.setattr(msa_prefill, "_SM107_Q_E4M3_ROWS", True)
     monkeypatch.setattr(msa_prefill, "_Q_E4M3_ROWS_ARCHS", frozenset((100, 103, 107)))
+    monkeypatch.setattr(msa_prefill, "_Q_E4M3_ROWS_BLACKWELL_MIN_ELEMS", 0)
     q = _strided_q(
         rows, scale=100.0
     )  # reaches past 448: aten gives NaN there, the row cast saturates

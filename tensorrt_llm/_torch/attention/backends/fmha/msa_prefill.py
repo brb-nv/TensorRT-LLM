@@ -72,6 +72,13 @@ _DENSE_FA4_PATCH_MARKER = "0.0 if const_expr(self.q_dtype.width == 8) else"
 # TRTLLM_CTX_Q_E4M3_ROWS_ARCHS picks the Blackwell SMs (default 100,103; see blackwell_rubin_opts).
 _SM107_Q_E4M3_ROWS = os.environ.get("TRTLLM_CTX_Q_E4M3_ROWS", "1") == "1"
 _Q_E4M3_ROWS_ARCHS = gate_archs("TRTLLM_CTX_Q_E4M3_ROWS_ARCHS")
+# On SM100/SM103 the row cast has a ~18-25 us floor, so it takes only queries of at least this many elements: 2^25
+# (4096 rows x 64 heads x 128, or 8192 x 32), where it measured 2.5-3.2x over aten on GB200 and GB300; at 2^24 it
+# was about break-even (0.9-1.3x), at 2^23 1.3-1.4x slower and below that up to 2.8x slower.
+# TRTLLM_CTX_Q_E4M3_ROWS_MIN_ELEMS overrides it; SM107 has no floor.
+_Q_E4M3_ROWS_BLACKWELL_MIN_ELEMS = int(
+    os.environ.get("TRTLLM_CTX_Q_E4M3_ROWS_MIN_ELEMS", str(1 << 25))
+)
 _SM107_Q_E4M3_ROWS_LOGGED = []
 
 
@@ -96,6 +103,7 @@ def _q_to_e4m3(q: torch.Tensor) -> torch.Tensor:
         and q.stride(1) == q.shape[2]
         and q.shape[0] > 0
         and get_sm_version() in _Q_E4M3_ROWS_ARCHS
+        and (get_sm_version() == 107 or q.numel() >= _Q_E4M3_ROWS_BLACKWELL_MIN_ELEMS)
     ):
         return q.to(torch.float8_e4m3fn)
     rows, width = q.shape[0], q.shape[1] * q.shape[2]
