@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
-# Prepare the FA4 (flash_attn.cute) copy that MiniMax-M3's FP8 dense prefill uses on SM107.
+# Prepare the FA4 (flash_attn.cute) copy that MiniMax-M3's FP8 dense prefill uses on SM107 and SM103 (GB300).
 #
 # Usage: bash setup_fa4.sh /absolute/path/to/new/fa4-dir
 #
