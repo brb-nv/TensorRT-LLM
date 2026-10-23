@@ -29,8 +29,8 @@ library's own work-list format (fmha_sm100 HostPrecomputedTileScheduler: per-CTA
 (tile, head, segment) items, per-item KV tile ranges and split index), which its adaptive planner also emits with
 arbitrary per-tile piece boundaries.
 
-Switch: M3_O12A_PROXY_SPLIT=0 restores stock routing exactly (msa_indexer then runs the stock functions only).
-stack-a: the master switch M3AX_STACK_A=0 (also false/off/no) does the same.
+Switch: off by default; M3_O12A_PROXY_SPLIT=1 turns it on. Off, msa_indexer runs the stock functions only (stock
+routing exactly). stack-a: the master switch M3AX_STACK_A=0 (also false/off/no) keeps it off as well.
 """
 
 from __future__ import annotations
@@ -54,7 +54,7 @@ _PACK_FACTORS = (1, 2, 4, 6, 8, 16)
 
 
 class Config(NamedTuple):
-    enabled: bool  # M3_O12A_PROXY_SPLIT (default 1) and stack-a's M3AX_STACK_A; 0 = stock routing, bit for bit
+    enabled: bool  # M3_O12A_PROXY_SPLIT=1 (default 0) and stack-a's M3AX_STACK_A; off = stock routing, bit for bit
     force: bool  # M3_O12A_FORCE: take the balanced plan whenever it applies (diagnostics / tests)
     margin_rel: float  # M3_O12A_MARGIN_REL: required predicted saving, fraction of stock's lower bound
     margin_iters: float  # M3_O12A_MARGIN_ITERS: required predicted saving, iterations per launch
@@ -73,7 +73,7 @@ def _env_float(name: str, default: float) -> float:
 
 
 def _stack_master_on() -> bool:
-    """stack-a master switch M3AX_STACK_A (default on): 0/false/off/no turns o12a off like M3_O12A_PROXY_SPLIT=0."""
+    """stack-a master switch M3AX_STACK_A (default on): 0/false/off/no keeps o12a off even with M3_O12A_PROXY_SPLIT=1."""
     return os.environ.get("M3AX_STACK_A", "1").strip().lower() not in ("0", "false", "off", "no")
 
 
@@ -85,7 +85,7 @@ def config() -> Config:
     global _CONFIG
     if _CONFIG is None:
         _CONFIG = Config(
-            enabled=_stack_master_on() and os.environ.get("M3_O12A_PROXY_SPLIT", "1") != "0",
+            enabled=_stack_master_on() and os.environ.get("M3_O12A_PROXY_SPLIT", "0") == "1",
             force=os.environ.get("M3_O12A_FORCE", "0") == "1",
             margin_rel=_env_float("M3_O12A_MARGIN_REL", 0.03),
             margin_iters=_env_float("M3_O12A_MARGIN_ITERS", 8.0),

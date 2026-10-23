@@ -23,8 +23,8 @@ o12a. When o12a's balanced proxy plans are on in this process (o12a_enabled()), 
   o12a-split   balanced proxy plans (msa_proxy_balance.build_plan): segments of <= 64 queries are KV-split too,
                which selects the single-softmax-warpgroup split variants (and the packed one at 2+ index heads,
                <= 32 queries); TP2 gains 2 variants (14 in all), TP4 1. Segments of 65..128 queries select
-               the proxy / proxy-split keys above. With M3_O12A_PROXY_SPLIT=0 (or M3AX_STACK_A=0) the set is
-               msa-prewarm's exactly.
+               the proxy / proxy-split keys above. With o12a off (the default; M3_O12A_PROXY_SPLIT=1 turns it on,
+               M3AX_STACK_A=0 keeps it off) the set is msa-prewarm's exactly.
 
 Segmented proxy. Where the backend plans the prefill indexer proxy segmented with planner-chosen split-KV
 (msa_backend._proxy_segmented(), on by default on SM100/SM103), a step with any row over 64 queries splits every
@@ -67,7 +67,7 @@ def log(msg, warn=False):
 
 def o12a_enabled():
     """Whether o12a's balanced proxy plans are on in this process (msa_proxy_balance is importable and its config is
-    enabled: M3_O12A_PROXY_SPLIT and M3AX_STACK_A not 0)."""
+    enabled: M3_O12A_PROXY_SPLIT=1 and M3AX_STACK_A not 0)."""
     try:
         bal = importlib.import_module("tensorrt_llm._torch.attention.backends.sparse.minimax_m3.msa_proxy_balance")
         return bool(bal.config().enabled)

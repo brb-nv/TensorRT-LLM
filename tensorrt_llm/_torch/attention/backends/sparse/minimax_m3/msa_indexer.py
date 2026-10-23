@@ -302,8 +302,8 @@ def segmented_proxy_plan(
     """
     qo_lens, qo_offsets = qo_lens_cpu.tolist(), qo_offset_cpu.tolist()
     num_kv_splits = _proxy_kv_splits(qo_lens, qo_offsets, num_index_heads)
-    # o12a: a work-balanced plan (msa_proxy_balance) where it is predicted to beat stock's; M3_O12A_PROXY_SPLIT=0
-    # skips this block, which leaves exactly the stock routing below.
+    # o12a: a work-balanced plan (msa_proxy_balance) where it is predicted to beat stock's, with M3_O12A_PROXY_SPLIT=1.
+    # Off (the default), this block is skipped, which leaves exactly the stock routing below.
     if _o12a.config().enabled:
         balanced = _o12a_balanced_plan(
             fmha_sm100,
