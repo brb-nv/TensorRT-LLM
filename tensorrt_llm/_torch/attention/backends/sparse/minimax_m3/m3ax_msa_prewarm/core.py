@@ -26,6 +26,11 @@ o12a. When o12a's balanced proxy plans are on in this process (o12a_enabled()), 
                the proxy / proxy-split keys above. With M3_O12A_PROXY_SPLIT=0 (or M3AX_STACK_A=0) the set is
                msa-prewarm's exactly.
 
+Segmented proxy. Where the backend plans the prefill indexer proxy segmented with planner-chosen split-KV
+(msa_backend._proxy_segmented(), on by default on SM100/SM103), a step with any row over 64 queries splits every
+segment of that step, short ones included, so the same KV-split variants as o12a-split are reachable;
+families_for() adds them as proxy-autosplit (TP2: 2 variants). Without that backend function the set is unchanged.
+
 Compile: one thread per missing variant (and the plan module), each holding that variant's own .compile.lock (the
 same lock FMHAVariantManager.get_variant takes), running the library's _compile_only (ninja -j1 nvcc, the stock
 command). Ranks cooperate through the locks. Nothing is loaded: the serving process later dlopens the same .so on
@@ -70,6 +75,16 @@ def o12a_enabled():
         return False
 
 
+def proxy_segmented_enabled():
+    """Whether the backend plans the prefill indexer proxy segmented with split-KV on this GPU."""
+    try:
+        backend = importlib.import_module("tensorrt_llm._torch.attention.backends.sparse.minimax_m3.msa_backend")
+        segmented = getattr(backend, "_proxy_segmented", None)
+        return bool(segmented()) if segmented is not None else False
+    except Exception:  # noqa: BLE001  (no segmented proxy in this backend: msa-prewarm's families only)
+        return False
+
+
 def stack_parts():
     """Every GB300 stack part's switch state in this process, for the log (prewarm is on, or this would not run)."""
     parts = [("master", int(os.environ.get("M3AX_STACK_A", "1").strip().lower() not in ("0", "false", "off", "no")))]
@@ -90,12 +105,16 @@ def stack_parts():
 
 
 def families_for(hq, hkv, hidx, dense_code, idx_code, page, o12a=None):
-    """Plan families of one rank: msa-prewarm's three, plus o12a-split when o12a is on (o12a=None: o12a_enabled())."""
+    """Plan families of one rank: msa-prewarm's three, plus o12a-split when o12a is on (o12a=None: o12a_enabled()),
+    else proxy-autosplit when the backend splits segmented proxy plans (proxy_segmented_enabled())."""
     fams = _families_for(hq, hkv, hidx, dense_code, idx_code, page)
     if o12a is None:
         o12a = o12a_enabled()
     if o12a:
         fams.append(dict(family="o12a-split", dtype_code=idx_code, hq=hidx, hkv=1, sparse_mode=2, page=page,
+                         split=True, q_lo=1, q_hi=64))
+    elif proxy_segmented_enabled():
+        fams.append(dict(family="proxy-autosplit", dtype_code=idx_code, hq=hidx, hkv=1, sparse_mode=2, page=page,
                          split=True, q_lo=1, q_hi=64))
     return fams
 
