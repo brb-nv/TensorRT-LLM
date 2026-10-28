@@ -293,12 +293,162 @@ def test_minimax_m3_nvfp4_horizontal_producer_matches_production_quantize(
     )
 
 
+def _nvfp4_index_pages(num_pages):
+    """Raw NVFP4 index-K pages [num_pages, 1, 128, 72] with a non-dense page stride."""
+    backing = torch.zeros(num_pages * 3, 1, 128, 72, dtype=torch.uint8, device="cuda")
+    return backing[::3]
+
+
+def _split_nvfp4_index_page(raw_page):
+    """(E2M1 rows [128, 64], E4M3 scale bytes [128, 8]) of one raw NVFP4 index-K page."""
+    flat = raw_page.reshape(-1)
+    return flat[: 128 * 64].view(128, 64), flat[128 * 64 :].view(128, 8)
+
+
+@pytest.mark.parametrize(
+    "num_tokens,num_heads_q,num_kv_heads",
+    [
+        pytest.param(1, 16, 1, id="tp4-hq16-hkv1-single-token"),
+        pytest.param(16, 32, 2, id="tp2-hq32-hkv2"),
+        pytest.param(129, 16, 1, id="multi-page-hq16-hkv1"),
+    ],
+)
+def test_minimax_m3_nvfp4_horizontal_producer_nvfp4_index_k(num_tokens, num_heads_q, num_kv_heads):
+    """A uint8 index cache selects NVFP4 index-K: unit-global-scale fp4_quantize, same Q/K/V."""
+    from tensorrt_llm._utils import get_sm_version
+
+    if get_sm_version() not in (100, 103):
+        pytest.skip("NVFP4 quantization requires Blackwell")
+
+    torch.manual_seed(2468)
+    num_pages = max(5, (num_tokens + 127) // 128 + 3)
+    total_heads = num_heads_q + 3 * num_kv_heads + 1
+    packed = torch.randn(num_tokens, total_heads * 128, dtype=torch.bfloat16, device="cuda")
+    weights = [torch.randn(128, dtype=torch.bfloat16, device="cuda") for _ in range(4)]
+    inv_scales = torch.tensor([1.0, 1.75, 0.625], dtype=torch.float32, device="cuda")
+    # Position zero isolates the quantizer from RoPE evaluation differences (see above).
+    position_ids = torch.zeros(num_tokens, dtype=torch.int32, device="cuda")
+    slots = (torch.arange(num_tokens, dtype=torch.int32, device="cuda") * 53 + 11) % (
+        (num_pages - 1) * 128
+    )
+    if num_tokens > 1:
+        slots[-1] = -1
+    rope_cache = _rope_cache(512)
+
+    index_width = (num_kv_heads + 1) * 128
+    index_qk = packed[:, -index_width:].clone(memory_format=torch.contiguous_format)
+    torch.ops.trtllm.fused_qk_norm_rope(
+        index_qk,
+        num_kv_heads,
+        1,
+        0,
+        128,
+        64,
+        1e-5,
+        weights[2],
+        weights[3],
+        5_000_000.0,
+        True,
+        position_ids,
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        True,
+        True,
+        False,
+        0,
+        0,
+    )
+    index_k = index_qk.view(num_tokens, num_kv_heads + 1, 128)[:, -1:].contiguous()
+    unit_scale = torch.ones(1, dtype=torch.float32, device="cuda")
+    expected_data, expected_scale = torch.ops.trtllm.fp4_quantize(
+        index_k, unit_scale, 16, False, False
+    )
+    expected_data = expected_data.view(torch.uint8).view(num_tokens, 64)
+    expected_scale = expected_scale.view(torch.uint8).view(num_tokens, 8)
+
+    data_cache, scale_cache, fp8_index_cache = _nvfp4_caches(num_pages, num_kv_heads)
+    q_reference, index_q_reference = _run_nvfp4(
+        packed,
+        data_cache,
+        scale_cache,
+        fp8_index_cache,
+        slots,
+        inv_scales,
+        num_heads_q,
+        num_kv_heads,
+        *weights,
+        rope_cache,
+        position_ids,
+    )
+    reference_data, reference_scale = data_cache.clone(), scale_cache.clone()
+    data_cache.zero_()
+    scale_cache.zero_()
+
+    index_pool = _nvfp4_index_pages(num_pages + 2)
+    index_cache = index_pool[1:-1]
+    q, index_q = _run_nvfp4(
+        packed,
+        data_cache,
+        scale_cache,
+        index_cache,
+        slots,
+        inv_scales,
+        num_heads_q,
+        num_kv_heads,
+        *weights,
+        rope_cache,
+        position_ids,
+    )
+    torch.cuda.synchronize()
+
+    assert torch.equal(q.view(torch.uint8), q_reference.view(torch.uint8))
+    assert torch.equal(index_q.view(torch.uint8), index_q_reference.view(torch.uint8))
+    assert torch.equal(data_cache, reference_data)
+    assert torch.equal(scale_cache, reference_scale)
+    expected_pages = torch.zeros_like(index_cache)
+    for row, slot in enumerate(slots.tolist()):
+        if slot < 0:
+            continue
+        page, within = divmod(slot, 128)
+        data_rows, scale_rows = _split_nvfp4_index_page(expected_pages[page])
+        data_rows[within] = expected_data[row]
+        scale_rows[within] = expected_scale[row]
+    assert torch.equal(index_cache, expected_pages)
+    assert torch.count_nonzero(index_pool[0]).item() == 0
+    assert torch.count_nonzero(index_pool[-1]).item() == 0
+
+
+def test_minimax_m3_nvfp4_horizontal_producer_rejects_bad_nvfp4_index_pages() -> None:
+    num_tokens, num_heads_q, num_kv_heads, num_pages = 2, 16, 1, 4
+    packed = torch.randn(
+        num_tokens, (num_heads_q + 3 * num_kv_heads + 1) * 128, dtype=torch.bfloat16, device="cuda"
+    )
+    data_cache, scale_cache, _ = _nvfp4_caches(num_pages, num_kv_heads)
+    index_cache = torch.zeros(num_pages, 1, 128, 64, dtype=torch.uint8, device="cuda")
+    with pytest.raises(RuntimeError, match=r"\[num_pages, 1, 128, 72\]"):
+        _run_nvfp4(
+            packed,
+            data_cache,
+            scale_cache,
+            index_cache,
+            torch.zeros(num_tokens, dtype=torch.int32, device="cuda"),
+            torch.ones(3, dtype=torch.float32, device="cuda"),
+            num_heads_q,
+            num_kv_heads,
+            *[torch.ones(128, dtype=torch.bfloat16, device="cuda") for _ in range(4)],
+            _rope_cache(8),
+            torch.zeros(num_tokens, dtype=torch.int32, device="cuda"),
+        )
+
+
 @pytest.mark.parametrize(
     "invalid_input,error",
     [
         ("page_count", "same number of pages"),
         ("index_page_overlap", "pages must not overlap"),
-        ("index_page_alignment", "32-bit FP8 store alignment"),
+        ("index_page_alignment", "32-bit store alignment"),
         ("packed_alignment", "8-byte-aligned"),
         ("data_alignment", "aligned addresses"),
         ("index_alignment", "aligned addresses"),

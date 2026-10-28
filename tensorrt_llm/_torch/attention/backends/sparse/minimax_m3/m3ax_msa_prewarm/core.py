@@ -284,7 +284,9 @@ def geometry(runner, kvm):
     return dict(
         hidx=int(hidx),
         page=int(kvm.tokens_per_block),
-        idx_dtype=torch.float8_e4m3fn if kvm.indexer_kv_dtype == "fp8" else torch.bfloat16,
+        idx_dtype=(
+            torch.float8_e4m3fn if kvm.indexer_kv_dtype in ("fp8", "nvfp4") else torch.bfloat16
+        ),
         nvfp4=bool(nvfp4),
         rank=int(getattr(mapping, "rank", 0)),
         tp=int(getattr(mapping, "tp_size", 1)),

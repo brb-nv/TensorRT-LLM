@@ -132,6 +132,17 @@ from ..resource_manager import (
     request_context,
 )
 from ..scheduler import ScheduledRequests
+from .kv_layerwise_onboard import (
+    LayerwiseOnboard,
+    layerwise_consumer_registered,
+    layerwise_onboard_requested,
+)
+from .kv_tier_staging import (
+    OffloadHeadroom,
+    gpu_backed_reuse_tokens,
+    has_lower_tier,
+    prefetch_reuse_to_gpu,
+)
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
@@ -1340,6 +1351,8 @@ class KVCacheManagerV2(BaseResourceManager):
     # The same pool also receives the drafter context window over the cache transceiver
     # (engage_disagg_draft_kv_receive): its gen-init pages are then RDMA destinations.
     _disagg_draft_kv_receive: bool = False
+    # Set in __init__ when a host tier exists (see kv_layerwise_onboard).
+    layerwise_onboard: Optional[LayerwiseOnboard] = None
     # Filled lazily by _cold_pool_group_membership(); the grouping is fixed after construction.
     # Declared on the class so it is present even when an instance is built without running __init__.
     _cold_pool_group_membership_cache: Optional[tuple[tuple[int, frozenset[int]], ...]] = None
@@ -1389,6 +1402,9 @@ class KVCacheManagerV2(BaseResourceManager):
     block_offset_patches: int = 0
     block_offset_patch_ns: int = 0
     _paired_hidden_state_draft_pool: bool = False
+    # Opt-in (enable_offload_headroom): GPU slots evicted one step ahead of use. On the class so it exists without
+    # running __init__.
+    _offload_headroom: Optional[OffloadHeadroom] = None
 
     def __init__(
         self,
@@ -1967,6 +1983,16 @@ class KVCacheManagerV2(BaseResourceManager):
         self.kv_cache_manager_py_config = config
         self.impl = candidate
         self.can_evict = len(config.cache_tiers) > 1
+        # Layer-wise onboarding only pays off with a host tier to onboard from.
+        self.layerwise_onboard = (
+            LayerwiseOnboard(
+                self.impl,
+                lambda idx: self.layer_offsets.get(idx),
+                self._layerwise_last_target_layer,
+            )
+            if self.can_evict and layerwise_onboard_requested()
+            else None
+        )
         if self.event_manager is not None:
             self.event_manager.set_layer_group_window_sizes(
                 self._get_event_window_sizes_by_layer_group(
@@ -3882,27 +3908,45 @@ class KVCacheManagerV2(BaseResourceManager):
             index = self.index_mapper.get_index(request_id)
             self.sparse_metadata_batch.add(kv_cache, index)
 
-    def _resume_and_restore(self, req_id: int, kv_cache, optional_reuse_groups=None) -> bool:
+    def _resume_and_restore(
+        self, req_id: int, kv_cache, optional_reuse_groups=None, defer_onboard: bool = False
+    ) -> bool:
         """Resume a suspended KV cache and restore its page index buffers.
 
+        ``defer_onboard`` (prefill only) leaves host->GPU copies to
+        ``_flush_layerwise_onboard`` when layer-wise onboarding is on.
         Returns True if the cache is (or becomes) active, False on failure.
         """
         if kv_cache.is_active:
             return True
-        if not (
-            kv_cache.resume(self._stream.cuda_stream)
-            if optional_reuse_groups is None
-            else kv_cache.resume(
-                self._stream.cuda_stream, optional_reuse_groups=optional_reuse_groups
-            )
-        ):
+        kwargs = {}
+        if optional_reuse_groups is not None:
+            kwargs["optional_reuse_groups"] = optional_reuse_groups
+        if defer_onboard:
+            kwargs["defer_onboard"] = True
+        if not kv_cache.resume(self._stream.cuda_stream, **kwargs):
             return False
         self._restore_page_index_bufs(req_id, kv_cache)
         return True
 
     def _resume_context_cache(self, req: LlmRequest, kv_cache: _KVCache) -> bool:
         """Resume context pages; subclasses may select model-specific reuse groups."""
-        return self._resume_and_restore(req.py_request_id, kv_cache)
+        if self.layerwise_onboard is None or not layerwise_consumer_registered():
+            return self._resume_and_restore(req.py_request_id, kv_cache)
+        return self._resume_and_restore(req.py_request_id, kv_cache, defer_onboard=True)
+
+    def _layerwise_last_target_layer(self) -> Optional[int]:
+        """Last local layer the target forward attends; it retires all onboarding events."""
+        if self.is_draft:
+            return None
+        shared_draft = set(getattr(self, "_shared_draft_layer_ids", ()))
+        target_layers = [layer for layer in self.layer_offsets if layer not in shared_draft]
+        return max(target_layers) if target_layers else None
+
+    def _flush_layerwise_onboard(self) -> None:
+        """Issue this step's deferred onboarding copies, layer by layer, ahead of the forward."""
+        if self.layerwise_onboard is not None and layerwise_consumer_registered():
+            self.layerwise_onboard.flush(self._stream.cuda_stream)
 
     def _context_reuse_tokens(
         self, req: LlmRequest, reuse_limit: int | None = None
@@ -4518,6 +4562,7 @@ class KVCacheManagerV2(BaseResourceManager):
             # Mirror the main manager. Under one-model spec decoding the
             # scheduler may already have created the context cache.
             self._prepare_draft_resources(scheduled_batch)
+            self._flush_layerwise_onboard()
             self._publish_sparse_metadata()
             return
 
@@ -4527,6 +4572,7 @@ class KVCacheManagerV2(BaseResourceManager):
         #
         # A capacity-only connector cannot reach those pages, so reporting them
         # would cost a page index gather per context request for nothing.
+        self._flush_layerwise_onboard()
         if self.kv_connector_manager is not None and not self.kv_connector_manager.capacity_only:
             self._run_kv_connector_hooks(scheduled_batch)
         self._publish_sparse_metadata()
@@ -6322,6 +6368,9 @@ class KVCacheManagerV2(BaseResourceManager):
         return bool(has_invalid_values)
 
     def shutdown(self):
+        if self.layerwise_onboard is not None:
+            self.layerwise_onboard.wait_all(self._stream.cuda_stream)
+        self.release_offload_headroom()
         if self._sharing is not None:
             self._sharing._on_shutdown()
         if self.sparse_metadata_batch is not None:
@@ -7272,6 +7321,80 @@ class KVCacheManagerV2(BaseResourceManager):
             finally:
                 kv_cache.close()
         return success
+
+    def has_lower_cache_tier(self) -> bool:
+        """Whether GPU eviction moves pages to a lower tier (and a reused prefix can need onboarding)."""
+        return has_lower_tier(self.impl)
+
+    def enable_offload_headroom(self, num_tokens: int) -> bool:
+        """Keep ``num_tokens`` worth of GPU slots evicted one step ahead (see ``OffloadHeadroom``).
+
+        Only meaningful with a lower tier: without one, eviction drops reusable blocks and costs no copy.
+        Returns whether the headroom is armed.
+        """
+        if num_tokens <= 0 or self.is_estimating_kv_cache or not self.has_lower_cache_tier():
+            return False
+        if self._offload_headroom is None:
+            self._offload_headroom = OffloadHeadroom(
+                self.impl, num_tokens, device=self._stream.device
+            )
+        return True
+
+    def reserve_offload_headroom(self) -> bool:
+        """Evict for the headroom now; call after a forward is launched. False when disarmed or unbackable."""
+        headroom = self._offload_headroom
+        return headroom is not None and headroom.reserve()
+
+    def release_offload_headroom(self) -> None:
+        """Hand the headroom's slots to the free list; call before scheduling and before pool adjustment."""
+        if self._offload_headroom is not None:
+            self._offload_headroom.release()
+
+    def prefetch_context_to_gpu(
+        self, requests: Iterable[LlmRequest], measure: bool = False
+    ) -> Dict[int, int]:
+        """Onboard the reusable prefix of context requests that are not admitted yet.
+
+        For each first-chunk request without a cache in this pool, the blocks its
+        admission will match are copied up to the GPU now, on the core's streams,
+        instead of when the scheduler resumes its cache. Best effort: a request
+        whose pages do not fit is skipped and onboards at admission as before.
+
+        Returns, per staged request id, how many reused tokens the GPU newly backs
+        (counted with a second radix-tree probe when ``measure``; else 0).
+        """
+        if not self.enable_block_reuse or self.is_estimating_kv_cache:
+            return {}
+        if not self.has_lower_cache_tier():
+            return {}
+        staged = {}
+        for req in requests:
+            if req.py_request_id in self.kv_cache_map or req.is_dummy:
+                continue
+            # The claim cap prepare_context applies: it decides which window
+            # pages of sliding-window groups the admission locks.
+            limit = None
+            if self._spec_recompute_tail:
+                limit = _spec_recompute_claim_limit(
+                    req,
+                    tail=self._spec_recompute_tail,
+                    tokens_per_block=self.tokens_per_block,
+                    is_draft=self.is_draft,
+                )
+            tokens = self._context_reuse_tokens(req, limit)
+            # Length test: on the C++ backend this is an int32 array view.
+            if len(tokens) < self.tokens_per_block:
+                continue
+            scope = ReuseScope(
+                lora_id=req.lora_task_id, salt=self._derive_reuse_salt(req.cache_salt)
+            )
+            backed = prefetch_reuse_to_gpu(self.impl, scope, tokens)
+            if backed is None:
+                continue
+            staged[req.py_request_id] = (
+                gpu_backed_reuse_tokens(self.impl, scope, tokens) - backed if measure else 0
+            )
+        return staged
 
     def reset_reuse_state(self):
         self.impl.clear_reusable_blocks()

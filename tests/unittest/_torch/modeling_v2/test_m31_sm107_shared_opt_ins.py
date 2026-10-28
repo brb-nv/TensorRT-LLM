@@ -77,6 +77,7 @@ FLAGS = (
     (msa_indexer, "PREFILL_SELECT_TILE", False),
     (msa_prewarm_hook, "ENABLED", False),
     (msa_cache_manager, "NVFP4_POOLLESS", False),
+    (msa_cache_manager, "NVFP4_INDEX_K_SINK", True),
     (interface, "_ONEHOT_INDEX_FILL", True),
     (interface, "_ONEHOT_INDEX_FILL_ARMED", True),
     (interface, "_CHEAP_PADDING_ROWS", False),

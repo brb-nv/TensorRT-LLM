@@ -43,6 +43,7 @@ from tensorrt_llm._torch.attention.backends.interface import AttentionForwardArg
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention, TrtllmAttentionMetadata
 from tensorrt_llm._torch.pyexecutor import h2d_cache, step_inputs
 from tensorrt_llm._torch.pyexecutor.h2d_cache import copy_h2d_if_changed
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_layerwise_onboard import register_layerwise_consumer
 from tensorrt_llm._torch.pyexecutor.runtime_hooks import MsaRuntimePolicy
 from tensorrt_llm._utils import maybe_pin_memory, mpi_rank
 from tensorrt_llm.bindings import DataType
@@ -55,6 +56,7 @@ from .common import (
     build_paged_kv_slot_mapping,
     write_kv_slots,
 )
+from .kernels import msa_v1_indexer
 from .kernels.msa_utils import (
     MSA_REQUIRED_HEAD_DIM,
     MSA_REQUIRED_TOPK,
@@ -302,6 +304,14 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
     # Set once per step by _set_decode_span(), ahead of every other preparation
     # step; see msa_decode_span.
     _msa_decode_span: Optional[MsaDecodeSpan] = None
+    # NVFP4 index-K (indexer_kv_dtype='nvfp4'), staged by _stage_nvfp4_decode_plan and
+    # _stage_nvfp4_proxy_pages: the Q8KV4 decode-indexer plan over this step's generation
+    # rows, the pool pages the fmha_sm100 proxy reads for its context rows (dequantized per
+    # layer into the E4M3 workspace it then reads through msa_prefill_proxy_kv_indices), and
+    # that workspace.
+    _msa_q8kv4_plan: Optional["msa_v1_indexer.Q8KV4Plan"] = None
+    _msa_idx_k_dequant_src: Optional[torch.Tensor] = None
+    _msa_idx_k_dequant_ws: Optional["msa_v1_indexer.DequantWorkspace"] = None
     # See msa_max_kv_len.
     _msa_max_kv_len: int = 0
     # See msa_worst_case_max_k_tiles.
@@ -938,14 +948,79 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         return (0, num_contexts) if num_contexts > 0 else None
 
     def _msa_index_kv_dtype(self) -> torch.dtype:
-        """dtype of the paged index-K cache, which index Q is cast to.
+        """dtype index Q is scored in, which the E4M3 / BF16 index-K cache matches.
 
         The CuTe DSL scorer requires index Q and K to match, and run_indexer
         casts Q to the cache dtype, so the cache decides what the scorer sees.
+        NVFP4 index-K pairs with E4M3 index Q: the Q8KV4 indexer takes it, and
+        the proxy reads an E4M3 copy of the pages.
         """
         indexer_kv_dtype = str(getattr(self.kv_cache_manager, "indexer_kv_dtype", "bf16"))
-        # NVFP4 index-K is scored as E4M3: the scorers read its gathered FP8 copy (run_indexer).
         return torch.float8_e4m3fn if indexer_kv_dtype in ("fp8", "nvfp4") else torch.bfloat16
+
+    def _msa_index_k_is_nvfp4(self) -> bool:
+        return bool(getattr(self.kv_cache_manager, "index_k_is_nvfp4", False))
+
+    def _stage_nvfp4_proxy_pages(
+        self, proxy_rows: Tuple[int, int], kv_lens_cpu: torch.Tensor, page_size: int
+    ) -> torch.Tensor:
+        """Stage the pool pages the proxy reads for rows [0, proxy_rows[1]) and return the page
+        table that addresses their dequantized copy: arange over the rows' pages, which
+        msa_kv_indices lists first, ceil(kv_len / page_size) per row."""
+        num_pages = int(((kv_lens_cpu[: proxy_rows[1]].long() + page_size - 1) // page_size).sum())
+        device = self.msa_kv_indices.device
+        if self._msa_idx_k_dequant_ws is None:
+            self._msa_idx_k_dequant_ws = msa_v1_indexer.DequantWorkspace()
+        self._msa_idx_k_dequant_ws.pages(num_pages, device)
+        self._msa_idx_k_dequant_src = self.msa_kv_indices[:num_pages]
+        return self._msa_idx_k_dequant_ws.identity(num_pages, device)[:num_pages]
+
+    def _stage_nvfp4_decode_plan(self, num_index_heads: int) -> None:
+        """Look up (or build, outside capture) the Q8KV4 plan for this step's generation rows."""
+        span = self._msa_decode_span
+        if span is None:
+            return
+        row_first, row_last = int(span.row_first), int(self.num_seqs)
+        block_table = self.msa_block_table[row_first:row_last]
+        seq_lens = self.msa_seq_lens_cuda[row_first:row_last]
+        params = self._msa_params
+        num_kv_heads = params.sharded_head_counts(self.mapping)[1] if params is not None else 0
+        if not msa_v1_indexer.q8kv4_supported(
+            num_heads=int(num_index_heads),
+            num_kv_heads=int(num_kv_heads),
+            query_len=int(span.query_len),
+            max_pages=int(block_table.shape[1]),
+            device=block_table.device,
+        ):
+            raise RuntimeError(
+                "MiniMax-M3 indexer_kv_dtype='nvfp4' scores generation rows with the MSA-v1 "
+                f"Q8KV4 indexer, which does not serve {num_index_heads} index head(s) over "
+                f"{num_kv_heads} KV head(s), {span.query_len} query tokens and "
+                f"{int(block_table.shape[1])} pages on this device."
+            )
+        self._msa_q8kv4_plan = msa_v1_indexer.get_or_plan(
+            self.fmha_plan_caches.setdefault(msa_v1_indexer.PLAN_CACHE_KEY, {}),
+            block_table=block_table,
+            seq_lens=seq_lens,
+            query_len=int(span.query_len),
+            num_heads=int(num_index_heads),
+        )
+
+    @property
+    def msa_q8kv4_plan(self) -> Optional["msa_v1_indexer.Q8KV4Plan"]:
+        """This step's Q8KV4 plan over its generation rows (NVFP4 index-K only)."""
+        return self._msa_q8kv4_plan
+
+    def msa_dequantize_proxy_index_k(self, data: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+        """Dequantize the pages the proxy reads (see _stage_nvfp4_proxy_pages) to E4M3."""
+        src = self._msa_idx_k_dequant_src
+        if src is None or self._msa_idx_k_dequant_ws is None:
+            raise RuntimeError(
+                "MiniMax-M3 NVFP4 index-K: prepare() staged no proxy pages for this step's "
+                "context rows."
+            )
+        workspace = self._msa_idx_k_dequant_ws.pages(int(src.shape[0]), src.device)
+        return msa_v1_indexer.dequantize_index_k_pages(data, scale, src, workspace)
 
     def _cutedsl_indexer_supported(
         self, *, num_index_heads: int, page_size: int, decode_query_len: int
@@ -1104,6 +1179,8 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         self._msa_prefill_proxy_plan = None
         self._msa_prefill_proxy_kv_indices = None
         self._msa_prefill_proxy_plan_ref = None
+        self._msa_q8kv4_plan = None
+        self._msa_idx_k_dequant_src = None
         self._msa_prefill_gqa_plan = None
         self._msa_prefill_dense_plan = None
         self._msa_prefill_n_valid_blocks = None
@@ -1142,6 +1219,8 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
             # Packed but never skipped: on_update_kv_lens rewrites this buffer on the device.
             step_inputs.copy_(self.msa_n_valid_blocks[:total_q], n_valid.to(torch.int32))
             self._stage_msa_short_table(n_valid, params)
+            if self._msa_index_k_is_nvfp4():
+                self._stage_nvfp4_decode_plan(num_index_heads)
             return
 
         fmha_sm100 = require_msa_module()
@@ -1189,13 +1268,21 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         # A short pure-prefill step selects every valid block, so it needs none.
         # Its rows are a batch prefix, so their pages prefix msa_kv_indices.
         proxy_rows = None if short_prefill else self._msa_proxy_plan_rows()
+        nvfp4_index_k = self._msa_index_k_is_nvfp4()
+        # NVFP4 index-K: the proxy reads an E4M3 copy of just its rows' pages, addressed in
+        # the order msa_kv_indices lists them.
+        proxy_kv_indices = (
+            self._stage_nvfp4_proxy_pages(proxy_rows, kv_lens_cpu, page_size)
+            if nvfp4_index_k and proxy_rows is not None
+            else self.msa_kv_indices
+        )
         segmented = proxy_rows is not None and segmented_proxy_plan(
             fmha_sm100,
             qo_lens_cpu[: proxy_rows[1]],
             qo_offset_cpu[: proxy_rows[1]],
             num_index_heads=num_index_heads,
             page_size=page_size,
-            kv_indices=self.msa_kv_indices,
+            kv_indices=proxy_kv_indices,
         )
         if segmented:
             self._msa_prefill_proxy_plan, self._msa_prefill_proxy_kv_indices = segmented
@@ -1213,6 +1300,10 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
             self._msa_prefill_proxy_plan_ref = plan_for(
                 proxy_rows, num_qo_heads=num_index_heads, num_kv_heads=1, output_maxscore=True
             )
+            if proxy_kv_indices is not self.msa_kv_indices:
+                self._msa_prefill_proxy_kv_indices = proxy_kv_indices
+        if nvfp4_index_k:
+            self._stage_nvfp4_decode_plan(num_index_heads)
         attn_rows = self._msa_attn_plan_rows()
         # Sparse layers: kv_block_num=topk limits attention to top-k blocks.
         # NVFP4 sparse layers run the MSA CSR kernel, which takes no plan.
@@ -1470,6 +1561,10 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         """Return the paged index-K cache in the HND layout MSA consumes."""
         return self.kv_cache_manager.get_index_k_buffer(layer_idx)
 
+    def msa_idx_k_nvfp4(self, layer_idx: int) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        """NVFP4 index-K (E2M1 rows, E4M3 scales) of a sparse layer, or None unless nvfp4."""
+        return self.kv_cache_manager.get_index_k_nvfp4_buffers(layer_idx)
+
     def msa_write_idx_k(self, layer_idx: int, idx_k: torch.Tensor) -> None:
         """Write the new-token index-K into the side cache at out_cache_loc."""
         cache = self.msa_idx_k_cache(layer_idx)
@@ -1551,6 +1646,18 @@ class MiniMaxM3MsaSparseAttention(TrtllmAttention):
         self.indexer_kv_dtype = str(sparse_params.indexer_kv_dtype)
         self._validate_msa_preconditions()
         self.indexer = MsaIndexer(self.m3_config)
+        # Cache reads below wait for this layer's onboarding alone (_wait_kv_onboard).
+        register_layerwise_consumer()
+
+    def _wait_kv_onboard(self, metadata) -> None:
+        """Order this layer's cache reads after its host->GPU onboarding copies."""
+        onboard = getattr(metadata.kv_cache_manager, "layerwise_onboard", None)
+        if onboard is not None and onboard.armed:
+            onboard.wait_layer(self.layer_idx)
+
+    def forward(self, q, k, v, metadata, *args, **kwargs):
+        self._wait_kv_onboard(metadata)
+        return super().forward(q, k, v, metadata, *args, **kwargs)
 
     def _validate_msa_preconditions(self) -> None:
         config = self.m3_config
@@ -1707,6 +1814,7 @@ class MiniMaxM3MsaSparseAttention(TrtllmAttention):
         `idx_k_prewritten` marks that the fused per-layer cache write
         (write_layer_caches) already stored this layer's index-K.
         """
+        self._wait_kv_onboard(metadata)
         config = self.m3_config
         idx_sm_scale = idx_sm_scale if idx_sm_scale is not None else config.sparse_index_dim**-0.5
         num_tokens = int(idx_q.shape[0])
@@ -1718,8 +1826,9 @@ class MiniMaxM3MsaSparseAttention(TrtllmAttention):
         idx_q_view = idx_q.view(num_tokens, config.num_index_heads, config.sparse_index_dim)
         idx_k_cache = metadata.msa_idx_k_cache(self.layer_idx)
         configured_for_nvfp4 = self.indexer_kv_dtype == "nvfp4"
-        # NVFP4 index-K takes the FP8 indexer's contract (E4M3 index-Q, a cache the fused producer populated) and
-        # is scored through its gathered FP8 copy below.
+        # NVFP4 index-K takes the FP8 indexer's contract (E4M3 index-Q, a cache the fused producer populated); its
+        # raw pages are uint8. The built-in model scores them with the MSA-v1 Q8KV4 indexer (_select_nvfp4); the
+        # sm_107 targets score their gathered FP8 copy below.
         configured_for_fp8 = self.indexer_kv_dtype == "fp8" or configured_for_nvfp4
         expected_cache_dtype = (
             torch.uint8
@@ -1770,6 +1879,9 @@ class MiniMaxM3MsaSparseAttention(TrtllmAttention):
             # Short pure-prefill step: every token selects all its valid blocks (staged once per step).
             num_kv_heads = int(self.indexer.config.num_kv_heads)
             return identity.unsqueeze(1).expand(num_tokens, num_kv_heads, int(identity.shape[1]))
+        if configured_for_nvfp4 and metadata._msa_index_k_is_nvfp4():
+            # Built-in model: the cache manager serves the Q8KV4 (data, scale) views.
+            return self._select_nvfp4(idx_q_view, metadata, span, idx_sm_scale)
         # NVFP4 replaces both page tables with ones addressing its gathered copy; the stock path reads them as staged.
         step_block_table = None
         kv_indices = metadata.msa_prefill_proxy_kv_indices
@@ -1909,6 +2021,70 @@ class MiniMaxM3MsaSparseAttention(TrtllmAttention):
             ctx_rows=ctx_rows,
             gen_scores=gen_scores,
         )
+
+    def _select_nvfp4(
+        self,
+        idx_q_view: torch.Tensor,
+        metadata,
+        span: Optional[MsaDecodeSpan],
+        idx_sm_scale: float,
+    ) -> torch.Tensor:
+        """Select blocks over NVFP4 index-K; same contract as MsaIndexer.select_blocks.
+
+        Generation rows are scored by the MSA-v1 Q8KV4 indexer straight from the NVFP4
+        pages, under the plan prepare() staged. Context rows run the fmha_sm100 proxy pass
+        over an E4M3 copy of only the pages they read, dequantized here once per layer.
+        """
+        nvfp4 = metadata.msa_idx_k_nvfp4(self.layer_idx)
+        if nvfp4 is None:
+            raise RuntimeError(
+                f"MiniMax-M3 layer {self.layer_idx} has no NVFP4 index-K buffers although "
+                "indexer_kv_dtype='nvfp4'."
+            )
+        data, scale = nvfp4
+        num_tokens = int(idx_q_view.shape[0])
+        gen_first = num_tokens
+        gen_table = None
+        if span is not None:
+            plan = metadata.msa_q8kv4_plan
+            if plan is None:
+                raise RuntimeError(
+                    "MiniMax-M3 NVFP4 index-K: prepare() staged no Q8KV4 indexer plan for "
+                    "this step's generation rows."
+                )
+            gen_first = num_tokens - span.query_len * (int(metadata.num_seqs) - span.row_first)
+            gen_table = msa_v1_indexer.run_q8kv4(
+                plan, idx_q_view[gen_first:], data, scale, layer_idx=self.layer_idx
+            )
+            if gen_first == 0:
+                return gen_table
+        ctx_rows = span.row_first if span is not None else int(metadata.num_seqs)
+        idx_k_fp8 = metadata.msa_dequantize_proxy_index_k(data, scale)
+        n_valid_blocks = metadata.msa_prefill_n_valid_blocks
+        qo_lens_cpu = metadata.msa_qo_lens_cpu
+        kv_lens_cpu = metadata.msa_kv_lens_cpu
+        qo_offset_cpu = metadata.msa_qo_offset_cpu
+        ctx_table = self.indexer.select_blocks(
+            idx_q_view[:gen_first],
+            idx_k_fp8,
+            idx_sm_scale=idx_sm_scale,
+            kv_indices=metadata.msa_prefill_proxy_kv_indices,
+            qo_lens_cpu=None if qo_lens_cpu is None else qo_lens_cpu[:ctx_rows],
+            kv_lens_cpu=None if kv_lens_cpu is None else kv_lens_cpu[:ctx_rows],
+            qo_offset_cpu=None if qo_offset_cpu is None else qo_offset_cpu[:ctx_rows],
+            proxy_plan=metadata.msa_prefill_proxy_plan,
+            n_valid_blocks=None if n_valid_blocks is None else n_valid_blocks[:gen_first],
+        )
+        if gen_table is None:
+            return ctx_table
+        # Head-major like every other table (see MsaIndexer._select).
+        num_kv_heads, topk = int(gen_table.shape[1]), int(gen_table.shape[2])
+        combined = torch.empty(
+            (num_kv_heads, num_tokens, topk), dtype=torch.int32, device=gen_table.device
+        ).permute(1, 0, 2)
+        combined[:gen_first].copy_(ctx_table)
+        combined[gen_first:].copy_(gen_table)
+        return combined
 
     def sparse_attn_predict(
         self,

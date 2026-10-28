@@ -21,6 +21,7 @@
 
 #include "tensorrt_llm/common/cudaDriverWrapper.h"
 #include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/nvmlWrapper.h"
 #include "tensorrt_llm/common/tllmException.h"
@@ -73,6 +74,8 @@ constexpr double kHostSustainedGBs = 355.0;
 //! Selects 8 and 12 CTAs on GH200, at 97% and 94% of plateau.
 constexpr double kOffloadGridMult = 0.90;
 constexpr double kOnboardGridMult = 1.45;
+//! Onboard grid floor on coherent links, measured on GB300 under a concurrent GEMM load.
+constexpr int kMinCoherentOnboardCtas = 32;
 
 //! Conservative link bandwidths used when NVML is unavailable.
 constexpr double kFallbackCoherentGBs = 223.6; //!< the narrower (2 GPUs per Grace) C2C config
@@ -811,6 +814,20 @@ void BatchedPageCopier::computeConfigs()
 
     mOffload = build(kOffloadStages, kOffloadGridMult);
     mOnboard = build(kOnboardStages, kOnboardGridMult);
+
+    // The Little's-Law estimate is a standalone figure: the copy overlaps compute kernels, which
+    // hold most SMs and stretch each CTA's round trip. On GB300 next to a GEMM load, the 12 CTAs
+    // it picks for onboarding move ~95 GB/s of the ~210 GB/s C2C link, while 24-64 CTAs hold
+    // ~150-205 GB/s; the extra CTAs only run while a copy is in flight.
+    if (mTopology.coherentLink)
+    {
+        mOnboard.ctas = std::clamp(std::max(mOnboard.ctas, kMinCoherentOnboardCtas), 2, std::max(2, mTopology.smCount));
+    }
+    // Temporary A/B override of the onboard grid (e.g. 12 reproduces the previous default).
+    if (auto const ctas = tensorrt_llm::common::getIntEnv("TRTLLM_KV_ONBOARD_CTAS"); ctas.has_value() && *ctas > 0)
+    {
+        mOnboard.ctas = std::clamp(*ctas, 1, std::max(1, mTopology.smCount));
+    }
 
     if (!kernelViable)
     {
