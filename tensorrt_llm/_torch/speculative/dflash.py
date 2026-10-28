@@ -52,17 +52,15 @@ def host_counted_block_width(attn_metadata) -> Optional[int]:
     With source and destination rows of equal width, each row then holds no
     negative entry, so its count is that width. Returns None for any other
     writer (V1, the per-layer page-table path, a subclass's own copy), where
-    only the device knows the count.
+    only the device knows the count. A unified drafter reads the target
+    manager's own table.
     """
-    from ..pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
-
     offsets = getattr(attn_metadata, "draft_kv_cache_block_offsets", None)
     manager = getattr(attn_metadata, "draft_kv_cache_manager", None)
-    if offsets is None or manager is None or not isinstance(manager, KVCacheManagerV2):
-        return None
-    if type(manager).copy_batch_block_offsets is not KVCacheManagerV2.copy_batch_block_offsets:
-        return None
-    if getattr(manager, "_use_per_layer_page_tables", True):
+    if offsets is None and manager is None:
+        offsets = getattr(attn_metadata, "kv_cache_block_offsets", None)
+        manager = getattr(attn_metadata, "kv_cache_manager", None)
+    if offsets is None or not _block_counts_are_full_rows(manager):
         return None
     host = getattr(manager, "host_kv_cache_block_offsets", None)
     if host is None or host.dim() != 4 or offsets.dim() != 4:
@@ -591,9 +589,7 @@ def _block_counts_are_full_rows(draft_kv_cache_manager) -> bool:
 
     return (
         isinstance(draft_kv_cache_manager, KVCacheManagerV2)
-        and type(draft_kv_cache_manager).copy_batch_block_offsets
-        is KVCacheManagerV2.copy_batch_block_offsets
-        and not getattr(draft_kv_cache_manager, "_use_per_layer_page_tables", True)
+        and draft_kv_cache_manager.block_offset_rows_are_full()
     )
 
 

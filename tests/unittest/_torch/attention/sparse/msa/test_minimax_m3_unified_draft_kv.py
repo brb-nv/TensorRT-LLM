@@ -129,6 +129,7 @@ def test_draft_layer_specs_join_the_hybrid_nvfp4_manager():
 
         # Only the drafter reads block offsets: one attention-op pool, filled with its view's rows.
         assert (unified.num_attention_op_pools, plain.num_attention_op_pools) == (1, 0)
+        assert unified.block_offset_rows_are_full() and not plain.block_offset_rows_are_full()
         assert int(unified.kv_cache_pool_mapping[unified.layer_offsets[NUM_TARGET], 0]) == 0
         (request,) = unified.add_dummy_requests([7], token_nums=[200])
         offsets = torch.zeros(1, 1, 2, unified.max_blocks_per_seq, dtype=torch.int32, device="cuda")

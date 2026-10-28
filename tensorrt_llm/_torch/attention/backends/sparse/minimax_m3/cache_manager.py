@@ -882,6 +882,10 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         self._draft_op_pools = ((0, self.layer_to_pool_mapping_dict[layer]),)
         return 1
 
+    def block_offset_rows_are_full(self) -> bool:
+        # Only the unified drafter's pool is copied, by copy_batch_block_offsets_to_device.
+        return 0 < self.num_attention_op_pools == len(self._draft_op_pools)
+
     def _prepare_swa_scratch_copy_tensors(self, index_mapper_capacity: int) -> None:
         # Staging for the per-layer block-offset copy, which a pool-less hybrid NVFP4 cache never runs.
         if self.dtype != DataType.NVFP4 or not NVFP4_POOLLESS:

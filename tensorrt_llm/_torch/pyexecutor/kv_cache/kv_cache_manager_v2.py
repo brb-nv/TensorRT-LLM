@@ -7676,6 +7676,14 @@ class KVCacheManagerV2(BaseResourceManager):
             self._stream.cuda_stream,
         )
 
+    def block_offset_rows_are_full(self) -> bool:
+        """Whether copy_batch_block_offsets rewrites each copied row in full, a missing page as 0."""
+        return type(
+            self
+        ).copy_batch_block_offsets is KVCacheManagerV2.copy_batch_block_offsets and not getattr(
+            self, "_use_per_layer_page_tables", True
+        )
+
     def _block_offsets_unchanged(
         self, dst_tensor: torch.Tensor, copy_idx: torch.Tensor, num_contexts: int
     ) -> bool:
