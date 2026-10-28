@@ -9,9 +9,12 @@ from unittest.mock import patch
 import torch
 
 from tensorrt_llm._torch.models.modeling_speculative import dspark_markov_step_bias
+from tensorrt_llm._torch.pyexecutor.sampler.ops import custom as fused_sampling
+from tensorrt_llm._torch.pyexecutor.sampler.ops import flashinfer as flashinfer_sampling
 from tensorrt_llm._torch.speculative.block_verification import block_verify
 from tensorrt_llm._torch.speculative.dspark import DSparkWorker
 from tensorrt_llm._torch.speculative.interface import SpecWorkerBase
+from tensorrt_llm.llmapi.llm_args import AdvancedSamplingMode
 
 VOCAB, K = 3, 3
 
@@ -118,11 +121,25 @@ def test_ancestral_drafts_condition_each_position_on_the_drawn_token():
     for step, (logits, probs, top_ks, top_ps, min_ps) in enumerate(calls):
         bias = dspark_markov_step_bias(prev, drafter.markov_w1, drafter.markov_w2)
         torch.testing.assert_close(logits, base[:, step] + bias)
-        assert (
-            (top_ks == torch.iinfo(torch.int32).max).all()
-            and (top_ps == 1).all()
-            and (min_ps == 0).all()
-        )
+        assert top_ks is None and top_ps is None and min_ps is None
         torch.testing.assert_close(meta.draft_probs[meta.batch_slot_ids, step], probs)
         prev = tokens[:, step]
     assert len(calls) == K
+
+
+def test_temperature_only_sampling_runs_no_filter():
+    """No filter reaches the FlashInfer chain; the fused op gets its disable sentinels."""
+    logits, params = torch.randn(2, VOCAB), SpecWorkerBase._temperature_only_params(torch.ones(2))
+    with patch.object(
+        flashinfer_sampling, "sampling_batch_spec_dec_one_model_for_rejection"
+    ) as chain:
+        SpecWorkerBase._sample_from_logits_with_probs(AdvancedSamplingMode.NO_TOPK, logits, *params)
+    assert chain.call_args.args[2:] == (None, None)
+    with patch.object(fused_sampling, "fused_sample_from_logits_with_probs") as fused:
+        SpecWorkerBase._sample_from_logits_with_probs(AdvancedSamplingMode.FULL, logits, *params)
+    _, _, top_ks, top_ps, min_ps = fused.call_args.args
+    assert (
+        (top_ks == torch.iinfo(torch.int32).max).all()
+        and (top_ps == 1).all()
+        and (min_ps == 0).all()
+    )
