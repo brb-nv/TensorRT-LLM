@@ -506,7 +506,7 @@ void KvCache::activate()
 }
 
 bool KvCache::resume(std::optional<CUstream> stream, std::optional<bool> isDecoding,
-    std::optional<std::vector<LifeCycleId>> optionalReuseGroups)
+    std::optional<std::vector<LifeCycleId>> optionalReuseGroups, bool deferOnboard)
 {
     KVCM2_API_GUARD();
     TLLM_CHECK(mStatus == Status::SUSPENDED);
@@ -546,6 +546,21 @@ bool KvCache::resume(std::optional<CUstream> stream, std::optional<bool> isDecod
     auto ssmLcId = mManager->lifeCycles().ssmLifeCycleId();
     LifeCycleId numLc = storageMgr.numLifeCycles();
 
+    // Decode readers run in CUDA graphs that cannot take per-layer waits, so only prefill defers.
+    bool const deferringOnboard = deferOnboard && !mIsDecoding && storageMgr.layerwiseOnboardEnabled();
+    if (deferringOnboard)
+    {
+        storageMgr.beginOnboardDeferral();
+    }
+    auto endOnboardDeferral = FuncGuard(
+        [&]()
+        {
+            if (deferringOnboard)
+            {
+                storageMgr.endOnboardDeferral();
+            }
+        });
+
     // Snapshot source levels before allocation or activation can migrate the selected pages.
     ReusedBlocksByLevelByLifeCycle optionalReusedByLevel;
     if (mNeverResumed && _shouldRecordStats())
@@ -574,6 +589,12 @@ bool KvCache::resume(std::optional<CUstream> stream, std::optional<bool> isDecod
         [&]()
         {
             std::optional<CachedCudaEvent> completion;
+            if (deferredCopiesStarted && storageMgr.hasPendingOnboard())
+            {
+                // A deferred copy into these slots must be issued, and ordered on this stream,
+                // before the slots are released.
+                storageMgr.flushPendingOnboard(cudaStream());
+            }
             for (LifeCycleId lc{0}; lc < numLc; ++lc)
             {
                 if (deferredSlots[lc].has_value() && deferredSlots[lc]->hasValidSlot())
@@ -794,9 +815,16 @@ bool KvCache::resume(std::optional<CUstream> stream, std::optional<bool> isDecod
             bool const hasPartialReuseSource = _hasReuseSource(*sourcePage);
             srcLocks.push_back(lock);
 
-            CacheLevel const sourceLevel = lock->page()->cacheLevel;
             deferredCopiesStarted = true;
-            storageMgr.copySlotData(lcIdx, kHotLevel, sourceLevel, newSlot.slotId(), lock->page()->slotId(), cudaStr);
+            // A source whose own onboarding is deferred is copied from its host copy instead.
+            std::optional<CacheLevel> const deferredSourceLevel
+                = storageMgr.deferCopyFromPendingPage(lcIdx, newSlot, *lock->page());
+            CacheLevel const sourceLevel = deferredSourceLevel.value_or(lock->page()->cacheLevel);
+            if (!deferredSourceLevel.has_value())
+            {
+                storageMgr.copySlotData(
+                    lcIdx, kHotLevel, sourceLevel, newSlot.slotId(), lock->page()->slotId(), cudaStr);
+            }
             if ((!ssmLcId.has_value() || lcIdx != *ssmLcId) && (recordManagerStats || recordRequestStats))
             {
                 bool const changed = mPendingStats.recordAllocationRange(lcIdx, lastOrdinal, lastOrdinal + 1,
@@ -969,6 +997,11 @@ void KvCache::suspend()
 
 void KvCache::_deactivate()
 {
+    // Unlocking may hand pending pages or private slots with deferred copies to other owners.
+    if (auto& storage = mManager->storage(); storage.hasPendingOnboard())
+    {
+        storage.flushPendingOnboard(cudaStream());
+    }
     // Copy data from external buffers back to internal vectors (mirrors Python's suspend).
     for (BeamIndex bi{0}; bi < mBeamWidth; ++bi)
         for (LifeCycleId lcId{0}; lcId < mBasePageIndices[bi].size(); ++lcId)
@@ -1038,6 +1071,11 @@ void KvCache::close()
         mManager->tryUpdateTargetRatios();
     }
 
+    // Only an active cache holds locks on pending pages or private slots with deferred copies.
+    if (auto& storage = mManager->storage(); mStatus == Status::ACTIVE && storage.hasPendingOnboard())
+    {
+        storage.flushPendingOnboard(cudaStream());
+    }
     // Record event scope — mirrors Python's `with self._record_event()`.
     // Python always enters _record_event() here; _cuda_stream is valid for both ACTIVE and SUSPENDED.
     {

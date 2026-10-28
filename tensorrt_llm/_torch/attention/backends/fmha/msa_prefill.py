@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import functools
 import inspect
+import os
 import sys
 from typing import TYPE_CHECKING, Callable, Optional
 
@@ -182,6 +183,36 @@ def _msa_sparse_api():
     return sparse
 
 
+# ARIA H27 (opt-in, TRTLLM_ARIA_PREFILL2=1): cap the NVFP4 sparse-prefill work-item size.
+# The packaged schedule model sizes each (kv-block, kv-head) work item for ~2 waves of CTAs
+# (~1.7k queries per item at a 16k chunk). With the top-k fanout concentrated on a few blocks
+# (local/recent/hot blocks), those few long items set the forward kernel's tail. Smaller items
+# balance it. Each (query, block) partial and the combine are unchanged, so the output is
+# bitwise identical (measured for 64..4096 at 0/92k/270k prefixes).
+_ARIA_PREFILL2 = os.environ.get("TRTLLM_ARIA_PREFILL2", "0") == "1"
+_ARIA_PREFILL2_TARGET_Q = int(os.environ.get("TRTLLM_ARIA_PREFILL2_MSA_TARGET_Q", "512"))
+_aria_prefill2_logged = False
+
+
+def _aria_prefill2_target_q(default_target: int, qhead_per_kv: int) -> int:
+    """The work-item size the forward schedule uses: the packaged default, or under
+    TRTLLM_ARIA_PREFILL2=1 at most TRTLLM_ARIA_PREFILL2_MSA_TARGET_Q queries, rounded up to
+    the kernel's query-group granularity (128 // qhead_per_kv)."""
+    global _aria_prefill2_logged
+    if not _ARIA_PREFILL2 or _ARIA_PREFILL2_TARGET_Q <= 0:
+        return default_target
+    group = max(1, 128 // max(1, int(qhead_per_kv)))
+    target = min(int(default_target), _ARIA_PREFILL2_TARGET_Q)
+    target = max(group, ((target + group - 1) // group) * group)
+    if not _aria_prefill2_logged:
+        _aria_prefill2_logged = True
+        logger.info(
+            "[ARIA prefill2] TRTLLM_ARIA_PREFILL2=1: MSA NVFP4 sparse-prefill work items capped at "
+            f"{_ARIA_PREFILL2_TARGET_Q} queries (first: default {default_target} -> {target})"
+        )
+    return target
+
+
 @functools.lru_cache(maxsize=1)
 def _k2q_csr_parts():
     """(run_with_schedule, schedule model, schedule type) behind sparse.build_k2q_csr, or None.
@@ -266,6 +297,7 @@ def _k2q_csr_with_schedule(
             qhead_per_kv=qhead_per_kv,
             device=device,
         )
+        target_q_per_cta = _aria_prefill2_target_q(target_q_per_cta, qhead_per_kv)
         capacity = model.flat_schedule_capacity(
             total_rows=total_rows,
             total_q=total_q,

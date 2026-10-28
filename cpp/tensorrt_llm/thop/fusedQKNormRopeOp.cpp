@@ -404,18 +404,29 @@ std::tuple<torch::Tensor, torch::Tensor> minimaxM3Nvfp4QKVIndexerNormRopeKVInser
     checkMinimaxM3Nvfp4HndKVPools(kvDataCache, kvScaleCache, numHeadsKV, headDim);
     TORCH_CHECK(kvDataCache.size(3) == kPageSize, "MiniMax-M3 NVFP4 horizontal producer requires page_size=128");
     TORCH_CHECK(kvQuantScale.numel() >= 3, "NVFP4 K/V quantization scale must contain [Q, K, V]");
-    TORCH_CHECK(indexKCache.is_cuda() && indexKCache.scalar_type() == at::ScalarType::Float8_e4m3fn,
-        "Index-K cache must be CUDA torch.float8_e4m3fn");
+    // Index-K is either E4M3 HND [num_pages, 1, 128, 128], or NVFP4 handed over as the raw uint8 page
+    // [num_pages, 1, 128, 72]: packed E2M1 rows [128, 64] followed by their E4M3 SF16 scales [128, 8].
+    TORCH_CHECK(indexKCache.is_cuda()
+            && (indexKCache.scalar_type() == at::ScalarType::Float8_e4m3fn
+                || indexKCache.scalar_type() == at::ScalarType::Byte),
+        "Index-K cache must be CUDA torch.float8_e4m3fn (FP8) or torch.uint8 (NVFP4)");
+    bool const indexKNvfp4 = indexKCache.scalar_type() == at::ScalarType::Byte;
+    constexpr int64_t kNvfp4IndexBytesPerToken = kHeadDim / 2 + kHeadDim / 16;
+    int64_t const indexRowBytes = indexKNvfp4 ? kNvfp4IndexBytesPerToken : kHeadDim;
     TORCH_CHECK(indexKCache.dim() == 4 && indexKCache.size(1) == 1 && indexKCache.size(2) == kPageSize
-            && indexKCache.size(3) == kHeadDim,
-        "Index-K cache must be HND [num_pages, 1, 128, 128]");
+            && indexKCache.size(3) == indexRowBytes,
+        indexKNvfp4 ? "NVFP4 index-K cache must be the raw page [num_pages, 1, 128, 72] uint8"
+                    : "Index-K cache must be HND [num_pages, 1, 128, 128]");
     TORCH_CHECK(indexKCache.size(0) == kvDataCache.size(0),
         "Index-K and main NVFP4 caches must contain the same number of pages");
-    TORCH_CHECK(indexKCache.stride(3) == 1 && indexKCache.stride(2) == kHeadDim,
+    TORCH_CHECK(indexKCache.stride(3) == 1 && indexKCache.stride(2) == indexRowBytes,
         "Index-K cache must have contiguous token rows");
     TORCH_CHECK(
         indexKCache.stride(0) >= indexKCache.size(2) * indexKCache.stride(2), "Index-K cache pages must not overlap");
-    TORCH_CHECK(indexKCache.stride(0) % 4 == 0, "Index-K cache page stride must preserve 32-bit FP8 store alignment");
+    TORCH_CHECK(indexKCache.stride(0) % 4 == 0, "Index-K cache page stride must preserve 32-bit store alignment");
+    // NVFP4: E2M1 rows are 64 bytes apart and the scales start after the page's 128 rows.
+    int64_t const indexTokenStride = indexKNvfp4 ? kHeadDim / 2 : indexKCache.stride(2);
+    int64_t const indexScaleOffset = indexKNvfp4 ? kPageSize * (kHeadDim / 2) : -1;
     TORCH_CHECK(rotaryCosSin.dim() == 3 && rotaryCosSin.size(1) == 2 && rotaryCosSin.size(2) == kRotaryDim / 2,
         "rotary_cos_sin must be [max_positions, 2, rotary_dim/2]");
 
@@ -455,7 +466,7 @@ std::tuple<torch::Tensor, torch::Tensor> minimaxM3Nvfp4QKVIndexerNormRopeKVInser
         indexQOut.data_ptr(), kvDataCache.data_ptr(), kvScaleCache.data_ptr(), indexKCache.data_ptr(),
         outCacheLoc.data_ptr<int>(), kvQuantScale.data_ptr<float>(), kvDataCache.stride(0), kvDataCache.stride(1),
         kvDataCache.stride(2), kvDataCache.stride(3), kvScaleCache.stride(0), kvScaleCache.stride(1),
-        kvScaleCache.stride(2), indexKCache.stride(0), indexKCache.stride(2), kvDataCache.size(0),
+        kvScaleCache.stride(2), indexKCache.stride(0), indexTokenStride, indexScaleOffset, kvDataCache.size(0),
         static_cast<int>(kvDataCache.size(3)), static_cast<int>(numTokens), static_cast<int>(numHeadsQ),
         static_cast<int>(numHeadsKV), static_cast<int>(numHeadsIndex), static_cast<int>(headDim),
         static_cast<int>(rotaryDim), static_cast<float>(eps), qWeight.data_ptr(), kWeight.data_ptr(),

@@ -264,6 +264,30 @@ class KVCacheV2Scheduler(RequestScheduler):
         # Registered by PyExecutor; see set_async_transfer_manager.
         self._async_transfer_manager = None
 
+        # ARIA H17, opt-in (default off): SGLang-style "never mix" scheduling
+        # (SGLang enable_mixed_chunk=False). A step that would carry both
+        # context chunks and generation rows runs the context chunks alone
+        # (prefill first, as Scheduler.get_next_batch_to_run does); the
+        # generation rows run in the next step, which is decode-only and so
+        # replays the full decode CUDA graph. See _nomix_split.
+        self._nomix = os.environ.get("TRTLLM_ARIA_NO_MIX", "0") == "1"
+        # Separate only when at least this many generation rows would share
+        # the step (1 = never mix, SGLang's default).
+        self._nomix_min_gen = max(1, int(os.environ.get("TRTLLM_ARIA_NO_MIX_MIN_GEN", "1")))
+        # SGLang --prefill-decode-interval (default 0 = off): after a context
+        # step, run this many decode-only steps before admitting context again.
+        self._nomix_decode_interval = max(
+            0, int(os.environ.get("TRTLLM_ARIA_NO_MIX_DECODE_INTERVAL", "0"))
+        )
+        self._nomix_interval_remaining = 0
+        self._nomix_counts = Counter()
+        if self._nomix:
+            logger.info(
+                "[ARIA nomix] KVCacheV2Scheduler: never-mix scheduling enabled "
+                f"(prefill first; min_gen={self._nomix_min_gen}, "
+                f"decode_interval={self._nomix_decode_interval})"
+            )
+
     def set_async_transfer_manager(self, mgr) -> None:
         """Register the AsyncTransferManager the deadlock detector consults.
 
@@ -547,6 +571,24 @@ class KVCacheV2Scheduler(RequestScheduler):
                 requests_list, protected, inflight_request_ids, recompute_paused, preempted_ids
             )
 
+        # ARIA nomix: decide before phase 2 whether this step is context-only
+        # (prefill first) or decode-only (SGLang prefill_decode_interval hold).
+        nomix_ctx_first = False
+        nomix_gen_budget = None
+        ctx_candidates = pending_ctx
+        if self._nomix:
+            nomix_ctx_first, ctx_candidates = self._nomix_pre_phase2(
+                pending_ctx, scheduled_gen, exclusive_remote_mode
+            )
+            if nomix_ctx_first:
+                # The context chunks get the whole token budget. The generation
+                # rows still count toward the request cap (they resume next
+                # step, as SGLang's max_running_requests counts running ones)
+                # and keep their KV growth (a one-step reservation, so phase 2
+                # cannot take their pages) until the split below.
+                nomix_gen_budget = budget.num_tokens
+                budget.num_tokens = 0
+
         # --- Phase 2: schedule deferred context / encoder requests ---
         # Generation PEFT pages are now fully committed in the budget.
         #
@@ -566,7 +608,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         # is itself the progress in that case.
         deferred_behind_contributor = False
 
-        for req in pending_ctx:
+        for req in ctx_candidates:
             if budget.requests_full:
                 break
             # A radix probe cannot affect admission once the chunk token budget
@@ -654,6 +696,24 @@ class KVCacheV2Scheduler(RequestScheduler):
                 if first_new_block is not None:
                     contributed_blocks.add(first_new_block)
 
+        if nomix_ctx_first:
+            if scheduled_ctx or scheduled_encoder:
+                scheduled_gen = self._nomix_split(scheduled_gen, len(scheduled_ctx))
+            else:
+                # No context fit (KV, budget, prefix deferral): decode runs,
+                # as SGLang runs decode when get_new_batch_prefill is None.
+                budget.num_tokens = nomix_gen_budget
+                self._nomix_counts["ctx_none_decode"] += 1
+        if (
+            self._nomix
+            and self._nomix_decode_interval > 0
+            and (scheduled_ctx or scheduled_encoder)
+            and self.remote_tail_phase is None
+            and exclusive_remote_mode is None
+        ):
+            # SGLang _arm_prefill_decode_interval: armed by every prefill batch.
+            self._nomix_interval_remaining = self._nomix_decode_interval
+
         made_progress = bool(
             scheduled_gen
             or scheduled_ctx
@@ -692,6 +752,55 @@ class KVCacheV2Scheduler(RequestScheduler):
             disagg_candidates,
             has_chunking,
         )
+
+    # ---- ARIA nomix (never mix context and generation in one step) ----
+
+    def _nomix_pre_phase2(self, pending_ctx, scheduled_gen, exclusive_remote_mode):
+        """Mirror SGLang Scheduler.get_next_batch_to_run's prefill/decode choice.
+
+        Returns ``(ctx_first, ctx_candidates)``. SGLang tries a prefill batch
+        first and runs decode only when none can be built; its one starvation
+        bound for decode is ``prefill_decode_interval`` (``_should_defer_prefill``:
+        that many decode rounds after each prefill batch, counted down on every
+        scheduling call). Remote-tail (attention-DP CSA2) phases keep their own
+        separation and are left alone.
+        """
+        if self.remote_tail_phase is not None or exclusive_remote_mode is not None:
+            return False, pending_ctx
+        if self._nomix_interval_remaining > 0:
+            self._nomix_interval_remaining -= 1
+            if scheduled_gen:
+                self._nomix_counts["ctx_deferred"] += int(bool(pending_ctx))
+                return False, []
+        if not pending_ctx or len(scheduled_gen) < self._nomix_min_gen:
+            return False, pending_ctx
+        return True, pending_ctx
+
+    def _nomix_split(self, scheduled_gen: RequestList, num_ctx: int) -> RequestList:
+        """Drop the generation rows from a step that also runs context chunks.
+
+        Each dropped row gives back the KV growth phase 1 gave it (the same
+        revert the executor applies to a skipped attention-DP batch) and loses
+        its overlap bookkeeping (``py_batch_idx``): its previous step's sample
+        is harvested on the host while this context step runs, so its next
+        step reads the host token instead of a stale overlap tensor, as a
+        resumed or remote-tail-deferred request does.
+        """
+        for req in scheduled_gen:
+            self.kv_cache_manager.revert_allocate_generation(req)
+            if self._joint_draft_manager is not None:
+                self._joint_draft_manager.revert_allocate_generation(req)
+            self._clear_request_runtime_state(req)
+        counts = self._nomix_counts
+        counts["ctx_only"] += 1
+        counts["gen_rows_deferred"] += len(scheduled_gen)
+        if counts["ctx_only"] == 1 or counts["ctx_only"] % 1000 == 0:
+            logger.info(
+                f"[ARIA nomix] context-only step #{counts['ctx_only']}: ran {num_ctx} context "
+                f"request(s), deferred {len(scheduled_gen)} generation row(s) to the next step "
+                f"(totals: {dict(counts)})"
+            )
+        return []
 
     # ---- Prefix-aware skip ----
 

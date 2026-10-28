@@ -62,6 +62,7 @@ from ..modules.embedding import Embedding
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import (
     Linear,
+    MXFP8LinearMethod,
     TensorParallelMode,
     WeightMode,
     WeightsLoadingConfig,
@@ -74,7 +75,13 @@ from ..moe.fused_moe import MiniMaxM3MoeRoutingMethod, SwigluBiasActivation, cre
 from ..moe.fused_moe.interface import MoESchedulerKind
 from ..pyexecutor.breakable_cuda_graph import eager_on_graph, is_in_breakable_cuda_graph
 from ..speculative import SpecMetadata
-from ..utils import AuxStreamType, EventType, get_model_extra_attrs, is_torch_compiling
+from ..utils import (
+    AuxStreamType,
+    EventType,
+    Fp4QuantizedTensor,
+    get_model_extra_attrs,
+    is_torch_compiling,
+)
 from .checkpoints.base_weight_mapper import BaseWeightMapper
 from .checkpoints.hf.minimaxm3_weight_mapper import (
     MINIMAX_M3_PARAMS_MAP,
@@ -95,6 +102,111 @@ def _moe_routed_output_is_global(experts: nn.Module) -> bool:
     """Return whether the selected MoE backend performs fused communication."""
     backend = getattr(experts, "backend", experts)
     return getattr(backend, "scheduler_kind", None) == MoESchedulerKind.FUSED_COMM
+
+
+# ARIA decode fusion (opt-in, TRTLLM_ARIA_DECODE_FUSION=1): the MoE top-k finalize and the shared-expert add run as
+# one Triton kernel on the experts' unfinalized output, in place of the TRTLLM-gen finalize kernel (one CTA per row)
+# plus a torch add. Bitwise equal to the stock path: the same FP32 sum over the top-k slots in slot order (a BF16
+# weight times a BF16 row is exact in FP32, so FMA contraction cannot change it), one RNE rounding to BF16, then the
+# BF16 + BF16 add rounded once more, exactly as finalizeKernelVecLoad + shared_output.add_(routed_output) compute it.
+# The TP all-reduce + residual + RMSNorm that follows is unchanged. Rows above the cap keep the stock path.
+_ARIA_DECODE_FUSION = os.environ.get("TRTLLM_ARIA_DECODE_FUSION", "0") == "1"
+_ARIA_DECODE_FUSION_MAX_ROWS = int(os.environ.get("TRTLLM_ARIA_DECODE_FUSION_MAX_ROWS", "256"))
+_ARIA_FINALIZE_BLOCK = 1024
+_aria_finalize_kernel = None
+
+
+def _get_aria_finalize_kernel():
+    """Build the Triton finalize + shared-add kernel on first use (triton is imported lazily)."""
+    global _aria_finalize_kernel
+    if _aria_finalize_kernel is not None:
+        return _aria_finalize_kernel
+    import triton
+    import triton.language as tl
+
+    @triton.jit
+    def _m3_finalize_shared_add_kernel(
+        fc2_ptr,
+        fc2_row_stride,
+        weight_ptr,
+        index_ptr,
+        shared_ptr,
+        out_ptr,
+        HIDDEN: tl.constexpr,
+        TOP_K: tl.constexpr,
+        HAS_SHARED: tl.constexpr,
+        BLOCK: tl.constexpr,
+    ):
+        token = tl.program_id(0).to(tl.int64)
+        cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+        in_row = cols < HIDDEN
+        acc = tl.zeros([BLOCK], dtype=tl.float32)
+        for k in tl.static_range(TOP_K):
+            slot = tl.load(index_ptr + token * TOP_K + k)
+            scale = tl.load(weight_ptr + token * TOP_K + k).to(tl.float32)
+            valid = slot >= 0
+            row = tl.load(
+                fc2_ptr + slot.to(tl.int64) * fc2_row_stride + cols,
+                mask=in_row & valid,
+                other=0.0,
+            ).to(tl.float32)
+            acc = tl.where(valid, acc + scale * row, acc)
+        routed = acc.to(tl.bfloat16)
+        if HAS_SHARED:
+            shared = tl.load(shared_ptr + token * HIDDEN + cols, mask=in_row, other=0.0)
+            routed = (shared.to(tl.float32) + routed.to(tl.float32)).to(tl.bfloat16)
+        tl.store(out_ptr + token * HIDDEN + cols, routed, mask=in_row)
+
+    _aria_finalize_kernel = _m3_finalize_shared_add_kernel
+    return _aria_finalize_kernel
+
+
+def aria_moe_finalize_shared_add(
+    fc2_output: torch.Tensor,
+    expert_weights: torch.Tensor,
+    expanded_idx_to_permuted_idx: torch.Tensor,
+    shared_output: Optional[torch.Tensor],
+    num_rows: int,
+    hidden: int,
+) -> torch.Tensor:
+    """sum_k expert_weights[t, k] * fc2_output[expanded_idx_to_permuted_idx[t, k]] (+ shared_output[t]) as BF16.
+
+    Writes into ``shared_output`` when given (the stock path's ``shared_output.add_(routed)`` is in place too)."""
+    top_k = expanded_idx_to_permuted_idx.shape[-1]
+    out = shared_output if shared_output is not None else fc2_output.new_empty((num_rows, hidden))
+    if num_rows == 0:
+        return out
+    kernel = _get_aria_finalize_kernel()
+    grid = (num_rows, (hidden + _ARIA_FINALIZE_BLOCK - 1) // _ARIA_FINALIZE_BLOCK)
+    kernel[grid](
+        fc2_output,
+        fc2_output.stride(0),
+        expert_weights,
+        expanded_idx_to_permuted_idx,
+        out,
+        out,
+        HIDDEN=hidden,
+        TOP_K=top_k,
+        HAS_SHARED=shared_output is not None,
+        BLOCK=_ARIA_FINALIZE_BLOCK,
+        num_warps=4,
+    )
+    return out
+
+
+# ARIA MoE-boundary communication fusions (opt-in, default off):
+# - TRTLLM_ARIA_AR_NVFP4=1: the pre-MoE AllReduce + residual + RMSNorm also emits the routed experts' NVFP4 input
+#   (linear scale factors, the experts' static input scale) from the BF16 norm it writes, so the experts skip their own
+#   quantize. Bitwise equal to the standalone quantize of that norm. Forwards of at most
+#   TRTLLM_ARIA_AR_NVFP4_MAX_ROWS rows that the experts run in one chunk.
+# - TRTLLM_ARIA_MOE_AR=1: at the post-MoE boundary of generation-only forwards of at most TRTLLM_ARIA_MOE_AR_MAX_ROWS
+#   rows, the experts' top-k finalize, the shared-expert add, the TP all-reduce, the residual add, the next layer's
+#   RMSNorm and (where the next QKV projection is MXFP8) its MXFP8 input run as one one-shot kernel
+#   (trtllm::aria_moe_finalize_allreduce) with the stock path's rounding and the one-shot fusion kernel's CTA shape.
+_ARIA_AR_NVFP4 = os.environ.get("TRTLLM_ARIA_AR_NVFP4", "0") == "1"
+_ARIA_AR_NVFP4_MAX_ROWS = int(os.environ.get("TRTLLM_ARIA_AR_NVFP4_MAX_ROWS", "512"))
+_ARIA_MOE_AR = os.environ.get("TRTLLM_ARIA_MOE_AR", "0") == "1"
+_ARIA_MOE_AR_MAX_ROWS = int(os.environ.get("TRTLLM_ARIA_MOE_AR_MAX_ROWS", "128"))
 
 
 class MiniMaxM3QKVIndexerLinear(Linear):
@@ -418,9 +530,10 @@ def _validate_sparse_attention_runtime_config(
             raise ValueError(
                 "MiniMax-M3 fuse_qkv_index_projection=True requires the 'msa' implementation."
             )
-        if getattr(sparse_config, "indexer_kv_dtype", None) != "fp8":
+        if getattr(sparse_config, "indexer_kv_dtype", None) not in ("fp8", "nvfp4"):
             raise ValueError(
-                "MiniMax-M3 fuse_qkv_index_projection=True requires indexer_kv_dtype='fp8'."
+                "MiniMax-M3 fuse_qkv_index_projection=True requires indexer_kv_dtype='fp8' "
+                "or 'nvfp4'."
             )
         if (
             quant_config is None
@@ -433,6 +546,15 @@ def _validate_sparse_attention_runtime_config(
             raise ValueError(
                 "MiniMax-M3 fuse_qkv_index_projection=True requires an FP8 or NVFP4 main KV cache."
             )
+    if getattr(sparse_config, "indexer_kv_dtype", None) == "nvfp4" and (
+        quant_config is None
+        or quant_config.quant_mode is None
+        or not quant_config.quant_mode.has_fp4_kv_cache()
+    ):
+        raise ValueError(
+            "MiniMax-M3 indexer_kv_dtype='nvfp4' requires an NVFP4 main KV cache: the NVFP4 "
+            "horizontal producer is its only index-K writer."
+        )
 
 
 def get_moe_layer_ids(text_config: PretrainedConfig) -> Tuple[List[int], List[int]]:
@@ -830,6 +952,199 @@ class MiniMaxM3MoE(nn.Module):
         # ``maybe_execute_in_parallel`` runs fn0/fn1 sequentially.
         self.aux_stream = aux_stream_dict[AuxStreamType.MoeShared]
         self.event_dict = {key: torch.cuda.Event() for key in [EventType.Main, EventType.MoeShared]}
+        # TRTLLM_ARIA_DECODE_FUSION: None until the first forward decides whether this layer's experts can hand back
+        # the unfinalized (FC2 rows, routing weights, expanded_idx_to_permuted_idx) triple.
+        self._aria_unfinalized_ok: Optional[bool] = None
+        # Layer-static answers of the ARIA fusions, decided at the first forward that asks.
+        self._aria_routed_input_scale_reason: Optional[str] = None
+        self._aria_unfinalized_layer_ok: Optional[bool] = None
+
+    def _aria_backend_reason(self, need_unfinalized: bool) -> Optional[str]:
+        """Why the routed experts are not a plain single-rank-routing TRTLLM-gen NVFP4 MoE, or None."""
+        from ..moe.fused_moe import ConfigurableMoE
+        from ..moe.fused_moe.trtllm_gen.fp4_block_scale import TRTLLMGenNvfp4Base
+
+        experts = self.experts
+        if not isinstance(experts, ConfigurableMoE):
+            return f"experts {type(experts).__name__}"
+        backend = experts.backend
+        if not isinstance(backend, TRTLLMGenNvfp4Base) or getattr(backend, "use_flashinfer", False):
+            return f"backend {type(backend).__name__}"
+        if backend._routes_outside_the_kernel():
+            return "top-k computed outside the kernel"
+        if backend.w2_weight.shape[1] != self.hidden_dim:
+            return f"expert hidden size padded ({backend.w2_weight.shape[1]} != {self.hidden_dim})"
+        if backend.w3_w1_weight.shape[-1] * 2 != self.hidden_dim:
+            return f"expert input padded ({backend.w3_w1_weight.shape[-1] * 2} != {self.hidden_dim})"
+        if need_unfinalized and not backend.supports_unfinalized_output():
+            return f"backend {type(backend).__name__} finalizes in the kernel"
+        if (
+            self.routed_output_is_global
+            or self.use_dp
+            or getattr(experts, "comm", None) is not None
+            or getattr(experts, "layer_load_balancer", None) is not None
+            or getattr(experts, "apply_router_weight_on_input", False)
+            or getattr(experts, "unfinalized_combine_fn", None) is not None
+            or getattr(experts, "reduce_results", False)
+        ):
+            return "attention DP, communication strategy, EPLB, router weight on input or a finalize hook"
+        return None
+
+    def _aria_single_chunk(self, rows: int, attn_metadata: AttentionMetadata) -> bool:
+        all_rank_num_tokens = attn_metadata.all_rank_num_tokens
+        return (
+            self.experts.calculate_num_chunks(
+                list(all_rank_num_tokens) if all_rank_num_tokens is not None else [rows]
+            )
+            == 1
+        )
+
+    def aria_routed_input_scale(
+        self, hidden_states: torch.Tensor, attn_metadata: AttentionMetadata
+    ) -> Optional[torch.Tensor]:
+        """The routed experts' static NVFP4 input scale when this forward can take an NVFP4 input quantized upstream
+        (linear scale factors), else None. Shapes and configuration only, so every TP rank decides alike."""
+        if is_torch_compiling() or hidden_states.dim() != 2 or hidden_states.dtype != torch.bfloat16:
+            return None
+        if self._aria_routed_input_scale_reason is None:
+            reason = self._aria_backend_reason(need_unfinalized=False)
+            backend = getattr(self.experts, "backend", None)
+            if reason is None and getattr(backend, "fc31_act_scale", None) is not None:
+                reason = "NVFP4_AWQ pre-quant scale"
+            if reason is None and getattr(backend, "fc31_input_scale", None) is None:
+                reason = "fc31_input_scale is missing"
+            self._aria_routed_input_scale_reason = reason or "available"
+            logger.info_once(
+                f"ARIA AR NVFP4 (MiniMax-M3 routed-expert input from the pre-MoE AllReduce): "
+                f"{self._aria_routed_input_scale_reason}",
+                key="aria_ar_nvfp4_layer",
+            )
+        if self._aria_routed_input_scale_reason != "available":
+            return None
+        if not self._aria_single_chunk(int(hidden_states.shape[0]), attn_metadata):
+            return None
+        return self.experts.backend.fc31_input_scale
+
+    def aria_unfinalized_applies(
+        self,
+        hidden_states: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        lora_params: Optional[dict],
+    ) -> bool:
+        """Whether forward_unfinalized() can run this forward: a single-chunk BF16 forward without LoRA of a layer
+        whose experts hand back the unfinalized (FC2 rows, BF16 routing weights, expanded_idx_to_permuted_idx)
+        triple. Shapes and configuration only."""
+        if lora_params or is_torch_compiling():
+            return False
+        if hidden_states.dim() != 2 or hidden_states.dtype != torch.bfloat16:
+            return False
+        if self._aria_unfinalized_layer_ok is None:
+            reason = self._aria_backend_reason(need_unfinalized=True)
+            self._aria_unfinalized_layer_ok = reason is None
+            logger.info_once(
+                f"ARIA MoE AR (MiniMax-M3 finalize + all-reduce + norm fusion) layer check: {reason or 'available'}",
+                key="aria_moe_ar_layer",
+            )
+        if not self._aria_unfinalized_layer_ok:
+            return False
+        return self._aria_single_chunk(int(hidden_states.shape[0]), attn_metadata)
+
+    def forward_unfinalized(
+        self,
+        hidden_states: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        lora_params: Optional[dict] = None,
+        hidden_states_fp4: Optional[Fp4QuantizedTensor] = None,
+    ) -> Tuple[Optional[torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor]:
+        """(shared expert output, routed FC2 rows, routing weights, expanded_idx_to_permuted_idx), all TP partial
+        terms, of a forward whose finalize, shared add and all-reduce the caller fuses; only after
+        aria_unfinalized_applies()."""
+
+        def _compute_routed_output():
+            router_logits = self.gate(hidden_states)
+            return self.experts(
+                hidden_states if hidden_states_fp4 is None else hidden_states_fp4,
+                router_logits,
+                do_finalize=False,
+                output_dtype=hidden_states.dtype,
+                all_rank_num_tokens=attn_metadata.all_rank_num_tokens,
+                use_dp_padding=False,
+                lora_params=lora_params,
+            )
+
+        if self.shared_experts is None:
+            shared_output, routed = None, _compute_routed_output()
+        else:
+            routed, shared_output = maybe_execute_in_parallel(
+                _compute_routed_output,
+                lambda: self.shared_experts(hidden_states, lora_params=lora_params),
+                self.event_dict[EventType.Main],
+                self.event_dict[EventType.MoeShared],
+                self.aux_stream,
+                disable_on_compile=True,
+            )
+        fc2_output, expert_weights, expanded_idx_to_permuted_idx = routed
+        return shared_output, fc2_output, expert_weights, expanded_idx_to_permuted_idx
+
+    def _aria_unfinalized_reason(self) -> Optional[str]:
+        """Why this layer cannot run the ARIA finalize + shared-add kernel, or None. Layer-static."""
+        from ..moe.fused_moe import ConfigurableMoE
+        from ..moe.fused_moe.trtllm_gen.fp4_block_scale import TRTLLMGenNvfp4Base
+
+        experts = self.experts
+        if not isinstance(experts, ConfigurableMoE):
+            return f"experts {type(experts).__name__}"
+        backend = experts.backend
+        if not isinstance(backend, TRTLLMGenNvfp4Base) or getattr(backend, "use_flashinfer", False):
+            return f"backend {type(backend).__name__}"
+        if not backend.supports_unfinalized_output():
+            return f"backend {type(backend).__name__} finalizes in the kernel"
+        if backend._routes_outside_the_kernel():
+            return "top-k computed outside the kernel"
+        if backend.w2_weight.shape[1] != self.hidden_dim:
+            return f"expert hidden size padded ({backend.w2_weight.shape[1]} != {self.hidden_dim})"
+        if (
+            self.routed_output_is_global
+            or self.use_dp
+            or getattr(experts, "comm", None) is not None
+            or getattr(experts, "layer_load_balancer", None) is not None
+            or getattr(experts, "apply_router_weight_on_input", False)
+            or getattr(experts, "unfinalized_combine_fn", None) is not None
+            or getattr(experts, "reduce_results", False)
+        ):
+            return "attention DP, communication strategy, EPLB, router weight on input or a finalize hook"
+        return None
+
+    def _aria_fusion_applies(
+        self,
+        hidden_states: torch.Tensor,
+        all_rank_num_tokens: Optional[List[int]],
+        lora_params: Optional[dict],
+    ) -> bool:
+        """Whether this forward runs the ARIA finalize + shared-add kernel: opt-in, a single-chunk BF16 forward of at
+        most TRTLLM_ARIA_DECODE_FUSION_MAX_ROWS rows without LoRA. Shapes and configuration only."""
+        if not _ARIA_DECODE_FUSION or lora_params or is_torch_compiling():
+            return False
+        if hidden_states.dim() != 2 or hidden_states.dtype != torch.bfloat16:
+            return False
+        rows = int(hidden_states.shape[0])
+        if not 0 < rows <= _ARIA_DECODE_FUSION_MAX_ROWS or self.hidden_dim % 8 != 0:
+            return False
+        if self._aria_unfinalized_ok is None:
+            reason = self._aria_unfinalized_reason()
+            self._aria_unfinalized_ok = reason is None
+            if reason is not None:
+                logger.info_once(
+                    f"ARIA decode fusion off for MiniMax-M3 MoE: {reason}", key="aria_decode_fusion_off"
+                )
+        if not self._aria_unfinalized_ok:
+            return False
+        return (
+            self.experts.calculate_num_chunks(
+                list(all_rank_num_tokens) if all_rank_num_tokens is not None else [rows]
+            )
+            == 1
+        )
 
     def forward(
         self,
@@ -837,11 +1152,31 @@ class MiniMaxM3MoE(nn.Module):
         attn_metadata: AttentionMetadata,
         final_all_reduce_params: Optional[AllReduceParams] = None,
         lora_params: Optional[dict] = None,
+        hidden_states_fp4: Optional[Fp4QuantizedTensor] = None,
     ) -> torch.Tensor:
         all_rank_num_tokens = attn_metadata.all_rank_num_tokens
+        if self._aria_fusion_applies(hidden_states, all_rank_num_tokens, lora_params):
+            return self._aria_forward_fused_finalize(
+                hidden_states,
+                all_rank_num_tokens,
+                final_all_reduce_params,
+                lora_params,
+                hidden_states_fp4,
+            )
 
         def _compute_routed_output():
             router_logits = self.gate(hidden_states)
+            # hidden_states_fp4: the same activation quantized upstream (TRTLLM_ARIA_AR_NVFP4); the router and the
+            # shared expert keep the BF16 norm.
+            if hidden_states_fp4 is not None:
+                return self.experts(
+                    hidden_states_fp4,
+                    router_logits,
+                    output_dtype=hidden_states.dtype,
+                    all_rank_num_tokens=all_rank_num_tokens,
+                    use_dp_padding=False,
+                    lora_params=lora_params,
+                )
             return self.experts(
                 hidden_states,
                 router_logits,
@@ -877,6 +1212,57 @@ class MiniMaxM3MoE(nn.Module):
             result = shared_output.add_(routed_output)
 
         if self.allreduce is not None and not self.routed_output_is_global:
+            result = self.allreduce(result, all_reduce_params=final_all_reduce_params)
+        return result
+
+    def _aria_forward_fused_finalize(
+        self,
+        hidden_states: torch.Tensor,
+        all_rank_num_tokens: Optional[List[int]],
+        final_all_reduce_params: Optional[AllReduceParams],
+        lora_params: Optional[dict],
+        hidden_states_fp4: Optional[Fp4QuantizedTensor] = None,
+    ) -> torch.Tensor:
+        """forward() with the experts' finalize and the shared-expert add as one kernel (bitwise equal)."""
+
+        def _compute_routed_output():
+            router_logits = self.gate(hidden_states)
+            return self.experts(
+                hidden_states if hidden_states_fp4 is None else hidden_states_fp4,
+                router_logits,
+                do_finalize=False,
+                output_dtype=hidden_states.dtype,
+                all_rank_num_tokens=all_rank_num_tokens,
+                use_dp_padding=False,
+                lora_params=lora_params,
+            )
+
+        if self.shared_experts is None:
+            routed, shared_output = _compute_routed_output(), None
+        else:
+            routed, shared_output = maybe_execute_in_parallel(
+                _compute_routed_output,
+                lambda: self.shared_experts(hidden_states, lora_params=lora_params),
+                self.event_dict[EventType.Main],
+                self.event_dict[EventType.MoeShared],
+                self.aux_stream,
+                disable_on_compile=True,
+            )
+        fc2_output, expert_weights, expanded_idx_to_permuted_idx = routed
+        result = aria_moe_finalize_shared_add(
+            fc2_output,
+            expert_weights,
+            expanded_idx_to_permuted_idx,
+            shared_output,
+            int(hidden_states.shape[0]),
+            self.hidden_dim,
+        )
+        logger.info_once(
+            "ARIA decode fusion engaged: MiniMax-M3 MoE finalize + shared-expert add in one kernel "
+            f"(TRTLLM_ARIA_DECODE_FUSION=1, rows <= {_ARIA_DECODE_FUSION_MAX_ROWS})",
+            key="aria_decode_fusion_engaged",
+        )
+        if self.allreduce is not None:
             result = self.allreduce(result, all_reduce_params=final_all_reduce_params)
         return result
 
@@ -1524,14 +1910,16 @@ class MiniMaxM3Attention(Attention):
             not self.enable_fused_qkv_index_projection
             or not isinstance(self.attn, MiniMaxM3MsaSparseAttention)
             or not (self.main_kv_is_fp8 or self.main_kv_is_nvfp4)
-            or self.attn.indexer_kv_dtype != "fp8"
+            or self.attn.indexer_kv_dtype not in ("fp8", "nvfp4")
             or packed.dtype != torch.bfloat16
             or position_ids is None
         ):
+            self._require_no_nvfp4_index_k()
             return None
         kv_cache_manager = attn_metadata.kv_cache_manager
         if cache_tensors is None:
             if kv_cache_manager is None:
+                self._require_no_nvfp4_index_k()
                 return None
             buffers = kv_cache_manager.get_buffers(self.layer_idx, kv_layout="HND")
             index_k_cache = attn_metadata.msa_idx_k_cache(self.layer_idx)
@@ -1540,14 +1928,17 @@ class MiniMaxM3Attention(Attention):
         else:
             buffers, index_k_cache, scale_buffers, out_cache_loc = cache_tensors
         if out_cache_loc is None:
+            self._require_no_nvfp4_index_k()
             return None
         plan = self._fused_producer_plan(
             kv_cache_manager, buffers, index_k_cache, scale_buffers, out_cache_loc
         )
         if plan is None:
+            self._require_no_nvfp4_index_k()
             return None
         num_tokens = int(packed.shape[0])
         if out_cache_loc.numel() < num_tokens:
+            self._require_no_nvfp4_index_k()
             return None
         layer_uses_nvfp4, main_cache, scale_buffers, kv_quant_scale, static_args = plan
         positions = position_ids.reshape(-1).contiguous().to(torch.int32)
@@ -1572,6 +1963,19 @@ class MiniMaxM3Attention(Attention):
                 positions,
             )
         return q.flatten(1), index_q.flatten(1)
+
+    def _require_no_nvfp4_index_k(self) -> None:
+        """Fail where NVFP4 index-K would need a fallback: only the fused producer writes it."""
+        if (
+            isinstance(self.attn, MiniMaxM3MsaSparseAttention)
+            and self.attn.indexer_kv_dtype == "nvfp4"
+        ):
+            raise RuntimeError(
+                f"MiniMax-M3 layer {self.layer_idx}: indexer_kv_dtype='nvfp4' requires the fused "
+                "NVFP4 horizontal producer (fuse_qkv_index_projection=True, BF16 activations, "
+                "position ids, an NVFP4 main KV cache and the M3 head geometry); it is the only "
+                "NVFP4 index-K writer."
+            )
 
     def _fused_producer_plan(
         self,
@@ -1694,14 +2098,20 @@ class MiniMaxM3Attention(Attention):
                 and buffers.stride(0) % 4 == 0
                 and buffers.stride(1) % 4 == 0
             )
+        # E4M3 index-K [pages, 1, 128, 128], or (NVFP4 main KV only) the raw NVFP4 index-K page
+        # [pages, 1, 128, 72] uint8 the producer quantizes into.
+        index_row_bytes = 72 if index_k_cache.dtype == torch.uint8 else 128
         supported_index_cache = (
             index_k_cache.is_cuda
-            and index_k_cache.dtype == torch.float8_e4m3fn
+            and (
+                index_k_cache.dtype == torch.float8_e4m3fn
+                or (index_k_cache.dtype == torch.uint8 and layer_uses_nvfp4)
+            )
             and index_k_cache.dim() == 4
-            and tuple(index_k_cache.shape[1:]) == (1, 128, 128)
+            and tuple(index_k_cache.shape[1:]) == (1, 128, index_row_bytes)
             and index_k_cache.stride(3) == 1
-            and index_k_cache.stride(2) == 128
-            and index_k_cache.stride(1) >= 128 * 128
+            and index_k_cache.stride(2) == index_row_bytes
+            and index_k_cache.stride(1) >= 128 * index_row_bytes
             and index_k_cache.stride(0) >= index_k_cache.stride(1)
             and index_k_cache.stride(0) % 4 == 0
             and index_k_cache.stride(1) % 4 == 0
@@ -2192,7 +2602,7 @@ class MiniMaxM3Attention(Attention):
                 self.attn.write_layer_caches(
                     k, v, idx_k, attn_metadata, kv_scale_orig_quant=kv_scale_orig_quant
                 )
-                if self.attn.indexer_kv_dtype == "fp8":
+                if self.attn.indexer_kv_dtype in ("fp8", "nvfp4"):
                     # The FP8 indexer accepts only an already-populated cache.
                     idx_k = None
             else:
@@ -2281,7 +2691,7 @@ class MiniMaxM3Attention(Attention):
                 and is_torch_compiling()
                 and isinstance(self.attn, MiniMaxM3MsaSparseAttention)
                 and (self.main_kv_is_fp8 or self.main_kv_is_nvfp4)
-                and self.attn.indexer_kv_dtype == "fp8"
+                and self.attn.indexer_kv_dtype in ("fp8", "nvfp4")
             ):
                 # Metadata stages these zero-copy views before compilation;
                 # tracing the cache manager's native pointer access is unsafe.
@@ -2636,6 +3046,31 @@ class MiniMaxM3DecoderLayer(DecoderLayer):
         # next layer's input_layernorm (or the final model norm for the last
         # layer). None disables POST fusion and boundary-norm folding.
         self.next_layer_layernorm: Optional[RMSNorm] = None
+        # The next layer's QKV projection when it is MXFP8 (setup_aliases).
+        # The POST-fusion AllReduce then also emits the boundary norm in MXFP8,
+        # so that projection skips its own activation quantization.
+        self.next_layer_qkv_proj: Optional[Linear] = None
+
+        # TRTLLM_ARIA_MOE_AR: the one-shot finalize kernel shares the boundary AllReduce's Lamport workspace, so it
+        # runs only where that AllReduce is the custom IPC one (AUTO / ONESHOT on one NVLink node).
+        self.aria_moe_ar_max_rows = 0
+        if (
+            _ARIA_MOE_AR
+            and self.block_sparse_moe is not None
+            and self.post_feed_forward_fusion
+            and self.allreduce is not None
+            and model_config.allreduce_strategy in (AllReduceStrategy.AUTO, AllReduceStrategy.ONESHOT)
+            and self.mapping.tp_size in (2, 4, 8)
+            and not self.mapping.is_multi_node()
+        ):
+            from ..distributed.allreduce_helper import CustomAllReduceHelper
+
+            # The Lamport comm buffer holds tp_size x rows x hidden BF16 values per rank and is sized
+            # max_workspace_size_auto x tp_size bytes.
+            ws_rows = CustomAllReduceHelper.max_workspace_size_auto(
+                self.mapping.tp_size, support_deterministic=False
+            ) // (2 * config.hidden_size)
+            self.aria_moe_ar_max_rows = min(_ARIA_MOE_AR_MAX_ROWS, ws_rows)
 
     def forward(
         self,
@@ -2670,6 +3105,10 @@ class MiniMaxM3DecoderLayer(DecoderLayer):
             lora_params=lora_params,
             **kwargs,
         )
+        if isinstance(self.self_attn.qkv_proj.quant_method, MXFP8LinearMethod):
+            # The previous layer may have offered a quantized input that this
+            # attention did not project (e.g. a padded or compiled path).
+            MXFP8LinearMethod.withdraw_quantized_input(self.self_attn.qkv_proj)
 
         if spec_metadata is not None and spec_metadata.is_layer_capture(self.layer_idx):
             # Eagle3 captures this layer's raw output, so keep the feed-forward
@@ -2735,6 +3174,24 @@ class MiniMaxM3DecoderLayer(DecoderLayer):
         """
         if self.next_layer_layernorm is None:
             return hidden_states, residual
+        if self.post_feed_forward_fusion and self._quantizes_next_layer_input():
+            # The boundary norm feeds only the next layer's MXFP8 QKV
+            # projection: quantize it in the AllReduce epilogue, bit for bit
+            # as the projection's own MXFP8 quantization would.
+            hidden_states, act_e4m3, act_sf, residual = self.allreduce(
+                hidden_states,
+                all_reduce_params=AllReduceParams(
+                    fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_MXFP8,
+                    residual=residual,
+                    norm_weight=self.next_layer_layernorm.weight,
+                    eps=self.next_layer_layernorm.variance_epsilon,
+                    trigger_completion_at_end=False,
+                ),
+            )
+            MXFP8LinearMethod.offer_quantized_input(
+                self.next_layer_qkv_proj, hidden_states, act_e4m3, act_sf
+            )
+            return hidden_states, residual
         if self.post_feed_forward_fusion:
             return self.allreduce(
                 hidden_states,
@@ -2747,6 +3204,149 @@ class MiniMaxM3DecoderLayer(DecoderLayer):
                 ),
             )
         return self.next_layer_layernorm(hidden_states, residual)
+
+    def _quantizes_next_layer_input(self) -> bool:
+        """Whether the POST-fusion AllReduce also emits the next layer's MXFP8 QKV input.
+
+        Every strategy but UB reaches a kernel or fallback that emits MXFP8.
+        MNNVL has no MXFP8 epilogue and would hand the op to the generic
+        AllReduce instead of its own fused add+RMSNorm, so it keeps the plain
+        fusion. The one/two-shot kernels quantize a 32-element block across
+        four adjacent threads of one CTA, which a hidden size that is a
+        multiple of 256 guarantees for every cluster split.
+        """
+        qkv_proj = self.next_layer_qkv_proj
+        return (
+            qkv_proj is not None
+            and isinstance(qkv_proj.quant_method, MXFP8LinearMethod)
+            and qkv_proj.quant_method.use_cutlass
+            and qkv_proj.in_features % 256 == 0
+            and self.allreduce is not None
+            and self.allreduce.strategy != AllReduceStrategy.UB
+            and getattr(self.allreduce, "mnnvl_allreduce", None) is None
+        )
+
+    def _apply_pre_moe_norm(
+        self,
+        hidden_states: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        residual: torch.Tensor,
+    ) -> Tuple[torch.Tensor, Optional[Fp4QuantizedTensor], torch.Tensor]:
+        """_apply_pre_feed_forward_norm, plus (TRTLLM_ARIA_AR_NVFP4) the routed experts' NVFP4 input.
+
+        The fused AllReduce + residual + RMSNorm epilogue quantizes the BF16 norm it writes with the experts' static
+        input scale and linear scale factors, exactly as the experts' own fp4_quantize(norm, scale, 16, False, False)
+        would; the router and the shared expert read the BF16 norm. The FP4 tensor is None where this does not apply.
+        """
+        scale = None
+        if (
+            _ARIA_AR_NVFP4
+            and self.pre_feed_forward_fusion
+            and 0 < hidden_states.shape[0] <= _ARIA_AR_NVFP4_MAX_ROWS
+            and self.allreduce.strategy != AllReduceStrategy.UB
+            and getattr(self.allreduce, "mnnvl_allreduce", None) is None
+            and self.post_attention_layernorm.weight.dtype == hidden_states.dtype
+        ):
+            scale = self.block_sparse_moe.aria_routed_input_scale(hidden_states, attn_metadata)
+        if scale is None:
+            hidden_states, residual = self._apply_pre_feed_forward_norm(hidden_states, residual)
+            return hidden_states, None, residual
+        norm_out, act_fp4, act_sf, residual = self.allreduce(
+            hidden_states,
+            all_reduce_params=AllReduceParams(
+                fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4_LINEAR_SF,
+                residual=residual,
+                norm_weight=self.post_attention_layernorm.weight,
+                scale=scale,
+                eps=self.post_attention_layernorm.variance_epsilon,
+                trigger_completion_at_end=False,
+            ),
+        )
+        logger.info_once(
+            "ARIA AR NVFP4 engaged: MiniMax-M3 routed-expert NVFP4 input emitted by the pre-MoE AllReduce "
+            f"(TRTLLM_ARIA_AR_NVFP4=1, rows <= {_ARIA_AR_NVFP4_MAX_ROWS})",
+            key="aria_ar_nvfp4_engaged",
+        )
+        return norm_out, Fp4QuantizedTensor(act_fp4, act_sf, is_sf_swizzled=False), residual
+
+    def _aria_moe_ar_applies(
+        self,
+        hidden_states: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        spec_metadata: Optional[SpecMetadata],
+        lora_params: Optional[dict],
+    ) -> bool:
+        """Whether this post-MoE boundary runs _aria_moe_finalize_allreduce_norm: a generation-only forward of at most
+        aria_moe_ar_max_rows rows on a POST-fusion boundary with a plain BF16 next-layer norm. Shapes and
+        configuration only, so every TP rank decides alike."""
+        if (
+            self.aria_moe_ar_max_rows <= 0
+            or not self.post_feed_forward_fusion
+            or self.next_layer_layernorm is None
+            or attn_metadata.num_contexts != 0
+            or (spec_metadata is not None and spec_metadata.is_layer_capture(self.layer_idx))
+        ):
+            return False
+        rows = int(hidden_states.shape[0])
+        if not 0 < rows <= self.aria_moe_ar_max_rows:
+            return False
+        weight = self.next_layer_layernorm.weight
+        if (
+            getattr(self.next_layer_layernorm, "use_gemma", False)
+            or weight.dtype != torch.bfloat16
+            or weight.dim() != 1
+            or weight.shape[0] != hidden_states.shape[-1]
+            or hidden_states.shape[-1] % 32 != 0
+            or getattr(self.allreduce, "workspace", None) is None
+            or getattr(self.allreduce, "mnnvl_allreduce", None) is not None
+        ):
+            return False
+        return self.block_sparse_moe.aria_unfinalized_applies(hidden_states, attn_metadata, lora_params)
+
+    def _aria_moe_finalize_allreduce_norm(
+        self,
+        hidden_states: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        residual: torch.Tensor,
+        lora_params: Optional[dict],
+        hidden_states_fp4: Optional[Fp4QuantizedTensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """(normed, updated residual) of the MoE block and the next layer's input_layernorm in one kernel: the
+        experts' top-k sum rounded to BF16, the shared-expert add rounded to BF16 (the stock finalize + add_), the
+        TP all-reduce, the residual add, the RMSNorm and, where the next QKV projection takes it, its MXFP8 input."""
+        shared_output, fc2_output, expert_weights, expanded_idx_to_permuted_idx = (
+            self.block_sparse_moe.forward_unfinalized(
+                hidden_states, attn_metadata, lora_params, hidden_states_fp4
+            )
+        )
+        norm = self.next_layer_layernorm
+        mxfp8_out = self._quantizes_next_layer_input()
+        outputs = torch.ops.trtllm.aria_moe_finalize_allreduce(
+            fc2_output,
+            residual if residual.is_contiguous() else residual.contiguous(),
+            norm.weight,
+            expanded_idx_to_permuted_idx,
+            shared_output,
+            expert_weights,
+            self.allreduce.workspace,
+            self.mapping.tp_rank,
+            self.mapping.tp_size,
+            norm.variance_epsilon,
+            mxfp8_out,
+            self.aria_moe_ar_max_rows,
+        )
+        logger.info_once(
+            "ARIA MoE AR engaged: MiniMax-M3 MoE finalize + shared add + all-reduce + residual + RMSNorm"
+            f"{' + MXFP8' if mxfp8_out else ''} in one kernel (TRTLLM_ARIA_MOE_AR=1, rows <= "
+            f"{self.aria_moe_ar_max_rows})",
+            key="aria_moe_ar_engaged",
+        )
+        if mxfp8_out:
+            normed, act_e4m3, act_sf, residual = outputs
+            MXFP8LinearMethod.offer_quantized_input(self.next_layer_qkv_proj, normed, act_e4m3, act_sf)
+            return normed, residual
+        normed, residual = outputs
+        return normed, residual
 
     def _feed_forward_all_reduce_params(self) -> Optional[AllReduceParams]:
         """AllReduce params handed to the MoE or dense-MLP output projection.
@@ -2767,13 +3367,21 @@ class MiniMaxM3DecoderLayer(DecoderLayer):
         spec_metadata: Optional[SpecMetadata] = None,
         lora_params: Optional[dict] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        hidden_states, residual = self._apply_pre_feed_forward_norm(hidden_states, residual)
+        hidden_states, hidden_states_fp4, residual = self._apply_pre_moe_norm(
+            hidden_states, attn_metadata, residual
+        )
+
+        if self._aria_moe_ar_applies(hidden_states, attn_metadata, spec_metadata, lora_params):
+            return self._aria_moe_finalize_allreduce_norm(
+                hidden_states, attn_metadata, residual, lora_params, hidden_states_fp4
+            )
 
         hidden_states = self.block_sparse_moe(
             hidden_states,
             attn_metadata,
             final_all_reduce_params=self._feed_forward_all_reduce_params(),
             lora_params=lora_params,
+            hidden_states_fp4=hidden_states_fp4,
         )
 
         if spec_metadata is not None and spec_metadata.is_layer_capture(self.layer_idx):
@@ -3083,6 +3691,10 @@ class MiniMaxM3ForCausalLM(SpecDecOneEngineForCausalLM[MiniMaxM3Model, Pretraine
                 layer.next_layer_layernorm = self.model.norm
             else:
                 layer.next_layer_layernorm = layers[idx + 1].input_layernorm
+                next_attention = getattr(layers[idx + 1], "self_attn", None)
+                next_qkv_proj = getattr(next_attention, "qkv_proj", None)
+                if isinstance(getattr(next_qkv_proj, "quant_method", None), MXFP8LinearMethod):
+                    layer.next_layer_qkv_proj = next_qkv_proj
 
 
 def _strip_language_model_prefix(

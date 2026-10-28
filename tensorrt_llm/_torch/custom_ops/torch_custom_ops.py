@@ -841,6 +841,110 @@ def _choose_mxfp8_tactic(custom_op: str, runner: TunableRunner,
     return tactic
 
 
+# TRTLLM_ARIA_LOWM_GEMM=1: decode-graph MXFP8 GEMMs with 33-256 rows run
+# FlashInfer's CuTeDSL GEMM with a fixed swap-AB tactic (MXFP8LowMGemm)
+# instead of the bucket's AutoTuner choice.
+_ARIA_LOWM_GEMM = os.environ.get("TRTLLM_ARIA_LOWM_GEMM", "0") == "1"
+
+
+class MXFP8LowMGemm:
+    """FlashInfer's CuTeDSL MXFP8 GEMM with a fixed tactic for decode-sized M.
+
+    A decode-sized GEMM streams its weight once and is bound by the bytes its
+    CTAs keep in flight, so its time follows the CTA count. FlashInfer's
+    heuristic 128x128 tile launches one CTA per 128 output columns (39 for a
+    4992-wide projection). Swapping A and B puts the weight rows on a 2-CTA
+    256-row MMA tile and the tokens on 64-row tiles; 128-row token tiles take
+    over once 64-row ones would exceed one wave.
+
+    The AutoTuner cannot rank these tactics: it profiles with the weight
+    L2-resident, while a decode step streams it from HBM. Every tactic here
+    keeps the whole K reduction in one CTA (no split-K), so the output is
+    bitwise identical to the heuristic tactic and to the CUTLASS backend.
+    """
+
+    MIN_M = 33
+    MAX_M = 256
+    _SM_VERSIONS = (100, 103)
+    _tactic_cache: ClassVar[dict] = {}
+    _logged: ClassVar[bool] = False
+
+    @staticmethod
+    @lru_cache(maxsize=None)
+    def _runner(output_dtype: torch.dtype) -> TunableRunner:
+        from flashinfer.gemm.gemm_base import _cute_dsl_gemm_mxfp8_runner
+        major, minor = torch.cuda.get_device_capability()
+        return _cute_dsl_gemm_mxfp8_runner(major, minor, True, output_dtype)
+
+    @staticmethod
+    @lru_cache(maxsize=None)
+    def _num_sms(device_index: int) -> int:
+        return torch.cuda.get_device_properties(
+            device_index).multi_processor_count
+
+    @staticmethod
+    def candidate_tactic(m: int, n: int, num_sms: int) -> Optional[tuple]:
+        """The (mma tile, cluster, swap_ab, prefetch, split-K) tactic for an M x N output.
+
+        None when even 128-row token tiles need more than one wave of CTAs.
+        """
+        weight_tiles = -(-n // 128)
+        for tile_m in (64, 128):
+            if weight_tiles * -(-m // tile_m) <= num_sms:
+                return ((256, tile_m), (2, 1), True, False, 1)
+        return None
+
+    @staticmethod
+    def _flashinfer_inputs(inputs: List[torch.Tensor],
+                           out: torch.Tensor) -> list:
+        act, act_scale, weight, weight_scale = inputs
+        return [act, weight.t(), act_scale, weight_scale, None, out, None]
+
+    @classmethod
+    def tactic(cls, inputs: List[torch.Tensor],
+               output_dtype: torch.dtype) -> Optional[tuple]:
+        """The fixed tactic for ``[act, act_scale, weight, weight_scale]``, or None."""
+        act, _, weight, _ = inputs
+        m = act.shape[0]
+        if (not _ARIA_LOWM_GEMM or not IS_FLASHINFER_MXFP8_CUTE_DSL_AVAILABLE
+                or not cls.MIN_M <= m <= cls.MAX_M
+                or output_dtype not in (torch.bfloat16, torch.float16)
+                or get_sm_version() not in cls._SM_VERSIONS):
+            return None
+        n, k = weight.shape
+        device_index = act.device.index
+        key = (m, n, k, output_dtype, device_index)
+        if key not in cls._tactic_cache:
+            tactic = cls.candidate_tactic(m, n, cls._num_sms(device_index))
+            if tactic is not None:
+                probe_out = torch.empty((m, n),
+                                        dtype=output_dtype,
+                                        device="meta")
+                valid = cls._runner(output_dtype).get_valid_tactics(
+                    cls._flashinfer_inputs(inputs, probe_out), None)
+                if tactic not in valid:
+                    tactic = None
+            cls._tactic_cache[key] = tactic
+            if tactic is not None and not cls._logged:
+                cls._logged = True
+                logger.info(
+                    f"[ARIA lowm] TRTLLM_ARIA_LOWM_GEMM=1: decode MXFP8 "
+                    f"GEMMs with {cls.MIN_M}-{cls.MAX_M} rows run the "
+                    f"swap-AB CuTeDSL tactic (first M={m} N={n} K={k} "
+                    f"tactic={tactic})")
+        return cls._tactic_cache[key]
+
+    @classmethod
+    def run(cls, inputs: List[torch.Tensor], output_dtype: torch.dtype,
+            tactic: tuple) -> torch.Tensor:
+        act, _, weight, _ = inputs
+        out = act.new_empty((act.shape[0], weight.shape[0]),
+                            dtype=output_dtype)
+        cls._runner(output_dtype).forward(cls._flashinfer_inputs(inputs, out),
+                                          tactic=tactic)
+        return out
+
+
 def mxfp8_quantize_gemm_autotuned(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -855,8 +959,29 @@ def mxfp8_quantize_gemm_autotuned(
         quantize_inputs,
         tactic=_choose_mxfp8_tactic(_MXFP8_QUANTIZE_AUTOTUNED_OP,
                                     quantize_runner, quantize_inputs, tune))
-    gemm_runner = FlashInferMXFP8GemmRunner(output_dtype)
+    return mxfp8_prequantized_gemm_autotuned(act, act_scale, weight,
+                                             weight_scale, output_dtype, tune)
+
+
+def mxfp8_prequantized_gemm_autotuned(
+    act: torch.Tensor,
+    act_scale: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    output_dtype: torch.dtype,
+    tune: bool = False,
+) -> torch.Tensor:
+    """The GEMM stage of ``mxfp8_quantize_gemm_autotuned`` for an activation quantized upstream.
+
+    ``act_scale`` uses the swizzled layout of ``trtllm::mxfp8_quantize``.
+    It runs the bucket's tuned FlashInfer backend, or MXFP8LowMGemm's fixed
+    tactic where that applies.
+    """
     gemm_inputs = [act, act_scale, weight, weight_scale]
+    low_m_tactic = MXFP8LowMGemm.tactic(gemm_inputs, output_dtype)
+    if low_m_tactic is not None:
+        return MXFP8LowMGemm.run(gemm_inputs, output_dtype, low_m_tactic)
+    gemm_runner = FlashInferMXFP8GemmRunner(output_dtype)
     return gemm_runner(gemm_inputs,
                        tactic=_choose_mxfp8_tactic(
                            _FLASHINFER_MXFP8_GEMM_AUTOTUNED_OP, gemm_runner,
@@ -3027,13 +3152,27 @@ def _(
         scale_fp4 = input.new_empty(scale_shape, dtype=torch.uint8)
         residual_out = torch.empty_like(input)
         return [quant_fp4, scale_fp4, residual_out]
-    elif op == int(AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4):
-        fp4_shape, scale_shape = fp4_utils.get_fp4_shape(input.shape, 16)
+    elif op in (
+            int(AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4),
+            int(AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4_LINEAR_SF)):
+        swizzled = op == int(
+            AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4)
+        fp4_shape, scale_shape = fp4_utils.get_fp4_shape(
+            input.shape, 16, swizzled)
         quant_fp4 = input.new_empty(fp4_shape, dtype=torch.uint8)
         scale_fp4 = input.new_empty(scale_shape, dtype=torch.uint8)
         norm_out = torch.empty_like(input)
         residual_out = torch.empty_like(input)
         return [norm_out, quant_fp4, scale_fp4, residual_out]
+    elif op in (int(AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_MXFP8),
+                int(AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_MXFP8)):
+        quant_out = torch.empty_like(input, dtype=torch.float8_e4m3fn)
+        scale_out = input.new_empty(fp4_utils.get_fp4_shape(input.shape, 32)[1],
+                                    dtype=torch.uint8)
+        outputs = [quant_out, scale_out, torch.empty_like(input)]
+        if op == int(AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_MXFP8):
+            outputs.insert(0, torch.empty_like(input))
+        return outputs
     else:
         return [torch.empty_like(input)]
 

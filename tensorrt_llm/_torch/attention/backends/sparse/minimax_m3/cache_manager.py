@@ -56,6 +56,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
 )
 
 from .common import get_sparse_disable_index_value_layer_ids, get_sparse_layer_ids
+from .kernels import msa_v1_indexer
 
 if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
@@ -258,6 +259,13 @@ def arm_msa_kv_cache_fixes() -> None:
 # The MiniMax-M3.1 sm_107 routing turns this off (msa_indexer.arm_sm107_msa_paths): those targets keep both.
 NVFP4_POOLLESS = True
 
+# NVFP4 index-K (indexer_kv_dtype="nvfp4") has two writer/reader pairs over the same 72 B-per-token pages. By default
+# the built-in model's fused producer writes the pages and the MSA-v1 Q8KV4 indexer reads them through the
+# (data, scale) views this manager serves (index_k_is_nvfp4). The MiniMax-M3.1 sm_107 routing sets this
+# (msa_indexer.arm_sm107_msa_paths): those targets write through an FP8 sink and pack and read the raw uint8 pages
+# themselves (kernels/nvfp4_index_k).
+NVFP4_INDEX_K_SINK = False
+
 
 def derive_shared_draft_layout(
     num_layers: Optional[int],
@@ -443,6 +451,14 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
             )
         super().__init__(*args, **kwargs)
         self._unchanged_copies: dict[int, _UnchangedCopy] = {}
+        if self.index_k_is_nvfp4 and self.dtype != DataType.NVFP4:
+            raise ValueError(
+                "MiniMax-M3 indexer_kv_dtype='nvfp4' requires an NVFP4 main KV cache "
+                "(kv_cache_config.dtype='nvfp4'): its fused producer is the only NVFP4 "
+                "index-K writer."
+            )
+        if self.index_k_is_nvfp4:
+            msa_v1_indexer.require_q8kv4()
 
         if self.dtype == DataType.NVFP4:
             dense_target_layers = [
@@ -478,9 +494,22 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         # nanobind methods that Dynamo cannot trace from the fused FP8 indexer.
         kv_layout = self._main_kv_layout_name()
         self._index_k_buffers: dict[int, Optional[torch.Tensor]] = {}
+        self._index_k_nvfp4: dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
         self._index_v_buffers: dict[int, torch.Tensor] = {}
         for layer_idx in self.sparse_layer_ids:
             if layer_idx not in self.layer_offsets:
+                continue
+            if self.index_k_is_nvfp4:
+                raw = super().get_index_k_buffer(
+                    layer_idx,
+                    num_heads=1,
+                    head_dim=msa_v1_indexer.NVFP4_INDEX_K_BYTES_PER_TOKEN,
+                    dtype=torch.uint8,
+                    kv_layout=kv_layout,
+                )
+                self._index_k_buffers[layer_idx] = raw
+                if raw is not None:
+                    self._index_k_nvfp4[layer_idx] = msa_v1_indexer.split_nvfp4_index_k(raw)
                 continue
             self._index_k_buffers[layer_idx] = super().get_index_k_buffer(
                 layer_idx,
@@ -505,7 +534,7 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         # are packed from it after its producer (kernels/nvfp4_index_k.write_from_sink). The index-K pool must
         # address the same pages as the main pool: the producer's slot is the index-K slot.
         self._nvfp4_index_k_sink: Optional[torch.Tensor] = None
-        if self.indexer_kv_dtype == "nvfp4" and self._index_k_buffers:
+        if self.indexer_kv_dtype == "nvfp4" and NVFP4_INDEX_K_SINK and self._index_k_buffers:
             main_pages = {
                 int(self.get_buffers(layer_idx, kv_layout).shape[0])
                 for layer_idx in self._index_k_buffers
@@ -584,6 +613,8 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         if data_role == Role.INDEX_KEY:
             if not has_index_k:
                 return 0
+            if self.index_k_is_nvfp4:
+                return msa_v1_indexer.NVFP4_INDEX_K_BYTES_PER_TOKEN
             index_dtype = self._torch_dtype_for_index_cache()
             index_elem_bytes = torch.empty(0, dtype=index_dtype, device="cpu").element_size()
             return self._index_cache_row_elems() * index_elem_bytes
@@ -899,12 +930,19 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         kv_factor = 1 if self.kv_cache_type == CacheTypeCpp.SELFKONLY else 2
         return int((page_upper // kv_factor) * self.tokens_per_block)
 
+    @property
+    def index_k_is_nvfp4(self) -> bool:
+        """Whether index-K is stored as NVFP4 and served as Q8KV4 (data, scale) views (see kernels/msa_v1_indexer.py
+        for the page layout). False on the sm_107 targets, which use the FP8 sink instead (NVFP4_INDEX_K_SINK)."""
+        return self.indexer_kv_dtype == "nvfp4" and not NVFP4_INDEX_K_SINK
+
     def _torch_dtype_for_index_cache(self) -> torch.dtype:
-        """Return the independently configured index-cache storage dtype."""
-        if self.indexer_kv_dtype == "fp8":
-            return torch.float8_e4m3fn
-        if self.indexer_kv_dtype == "nvfp4":
+        """Return the element dtype index Q is scored in (and FP8/BF16 index-K is stored in)."""
+        if self.indexer_kv_dtype == "nvfp4" and NVFP4_INDEX_K_SINK:
+            # The sm_107 targets allocate the raw NVFP4 pages through the generic index-K path.
             return torch.uint8
+        if self.indexer_kv_dtype in ("fp8", "nvfp4"):
+            return torch.float8_e4m3fn
         return torch.bfloat16
 
     def _index_cache_row_elems(self) -> int:
@@ -920,6 +958,14 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         read tensors, without entering the C++ pool-address accessors.
         """
         return self._index_k_buffers.get(layer_idx)
+
+    def get_index_k_nvfp4_buffers(
+        self, layer_idx: int
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        """NVFP4 index-K of a sparse layer as (E2M1 rows [pages, 128, 64] uint8, E4M3 scales
+        [pages, 128, 8]), or None unless indexer_kv_dtype='nvfp4'. get_index_k_buffer returns
+        the raw [pages, 1, 128, 72] uint8 page view both are carved from."""
+        return self._index_k_nvfp4.get(layer_idx)
 
     def get_index_v_buffer(self, layer_idx: int) -> Optional[torch.Tensor]:
         """Plain-tensor index-V cache for non-disabled sparse layers."""

@@ -464,6 +464,12 @@ def warmup_sampling_module() -> None:
             "flashinfer sampling module prewarm failed; it will be built "
             f"lazily on first use. {type(e).__name__}: {e}"
         )
+    # Opt-in (TRTLLM_ARIA_FAST_SAMPLER=1): the compiled sm_103 sampling ops as overrides, with their workspaces
+    # allocated here, ahead of warmup and every CUDA-graph capture.
+    from . import aria_fast_sampler
+
+    if aria_fast_sampler.ENABLED:
+        aria_fast_sampler.prebuild()
 
 
 @torch.compile(options={"max-autotune": True})

@@ -670,7 +670,8 @@ def arm_sm107_msa_paths() -> None:
 
     Context proxy plans stay unsplit (or split by MsaRuntimePolicy), proxy scores go into the
     -inf-filled buffer fmha_sm100 allocates, context rows take the stock select, the decoder
-    warmup runs no MSA prewarm, and a hybrid NVFP4 KV cache keeps its attention-op pools.
+    warmup runs no MSA prewarm, a hybrid NVFP4 KV cache keeps its attention-op pools, and NVFP4 index-K uses the
+    targets' FP8-sink writer and readers.
     """
     global PREFILL_PROXY_SPLIT, PREFILL_HOST_TRIMS, PREFILL_SELECT_TILE
     from . import cache_manager
@@ -679,6 +680,7 @@ def arm_sm107_msa_paths() -> None:
     PREFILL_PROXY_SPLIT = PREFILL_HOST_TRIMS = PREFILL_SELECT_TILE = False
     msa_prewarm_hook.ENABLED = False
     cache_manager.NVFP4_POOLLESS = False
+    cache_manager.NVFP4_INDEX_K_SINK = True
 
 
 _proxy_ms_step: Optional[tuple] = None  # (proxy_plan, tokens, max_score)

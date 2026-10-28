@@ -20,7 +20,8 @@ from torch.nn.parameter import Parameter
 
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 from tensorrt_llm._torch.custom_ops.torch_custom_ops import (
-    BufferKind, mxfp8_quantize_gemm_autotuned)
+    BufferKind, mxfp8_prequantized_gemm_autotuned,
+    mxfp8_quantize_gemm_autotuned)
 from tensorrt_llm._torch.peft.lora.layer import LoraLayer
 from tensorrt_llm._utils import is_device_integrated, mpi_disabled
 from tensorrt_llm.bindings import ipc_nvls_supported
@@ -3360,6 +3361,52 @@ def _mxfp8_cutlass_op_available() -> bool:
                    ) and torch.cuda.get_device_capability()[0] >= 10
 
 
+# TRTLLM_ARIA_PREFILL=1: run the eager (prefill / mixed-step) MXFP8 x MXFP8 GEMM
+# with at least TRTLLM_ARIA_PREFILL_GEMM_MIN_M rows on cuBLASLt's block-scaled
+# MXFP8 kernel (torch._scaled_mm with the same E4M3 operands and swizzled UE8M0
+# scales) instead of the native CUTLASS op. The native op serves untuned row
+# counts (every M outside its 6553-8192 / 13106-16384 tuning bands) with a
+# generic 128x256 4x4-cluster config at ~30% of FP8 peak; cuBLASLt reaches
+# 60-70% at M >= 1024 and is bitwise identical (FP32 accumulation, no split-K).
+_ARIA_PREFILL_GEMM = os.environ.get("TRTLLM_ARIA_PREFILL", "0") == "1"
+_ARIA_PREFILL_GEMM_MIN_M = int(
+    os.environ.get("TRTLLM_ARIA_PREFILL_GEMM_MIN_M", "1024"))
+_ARIA_PREFILL_GEMM_STATE = {"ok": None}
+
+
+def _aria_prefill_mxfp8_gemm(act_e4m3: torch.Tensor, act_sf: torch.Tensor,
+                             weight: torch.Tensor, weight_scale: torch.Tensor,
+                             out_dtype: torch.dtype) -> Optional[torch.Tensor]:
+    """cuBLASLt MXFP8 GEMM for a large eager row count, or None to use native."""
+    ok = _ARIA_PREFILL_GEMM_STATE["ok"]
+    if ok is False:
+        return None
+    e8m0 = torch.float8_e8m0fnu
+    if ok is None:
+        # First eligible call (startup warmup, outside any graph capture):
+        # probe once and fall back to the native op for good if unsupported.
+        if torch.cuda.is_current_stream_capturing():
+            return None
+        try:
+            out = torch._scaled_mm(act_e4m3, weight.t(), act_sf.view(e8m0),
+                                   weight_scale.view(e8m0),
+                                   out_dtype=out_dtype)
+        except (RuntimeError, AttributeError, TypeError) as error:
+            _ARIA_PREFILL_GEMM_STATE["ok"] = False
+            logger.warning(f"[ARIA prefill] cuBLASLt MXFP8 GEMM unavailable "
+                           f"({error}); keeping the native MXFP8 GEMM")
+            return None
+        _ARIA_PREFILL_GEMM_STATE["ok"] = True
+        logger.info(
+            f"[ARIA prefill] TRTLLM_ARIA_PREFILL=1: eager MXFP8 GEMMs with "
+            f">= {_ARIA_PREFILL_GEMM_MIN_M} rows run on cuBLASLt "
+            f"(first M={act_e4m3.shape[0]} N={weight.shape[0]} "
+            f"K={weight.shape[1]})")
+        return out
+    return torch._scaled_mm(act_e4m3, weight.t(), act_sf.view(e8m0),
+                            weight_scale.view(e8m0), out_dtype=out_dtype)
+
+
 _FLASHINFER_MXFP8_AUTOTUNE_ACTIVE = ContextVar(
     "flashinfer_mxfp8_autotune_active", default=False)
 _FLASHINFER_MXFP8_DECODE_GRAPH_CAPTURE_ACTIVE = ContextVar(
@@ -3570,17 +3617,61 @@ class MXFP8LinearMethod(LinearMethodBase):
         else:
             module.register_parameter("bias", None)
 
+    @staticmethod
+    def offer_quantized_input(module: Linear, input: torch.Tensor,
+                              act_e4m3: torch.Tensor,
+                              act_sf: torch.Tensor) -> None:
+        """Hand the next ``apply`` on ``input`` its MXFP8 quantization from upstream.
+
+        A producer that already quantized ``input`` exactly as
+        ``trtllm::mxfp8_quantize(input, True)`` would (E4M3 data and swizzled
+        UE8M0 scales) offers the result here, and ``apply`` skips its own
+        quantization when it is called with this very tensor. A call with any
+        other tensor ignores the offer, so a view or copy of ``input`` made
+        in between falls back to quantizing.
+        """
+        module._mxfp8_offered_input = (input, act_e4m3, act_sf)
+
+    @staticmethod
+    def withdraw_quantized_input(module: Linear) -> None:
+        """Drop an offer that ``apply`` did not consume."""
+        module._mxfp8_offered_input = None
+
+    @staticmethod
+    def _take_offered_input(
+            module: Linear,
+            input: torch.Tensor) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        offered = getattr(module, "_mxfp8_offered_input", None)
+        if offered is None:
+            return None
+        module._mxfp8_offered_input = None
+        source, act_e4m3, act_sf = offered
+        if source is not input:
+            return None
+        return act_e4m3.reshape(-1, act_e4m3.shape[-1]), act_sf
+
     def apply(self, module: Linear, input: torch.Tensor,
               bias: Optional[torch.Tensor]):
         """Apply MXFP8 linear projection with eager or capture-safe dispatch."""
+        offered = self._take_offered_input(module, input)
         original_shape = input.shape
         if input.dim() > 2:
             input = input.reshape(-1, input.shape[-1])
 
         if self.use_cutlass:
             input = input.contiguous()
-            if (self.tune_decode_graph_backends and not is_torch_compiling()
-                    and _FLASHINFER_MXFP8_DECODE_GRAPH_CAPTURE_ACTIVE.get()):
+            decode_graph = (self.tune_decode_graph_backends
+                            and not is_torch_compiling() and
+                            _FLASHINFER_MXFP8_DECODE_GRAPH_CAPTURE_ACTIVE.get())
+            if decode_graph and offered is not None:
+                output = mxfp8_prequantized_gemm_autotuned(
+                    *offered,
+                    module.weight,
+                    module.weight_scale,
+                    module.dtype,
+                    tune=_FLASHINFER_MXFP8_AUTOTUNE_ACTIVE.get(),
+                )
+            elif decode_graph:
                 # Tune only in the warmup-only pass (flashinfer_mxfp8_autotune).
                 output = mxfp8_quantize_gemm_autotuned(
                     input,
@@ -3592,7 +3683,9 @@ class MXFP8LinearMethod(LinearMethodBase):
             else:
                 # Dynamic MXFP8 activation quantization (swizzled SF layout),
                 # then the CUTLASS block-scaled e4m3xe4m3 GEMM.
-                act_e4m3, act_sf = torch.ops.trtllm.mxfp8_quantize(input, True)
+                act_e4m3, act_sf = (offered if offered is not None else
+                                    torch.ops.trtllm.mxfp8_quantize(
+                                        input, True))
                 use_flashinfer = self.backend == "flashinfer" or (
                     self.backend == "auto" and not is_torch_compiling() and
                     (_FLASHINFER_MXFP8_AUTOTUNE_ACTIVE.get() or
@@ -3609,17 +3702,26 @@ class MXFP8LinearMethod(LinearMethodBase):
                         module.dtype,
                     )
                 else:
-                    gemm = (torch.ops.trtllm.mxfp8_mxfp8_gemm_autotuned
-                            if self.needs_native_autotune else
-                            torch.ops.trtllm.mxfp8_mxfp8_gemm)
-                    output = gemm(
-                        act_e4m3,
-                        act_sf,
-                        module.weight,
-                        module.weight_scale,
-                        module._mxfp8_alpha,
-                        module.dtype,
-                    )
+                    output = None
+                    if (_ARIA_PREFILL_GEMM and not self.needs_native_autotune
+                            and not is_torch_compiling()
+                            and act_e4m3.shape[0] >= _ARIA_PREFILL_GEMM_MIN_M
+                            and module.dtype in (torch.bfloat16, torch.float16)):
+                        output = _aria_prefill_mxfp8_gemm(
+                            act_e4m3, act_sf, module.weight,
+                            module.weight_scale, module.dtype)
+                    if output is None:
+                        gemm = (torch.ops.trtllm.mxfp8_mxfp8_gemm_autotuned
+                                if self.needs_native_autotune else
+                                torch.ops.trtllm.mxfp8_mxfp8_gemm)
+                        output = gemm(
+                            act_e4m3,
+                            act_sf,
+                            module.weight,
+                            module.weight_scale,
+                            module._mxfp8_alpha,
+                            module.dtype,
+                        )
             if bias is not None:
                 output = output + bias
         else:

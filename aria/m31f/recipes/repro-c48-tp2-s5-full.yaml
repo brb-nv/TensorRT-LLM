@@ -1,0 +1,120 @@
+# Repro of recipe c48-tp2-s5-full (orig job 423532) on the single image built from this branch. No overlay:
+# all code is in the wheel; env switches and args are the original's. Orig image: trtllm-m31-705ea94-whl-p17bc18cd20e7-msa1e7bf76-pa20552d.sqsh,
+# overlay: s4stack.patch.
+# Lines marked SITE-SPECIFIC hold cluster paths or node excludes.
+schema: 2
+name: minimaxm31flash-fp4-gb300-trtllm-agentic_tp2_dspark7_c48
+model:
+  path: hf:MiniMaxAI/MiniMax-M3.1-Flash
+  container: '/scratch/fsw/portfolios/coreai/projects/coreai_kf_aria/users/bbuddharaju/MinimaxM3.1_ARIA_SGL/ws/runs/aria-m31f-sgl-1026/images/trtllm-m31-frontier-298875d.sqsh'    # this branch's image (one wheel, no overlay)    # SITE-SPECIFIC
+  precision: fp4
+resources:
+  gpu_type: gb300
+  gpus_per_node: 4
+frontend:
+  type: trtllm_serve
+  enable_multiple_frontends: false
+observability:
+  enabled: false
+  tachometer:
+    enabled: false
+engine:
+  type: trtllm
+  served_model_name: MiniMaxAI/MiniMax-M3.1-Flash    # InferenceX's served name for this model
+health_check:
+  interval_seconds: 5
+  max_attempts: 720    # 1 h: cold load of the 236 GB checkpoint, autotuning and graph capture
+roles:
+  agg:
+    nodes: 1
+    workers: 1
+    gpus: 2
+    env:
+      TLLM_LOG_LEVEL: INFO
+      TRTLLM_SERVER_DISABLE_GC: '1'
+      TRTLLM_WORKER_DISABLE_GC: '1'
+      TRTLLM_ENABLE_PDL: '1'
+      NCCL_GRAPH_MIXING_SUPPORT: '0'
+      PYTHONNOUSERSITE: '1'
+      TQDM_DISABLE: '1'
+      HF_HUB_OFFLINE: '1'
+      TRANSFORMERS_OFFLINE: '1'
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+      TRTLLM_M3_MSA_V1_DECODE: '1'    # S2/H1: MSA-v1 Q8KV4 sparse decode
+      MINIMAX_MSA_Q8KV4_V_SCALE_LAYOUT: quad4
+      TORCH_EXTENSIONS_DIR: /tmp/aria-msa-jit
+      TRTLLM_KV_LAYERWISE_ONBOARD: '0'    # S4: as in idxk4 recipes (wheel-1 default-on)
+      TRTLLM_ARIA_NO_MIX: '1'    # S2/H17: never-mix (overlay aria-nomix)
+      TRTLLM_ARIA_NO_MIX_DECODE_INTERVAL: '1'
+      TRTLLM_ARIA_FAST_SAMPLER: '1'    # H32: s4stack overlay (sampler, H15)
+      TRTLLM_ARIA_PREFILL: '1'    # H32: s4stack overlay (prefill GEMM, H25)
+      TRTLLM_ARIA_PREFILL2: '1'    # H32: s4stack overlay (prefill2, H27)
+      TRTLLM_ARIA_DECODE_FUSION: '1'    # H32: s4stack overlay (decode fusion, H20; cleared by H23)
+    args:
+      modeling_v2: auto
+      trust_remote_code: true
+      tensor_parallel_size: 2
+      moe_expert_parallel_size: 1
+      enable_attention_dp: false
+      max_batch_size: 48    # H47: draft-pool cap scaled from c44-tp2-s5cap-full (44 at c44), ~1.25x expected peak running
+      max_num_tokens: 16384
+      max_seq_len: 1048576
+      attn_backend: TRTLLM
+      enable_chunked_prefill: true
+      disable_overlap_scheduler: false
+      prefill_cuda_graph_backend: breakable
+      prefill_capture_num_tokens: [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 768, 1024, 1280, 1536, 1792, 2048, 2304, 2560, 2816, 3072]    # S1: buckets >3072 dropped (no step gain, c32-tp2-pfg-fast)
+      allreduce_strategy: AUTO
+      moe_config:
+        backend: TRTLLM
+        use_low_precision_moe_combine: true
+      sparse_attention_config:
+        algorithm: minimax_m3
+        implementation: msa
+        indexer_kv_dtype: nvfp4    # S4/H29: NVFP4 index-K (H2)
+        sparse_disable_index_value: true
+        fuse_qkv_index_projection: true
+      kv_cache_config:
+        dtype: nvfp4
+        tokens_per_block: 128
+        use_kv_cache_manager_v2: true
+        free_gpu_memory_fraction: 0.94
+        enable_block_reuse: true
+        block_reuse_config:
+          policy: per_conversation
+        host_cache_size: 178000000000    # bytes per rank
+      cuda_graph_config:
+        enable_padding: true
+        batch_sizes: [1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30, 32, 40, 48]
+      speculative_config:
+        decoding_type: DSpark
+        max_draft_len: 7
+        block_size: 7
+        use_rejection_sampling: true
+        advanced_sampling_mode: no_topk
+        attention_backend: TRTLLM
+        speculative_model: 
+          /scratch/fsw/portfolios/coreai/projects/coreai_kf_aria/users/bbuddharaju/MinimaxM3.1/Minimax_M3.1/models/MiniMax-M3.1-Flash/dspark    # SITE-SPECIFIC
+      enable_autotuner: true
+      enable_tokenization_cache: true
+      stream_interval: 20
+      reasoning_parser: minimax_m3
+      print_iter_log: true
+      enable_iter_perf_stats: true
+benchmark:
+  type: custom
+  command: bash /infmax-workspace/benchmarks/srt_agentic.sh
+  env:
+    MODEL: MiniMaxAI/MiniMax-M3.1-Flash
+    AIPERF_SERVER_METRICS_URLS: http://localhost:8000/prometheus/metrics    # trtllm-serve's Prometheus route
+    AIPERF_REQUIRED_SERVER_METRIC_PREFIX: trtllm_kv_cache_utilization
+    AIPERF_HTTP_TCP_USER_TIMEOUT: '900000'
+    KV_OFFLOADING: dram
+    TOTAL_CPU_DRAM_GB: '356'
+    CONC: '48'
+
+  placement:
+    node: head
+sbatch_directives:
+  exclude: nvl72d024-T[01-18],nvl72d027-T02,nvl72d062-T09,nvl72d052-T06,nvl72d058-T04,nvl72d009-T17,nvl72d041-T05,nvl72d033-T01    # SITE-SPECIFIC
+

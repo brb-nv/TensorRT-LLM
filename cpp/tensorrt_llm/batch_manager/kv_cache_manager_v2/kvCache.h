@@ -262,8 +262,11 @@ public:
     // isDecoding defaults to the current phase. A cache starts in prefill and cannot return to it
     // after decode admission. Set true when admitting a suspended request directly to decode.
     // Returns false if utilization too high or out of memory.
+    // deferOnboard: with layer-wise onboarding enabled on the manager, host->GPU copies are deferred
+    // to KvCacheManager::flushOnboard() and this cache's stream does not wait for them; its readers
+    // must wait per layer (KvCacheManager::waitLayerOnboard). Prefill only.
     bool resume(std::optional<CUstream> stream = std::nullopt, std::optional<bool> isDecoding = std::nullopt,
-        std::optional<std::vector<LifeCycleId>> optionalReuseGroups = std::nullopt);
+        std::optional<std::vector<LifeCycleId>> optionalReuseGroups = std::nullopt, bool deferOnboard = false);
 
     // Enter decode only after prefill has submitted its final KV accesses. Offloads complete sparse
     // history, deferring pages still needed on GPU by another owner. Retries deferred pages even
