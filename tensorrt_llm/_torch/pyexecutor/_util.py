@@ -52,9 +52,9 @@ from ..disaggregation.kv_cache_transceiver import (
 from ..hostfunc import set_low_latency_dispatch
 from ..model_config import ModelConfig
 from ..models.modeling_multimodal_mixin import MultimodalModelMixin
-from ..speculative import (draft_prompt_lookahead, get_num_extra_kv_tokens,
-                           get_num_spec_layers, get_spec_decoder,
-                           should_use_separate_draft_kv_cache)
+from ..speculative import (draft_prompt_lookahead, get_draft_block_width,
+                           get_num_extra_kv_tokens, get_num_spec_layers,
+                           get_spec_decoder, should_use_separate_draft_kv_cache)
 from ..speculative.spec_sampler_base import SpecSampler
 from ..utils import is_gdn_replay_enabled
 from . import config_utils
@@ -1064,6 +1064,8 @@ class KvCacheCreator:
             extra_kwargs[
                 "layer_specs"] = self._build_unified_dflash_layer_specs(
                     kv_cache_config)
+            extra_kwargs.update(
+                shared_draft_block_width=self._unified_drafter_block_width())
         if not is_draft:
             derived_windows = _derive_v2_layer_type_attention_windows(
                 kv_cache_config, manager_cls, model_config, self._max_seq_len)
@@ -1987,9 +1989,11 @@ class KvCacheCreator:
 
         estimating_kv_cache = estimating_kv_cache and not self._skip_est
         unified_layer_specs = None
+        shared_draft_block_width = None
         if self._should_unify_dflash_kv_cache():
             unified_layer_specs = self._build_unified_dflash_layer_specs(
                 kv_cache_config)
+            shared_draft_block_width = self._unified_drafter_block_width()
             logger.info(
                 "DFlash: target and draft KV layers share one KV cache manager "
                 f"({len(unified_layer_specs)} layers, disagg={self._is_disagg})."
@@ -2019,6 +2023,7 @@ class KvCacheCreator:
             cold_page_codec_provider=cold_page_codec_provider,
             joint_kv_cache_reuse=self._joint_kv_cache_reuse,
             layer_specs=unified_layer_specs,
+            shared_draft_block_width=shared_draft_block_width,
         )
 
         if not self._skip_est:
@@ -2084,6 +2089,13 @@ class KvCacheCreator:
                 self._mapping.pp_size)
             return False
         return should_use_separate_draft_kv_cache(self._speculative_config)
+
+    def _unified_drafter_block_width(self) -> int:
+        """Use the loaded checkpoint's slot convention for sizing and allocation."""
+        draft_model = getattr(self._model_engine.model, "draft_model", None)
+        shift_label = getattr(draft_model, "_dspark_shift_label", False)
+        return get_draft_block_width(self._speculative_config,
+                                     shift_label=shift_label)
 
     def _should_unify_dflash_kv_cache(self) -> bool:
         """Whether this run can place target and DFlash layers in one V2 manager."""
@@ -3592,8 +3604,8 @@ def _create_kv_cache_manager(
         joint_kv_cache_reuse: bool = False,
         hidden_state_draft_pool: bool = False,
         max_cuda_graph_batch_size: Optional[int] = None,
-        layer_specs: Optional[Sequence[KVCacheLayerSpec]] = None
-) -> KVCacheManager:
+        layer_specs: Optional[Sequence[KVCacheLayerSpec]] = None,
+        shared_draft_block_width: Optional[int] = None) -> KVCacheManager:
     """
     Returns:
         A KVCacheManager instance for the given model engine or model config
@@ -3771,6 +3783,8 @@ def _create_kv_cache_manager(
         manager_extra_kwargs[
             "disable_overlap_scheduler"] = disable_overlap_scheduler
         manager_extra_kwargs["layer_specs"] = layer_specs
+        manager_extra_kwargs[
+            "shared_draft_block_width"] = shared_draft_block_width
         # Vocab size also enables multimodal event decoding and its per-block
         # digest scan. Leave it unset for text-only engines. Without an engine
         # (e.g. separate one-model draft caches), preserve config resolution:

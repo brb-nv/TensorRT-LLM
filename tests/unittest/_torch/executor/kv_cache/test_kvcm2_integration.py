@@ -51,6 +51,7 @@ from tensorrt_llm.conversation_params import ConversationParams
 from tensorrt_llm.llmapi.llm_args import (
     BlockReuseConfig,
     DFlashDecodingConfig,
+    DSparkDecodingConfig,
     Eagle3DecodingConfig,
     KvCacheConfig,
     MTPDecodingConfig,
@@ -844,6 +845,91 @@ def test_dflash_block_tables_with_fp8_target_and_bf16_draft() -> None:
             assert len(indices) == (2, 3)[row]
             assert worker._ctx_block_tables[row, : len(indices)].tolist() == indices
     finally:
+        manager.shutdown()
+
+
+@pytest.mark.parametrize("disagg", [False, True], ids=["aggregated", "disaggregated"])
+@pytest.mark.parametrize("prompt_len", [58, 50], ids=["prompt_end_on_edge", "decode_end_on_edge"])
+def test_shared_draft_pages_cover_the_drafter_block(disagg: bool, prompt_len: int) -> None:
+    """A shared drafter appends its K-wide block after the context, so the pages must reach it.
+
+    K-1 extra tokens end the allocation on a page edge one slot short of the block: at the
+    prompt end for prompt 58, and after a step accepting all K+1 tokens for prompt 50.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    torch.cuda.init()
+    max_draft_len, block_width, tokens_per_block, draft_layer = 7, 7, 32, 2
+    target = KVCacheLayerSpec(
+        global_layer_id=0,
+        owner=KVCacheLayerOwner.TARGET,
+        dtype=DataType.FP8,
+        num_kv_heads=8,
+        head_dim=128,
+        buffer_roles=(Role.KEY, Role.VALUE),
+    )
+    draft = replace(
+        target, global_layer_id=draft_layer, owner=KVCacheLayerOwner.DRAFT, dtype=DataType.BF16
+    )
+    manager = KVCacheManagerV2(
+        KvCacheConfig(
+            enable_block_reuse=False,
+            max_gpu_total_bytes=64 << 20,
+            host_cache_size=0,
+            enable_swa_scratch_reuse=False,
+        ),
+        CacheType.SELF,
+        num_layers=3,
+        num_kv_heads=8,
+        head_dim=128,
+        tokens_per_block=tokens_per_block,
+        max_seq_len=1024,
+        max_batch_size=2,
+        mapping=Mapping(),
+        dtype=DataType.FP8,
+        layer_specs=[target, replace(target, global_layer_id=1), draft],
+        spec_config=DSparkDecodingConfig(max_draft_len=max_draft_len, speculative_model="draft"),
+        shared_draft_block_width=block_width,
+        vocab_size=4096,
+        enable_stats=False,
+    )
+    request = _ContextRequest(
+        1,
+        list(range(prompt_len)),
+        prompt_len,
+        "conversation",
+        use_conversation_params=False,
+        is_disagg_generation_init_state=disagg,
+    )
+
+    def draft_pages_end() -> int:
+        pages = manager.get_batch_cache_indices([request.py_request_id], layer_idx=draft_layer)[0]
+        return len(pages) * tokens_per_block
+
+    try:
+        if disagg:
+            request.py_draft_tokens = []
+            request.is_disagg_generation_transmission_complete = False
+            request.context_phase_params = None
+            assert manager.prepare_disagg_gen_init(request)
+            request.is_disagg_generation_init_state = False
+        else:
+            _run_context(manager, request)
+        assert draft_pages_end() >= prompt_len + block_width
+        generation = SimpleNamespace(
+            py_request_id=request.py_request_id,
+            py_beam_width=1,
+            py_draft_tokens=[0] * max_draft_len,
+            state=LlmRequestState.GENERATION_IN_PROGRESS,
+            is_dummy_request=False,
+            is_disagg_generation_transmission_complete=False,
+            context_phase_params=None,
+            max_beam_num_tokens=prompt_len + 1,
+        )
+        assert manager.try_allocate_generation(generation)
+        assert draft_pages_end() >= prompt_len + max_draft_len + 1 + block_width
+    finally:
+        manager.free_resources(request)
         manager.shutdown()
 
 
