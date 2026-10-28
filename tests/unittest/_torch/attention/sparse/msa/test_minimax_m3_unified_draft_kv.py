@@ -127,6 +127,19 @@ def test_draft_layer_specs_join_the_hybrid_nvfp4_manager():
         assert unified.get_draft_kv_cache_view() is unified
         assert plain.get_draft_kv_cache_view() is None
 
+        # Only the drafter reads block offsets: one attention-op pool, filled with its view's rows.
+        assert (unified.num_attention_op_pools, plain.num_attention_op_pools) == (1, 0)
+        assert int(unified.kv_cache_pool_mapping[unified.layer_offsets[NUM_TARGET], 0]) == 0
+        (request,) = unified.add_dummy_requests([7], token_nums=[200])
+        offsets = torch.zeros(1, 1, 2, unified.max_blocks_per_seq, dtype=torch.int32, device="cuda")
+        unified.copy_batch_block_offsets(offsets, [7], 1, 1, 1)
+        # M3 hands out slot ids; the row holds the draft layer's K page of each slot, V right after it.
+        slots = [s for s in unified.get_batch_cache_indices([7], layer_idx=NUM_TARGET)[0] if s >= 0]
+        scale = unified.get_layer_page_index_scale(NUM_TARGET)
+        pages = [[slot * scale + plane for slot in slots] for plane in (0, 1)]
+        assert offsets[0, 0, :, : len(slots)].tolist() == pages
+        unified.free_resources(request)
+
         # The draft lifecycle is sized by its window, not by its share of the bytes per token.
         target_ratio, draft_ratio = unified.kv_cache_manager_py_config.initial_pool_ratio
         assert target_ratio + draft_ratio == pytest.approx(1.0)

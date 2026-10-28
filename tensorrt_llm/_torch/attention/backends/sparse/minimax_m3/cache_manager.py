@@ -808,12 +808,14 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         pool's slot ids; :meth:`copy_batch_block_offsets` scales them.
         """
         super()._prepare_page_table_tensor(index_mapper_capacity)
-        # Explicit draft layers keep the pools: the unified drafter reads their block offsets.
-        if self.dtype == DataType.NVFP4 and NVFP4_POOLLESS and self.layer_specs is None:
+        if self.dtype == DataType.NVFP4 and NVFP4_POOLLESS:
             # Nothing reads a hybrid cache's own block offsets: MSA layers address pages
             # by slot id and the shared draft layer reads MiniMaxM3DraftKVCacheView's
             # table. Without pools, a new reader fails instead of reading unfilled offsets.
-            self.num_attention_op_pools = 0
+            # Explicit draft layers keep one pool, the one the unified drafter reads.
+            self.num_attention_op_pools = (
+                0 if self.layer_specs is None else self._keep_unified_draft_pool()
+            )
         draft_layers = [
             layer_idx
             for layer_idx in self._shared_draft_layer_ids
@@ -859,9 +861,30 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
             f"attention-op pools {[pool for pool, _ in op_pools]} address their pages."
         )
 
+    def _keep_unified_draft_pool(self) -> int:
+        """Keep only the first draft layer's attention-op pool, filled per step from its lifecycle."""
+        if not self.draft_layer_ids:
+            return 0
+        layer = self.layer_offsets[self.draft_layer_ids[0]]
+        key = self.impl.get_page_index_converter(layer, Role.KEY)
+        value = self.impl.get_page_index_converter(layer, Role.VALUE)
+        if key.layer_offset != 0 or value.scale != key.scale:
+            raise NotImplementedError(
+                "MiniMax-M3 unified draft layers need the first one's K page at slot offset 0"
+            )
+        pinned = prefer_pinned()
+        self.kv_cache_pool_pointers = self.kv_cache_pool_pointers[layer : layer + 1]
+        self.kv_cache_pool_mapping.zero_()
+        self._draft_index_scales = torch.tensor([key.scale], dtype=torch.int32, pin_memory=pinned)
+        self._draft_kv_offsets = torch.tensor(
+            [value.layer_offset], dtype=torch.int32, pin_memory=pinned
+        )
+        self._draft_op_pools = ((0, self.layer_to_pool_mapping_dict[layer]),)
+        return 1
+
     def _prepare_swa_scratch_copy_tensors(self, index_mapper_capacity: int) -> None:
         # Staging for the per-layer block-offset copy, which a pool-less hybrid NVFP4 cache never runs.
-        if self.dtype != DataType.NVFP4 or not NVFP4_POOLLESS or self.layer_specs is not None:
+        if self.dtype != DataType.NVFP4 or not NVFP4_POOLLESS:
             super()._prepare_swa_scratch_copy_tensors(index_mapper_capacity)
 
     def copy_batch_block_offsets(
@@ -875,7 +898,9 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
     ) -> None:
         if self.num_attention_op_pools == 0:
             return
-        if self.skip_unchanged_block_offsets:
+        # A pool-less target with explicit draft layers keeps only the drafter's pool.
+        draft_only = len(self._draft_op_pools) == self.num_attention_op_pools
+        if self.skip_unchanged_block_offsets and not draft_only:
             guard = self._unchanged_copies.setdefault(dst_tensor.data_ptr(), _UnchangedCopy())
             args = (
                 dst_tensor,
@@ -889,9 +914,10 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
             if guard.skip(*args):
                 return
             guard.record(*args)
-        super().copy_batch_block_offsets(
-            dst_tensor, request_ids, beam_width, num_contexts, num_seqs, max_blocks=max_blocks
-        )
+        if not draft_only:
+            super().copy_batch_block_offsets(
+                dst_tensor, request_ids, beam_width, num_contexts, num_seqs, max_blocks=max_blocks
+            )
         if not self._draft_op_pools:
             return
         # Fill each virtual pool from its source pool's slot ids with the draft
