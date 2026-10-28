@@ -4782,8 +4782,8 @@ class KVCacheManagerV2(BaseResourceManager):
     def _drafter_window_claim_limit(self, req: LlmRequest, reuse_limit: int | None) -> int | None:
         """Claim limit of a new context cache that never hands the drafter a page it did not write.
 
-        The target alone sets the match; the drafter's window is reused only where it is complete
-        there, which needs a page-aligned match. Otherwise the prefill must cover what the drafter
+        The target alone sets the match; the drafter's window is reused where it is complete there,
+        else at the match's last full page. Otherwise the prefill must cover what the drafter
         reads, from L + 2 - W on (L: prompt length, W: its window): the claim stops at L + 1 - W,
         or one window before a branch point within W of L, whose window the request then publishes.
         """

@@ -184,22 +184,42 @@ def test_continuation_reuses_the_draft_window(unified):
         _finish(manager, first, turn)
 
 
+@pytest.mark.parametrize("first_len, shared", [(43, 43), (64, 63)])
+def test_a_partial_match_reuses_the_drafters_partial_page(unified, first_len, shared):
+    """A continuation of a 43-token prompt, or a 63-token prefix of a 64-token one, is claimed whole:
+    the drafter's window there ends in a partial page, which the tree holds."""
+    scheduler, manager = unified
+    first = _Request(1, _prompt(0, first_len))
+    turn = _Request(2, first.tokens[:shared] + _prompt(1000, 5))
+    try:
+        _prefill(scheduler, manager, first)
+        _finish(manager, first)
+        assert _prefill(scheduler, manager, turn) == shared
+    finally:
+        _finish(manager, first, turn)
+
+
 @pytest.mark.parametrize("unified", ["per_conversation"], indirect=True)
 def test_a_branch_point_window_is_recomputed_once_and_then_shared(unified):
     """Only the window at the first prompt's end is committed, none at the shared prefix (page 40
-    of 43 tokens): the first branch claims 24, one window before 40, and publishes the window there."""
+    of 43 tokens): the first branch claims 24, one window before 40, and publishes the window there
+    with its page 40, so the third claims all 43. A match ending in the first prompt's page 40, which
+    has no drafter page, falls back to 40."""
     scheduler, manager = unified
     first = _Request(1, _prompt(0, 64))
     second = _Request(2, first.tokens[:43] + _prompt(1000, 9))
     third = _Request(3, first.tokens[:43] + _prompt(2000, 9))
+    fourth = _Request(4, first.tokens[:44] + _prompt(3000, 9))
     try:
         _prefill(scheduler, manager, first)
         _finish(manager, first)
         assert _prefill(scheduler, manager, second) == 24
         _finish(manager, second)
-        assert _prefill(scheduler, manager, third) == 40
+        assert _prefill(scheduler, manager, third) == 43
+        _finish(manager, third)
+        assert _prefill(scheduler, manager, fourth) == 40
     finally:
-        _finish(manager, first, second, third)
+        _finish(manager, first, second, third, fourth)
 
 
 def test_an_unstored_context_is_never_published(unified):
