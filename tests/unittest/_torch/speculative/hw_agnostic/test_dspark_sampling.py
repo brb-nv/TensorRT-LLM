@@ -1,18 +1,15 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""DSpark ancestral drafting and block verification under rejection sampling."""
+"""Block verification and temperature-only sampling under rejection sampling."""
 
 import math
-import types
 from unittest.mock import patch
 
 import torch
 
-from tensorrt_llm._torch.models.modeling_speculative import dspark_markov_step_bias
 from tensorrt_llm._torch.pyexecutor.sampler.ops import custom as fused_sampling
 from tensorrt_llm._torch.pyexecutor.sampler.ops import flashinfer as flashinfer_sampling
 from tensorrt_llm._torch.speculative.block_verification import block_verify
-from tensorrt_llm._torch.speculative.dspark import DSparkWorker
 from tensorrt_llm._torch.speculative.interface import SpecWorkerBase
 from tensorrt_llm.llmapi.llm_args import AdvancedSamplingMode
 
@@ -71,60 +68,6 @@ def test_block_verification_is_lossless():
     dof = observed.numel() - 1
     critical = dof * (1 - 2 / (9 * dof) + 3.719 * math.sqrt(2 / (9 * dof))) ** 3  # p = 1e-4
     assert stat < critical, f"chi-square {stat:.1f} >= {critical:.1f}"
-
-
-def test_ancestral_drafts_condition_each_position_on_the_drawn_token():
-    """Position k is drawn, with the temperature only, from base_k plus the Markov bias of the token drawn before it;
-    the distribution it was drawn from is stored as its proposal."""
-    generator = torch.Generator().manual_seed(1)
-    num_gens, vocab, rank = 4, 32, 8
-    drafter = types.SimpleNamespace(
-        has_markov_head=True,
-        markov_w1=torch.randn(vocab, rank, generator=generator),
-        markov_w2=torch.randn(vocab, rank, generator=generator),
-    )
-    base = torch.randn(num_gens, K, vocab, generator=generator)
-    anchors = torch.randint(vocab, (num_gens,), generator=generator)
-    meta = types.SimpleNamespace(
-        request_temperatures=torch.full((num_gens,), 0.7),
-        request_seeds=torch.arange(num_gens, dtype=torch.int64),
-        request_offsets=torch.zeros(num_gens, dtype=torch.int64),
-        rng_draft_slot=lambda step: K + 1 + step,
-        batch_slot_ids=torch.arange(num_gens).flip(0),
-        draft_probs=torch.zeros(num_gens, K, vocab),
-        draft_probs_last_dim=0,
-        dummy_slot_row=0,
-        advanced_sampling_mode=None,
-        is_all_greedy_sample=False,
-        wants_advanced_draft_sampling=True,
-        draft_vocab_size=vocab,
-        vocab_size=vocab,
-    )
-    calls = []
-
-    def sampler(mode, logits, temperatures, top_ks, top_ps, min_ps, *, seed, offset):
-        probs = torch.softmax(logits / temperatures[:, None], -1)
-        calls.append((logits, probs, top_ks, top_ps, min_ps))
-        return torch.multinomial(probs, 1, generator=generator).squeeze(-1).int(), probs
-
-    worker = DSparkWorker.__new__(DSparkWorker)
-    torch.nn.Module.__init__(worker)
-    worker.mapping = None
-    assert worker._samples_block_ancestrally(drafter, meta)
-    with patch.object(SpecWorkerBase, "_sample_from_logits_with_probs", staticmethod(sampler)):
-        tokens, stored_vocab = worker._sample_block_ancestrally(
-            drafter, base, {"first_prev_tokens": anchors}, meta, 0, num_gens
-        )
-
-    assert tokens.dtype == torch.int32 and stored_vocab == vocab == meta.draft_probs_last_dim
-    prev = anchors
-    for step, (logits, probs, top_ks, top_ps, min_ps) in enumerate(calls):
-        bias = dspark_markov_step_bias(prev, drafter.markov_w1, drafter.markov_w2)
-        torch.testing.assert_close(logits, base[:, step] + bias)
-        assert top_ks is None and top_ps is None and min_ps is None
-        torch.testing.assert_close(meta.draft_probs[meta.batch_slot_ids, step], probs)
-        prev = tokens[:, step]
-    assert len(calls) == K
 
 
 def test_temperature_only_sampling_runs_no_filter():

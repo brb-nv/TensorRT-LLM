@@ -1299,45 +1299,33 @@ class DSparkWorker(DFlashWorker):
         """Draw position k from ``softmax((base_k + bias(d_{k-1})) / T)``, ``d_{k-1}`` the token drawn
         before it (the anchor for k = 0), with the temperature only, and store that distribution as
         the proposal. Returns the int32 tokens and the stored vocab width."""
-        from ..models.modeling_speculative import dspark_markov_step_bias
+        from .interface import _RNG_SLOT_SPAN
+        from .markov_sampling import sample_markov_block
 
-        num_gens, num_drafts, _ = gen_logits.shape
         # The chain indexes the full Markov table; verification reads full-vocab q.
         gen_logits = self.maybe_gather_sharded_draft_logits(gen_logits, spec_metadata)
-        vocab = gen_logits.shape[-1]
-        # Zero the CUDA-graph padding rows (uninitialized state) so every draw is legal.
-        gen_logits = self._zero_padding_rows(
-            gen_logits.reshape(num_gens * num_drafts, vocab),
-            spec_metadata,
-            num_contexts,
-            batch_size,
-            num_drafts,
-        ).reshape(num_gens, num_drafts, vocab)
-        params = self._temperature_only_params(
-            spec_metadata.request_temperatures[num_contexts:batch_size]
+        seed, offset = self._rng_state_per_request(
+            spec_metadata, num_contexts, batch_size, slot=spec_metadata.rng_draft_slot(0)
         )
-        draft_probs = spec_metadata.draft_probs
-        slots = spec_metadata.batch_slot_ids[num_contexts:batch_size]
-        tokens = inputs["first_prev_tokens"]
-        drafts = []
-        for step in range(num_drafts):
-            bias = dspark_markov_step_bias(tokens, draft_model.markov_w1, draft_model.markov_w2)
-            seed, offset = self._rng_state_per_request(
-                spec_metadata, num_contexts, batch_size, slot=spec_metadata.rng_draft_slot(step)
-            )
-            tokens, probs = self._sample_from_logits_with_probs(
-                spec_metadata.advanced_sampling_mode,
-                gen_logits[:, step] + bias.to(gen_logits.dtype),
-                *params,
-                seed=seed,
-                offset=offset,
-            )
-            if draft_probs is not None:
-                draft_probs[slots, step, :vocab] = probs
-            drafts.append(tokens)
-        if draft_probs is not None:
+        # A dummy_slot_row of 0 is not published yet: row 0 is then a live request's, not padding.
+        padding_slot = getattr(spec_metadata, "dummy_slot_row", 0)
+        tokens = sample_markov_block(
+            gen_logits.contiguous(),
+            inputs["first_prev_tokens"],
+            draft_model.markov_w1,
+            draft_model.markov_w2,
+            spec_metadata.request_temperatures[num_contexts:batch_size],
+            seed,
+            offset,
+            _RNG_SLOT_SPAN,
+            spec_metadata.draft_probs,
+            spec_metadata.batch_slot_ids[num_contexts:batch_size],
+            padding_slot if padding_slot > 0 else -1,
+        )
+        vocab = gen_logits.shape[-1]
+        if spec_metadata.draft_probs is not None:
             spec_metadata.draft_probs_last_dim = vocab
-        return torch.stack(drafts, dim=1).to(torch.int32), vocab
+        return tokens, vocab
 
     def _refine_block_logits(
         self,
