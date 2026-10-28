@@ -1574,6 +1574,8 @@ class KVCacheManagerV2(BaseResourceManager):
     block_offset_patches: int = 0
     block_offset_patch_ns: int = 0
     _paired_hidden_state_draft_pool: bool = False
+    _draft_reuse_group: Optional[int] = None
+    _publishes_drafter_kv: bool = False
     # Opt-in (enable_offload_headroom): GPU slots evicted one step ahead of use. On the class so it exists without
     # running __init__.
     _offload_headroom: Optional[OffloadHeadroom] = None
@@ -2261,6 +2263,20 @@ class KVCacheManagerV2(BaseResourceManager):
             layer_id: self.impl.get_layer_group_id(layer_id)
             for layer_id in typed_range(LayerId(num_layers))
         }
+        # A hidden-state drafter's windowed layers, reused only where the target's match keeps their
+        # window (_drafter_window_claim_limit).
+        draft_layers = [
+            self.layer_offsets[spec.global_layer_id]
+            for spec in self.layer_specs or ()
+            if spec.owner is KVCacheLayerOwner.DRAFT
+            and spec.reuse_policy == AttentionReusePolicy.OPTIONAL
+        ]
+        if draft_layers:
+            self._draft_reuse_group = self.layer_to_pool_mapping_dict[draft_layers[0]]
+            self._draft_window = self.max_attention_window_vec[draft_layers[0]]
+        self._publishes_drafter_kv = (
+            self._paired_hidden_state_draft_pool or self._draft_reuse_group is not None
+        )
 
         self.kv_cache_map: dict[int, _KVCache] = {}
         self._disagg_receive_ready: dict[int, torch.cuda.Event] = {}
@@ -4537,7 +4553,17 @@ class KVCacheManagerV2(BaseResourceManager):
                 # Connector loads need persistent destination pages; scratch
                 # slots are reserved for local prefill.
                 kv_cache.enable_swa_scratch_reuse = False
-            if not self._resume_context_cache(req, kv_cache):
+            group = self._draft_reuse_group
+            if (
+                num_lookup_tokens is not None
+                and group is not None
+                and kv_cache.reuse_status[group].complete
+            ):
+                # Only a new cache's first resume can select an OPTIONAL group.
+                resumed = self._resume_and_restore(req.py_request_id, kv_cache, [group])
+            else:
+                resumed = self._resume_context_cache(req, kv_cache)
+            if not resumed:
                 return None
             return kv_cache.num_committed_tokens
 
@@ -4576,7 +4602,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 tokens_per_block=self.tokens_per_block,
                 is_draft=self.is_draft,
             )
-        reused = self.prepare_context_cache(req, limit)
+        reused = self.prepare_context_cache(req, self._drafter_window_claim_limit(req, limit))
         if reused is None:
             return False
         # First chunk only: num_committed_tokens holds at the initial prefix
@@ -4692,6 +4718,47 @@ class KVCacheManagerV2(BaseResourceManager):
         """Have the request publish the drafter's window at ``point``."""
         self._branch_points[request_id] = point
 
+    def _drafter_window_claim_limit(self, req: LlmRequest, reuse_limit: int | None) -> int | None:
+        """Claim limit of a new context cache that never hands the drafter a page it did not write.
+
+        The target alone sets the match; the drafter's window is reused only where it is complete
+        there, which needs a page-aligned match. Otherwise the prefill must cover what the drafter
+        reads, from L + 2 - W on (L: prompt length, W: its window): the claim stops at L + 1 - W,
+        or one window before a branch point within W of L, whose window the request then publishes.
+        """
+        if (
+            self._draft_reuse_group is None
+            or not self.enable_block_reuse
+            or not req.is_first_context_chunk
+            or req.py_request_id in self.kv_cache_map
+        ):
+            return reuse_limit
+        tokens_per_block = self.tokens_per_block
+        window = self._draft_window
+        limit = max(0, req.prompt_len + 1 - window) // tokens_per_block * tokens_per_block
+        match, complete = self._probe_drafter_window(req, reuse_limit)
+        if complete or match <= limit:
+            return reuse_limit
+        point = match // tokens_per_block * tokens_per_block
+        if point < match and self._probe_drafter_window(req, point)[1]:
+            return point
+        if req.prompt_len - point > window:
+            return limit
+        self.mark_branch_point(req.py_request_id, point)
+        return max(0, point + 1 - window) // tokens_per_block * tokens_per_block
+
+    def _probe_drafter_window(self, req: LlmRequest, reuse_limit: int | None) -> tuple[int, bool]:
+        """The target's match and whether the drafter's window is complete there, unclaimed."""
+        kv_cache = self.impl.create_kv_cache(
+            ReuseScope(lora_id=req.lora_task_id, salt=self._derive_reuse_salt(req.cache_salt)),
+            self._context_reuse_tokens(req, reuse_limit),
+        )
+        try:
+            status = kv_cache.reuse_status[self._draft_reuse_group]
+            return status.endpoint, status.complete
+        finally:
+            kv_cache.close()
+
     def _publish_branch_point(self, req: LlmRequest, kv_cache) -> None:
         """Commit the prompt up to its branch point, publishing the drafter's window there."""
         point = self._branch_points.get(req.py_request_id)
@@ -4713,7 +4780,7 @@ class KVCacheManagerV2(BaseResourceManager):
 
     def mark_unwritten_prefix(self, request_id: int, end: float) -> None:
         """Record that this pool holds no drafter K/V for the request below ``end``."""
-        if not self._paired_hidden_state_draft_pool:
+        if not self._publishes_drafter_kv:
             return
         self._unwritten_prefix_end[request_id] = max(
             end, self._unwritten_prefix_end.get(request_id, 0)
@@ -6516,7 +6583,7 @@ class KVCacheManagerV2(BaseResourceManager):
             return
 
         commit_end = request.context_current_position
-        if self._paired_hidden_state_draft_pool and not self._commit_publishes_written_pages_only(
+        if self._publishes_drafter_kv and not self._commit_publishes_written_pages_only(
             request.py_request_id, commit_end
         ):
             # A later chunk commits once the window has left the unwritten prefix.
@@ -6590,7 +6657,7 @@ class KVCacheManagerV2(BaseResourceManager):
         # both leak and let a recycled page skip its fill.
         self._fresh_pages_filled.pop(request.py_request_id, None)
         self._disagg_receive_ready.pop(request.py_request_id, None)
-        if self._paired_hidden_state_draft_pool:
+        if self._publishes_drafter_kv:
             self._unwritten_prefix_end.pop(request.py_request_id, None)
             self._branch_points.pop(request.py_request_id, None)
         kv_cache = self.kv_cache_map.pop(request.py_request_id, None)
@@ -7391,7 +7458,7 @@ class KVCacheManagerV2(BaseResourceManager):
             )
             should_commit = is_all_reusable or req.context_remaining_length == 0
 
-            if should_block_reuse and self._paired_hidden_state_draft_pool:
+            if should_block_reuse and self._publishes_drafter_kv:
                 self._publish_branch_point(req, kv_cache)
             if should_resize:
                 self._resize_context_history(req, kv_cache, req.context_current_position)

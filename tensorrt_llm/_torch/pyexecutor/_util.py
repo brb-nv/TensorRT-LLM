@@ -2302,7 +2302,10 @@ class KvCacheCreator:
                 buffer_roles=self._layer_spec_roles(draft_dtype,
                                                     k_only=draft_k_only),
                 sliding_window_size=window,
-                reuse_policy=AttentionReusePolicy.REQUIRED,
+                # A windowed drafter does not constrain the target's match
+                # (KVCacheManagerV2._drafter_window_claim_limit).
+                reuse_policy=(AttentionReusePolicy.OPTIONAL
+                              if window else AttentionReusePolicy.REQUIRED),
             ) for layer_id, window in zip(draft_local_ids, draft_windows))
         return tuple(specs)
 
