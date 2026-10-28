@@ -811,7 +811,13 @@ class DFlashSpecMetadata(SpecMetadata):
 
             # Route unknown request IDs (cuda graph padding or warmup dummies)
             # to dummy slot to avoid corrupting real request's context
-            slots = [worker._req_to_slot.get(rid, worker._dummy_slot) for rid in self.request_ids]
+            slots = [
+                # Attention-DP dummies never take a real slot: past their pages offsets map page 0.
+                worker._dummy_slot
+                if i >= num_contexts and rid == ATTENTION_DP_DUMMY_REQUEST_ID
+                else worker._req_to_slot.get(rid, worker._dummy_slot)
+                for i, rid in enumerate(self.request_ids)
+            ]
             # With batch_map_changed_only the map is re-uploaded only when it differs from the last upload (see
             # DFlashWorker._batch_to_slot_uploaded).
             if changed_only and getattr(worker, "_batch_to_slot_uploaded", None) == slots:

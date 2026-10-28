@@ -27,6 +27,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from tensorrt_llm._torch.pyexecutor.llm_request import ATTENTION_DP_DUMMY_REQUEST_ID
 from tensorrt_llm._torch.speculative.dflash import DFlashSpecMetadata, DFlashWorker
 
 pytestmark = pytest.mark.skipif(
@@ -125,3 +126,11 @@ def test_prepare_resets_only_evicted_slots():
     assert written == [{}, {1: 0}]
     assert worker._ctx_len.tolist() == [40, 0, 7, 0, 96]
     assert 1 in worker._free_slots and 12 not in worker._req_to_slot
+
+
+def test_attention_dp_dummy_generation_row_takes_the_dummy_slot():
+    worker = _worker([40, 300, 7, 0, 0])
+    # A context warmup stored a prompt under the dummy id.
+    worker._req_to_slot[ATTENTION_DP_DUMMY_REQUEST_ID] = 3
+    _prepare(worker, [11, ATTENTION_DP_DUMMY_REQUEST_ID], num_generations=2)
+    assert worker._batch_to_slot[:2].tolist() == [0, worker._dummy_slot]
