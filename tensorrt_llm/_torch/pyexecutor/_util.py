@@ -2088,23 +2088,44 @@ class KvCacheCreator:
     def _should_unify_dflash_kv_cache(self) -> bool:
         """Whether this run can place target and DFlash layers in one V2 manager."""
         spec_config = self._speculative_config
-        if (spec_config is None or not spec_config.spec_dec_mode.is_dflash()
-                or spec_config.attention_backend != "TRTLLM"
-                or self._tokens_per_block not in (16, 32, 64)
+        if spec_config is None:
+            return False
+        # Specialized managers add cache roles and lifecycle protocols that an
+        # external drafter cannot yet describe. Keep their existing fallback
+        # unless the manager hosts explicit draft layer specs.
+        manager_cls = self._kv_cache_manager_cls
+        hosts_draft_layers = (isinstance(manager_cls, type)
+                              and issubclass(manager_cls, KVCacheManagerV2)
+                              and manager_cls.hosts_unified_draft_layers)
+        if not (spec_config.spec_dec_mode.is_dflash() or
+                (hosts_draft_layers and spec_config.spec_dec_mode.is_dspark())):
+            return False
+        attention_backend = spec_config.attention_backend
+        if attention_backend == "AUTO":
+            attention_backend = getattr(
+                getattr(self._model_engine.model, "draft_model", None),
+                "dflash_attention_backend", None)
+        if (attention_backend != "TRTLLM" or
+            (self._tokens_per_block not in (16, 32, 64)
+             and not (hosts_draft_layers and self._draft_tokens_per_block()
+                      == self._tokens_per_block))
                 or not spec_config._allow_separate_draft_kv_cache
                 or spec_config.draft_len_schedule is not None
                 or self._draft_config is None or self._mapping.pp_size != 1
                 or self._mapping.cp_size != 1
-                or self._llm_args.attn_backend != "TRTLLM"
-                or is_gemma4_hybrid(
+                or self._llm_args.attn_backend != "TRTLLM" or is_gemma4_hybrid(
                     self._model_engine.model.model_config.pretrained_config)
                 or getattr(self._kv_cache_config, "mixed_precision_kv",
                            None) is not None
                 or self._llm_args.kv_cache_compression_config is not None):
             return False
-        # Specialized managers add cache roles and lifecycle protocols that an
-        # external drafter cannot yet describe. Keep their existing fallback.
-        if self._kv_cache_manager_cls is not KVCacheManagerV2:
+        if (self._kv_cache_manager_cls is not KVCacheManagerV2
+                and not hosts_draft_layers):
+            return False
+        # Such a manager keeps its agg drafter in the separate pool paired with
+        # block reuse; a model shipping that pool's window itself keeps it too.
+        if hosts_draft_layers and (not self._is_disagg or runtime_hooks_of(
+                self._model_engine.model).disagg_draft_kv):
             return False
         target_layout = self._dflash_kv_layout(
             self._model_engine.model.model_config,
@@ -2131,10 +2152,13 @@ class KvCacheCreator:
                 key="dflash_mixed_draft_windows_fallback")
             return False
         if self._is_disagg and os.environ.get(
-                "TRTLLM_DISAGG_SHARED_DRAFT_KV") != "1":
+                "TRTLLM_DISAGG_SHARED_DRAFT_KV",
+                "1" if hosts_draft_layers else "0") != "1":
             return False
         if self._is_disagg and not self._dflash_disagg_layouts_compatible(
-                target_layout, draft_layout):
+                target_layout,
+                draft_layout,
+                nvfp4_target_with_other_draft=hosts_draft_layers):
             logger.info_once(
                 "DFlash: draft KV layout (kv_heads, head_dim, dtype, k_only)="
                 f"{draft_layout} cannot be transferred with the target's "
@@ -2147,22 +2171,27 @@ class KvCacheCreator:
     @staticmethod
     def _dflash_disagg_layouts_compatible(
             target_layout: tuple[int, int, object, bool],
-            draft_layout: tuple[int, int, object, bool]) -> bool:
+            draft_layout: tuple[int, int, object, bool],
+            *,
+            nvfp4_target_with_other_draft: bool = False) -> bool:
         """Whether the transceiver can move draft layers with the target's.
 
         Heads are resharded in bytes: a view's bytes per head are its own
         per-layer bytes over the rank's KV-head count, so dtype and head_dim
         may differ. The KV-head count and K-only flag come from the rank's
         single AttentionInfo and must match. NVFP4 adds block-scale views, so
-        an NVFP4 side is only paired with an identical layout.
+        an NVFP4 side is only paired with an identical layout, unless the
+        manager keeps a non-NVFP4 draft in pools of its own
+        (``nvfp4_target_with_other_draft``).
         """
         target_heads, _, target_dtype, target_k_only = target_layout
         draft_heads, _, draft_dtype, draft_k_only = draft_layout
         if (target_heads, target_k_only) != (draft_heads, draft_k_only):
             return False
         nvfp4 = tensorrt_llm.bindings.DataType.NVFP4
-        return target_dtype == draft_dtype or nvfp4 not in (target_dtype,
-                                                            draft_dtype)
+        return (target_dtype == draft_dtype
+                or nvfp4 not in (target_dtype, draft_dtype)
+                or (nvfp4_target_with_other_draft and draft_dtype != nvfp4))
 
     def _dflash_kv_layout(
             self, model_config: ModelConfig,
