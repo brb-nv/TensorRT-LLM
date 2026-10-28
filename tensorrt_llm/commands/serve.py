@@ -2577,8 +2577,9 @@ def disaggregated_mpi_worker(config_file: Optional[str], log_level: str,
                 or kv_cache.get("tokens_per_block", 32) not in (16, 32, 64)):
             shared_draft_kv_supported = False
             break
+    # "auto" shares where both creators can; only an explicit "1" fails fast.
     os.environ["TRTLLM_DISAGG_SHARED_DRAFT_KV"] = (
-        "1"
+        "auto"
         if with_spec == {"ctx", "gen"} and len(attention_parallel_configs) == 1
         and shared_draft_kv_supported else "0")
 

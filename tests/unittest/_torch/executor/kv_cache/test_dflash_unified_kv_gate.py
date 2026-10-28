@@ -192,6 +192,29 @@ def test_per_layer_kv_heads_keep_separate_cache(is_disagg, per_layer_side):
     assert creator._build_unified_dflash_layer_specs(kv_cache_config=None) == ()
 
 
+@pytest.mark.parametrize(
+    "is_disagg,request_mode,draft_heads,raises",
+    [(True, "1", 4, True), (True, None, 4, False), (False, "1", 4, False), (True, "1", 8, False)],
+    ids=["explicit_unhonorable", "unset", "aggregated", "explicit_honored"],
+)
+def test_explicit_shared_draft_kv_request_fails_fast(
+    monkeypatch, is_disagg, request_mode, draft_heads, raises
+) -> None:
+    if request_mode is None:
+        monkeypatch.delenv(_SHARED_DRAFT_KV_ENV)
+    creator = _creator(
+        is_disagg=is_disagg,
+        target=_model_config(kv_heads=8, head_dim=128),
+        draft=_model_config(kv_heads=draft_heads, head_dim=128),
+    )
+
+    if raises:
+        with pytest.raises(ValueError, match="TRTLLM_DISAGG_SHARED_DRAFT_KV=1"):
+            creator._check_shared_draft_kv_request()
+    else:
+        creator._check_shared_draft_kv_request()
+
+
 class _StopLauncher(Exception):
     pass
 
@@ -290,7 +313,7 @@ def test_launcher_requires_trtllm_draft_attention_on_both_peers(
         generation_servers={"speculative_config": specs[1]},
     )
 
-    assert os.environ[_SHARED_DRAFT_KV_ENV] == ("1" if shared else "0")
+    assert os.environ[_SHARED_DRAFT_KV_ENV] == ("auto" if shared else "0")
     for backend in (context_backend, generation_backend):
         creator = _creator(
             is_disagg=True,
@@ -337,7 +360,7 @@ def test_launcher_checks_all_peer_configs(
     servers[peer_index]["speculative_config"].update(spec_overrides)
     _launch_from_disagg_config(monkeypatch, tmp_path, servers[0], servers[1])
 
-    assert os.environ[_SHARED_DRAFT_KV_ENV] == ("1" if shared else "0")
+    assert os.environ[_SHARED_DRAFT_KV_ENV] == ("auto" if shared else "0")
     # The unchanged, locally eligible peer must follow the common decision.
     creator = _creator(
         is_disagg=True,

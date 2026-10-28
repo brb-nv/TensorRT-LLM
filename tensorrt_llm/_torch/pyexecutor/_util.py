@@ -1988,6 +1988,7 @@ class KvCacheCreator:
             spec_dec_layer_mask = [True] * num_target_layers
 
         estimating_kv_cache = estimating_kv_cache and not self._skip_est
+        self._check_shared_draft_kv_request()
         unified_layer_specs = None
         shared_draft_block_width = None
         if self._should_unify_dflash_kv_cache():
@@ -2097,6 +2098,22 @@ class KvCacheCreator:
         return get_draft_block_width(self._speculative_config,
                                      shift_label=shift_label)
 
+    def _check_shared_draft_kv_request(self) -> None:
+        """Fail at startup when TRTLLM_DISAGG_SHARED_DRAFT_KV=1 cannot be honored."""
+        spec_config = self._speculative_config
+        if (not self._is_disagg
+                or os.environ.get("TRTLLM_DISAGG_SHARED_DRAFT_KV") != "1"
+                or spec_config is None
+                or not (spec_config.spec_dec_mode.is_dflash() or
+                        (spec_config.spec_dec_mode.is_dspark()
+                         and not spec_config.draft_is_embedded_in_target))):
+            return
+        if not self._should_unify_dflash_kv_cache():
+            raise ValueError(
+                "TRTLLM_DISAGG_SHARED_DRAFT_KV=1 requires the target and draft "
+                "KV layers to share one KV cache manager, but this "
+                "configuration keeps a separate draft KV cache.")
+
     def _should_unify_dflash_kv_cache(self) -> bool:
         """Whether this run can place target and DFlash layers in one V2 manager."""
         spec_config = self._speculative_config
@@ -2165,7 +2182,7 @@ class KvCacheCreator:
             return False
         if self._is_disagg and os.environ.get(
                 "TRTLLM_DISAGG_SHARED_DRAFT_KV",
-                "1" if hosts_draft_layers else "0") != "1":
+                "1" if hosts_draft_layers else "0") not in ("1", "auto"):
             return False
         if self._is_disagg and not self._dflash_disagg_layouts_compatible(
                 target_layout,
