@@ -2569,19 +2569,24 @@ def disaggregated_mpi_worker(config_file: Optional[str], log_level: str,
     for cfg in disagg_cfg.server_configs:
         spec = cfg.other_args.get("speculative_config") or {}
         kv_cache = cfg.other_args.get("kv_cache_config") or {}
-        if (spec.get("decoding_type") != "DFlash"
-                or spec.get("attention_backend") != "TRTLLM"
+        dspark = spec.get("decoding_type") == "DSpark"
+        backends = (None, "AUTO", "TRTLLM") if dspark else ("TRTLLM", )
+        page = kv_cache.get("tokens_per_block", 32)
+        # Each worker's KvCacheCreator checks that a DSpark drafter reads the target's page size.
+        if (not (dspark or spec.get("decoding_type") == "DFlash")
+                or spec.get("attention_backend") not in backends
                 or spec.get("draft_len_schedule") is not None
                 or spec.get("max_concurrency") is not None
                 or cfg.other_args.get("attn_backend", "TRTLLM") != "TRTLLM"
-                or kv_cache.get("tokens_per_block", 32) not in (16, 32, 64)):
+                or not (dspark or page in (16, 32, 64))):
             shared_draft_kv_supported = False
             break
     # "auto" shares where both creators can; only an explicit "1" fails fast.
-    os.environ["TRTLLM_DISAGG_SHARED_DRAFT_KV"] = (
-        "auto"
-        if with_spec == {"ctx", "gen"} and len(attention_parallel_configs) == 1
-        and shared_draft_kv_supported else "0")
+    if os.environ.get("TRTLLM_DISAGG_SHARED_DRAFT_KV") != "0":
+        os.environ["TRTLLM_DISAGG_SHARED_DRAFT_KV"] = (
+            "auto" if with_spec == {"ctx", "gen"}
+            and len(attention_parallel_configs) == 1
+            and shared_draft_kv_supported else "0")
 
     # Run a server with the underlying LLM invokes a RemoteMPISessionClient
     if os.environ.get(DisaggLauncherEnvs.

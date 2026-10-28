@@ -368,3 +368,23 @@ def test_launcher_checks_all_peer_configs(
         draft=_model_config(kv_heads=8, head_dim=128),
     )
     assert creator._should_unify_dflash_kv_cache() is shared
+
+
+@pytest.mark.parametrize(
+    "request_mode,expected", [(None, "auto"), ("0", "0")], ids=["unset", "opt_out"]
+)
+def test_launcher_lets_dspark_workers_decide_on_128_token_pages(
+    monkeypatch, tmp_path, request_mode, expected
+) -> None:
+    if request_mode is None:
+        monkeypatch.delenv(_SHARED_DRAFT_KV_ENV)
+    else:
+        monkeypatch.setenv(_SHARED_DRAFT_KV_ENV, request_mode)
+    server = {
+        "speculative_config": {"decoding_type": "DSpark"},
+        "kv_cache_config": {"tokens_per_block": 128},
+    }
+
+    _launch_from_disagg_config(monkeypatch, tmp_path, server, server)
+
+    assert os.environ[_SHARED_DRAFT_KV_ENV] == expected
