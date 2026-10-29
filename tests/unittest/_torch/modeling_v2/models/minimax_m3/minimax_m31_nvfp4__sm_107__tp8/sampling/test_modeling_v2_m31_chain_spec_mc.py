@@ -378,15 +378,14 @@ def test_the_slots_kill_switch_installs_no_slot_hook() -> None:
     assert out.stdout.strip().splitlines()[-1] == "False True"
 
 
-def test_the_slots_hook_is_off_by_default_and_opt_in() -> None:
-    """REJ_SLOTS is off by default (read at import); TRTLLM_M31_ENABLE_REJ_SLOTS=1 turns it on; the disable switch
-    wins."""
+def test_the_slots_hook_is_on_by_default() -> None:
+    """REJ_SLOTS is on by default (read at import); TRTLLM_M31_DISABLE_REJ_SLOTS=1 turns it off."""
     probe = f"import {TARGET}.modeling as m\nprint(m.REJ_SLOTS)"
     base = {k: v for k, v in os.environ.items() if not k.endswith("_REJ_SLOTS")}
     for extra, want in (
-        ({}, "False"),
-        ({"TRTLLM_M31_ENABLE_REJ_SLOTS": "1"}, "True"),
-        ({"TRTLLM_M31_ENABLE_REJ_SLOTS": "1", "TRTLLM_M31_DISABLE_REJ_SLOTS": "1"}, "False"),
+        ({}, "True"),
+        ({"TRTLLM_M31_DISABLE_REJ_SLOTS": "1"}, "False"),
+        ({"TRTLLM_M31_DISABLE_REJ_SLOTS": "0"}, "True"),
     ):
         out = subprocess.run(
             [sys.executable, "-c", probe],

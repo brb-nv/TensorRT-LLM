@@ -6670,10 +6670,9 @@ REJ_MC = not m31_disabled("REJ_MC")
 # REJ_SLOTS (VR only): on top of REJ_MC, the rejection step reads each request's draft
 # distributions in place from the spec metadata's slot-indexed buffer (draft_probs[slot, k, :]) instead of the
 # sampler first gathering them into a contiguous copy (one ~5.6 MB index_elementwise per step at c1). The same floats,
-# so bitwise the gathered call. OFF by default on this target: it is exact but measured flat at c1 (the in-graph gather
-# is cheap here). Opt in with TRTLLM_M31_ENABLE_REJ_SLOTS=1; TRTLLM_M31_DISABLE_REJ_SLOTS=1 still wins (the
-# gather + REJ_MC).
-REJ_SLOTS = m31_enabled("REJ_SLOTS") and not m31_disabled("REJ_SLOTS")
+# so bitwise the gathered call. VR TP8 K7 c1 microbench (store + rejection graph, L2 flushed between them): -10.9 us
+# per step. Default ON; kill switch TRTLLM_M31_DISABLE_REJ_SLOTS=1 (the gather + REJ_MC), read at import.
+REJ_SLOTS = not m31_disabled("REJ_SLOTS")
 _REJ_MC_STATE: dict = {}
 
 

@@ -89,6 +89,15 @@ TAILBK_SPEC = not m31_disabled("TAILBK_SPEC")
 # poll). Bitwise the S4B8 kernel's tokens (same entries, same total argmax order). Default ON; kill switch
 # TRTLLM_M31_DISABLE_MARKOV_LL=1, read at import.
 MARKOV_LL = not m31_disabled("MARKOV_LL")
+# TAIL16_G3: the block draft probabilities stored into their request slots as one vectorized row copy
+# (trtllm::minimax_m31_scatter_rows) instead of the stock index_put. Bitwise the stock store. VR TP8 K7 c1 microbench
+# (store + rejection graph): -6.3 us per step alone, -13.5 us with REJ_SLOTS. Default ON; kill switch
+# TRTLLM_M31_DISABLE_TAIL16_G3=1, read at import.
+TAIL16_G3 = not m31_disabled("TAIL16_G3")
+TAIL16_G3_MAX_REQUESTS = (
+    8  # capacity: measured at 1 request on VR; the tp2 target measured it slower at 96 rows
+)
+_TAIL16_G3_LOGGED: set = set()
 
 # Read once, at import: every rank and every step of a process sees the same setting. Any value but "" or "0" turns
 # the item off, as the targets' m31_switches reads its switches.
@@ -538,6 +547,42 @@ class S4WorkerMixin:
         path = os.path.join(self._s4_dump_dir, f"rank{self.mapping.tp_rank}.jsonl")
         with open(path, "a") as f:
             f.write(json.dumps(rec) + "\n")
+
+    @staticmethod
+    def _store_block_draft_probs(draft_probs, slot_ids, probs):
+        """TAIL16_G3: the stock store as one vectorized row copy for up to TAIL16_G3_MAX_REQUESTS requests; any other
+        layout or size keeps the stock index_put."""
+        op = getattr(torch.ops.trtllm, "minimax_m31_scatter_rows", None) if TAIL16_G3 else None
+        if (
+            op is not None
+            and isinstance(draft_probs, torch.Tensor)
+            and isinstance(probs, torch.Tensor)
+            and isinstance(slot_ids, torch.Tensor)
+            and draft_probs.is_cuda
+            and probs.is_cuda
+            and slot_ids.is_cuda
+            and draft_probs.dtype == torch.float32
+            and probs.dtype == torch.float32
+            and draft_probs.dim() == 3
+            and probs.dim() == 3
+            and draft_probs.stride(2) == 1
+            and draft_probs.shape[1] >= probs.shape[1]
+            and draft_probs.shape[2] >= probs.shape[2]
+            and slot_ids.dtype == torch.int64
+            and slot_ids.dim() == 1
+            and slot_ids.shape[0] == probs.shape[0]
+            and 1 <= probs.shape[0] <= TAIL16_G3_MAX_REQUESTS
+            and draft_probs.device == probs.device == slot_ids.device
+        ):
+            op(draft_probs, slot_ids.contiguous(), probs.contiguous())
+            key = (int(probs.shape[0]), int(probs.shape[1]))
+            if key not in _TAIL16_G3_LOGGED:
+                _TAIL16_G3_LOGGED.add(key)
+                logger.info(f"[M3.1] TAIL16_G3 taken at {key[0]} requests ({key[1]} rows)")
+            return
+        from tensorrt_llm._torch.speculative.interface import SpecWorkerBase
+
+        SpecWorkerBase._store_block_draft_probs(draft_probs, slot_ids, probs)
 
     def sample_draft_tokens(self, logits, spec_metadata, batch_size, **kwargs):
         tokens = self._s4_tokens

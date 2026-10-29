@@ -72,6 +72,7 @@ from .dspark_s4 import MAX_FAST_BATCH, TAILBK_SPEC, S4WorkerMixin
 from .kernels import m3_mc_allreduce
 from .m31_switches import m31_disabled, m31_enabled
 from .mxdraft import route_gu_swiglu, route_mx_linears
+from .mxdraft_down_splitk import route_down_splitk
 from .ops.embedding.m3_embedding import m3_embedding
 from .ops.gemm.m31_fc_shard import FcShard
 
@@ -456,6 +457,10 @@ class M3DSparkWorker(S4WorkerMixin, DSparkWorker):
             f"M3.1 DSpark DRAFT_APPEND_FUSE: drafter K / V append in the EX-11 launch {'on' if append_fuse else 'off'} "
             f"on rank {rank}"
         )
+        attn_pdl = self.enable_attention_pdl(draft_model, not m31_disabled("DRAFT_ATTN_PDL"))
+        logger.info(
+            f"M3.1 DSpark DRAFT_ATTN_PDL: drafter attention PDL {'on' if attn_pdl else 'off'} on rank {rank}"
+        )
         # MXDRAFT: the drafter's qkv / o / gate_up / down GEMMs on this target's MXFP8 GEMV for the decode passes'
         # rows (B x K, B <= MAX_FAST_BATCH, up to the GEMV's own row bound), from the exact MXFP8 form of the shipped
         # weights (drafter-only precision, gated on natural AL). Kill switch TRTLLM_M31_DISABLE_MXDRAFT, read
@@ -466,6 +471,11 @@ class M3DSparkWorker(S4WorkerMixin, DSparkWorker):
             else route_mx_linears(draft_model, [b * k for b in range(1, MAX_FAST_BATCH + 1)])
         )
         logger.info(f"M3.1 DSpark MXDRAFT: MXFP8 drafter GEMV on {mx} projections on rank {rank}")
+        down = route_down_splitk(
+            draft_model,
+            enabled=k == 7 and s9b and not S9B_MC and not m31_disabled("MXDRAFT_DOWN_SPLITK"),
+        )
+        logger.info(f"M3.1 MXDRAFT_DOWN_SPLITK: armed {down}/5 projections on rank {rank}")
         # DRAFT_GU_SWIGLU_EPI (F5, exact): the drafter MLP's SwiGLU in its gate_up GEMV's epilogue (one launch fewer per
         # drafter MLP), on MXDRAFT's rows. Kill switch TRTLLM_M31_DISABLE_DRAFT_GU_SWIGLU_EPI.
         gus = (

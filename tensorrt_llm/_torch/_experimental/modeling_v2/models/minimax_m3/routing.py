@@ -297,9 +297,11 @@ def route(
             from .minimax_m31_nvfp4__sm_107__tp4.modeling import ModelingV2MiniMaxM31Nvfp4Sm107Tp4
 
             return ModelingV2MiniMaxM31Nvfp4Sm107Tp4
-        from .minimax_m31_nvfp4__sm_107__tp8.modeling import ModelingV2MiniMaxM31Nvfp4Sm107Tp8
+        from .minimax_m31_local_moe_tp8.bootstrap import install_tp8
+        from .minimax_m31_nvfp4__sm_107__tp8 import modeling as tp8_model
 
-        return ModelingV2MiniMaxM31Nvfp4Sm107Tp8
+        install_tp8(tp8_model, mapping)
+        return tp8_model.ModelingV2MiniMaxM31Nvfp4Sm107Tp8
 
     # MiniMax-M3.1 context (prefill) worker on 2 Rubin GPUs (sm107): tensor-parallel attention, expert-parallel
     # experts, no speculative decoding or a standalone MiniMax DSpark drafter. Attention DP keeps the built-in model.
