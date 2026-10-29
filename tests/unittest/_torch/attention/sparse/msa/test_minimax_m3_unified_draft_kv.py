@@ -155,13 +155,14 @@ def test_draft_layer_specs_join_the_hybrid_nvfp4_manager():
 
 
 @pytest.mark.cpu_only
-def test_window_sized_draft_ratio():
+@pytest.mark.parametrize("is_disagg", [False, True])
+def test_window_sized_draft_ratio(is_disagg):
     manager = object.__new__(KVCacheManagerV2)
     manager.layer_specs = _specs()[NUM_TARGET - 1 :]
     manager.max_batch_size = 2
     manager.max_num_tokens = 256
     manager.mapping = Mapping()
-    manager.is_disagg = True
+    manager.is_disagg = is_disagg
     manager._generation_kv_capacity_headroom = 1
     configs = [
         SimpleNamespace(
@@ -238,20 +239,20 @@ def _dspark_creator(*, is_disagg):
 
 
 @pytest.mark.cpu_only
-def test_m3_unifies_a_dspark_drafter_only_under_disagg(monkeypatch):
+@pytest.mark.parametrize("is_disagg", [False, True])
+def test_m3_unifies_a_dspark_drafter(monkeypatch, is_disagg):
     monkeypatch.delenv("TRTLLM_DISAGG_SHARED_DRAFT_KV", raising=False)
-    assert _dspark_creator(is_disagg=True)._should_unify_dflash_kv_cache()
-    assert not _dspark_creator(is_disagg=False)._should_unify_dflash_kv_cache()
+    assert _dspark_creator(is_disagg=is_disagg)._should_unify_dflash_kv_cache()
 
-    # The opt-out, a drafter that cannot read the target's pages, and a model that ships
+    # The disagg opt-out, a drafter that cannot read the target's pages, and a model that ships
     # its separate pool's window all keep the separate draft KV cache.
     monkeypatch.setenv("TRTLLM_DISAGG_SHARED_DRAFT_KV", "0")
-    assert not _dspark_creator(is_disagg=True)._should_unify_dflash_kv_cache()
+    assert _dspark_creator(is_disagg=is_disagg)._should_unify_dflash_kv_cache() is not is_disagg
     monkeypatch.delenv("TRTLLM_DISAGG_SHARED_DRAFT_KV")
-    creator = _dspark_creator(is_disagg=True)
+    creator = _dspark_creator(is_disagg=is_disagg)
     creator._draft_tokens_per_block = lambda: 64
     assert not creator._should_unify_dflash_kv_cache()
-    creator = _dspark_creator(is_disagg=True)
+    creator = _dspark_creator(is_disagg=is_disagg)
     creator._model_engine.model.runtime_hooks = RuntimeHooks(disagg_draft_kv=True)
     assert not creator._should_unify_dflash_kv_cache()
 
