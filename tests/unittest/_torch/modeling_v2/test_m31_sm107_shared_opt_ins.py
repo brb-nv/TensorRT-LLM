@@ -37,7 +37,7 @@ from tensorrt_llm._torch.pyexecutor import llm_request, perf_metrics_manager, py
 from tensorrt_llm._torch.pyexecutor.kv_cache import kv_cache_manager_v2, kv_layerwise_onboard
 from tensorrt_llm._torch.pyexecutor.runtime_hooks import RuntimeHooks
 from tensorrt_llm._torch.pyexecutor.sampler.ops import flashinfer as flashinfer_ops
-from tensorrt_llm._torch.speculative import dflash, interface
+from tensorrt_llm._torch.speculative import dflash, dflash_later_key_merge, interface
 
 pytestmark = pytest.mark.cpu_only
 
@@ -63,6 +63,7 @@ ARM_CALLS = (
     "arm_host_ctx_alloc",
     "arm_gpu_timestamps",
     "arm_minimax_m31",  # m31_kv_defaults
+    "arm_sm107_fused_merge",
 )
 # (module, flag, value once armed) for every process-wide flag the helper sets.
 FLAGS = (
@@ -88,6 +89,7 @@ FLAGS = (
     (perf_metrics_manager, "_GPU_TIMESTAMPS", True),
     (kv_layerwise_onboard, "_M31_DEFAULT_OFF", True),
     (kv_cache_manager_v2, "_M31_UNPAIRED_DRAFT_POOL", True),
+    (dflash_later_key_merge, "_ARMED", True),
 )
 KILL_SWITCHES = (
     "TRTLLM_M31_DISABLE_DRAFT_KV_RESERVE",
@@ -99,6 +101,7 @@ KILL_SWITCHES = (
     "TRTLLM_M31_DISABLE_GPU_TIMESTAMPS",
     "TRTLLM_M31_DISABLE_KVLO_OFF",
     "TRTLLM_M31_DISABLE_UNPAIRED_DRAFT_POOL",
+    "TRTLLM_M31_DISABLE_DFLASH_FUSED_MERGE",
 )
 
 

@@ -21,6 +21,7 @@ try:
 except ImportError:
     _flashinfer_rope = None
 from ..pyexecutor.config_utils import _is_sliding_attention_layer, get_layer_attention_window
+from ..speculative import dflash_later_key_merge
 from ..speculative.dflash_attention import (
     dflash_trtllm_gen_unavailability_reason,
     get_dflash_fa4_fwd,
@@ -1943,7 +1944,16 @@ class DFlashForCausalLM(nn.Module):
                         return_lse=merge_later_keys,
                         multi_ctas_kv_counter_buffer=self._dflash_trtllm_gen_counters,
                     )
-                    if merge_later_keys:
+                    if merge_later_keys and not dflash_later_key_merge.merge_later_block_keys_(
+                        dflash_merge_later_block_keys_,
+                        out_flat,
+                        decoded[1],
+                        Q_bshd,
+                        k_noise_bshd,
+                        v_noise_bshd,
+                        head_dim**-0.5,
+                        window_size[1],
+                    ):
                         dflash_merge_later_block_keys_(
                             out_flat,
                             decoded[1],

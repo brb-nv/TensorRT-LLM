@@ -179,16 +179,17 @@ def arm_sm107_shared_opt_ins() -> None:
     shipped ahead-of-time CuTe DSL objects, the drafter KV reserve and guard page, the host-tier KV prefetch, the
     context-only int32 prompt tokens, the BF16X / E4M3X sparse-prefill fork, the indexer proxy max-score buffer reuse,
     the context one-hot index_fill, the DFlash host-side context allocation, GPU timestamps for the executor's
-    timing events and the MiniMax-M3.1 KV defaults (m31_kv_defaults.arm_minimax_m31). Each keeps its kill switch. The
-    MSA context paths and warmup stay the ones these targets run (msa_indexer.arm_sm107_msa_paths), and CUDA-graph
-    padding rows stay zeroed (interface.arm_sm107_spec_paths). Armed here rather than in a target's RuntimeHooks so
+    timing events, the MiniMax-M3.1 KV defaults (m31_kv_defaults.arm_minimax_m31) and the drafter's one-launch
+    later-key merge where it is bitwise the compiled one (DFLASH_FUSED_MERGE). Each keeps its kill switch. The MSA
+    context paths and warmup stay the ones these targets run (msa_indexer.arm_sm107_msa_paths), and CUDA-graph padding
+    rows stay zeroed (interface.arm_sm107_spec_paths). Armed here rather than in a target's RuntimeHooks so
     that the target directories (the AOT objects' source digests) are not edited."""
     from tensorrt_llm._torch import cute_aot
     from tensorrt_llm._torch.attention.backends.fmha import msa_prefill
     from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import msa_indexer
     from tensorrt_llm._torch.pyexecutor import llm_request, perf_metrics_manager, py_executor
     from tensorrt_llm._torch.pyexecutor.kv_cache import kv_cache_manager_v2, m31_kv_defaults
-    from tensorrt_llm._torch.speculative import dflash, interface
+    from tensorrt_llm._torch.speculative import dflash, dflash_later_key_merge, interface
 
     cute_aot.arm()
     kv_cache_manager_v2.arm_draft_kv_reserve_guard()
@@ -202,6 +203,7 @@ def arm_sm107_shared_opt_ins() -> None:
     dflash.arm_host_ctx_alloc()
     perf_metrics_manager.arm_gpu_timestamps()
     m31_kv_defaults.arm_minimax_m31(_SM_RUBIN)
+    dflash_later_key_merge.arm_sm107_fused_merge()
 
 
 def route(
