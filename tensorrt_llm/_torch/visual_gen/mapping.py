@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Unified multi-dimensional communicator mesh for visual generation models.
 
 VisualGenMapping subclasses DeviceMeshTopologyImpl and overrides build_mesh()
@@ -281,6 +284,8 @@ class VisualGenMapping(DeviceMeshTopologyImpl):
     # ------------------------------------------------------------------
     def build_mesh(self):
         cls = DeviceMeshTopologyImpl
+        # Visual-gen keeps the uncached mesh lookup it had before the memoization.
+        cls._memoize_mesh_dims = False
         expected_shape = tuple(self._dim_sizes[d] for d in self._dim_names)
         if cls.device_mesh is not None:
             cached_dim_names = tuple(cls.device_mesh.mesh_dim_names)

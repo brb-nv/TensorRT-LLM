@@ -22,6 +22,7 @@ from tensorrt_llm._torch.compilation.backend import Backend
 from tensorrt_llm._torch.compilation.piecewise_optimizer import PiecewiseRunner
 from tensorrt_llm._torch.compilation.utils import capture_piecewise_cuda_graph
 from tensorrt_llm._torch.distributed import Distributed
+from tensorrt_llm._torch.distributed.ops import warmup_named_allreduce_topologies
 from tensorrt_llm._torch.memory_buffer_utils import clear_memory_buffers, with_shared_pool
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import _build_request_multimodal_input
@@ -468,6 +469,8 @@ class DecoderRunner(ScheduledModelRunner):
 
     def warmup(self, resource_manager: ResourceManager) -> None:
         kv_cache_manager = resource_manager.get_resource_manager(self.kv_cache_manager_key)
+        # Scope topology warmup to the executor's graph capture, not AllReduce construction.
+        warmup_named_allreduce_topologies(self.model)
         # The MSA prewarm scope closes after the timed warmup: its end-of-warmup
         # sparse-decode prewarm is not one of the warmup timer's phases.
         with self._msa_prewarm_scope():
