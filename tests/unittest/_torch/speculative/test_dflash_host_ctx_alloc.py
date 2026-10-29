@@ -55,6 +55,12 @@ def _metadata(manager, width: int = WIDTH, device: str = "cpu") -> SimpleNamespa
 @pytest.mark.cpu_only
 def test_the_width_is_known_for_the_shared_page_table_copy():
     assert host_counted_block_width(_metadata(_manager())) == WIDTH
+    # A unified drafter reads the target manager's own table.
+    unified = SimpleNamespace(
+        kv_cache_manager=_manager(),
+        kv_cache_block_offsets=_metadata(None).draft_kv_cache_block_offsets,
+    )
+    assert host_counted_block_width(unified) == WIDTH
 
 
 @pytest.mark.cpu_only

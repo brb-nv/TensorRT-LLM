@@ -29,6 +29,7 @@ def _worker(rows, width, pool_idx, divisor, fused):
     worker = object.__new__(DFlashWorker)
     worker._ctx_block_tables = torch.full((rows, width), 77, dtype=torch.int32, device="cuda")
     worker._ctx_block_counts = torch.full((rows,), 77, dtype=torch.int64, device="cuda")
+    worker._ctx_block_cols = torch.arange(1, width + 1, dtype=torch.long, device="cuda")
     worker._ctx_pool_idx = pool_idx
     worker._ctx_block_divisor = divisor
     worker._fused_block_refresh = refresh_block_tables if fused else None

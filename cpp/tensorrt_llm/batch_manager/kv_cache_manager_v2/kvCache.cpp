@@ -182,8 +182,7 @@ void KvCache::_collectReuseCandidates()
         }
         // OPTIONAL checks coverage at the REQUIRED endpoint without shortening it.
         // Use the ordinary SWA live ranges, including sinks and multi-page windows.
-        if (attention && attention->allowsCheckpoint() && end > 0 && end % mTokensPerBlock == 0
-            && attention->windowSize)
+        if (attention && attention->allowsCheckpoint() && end > 0 && attention->windowSize)
         {
             auto const stale = getStaleRange(lifeCycles[lc], end, mTokensPerBlock);
             auto& candidates = mOptionalCandidates[lc];
@@ -194,7 +193,9 @@ void KvCache::_collectReuseCandidates()
                 {
                     auto const& block = mBlocks[ordinal].treeBlock;
                     auto* page = block && !block->isOrphan() ? block->getPage(lc) : nullptr;
-                    if (!page || page->numTokensInBlock < mTokensPerBlock)
+                    // A partial endpoint's last page needs to cover only the matched prefix, as for REQUIRED.
+                    int const needed = std::min(mTokensPerBlock, end - ordinal.value() * mTokensPerBlock);
+                    if (!page || page->numTokensInBlock < needed)
                     {
                         status.complete = false;
                         return;
@@ -203,13 +204,14 @@ void KvCache::_collectReuseCandidates()
                 }
                 if (beg < limit)
                 {
-                    status.coverage.emplace_back(beg.value() * mTokensPerBlock, limit.value() * mTokensPerBlock);
+                    status.coverage.emplace_back(
+                        beg.value() * mTokensPerBlock, std::min(end, limit.value() * mTokensPerBlock));
                 }
             };
             collectRange(BlockOrdinal{0}, stale.beg);
             if (status.complete)
             {
-                collectRange(stale.end, BlockOrdinal{end / mTokensPerBlock});
+                collectRange(stale.end, BlockOrdinal{divUp(end, mTokensPerBlock)});
             }
             if (!status.complete)
             {
@@ -575,7 +577,9 @@ bool KvCache::resume(std::optional<CUstream> stream, std::optional<bool> isDecod
             {
                 if (!stale.contains(ordinal))
                 {
-                    ++byLevel.full.at(holder->page->cacheLevel);
+                    // A partial endpoint's last page is a partial reuse, as for REQUIRED.
+                    bool const partial = (ordinal.value() + 1) * mTokensPerBlock > numCommittedTokens();
+                    ++(partial ? byLevel.partial : byLevel.full).at(holder->page->cacheLevel);
                 }
             }
         }
@@ -894,8 +898,9 @@ bool KvCache::resume(std::optional<CUstream> stream, std::optional<bool> isDecod
         for (auto const& [lc, byLevel] : optionalReusedByLevel)
         {
             int const reused = static_cast<int>(countsByLevelTotal(byLevel.full));
+            int const partial = static_cast<int>(countsByLevelTotal(byLevel.partial));
             if (mPendingStats.recordReuse(
-                    lc, reused, 0, byLevel, _shouldRecordManagerStats(), _shouldRecordRequestStats()))
+                    lc, reused, partial, byLevel, _shouldRecordManagerStats(), _shouldRecordRequestStats()))
             {
                 mManager->markStatsDirty(id);
             }
@@ -1498,7 +1503,8 @@ void KvCache::_snapshotPartialBlockToTree(BlockOrdinal ordinal, bool commitSsm)
     std::vector<LifeCycleId> attachedLcs;
     for (auto const& [lcIdx, attn] : mManager->lifeCycles().attentionLifeCycles())
     {
-        if (!attn->requiresPrefixCoverage())
+        // OPTIONAL pages are published too, so a later reader can select them at this partial endpoint.
+        if (attn->isPrivate())
         {
             continue;
         }

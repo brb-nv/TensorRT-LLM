@@ -376,6 +376,44 @@ TEST_F(ReplayCacheTest, OptionalWindowClaimsSurviveIndependentPageRemoval)
     }
 }
 
+TEST_F(ReplayCacheTest, OptionalWindowClaimsAPartialEndpoint)
+{
+    // The partial page at the 7-token endpoint comes from a longer full block or a partial snapshot.
+    for (int committed : {8, 7})
+    {
+        SCOPED_TRACE(committed);
+        auto config = makeConfig();
+        config.commitMinSnapshot = true;
+        addWindow(config, 1, 4, AttentionReusePolicy::OPTIONAL);
+        auto manager = std::make_shared<KvCacheManager>(config);
+        auto const encoder = manager->getLayerGroupId(LayerId{1});
+        auto const tokens = makeTokens(committed);
+        TokenSpan const prefix{tokens.data(), 7};
+        auto source = manager->createKvCache({}, {}, 1);
+        ASSERT_TRUE(source->resume(mStream));
+        ASSERT_TRUE(source->resize(committed));
+        ASSERT_TRUE(source->resize(std::nullopt, committed));
+        source->commit(TokenSpan{tokens.data(), committed});
+        source->stopCommitting();
+        auto reader = manager->createKvCache({}, prefix, 2);
+        EXPECT_EQ(reader->numCommittedTokens(), 7);
+        ASSERT_TRUE(reader->reuseStatus()[encoder.value()].complete);
+        EXPECT_EQ(reader->reuseStatus()[encoder.value()].coverage, (std::vector<std::pair<int, int>>{{4, 7}}));
+        manager->getAndResetIterationReusedBlocksByLevel();
+        ASSERT_TRUE(reader->resume(mStream, std::nullopt, std::vector<LifeCycleId>{encoder}));
+        reader->commitPendingStats();
+        auto const reusedByLevel = manager->getAndResetIterationReusedBlocksByLevel();
+        ASSERT_NE(reusedByLevel.find(encoder), reusedByLevel.end());
+        EXPECT_EQ(countsByLevelTotal(reusedByLevel.at(encoder).full), 0);
+        EXPECT_EQ(countsByLevelTotal(reusedByLevel.at(encoder).partial), 1);
+        // Like a REQUIRED partial page, the claimed one is copied into a private page.
+        EXPECT_NE(reader->getBasePageIndices(encoder)[1], source->getBasePageIndices(encoder)[1]);
+        reader->close();
+        source->close();
+        manager->shutdown();
+    }
+}
+
 TEST_F(ReplayCacheTest, IndependentOptionalDropPreservesMigrationPeer)
 {
     auto config = makeConfig();

@@ -57,6 +57,9 @@ class RankInfo:
     # Set on a rank that takes part in the draft-window exchange but will not RECEIVE a window
     # (the reason, e.g. "sync_path_tp"); senders then ship it the target set only.
     draft_receive_disabled: Optional[str] = None
+    # Layers a unified KV cache manager owns for the drafter (layer specs with
+    # a DRAFT owner). They ride the target's pages, so both peers must agree.
+    num_draft_layers: int = 0
 
     @property
     def tp_size_per_dp_group(self) -> int:
@@ -164,6 +167,9 @@ class RankInfo:
             bounded_replay_on_generation=getattr(kvm, "bounded_replay_on_generation", False),
             draft_attention=draft_attention,
             draft_page_table=draft_page_table,
+            num_draft_layers=(
+                len(kvm.draft_layer_ids) if getattr(kvm, "layer_specs", None) is not None else 0
+            ),
         )
 
     @classmethod
