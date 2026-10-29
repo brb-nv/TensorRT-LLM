@@ -956,6 +956,7 @@ def create_test_backend(
     locality_domain_policy: Optional[LocalityDomainPolicy] = None,
     n_shared_experts: int = 0,
     moe_cls: Optional[type] = None,
+    moe_disable_finalize_fusion: bool = False,
 ) -> MoE:
     """Create a MoE backend for testing.
 
@@ -992,6 +993,7 @@ def create_test_backend(
         mapping=mapping,
         moe_backend=moe_backend_value,
         locality_domain_policy=locality_domain_policy,
+        moe_disable_finalize_fusion=moe_disable_finalize_fusion,
     )
     if n_shared_experts > 0:
         # The shared-expert-fusion gate runs after the eager create_weights()
@@ -3850,3 +3852,147 @@ def test_unresolvable_layer_error_carries_rejection_details():
     )
     with pytest.raises(ValueError, match="raise moe_expert_parallel_size"):
         impl_class_for(report)
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("fused_finalize", [True, False], ids=["fused_finalize", "deterministic"])
+@pytest.mark.parametrize("seq_len", [16, 512])
+def test_cutedsl_nvfp4_minimax_m3_swiglu_bias_run_moe(seq_len: int, fused_finalize: bool) -> None:
+    """MiniMax's SwiGLU (SwigluBias 1.702 / 1.0 / clamp 7, no expert bias) on the CuteDSL NVFP4 MoE through
+    create_moe -> load_weights -> run_moe, the path the model takes, vs the reference module.
+
+    With the finalize fusion off, FC2 writes every permuted row once and moe_unpermute reduces each token's
+    top-k in a fixed order, so three eager runs and three CUDA-graph replays must be bitwise identical (the
+    fused finalize's bf16 scatter-add is not: its sum depends on the order in which CTAs finish).
+    """
+    backend_type = MoeBackendType.CUTEDSL
+    dtype = torch.bfloat16
+    num_experts, top_k, hidden_size, intermediate_size = 8, 4, 512, 512
+    swiglu_alpha, swiglu_beta, swiglu_limit = 1.702, 1.0, 7.0
+
+    verdict = CuteDslFusedMoE.can_implement(
+        MoEProblem(
+            quant=QuantAlgo.NVFP4.value,
+            dtype_act=dtype,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=num_experts,
+            top_k=top_k,
+            swiglu_gptoss_style=True,
+            bias=False,
+            activation=ActivationType.SwigluBias.name,
+            activation_constants=frozenset({"alpha", "beta", "clamp"}),
+        ),
+        MoEDeployment(
+            ep_size=1,
+            tp_size=1,
+            parallel_size=1,
+            use_dp=False,
+            num_slots=num_experts,
+            fused_finalize_enabled=fused_finalize,
+            env=collect_moe_environment(),
+        ),
+    )
+    if not verdict.eligible:
+        pytest.skip(verdict.detail)
+
+    mapping = Mapping(rank=mpi_rank())
+    with torch.device(f"cuda:{mapping.rank}"):
+        torch.manual_seed(0)
+        torch.cuda.manual_seed(0)
+        AutoTuner.get().setup_distributed_state(mapping)
+        routing_method = RenormalizeMoeRoutingMethod(top_k=top_k)
+        # wide enough that the dequantized FC1 halves cross the clamp in both directions (asserted below)
+        x = torch.randn((seq_len, hidden_size), dtype=dtype, device="cuda") * 8.0
+        router_logits = torch.randn((seq_len, num_experts), dtype=dtype, device="cuda")
+        quantize_util_cls, quant_config, quant_kwargs = get_test_quant_params(
+            QuantAlgo.NVFP4, x, backend_type
+        )
+        quantize_util = quantize_util_cls(
+            num_experts=num_experts,
+            dtype=dtype,
+            intermediate_size=intermediate_size,
+            hidden_size=hidden_size,
+            quant_config=quant_config,
+            bias=False,
+            swiglu_gptoss_style=True,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
+            swiglu_limit=swiglu_limit,
+            activation_type=ActivationType.SwigluBias,
+        )
+        swiglu_tensors = quantize_util.get_swiglu_tensors()
+        backend = create_test_backend(
+            backend_type=backend_type,
+            routing_method=routing_method,
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            dtype=dtype,
+            quant_config=quant_config,
+            mapping=mapping,
+            bias=False,
+            swiglu_alpha=swiglu_tensors["swiglu_alpha"],
+            swiglu_beta=swiglu_tensors["swiglu_beta"],
+            swiglu_limit=swiglu_tensors["swiglu_limit"],
+            weight_loading_mode=getattr(
+                quantize_util, "weight_loading_mode", MoEWeightLoadingMode.VANILLA
+            ),
+            activation_type=ActivationType.SwigluBias,
+            moe_disable_finalize_fusion=not fused_finalize,
+        )
+        assert isinstance(backend, CuteDslFusedMoE)
+        assert backend.use_fused_finalize == fused_finalize
+        # Only some quant utils name a reference class; the rest use their default (as test_moe_backend does).
+        ref_cls = quant_kwargs.pop("ref_cls", None)
+        weights = quantize_util.create_weights(**quant_kwargs)
+        backend.load_weights([weights])
+        backend.post_load_weights()
+        backend.cuda()
+        ref_fused_moe = (
+            quantize_util.create_ref_module(routing_method, ref_cls=ref_cls)
+            if ref_cls is not None
+            else quantize_util.create_ref_module(routing_method)
+        )
+        ref_fused_moe.load_weights([weights])
+        ref_fused_moe.cuda()
+
+        with torch.inference_mode():
+            gate_up = ref_fused_moe.experts[0].gate_up_proj(x)
+            gate, up = gate_up.chunk(2, dim=-1)
+            assert torch.any(gate > swiglu_limit) and torch.any(gate < swiglu_limit)
+            assert torch.any(up < -swiglu_limit) and torch.any((up < 0) & (up > -swiglu_limit))
+            ref_output = ref_fused_moe(x, router_logits)
+            token_selected_experts, token_final_scales = routing_method.apply(router_logits)
+            x_quantized, x_sf = backend.quantize_input(x, post_quant_comm=False)
+
+            def run():
+                return run_backend_moe(
+                    backend,
+                    backend_type,
+                    x_quantized,
+                    x_sf,
+                    token_selected_experts,
+                    token_final_scales,
+                    dtype,
+                    router_logits,
+                )
+
+            eager = [run().clone() for _ in range(3)]
+            check_accuracy(eager[0], ref_output, rtol=0.1, atol=0.1, percent=0.94)
+            if fused_finalize:
+                return
+            for out in eager[1:]:
+                assert torch.equal(out, eager[0]), "deterministic CuteDSL MoE: eager runs differ"
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                graph_out = run()
+            replays = []
+            for _ in range(3):
+                graph.replay()
+                replays.append(graph_out.clone())
+            torch.cuda.synchronize()
+            for out in replays:
+                assert torch.equal(out, eager[0]), (
+                    "deterministic CuteDSL MoE: graph replay differs from eager"
+                )

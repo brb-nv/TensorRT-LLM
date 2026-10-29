@@ -53,6 +53,7 @@ from .utils import (
 
 SUPPORTED_ACTIVATION_TYPES = (
     ActivationType.Swiglu,
+    ActivationType.SwigluBias,
     ActivationType.Relu2,
     ActivationType.SiTu,
 )
@@ -290,6 +291,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         num_local_experts: int = 0,
         situ_beta: Optional[float] = None,
         situ_linear_beta: Optional[float] = None,
+        swiglu_bias: Optional[Tuple[float, float]] = None,
     ):
         """Initializes the configuration for a Blackwell blockscaled dense GEMM kernel with
         gather operation and fused activation.
@@ -471,6 +473,26 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             )
         self.situ_beta = None if situ_beta is None else float(situ_beta)
         self.situ_linear_beta = None if situ_linear_beta is None else float(situ_linear_beta)
+
+        # SwigluBias (gpt-oss / MiniMax SwiGLU, ``SwigluBiasAdaptor``):
+        # ``g * sigmoid(gate_sigmoid_scale * g) * (l + linear_offset)`` on the clamped halves.
+        # Per-model scalars folded at trace time, so they belong in the caller's kernel cache key.
+        if self.activation_type == ActivationType.SwigluBias:
+            if swiglu_bias is None:
+                raise ValueError(
+                    "ActivationType.SwigluBias requires swiglu_bias = (gate_sigmoid_scale, linear_offset)."
+                )
+            _INF = float("inf")
+            gate_sigmoid_scale, linear_offset = (float(v) for v in swiglu_bias)
+            if not (-_INF < gate_sigmoid_scale < _INF and -_INF < linear_offset < _INF):
+                raise ValueError(f"swiglu_bias constants must be finite, got {swiglu_bias}.")
+            self.swiglu_bias = (gate_sigmoid_scale, linear_offset)
+        elif swiglu_bias is not None:
+            raise ValueError(
+                f"swiglu_bias requires ActivationType.SwigluBias, got {self.activation_type.name}."
+            )
+        else:
+            self.swiglu_bias = None
 
     def _setup_attributes(self):
         """Set up configurations that are dependent on GEMM inputs
@@ -2536,7 +2558,9 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                     acc_vec_up = tTR_rAcc_up.load()
 
                     tCompute = cute.make_rmem_tensor(acc_vec_up.shape, self.acc_dtype)
-                    if cutlass.const_expr(self.activation_type == ActivationType.Swiglu):
+                    if cutlass.const_expr(
+                        self.activation_type in (ActivationType.Swiglu, ActivationType.SwigluBias)
+                    ):
                         acc_vec_gate = tTR_rAcc_gate.load()
                         self._apply_swiglu_epilogue(acc_vec_up, acc_vec_gate, alpha_val, tCompute)
                     elif cutlass.const_expr(self.activation_type == ActivationType.SiTu):
@@ -2791,10 +2815,27 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                     up_lo = fclip_xorsign(acc_vec_up_alpha[0], self.swiglu_limit)
                     up_hi = fclip_xorsign(acc_vec_up_alpha[1], self.swiglu_limit)
                     acc_vec_up_alpha = (up_lo, up_hi)
-                tCompute_log2e = cute.arch.mul_packed_f32x2(
-                    (acc_vec_gate_alpha[0], acc_vec_gate_alpha[1]),
-                    (-LOG2_E, -LOG2_E),
-                )
+                if cutlass.const_expr(self.swiglu_bias is not None):
+                    # SwigluBias: (l + linear_offset) and sigmoid(gate_sigmoid_scale * g)
+                    acc_vec_up_alpha = cute.arch.add_packed_f32x2(
+                        acc_vec_up_alpha,
+                        (
+                            cutlass.Float32(self.swiglu_bias[1]),
+                            cutlass.Float32(self.swiglu_bias[1]),
+                        ),
+                    )
+                    tCompute_log2e = cute.arch.mul_packed_f32x2(
+                        (acc_vec_gate_alpha[0], acc_vec_gate_alpha[1]),
+                        (
+                            -LOG2_E * cutlass.Float32(self.swiglu_bias[0]),
+                            -LOG2_E * cutlass.Float32(self.swiglu_bias[0]),
+                        ),
+                    )
+                else:
+                    tCompute_log2e = cute.arch.mul_packed_f32x2(
+                        (acc_vec_gate_alpha[0], acc_vec_gate_alpha[1]),
+                        (-LOG2_E, -LOG2_E),
+                    )
                 (
                     tCompute[i],
                     tCompute[i + 1],
@@ -2828,7 +2869,16 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                 if cutlass.const_expr(self.has_swiglu_limit):
                     acc_vec_gate_alpha = fmin(acc_vec_gate_alpha, self.swiglu_limit)
                     acc_vec_up_alpha = fclip_xorsign(acc_vec_up_alpha, self.swiglu_limit)
-                tCompute[i] = acc_vec_up_alpha * silu_f32(acc_vec_gate_alpha, fastmath=True)
+                if cutlass.const_expr(self.swiglu_bias is not None):
+                    tCompute[i] = (
+                        (acc_vec_up_alpha + cutlass.Float32(self.swiglu_bias[1]))
+                        * acc_vec_gate_alpha
+                        * sigmoid_f32(
+                            acc_vec_gate_alpha * cutlass.Float32(self.swiglu_bias[0]), fastmath=True
+                        )
+                    )
+                else:
+                    tCompute[i] = acc_vec_up_alpha * silu_f32(acc_vec_gate_alpha, fastmath=True)
 
     @cute.jit
     def _apply_situ_epilogue(

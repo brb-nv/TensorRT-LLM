@@ -19,7 +19,8 @@
 // (md5 546e8c75) and common/reduceKernelUtils.cuh: LamportComm, FusedOp<kARResidualRMSNorm, bf16>, allreduce_sum
 // (Fp32Acc), IndexHelper, blockReduceSumV2, with the push loop removed (the producer pre-pushed) and the MXFP8 output
 // of the norm (quantization.cuh cvt_quant_get_sf_out_offset<uint32_t, 4> SWIZZLED + cvt_warp_fp16_to_mxfp8<bf16, 32>,
-// as quantize_mxfp8_rows). Same device code as the shipped libm31_f3_ar.so.
+// as quantize_mxfp8_rows), and the NVFP4 of the norm (cvt_quant_get_sf_out_offset<uint32_t, 2, 1> LINEAR +
+// cvt_warp_fp16_to_fp4<bf16, 16, false>, as fp4_quantize(x, scale, 16, false, false)).
 #include "tensorrt_llm/kernels/minimaxM31/f3ArPrepushedSm107.h"
 #include "tensorrt_llm/kernels/quantization.cuh"
 
@@ -188,6 +189,19 @@ public:
                 tensorrt_llm::QuantizationSFLayout::SWIZZLED);
             reinterpret_cast<uint64_t*>(m_params.mx_out)[m_access_id]
                 = tensorrt_llm::kernels::cvt_warp_fp16_to_mxfp8<DType, 32>(pv, sf_out);
+        }
+        if (m_params.fp4_out != nullptr)
+        {
+            // quantize_with_block_size<FP16_TO_FP4, bf16, 16, false, 16> with the LINEAR layout: same device calls,
+            // same row / 8-element column index, same SFScale[0].
+            using PV = tensorrt_llm::kernels::PackedVec<DType>;
+            PV pv = *reinterpret_cast<PV const*>(&val);
+            auto sf_out = tensorrt_llm::kernels::cvt_quant_get_sf_out_offset<uint32_t, 2, 1>(std::optional<int>(0),
+                token_id, m_access_id_in_token, std::optional<int>(m_params.size / m_params.hidden_dim),
+                m_params.hidden_dim / 16, reinterpret_cast<uint32_t*>(m_params.fp4_sf),
+                tensorrt_llm::QuantizationSFLayout::LINEAR);
+            reinterpret_cast<uint32_t*>(m_params.fp4_out)[m_access_id]
+                = tensorrt_llm::kernels::cvt_warp_fp16_to_fp4<DType, 16, false>(pv, m_params.fp4_scale[0], sf_out);
         }
     }
 

@@ -148,6 +148,17 @@ def _canonicalize_swiglu_limit_scalar(swiglu_limit_scalar: float) -> float:
     return float("inf") if swiglu_limit_scalar < 0 else swiglu_limit_scalar
 
 
+def _swiglu_bias_from_op_args(
+        swiglu_sigmoid_scale: Optional[float],
+        swiglu_linear_offset: Optional[float]) -> Optional[Tuple[float, float]]:
+    """The ``ActivationType.SwigluBias`` constants of an op call: both or neither."""
+    if (swiglu_sigmoid_scale is None) != (swiglu_linear_offset is None):
+        raise ValueError(
+            "swiglu_sigmoid_scale and swiglu_linear_offset go together")
+    return (None if swiglu_sigmoid_scale is None else
+            (swiglu_sigmoid_scale, swiglu_linear_offset))
+
+
 def _get_cute_dsl_swap_ab_candidates(
     m: int,
     output_aligned: bool,
@@ -3965,13 +3976,17 @@ if IS_CUTLASS_DSL_AVAILABLE:
                      swiglu_limit_scalar: float = float("inf"),
                      use_expert_counts: bool = False,
                      situ_beta: Optional[float] = None,
-                     situ_linear_beta: Optional[float] = None):
+                     situ_linear_beta: Optional[float] = None,
+                     swiglu_bias: Optional[Tuple[float, float]] = None):
             """Initialize the runner.
 
             Args:
                 activation_type: ``ActivationType`` for the fused epilogue.
-                    ``Swiglu`` (gated), ``Relu2`` (non-gated) and ``SiTu``
-                    (gated) are supported.
+                    ``Swiglu`` (gated), ``SwigluBias`` (gated; gpt-oss / MiniMax),
+                    ``Relu2`` (non-gated) and ``SiTu`` (gated) are supported.
+                swiglu_bias: ``(gate_sigmoid_scale, linear_offset)`` of
+                    ``ActivationType.SwigluBias``; required for -- and only valid
+                    with -- that activation.
                 swiglu_limit_scalar: Uniform clamp limit for SwiGLU. ``+inf`` disables clamp.
                 situ_beta: Gate-side SiTU soft-cap. Required for -- and only
                     valid with -- ``ActivationType.SiTu``.
@@ -3982,6 +3997,14 @@ if IS_CUTLASS_DSL_AVAILABLE:
             self.is_gated = is_gated_activation(self.activation_type)
             self.situ_beta = situ_beta
             self.situ_linear_beta = situ_linear_beta
+            if (self.activation_type == ActivationType.SwigluBias) != (
+                    swiglu_bias is not None):
+                raise ValueError(
+                    "swiglu_bias is required for -- and only valid with -- "
+                    f"ActivationType.SwigluBias, got {self.activation_type.name} / {swiglu_bias}"
+                )
+            self.swiglu_bias = None if swiglu_bias is None else tuple(
+                float(v) for v in swiglu_bias)
             self.num_experts = num_experts
             self.top_k = top_k
             self.num_local_experts = num_local_experts
@@ -4029,6 +4052,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 self.use_expert_counts,
                 self.situ_beta,
                 self.situ_linear_beta,
+                self.swiglu_bias,
             )
 
         def get_valid_tactics(
@@ -4294,9 +4318,15 @@ if IS_CUTLASS_DSL_AVAILABLE:
                          mma_tiler_mn, cluster_shape_mn, raster_along_m,
                          self.activation_type, self.swiglu_limit_scalar,
                          self.use_expert_counts, self.num_local_experts,
-                         self.situ_beta, self.situ_linear_beta)
+                         self.situ_beta, self.situ_linear_beta,
+                         self.swiglu_bias)
 
             if cache_key not in self.__class__.kernel_cache:
+                # swiglu_bias only when set, so every other activation builds the
+                # kernel with exactly the arguments it always had.
+                swiglu_bias_kwargs = ({} if self.swiglu_bias is None else {
+                    "swiglu_bias": self.swiglu_bias
+                })
                 gemm = self.__class__.kernel_class(
                     sf_vec_size=self.scaling_vector_size,
                     mma_tiler_mn=mma_tiler_mn,
@@ -4310,6 +4340,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     num_local_experts=self.num_local_experts,
                     situ_beta=self.situ_beta,
                     situ_linear_beta=self.situ_linear_beta,
+                    **swiglu_bias_kwargs,
                 )
                 hardware_info = cutlass.utils.HardwareInfo()
                 max_active_clusters = hardware_info.get_max_active_clusters(
@@ -4401,6 +4432,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
         expert_capacity: int = 0,
         situ_beta: Optional[float] = None,
         situ_linear_beta: Optional[float] = None,
+        swiglu_sigmoid_scale: Optional[float] = None,
+        swiglu_linear_offset: Optional[float] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """CuteDSL-based NVFP4 gather grouped GEMM with activation fusion.
 
@@ -4411,8 +4444,18 @@ if IS_CUTLASS_DSL_AVAILABLE:
         ``situ_beta`` / ``situ_linear_beta`` carry the two SiTU soft-caps, and
         are ``None`` for every other activation. The runner rejects a mismatch
         against ``activation_type`` in either direction.
+
+        ``swiglu_sigmoid_scale`` / ``swiglu_linear_offset`` are the
+        ``ActivationType.SwigluBias`` constants (gpt-oss / MiniMax SwiGLU:
+        ``g * sigmoid(scale * g) * (l + offset)`` on the clamped halves); both
+        are required for that activation and ``None`` for every other one.
         """
         tuner = AutoTuner.get()
+        if (swiglu_sigmoid_scale is None) != (swiglu_linear_offset is None):
+            raise ValueError(
+                "swiglu_sigmoid_scale and swiglu_linear_offset go together")
+        swiglu_bias = (None if swiglu_sigmoid_scale is None else
+                       (swiglu_sigmoid_scale, swiglu_linear_offset))
         swiglu_limit_scalar = _canonicalize_swiglu_limit_scalar(
             swiglu_limit_scalar)
         if expert_counts is None and expert_capacity != 0:
@@ -4438,7 +4481,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             swiglu_limit_scalar=swiglu_limit_scalar,
             use_expert_counts=expert_counts is not None,
             situ_beta=situ_beta,
-            situ_linear_beta=situ_linear_beta)
+            situ_linear_beta=situ_linear_beta,
+            swiglu_bias=swiglu_bias)
         inputs = [
             input, weight, input_scale, weight_scale, alpha,
             tile_idx_to_group_idx, tile_idx_to_mn_limit,
@@ -4479,6 +4523,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
         expert_capacity: int = 0,
         situ_beta: Optional[float] = None,
         situ_linear_beta: Optional[float] = None,
+        swiglu_sigmoid_scale: Optional[float] = None,
+        swiglu_linear_offset: Optional[float] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Meta-device shapes for the FC1 output and its block scales.
 
@@ -15165,17 +15211,18 @@ if IS_CUTLASS_DSL_AVAILABLE:
             tuning_config_cache = dict()
 
             def __init__(
-                self,
-                num_experts: int,
-                top_k: int,
-                num_local_experts: int,
-                local_expert_offset: int,
-                tile_size: int,
-                scaling_vector_size: int = 16,
-                activation_type: ActivationType = ActivationType.Swiglu,
-                situ_beta: Optional[float] = None,
-                situ_linear_beta: Optional[float] = None,
-                swiglu_limit_scalar: float = float("inf")):
+                    self,
+                    num_experts: int,
+                    top_k: int,
+                    num_local_experts: int,
+                    local_expert_offset: int,
+                    tile_size: int,
+                    scaling_vector_size: int = 16,
+                    activation_type: ActivationType = ActivationType.Swiglu,
+                    situ_beta: Optional[float] = None,
+                    situ_linear_beta: Optional[float] = None,
+                    swiglu_limit_scalar: float = float("inf"),
+                    swiglu_bias: Optional[Tuple[float, float]] = None):
                 super().__init__()
                 self.num_experts = num_experts
                 self.top_k = top_k
@@ -15187,6 +15234,22 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     activation_type)
                 self.situ_beta = situ_beta
                 self.situ_linear_beta = situ_linear_beta
+                # (gate_sigmoid_scale, linear_offset) of ActivationType.SwigluBias
+                # (gpt-oss / MiniMax SwiGLU); required for -- and only valid with --
+                # that activation. Trace-time constants, so part of unique_id and the
+                # kernel cache key.
+                if (self.activation_type == ActivationType.SwigluBias) != (
+                        swiglu_bias is not None):
+                    raise ValueError(
+                        "swiglu_bias is required for -- and only valid with -- "
+                        f"ActivationType.SwigluBias, got {self.activation_type.name} / {swiglu_bias}"
+                    )
+                if swiglu_bias is not None and not all(
+                        math.isfinite(float(v)) for v in swiglu_bias):
+                    raise ValueError(
+                        f"swiglu_bias must be finite, got {swiglu_bias}")
+                self.swiglu_bias = None if swiglu_bias is None else tuple(
+                    float(v) for v in swiglu_bias)
                 # Trace-time constant folded into the kernel; part of unique_id
                 # and the kernel cache key so clamped / unclamped kernels never
                 # share a compilation or a tuning result.
@@ -15216,6 +15279,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     self.situ_beta,
                     self.situ_linear_beta,
                     self.swiglu_limit,
+                    self.swiglu_bias,
                 )
 
             def get_valid_tactics(
@@ -15520,8 +15584,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
                              locality_domain_half_gemm, a_path,
                              int(self.activation_type), self.situ_beta,
                              self.situ_linear_beta, self.swiglu_limit,
-                             max_active_clusters)
+                             max_active_clusters, self.swiglu_bias)
                 if cache_key not in self.__class__.kernel_cache:
+                    # swiglu_bias only when set, so every other activation builds
+                    # the kernel with exactly the arguments it always had.
+                    swiglu_bias_kwargs = ({} if self.swiglu_bias is None else {
+                        "swiglu_bias": self.swiglu_bias
+                    })
                     gemm = self.__class__.kernel_class(
                         sf_vec_size=self.scaling_vector_size,
                         mma_inst_shape=mma_inst_shape,
@@ -15536,6 +15605,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         situ_beta=self.situ_beta,
                         situ_linear_beta=self.situ_linear_beta,
                         swiglu_limit=self.swiglu_limit,
+                        **swiglu_bias_kwargs,
                     )
                     compiled_gemm = cute.compile(
                         gemm.wrapper,
@@ -15617,6 +15687,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             swiglu_limit_scalar: float,
             precomputed_tactic: Optional[str],
             tuner_key: str,
+            swiglu_bias: Optional[Tuple[float, float]] = None,
         ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
             tuner = AutoTuner.get()
             if output_tensor is not None or output_sf_tensor is not None:
@@ -15645,6 +15716,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 situ_linear_beta=_canonicalize_situ_beta(situ_linear_beta),
                 swiglu_limit_scalar=_canonicalize_swiglu_limit_scalar(
                     swiglu_limit_scalar),
+                swiglu_bias=swiglu_bias,
             )
             inputs = [
                 input, weight, input_scale, weight_scale, alpha,
@@ -15687,7 +15759,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             f"SymInt activation_type={int(ActivationType.Swiglu)}, "
             "float situ_beta=-1.0, float situ_linear_beta=-1.0, "
             "float swiglu_limit_scalar=-1.0, "
-            "str? precomputed_tactic=None) -> (Tensor?, Tensor?)",
+            "str? precomputed_tactic=None, float? swiglu_sigmoid_scale=None, "
+            "float? swiglu_linear_offset=None) -> (Tensor?, Tensor?)",
             device_types="cuda")
         def cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_rubin(
             input: torch.Tensor,
@@ -15714,6 +15787,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             situ_linear_beta: float = SITU_BETA_DISABLED,
             swiglu_limit_scalar: float = SWIGLU_LIMIT_SCALAR_DISABLED,
             precomputed_tactic: Optional[str] = None,
+            swiglu_sigmoid_scale: Optional[float] = None,
+            swiglu_linear_offset: Optional[float] = None,
         ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
             return _run_nvfp4_gather_grouped_gemm_act_fusion_rubin(
                 input, weight, input_scale, weight_scale, alpha,
@@ -15724,7 +15799,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 scaling_vector_size, partition_id,
                 ActivationType(activation_type), situ_beta, situ_linear_beta,
                 swiglu_limit_scalar, precomputed_tactic,
-                "trtllm::cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_rubin")
+                "trtllm::cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_rubin",
+                _swiglu_bias_from_op_args(swiglu_sigmoid_scale,
+                                          swiglu_linear_offset))
 
         @torch.library.register_fake(
             "trtllm::cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_rubin")
@@ -15753,6 +15830,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             situ_linear_beta: float = SITU_BETA_DISABLED,
             swiglu_limit_scalar: float = SWIGLU_LIMIT_SCALAR_DISABLED,
             precomputed_tactic: Optional[str] = None,
+            swiglu_sigmoid_scale: Optional[float] = None,
+            swiglu_linear_offset: Optional[float] = None,
         ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
             m = permuted_idx_to_expanded_idx.size(0)
             n = weight.size(1)
@@ -16572,8 +16651,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
                          local_expert_offset: int,
                          tile_size: int,
                          output_dtype: torch.dtype,
-                         scaling_vector_size: int = 16):
+                         scaling_vector_size: int = 16,
+                         permuted_output: bool = False):
                 super().__init__()
+                # permuted_output: C is [m, n] and row r receives permuted row r's
+                # alpha * acc (no top-k weight, no scatter-add); the caller reduces
+                # the top-k in a fixed order (moe_unpermute). Deterministic.
+                self.permuted_output = permuted_output
                 self.num_experts = num_experts
                 self.top_k = top_k
                 self.num_local_experts = num_local_experts
@@ -16603,6 +16687,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     self.tile_size,
                     self.output_dtype,
                     self.scaling_vector_size,
+                    self.permuted_output,
                 )
 
             @staticmethod
@@ -16708,7 +16793,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
                             helper.map_to_tuning_buckets), ),
                         constraint_specs=(
                             ConstraintSpec(2, 0, fp4_scale_infer_shape),
-                            ConstraintSpec(5, 0, helper.infer_shape_num_tokens),
+                            ConstraintSpec(
+                                5, 0, helper.infer_shape_max_num_permuted_tokens
+                                if self.permuted_output else
+                                helper.infer_shape_num_tokens),
                             ConstraintSpec(6, 0,
                                            helper.infer_shape_max_num_tiles),
                             ConstraintSpec(7, 0,
@@ -16753,6 +16841,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 assert c.dim() == 2
                 num_tokens = c.size(0)
                 assert c.size(1) == n or c.size(1) == n * 2
+                if self.permuted_output:
+                    # C rows are permuted rows; the kernel indexes C by them.
+                    assert num_tokens == m and c.size(1) == n
+                    num_tokens = token_final_scales.size(0)
 
                 num_tiles = m // self.tile_size
                 assert tile_idx_to_group_idx.dtype == torch.int32
@@ -16766,9 +16858,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 assert token_final_scales.dtype == torch.float32
                 assert token_final_scales.dim() == 2
                 assert token_final_scales.size() == (num_tokens, self.top_k)
+                # rows of C as the kernel sees them (== num_tokens unless permuted_output)
+                c_rows = c.size(0)
 
                 locality_domain_id = get_current_locality_domain()
                 locality_domain_half_gemm = locality_domain_id is not None
+                assert not (locality_domain_half_gemm and self.permuted_output), \
+                    "permuted_output has no locality-domain variant"
                 if locality_domain_half_gemm:
                     assert locality_domain_id in (
                         0,
@@ -16845,7 +16941,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 cache_key = (self.scaling_vector_size, self.tile_size,
                              self.top_k, mma_tiler, mma_inst_shape,
                              cluster_shape_mn, raster_along_m,
-                             locality_domain_half_gemm, max_active_clusters)
+                             locality_domain_half_gemm, max_active_clusters,
+                             self.permuted_output)
                 if cache_key not in self.__class__.kernel_cache:
                     gemm = self.__class__.kernel_class(
                         sf_vec_size=self.scaling_vector_size,
@@ -16854,6 +16951,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         cluster_shape_mn=cluster_shape_mn,
                         raster_along_m=raster_along_m,
                         topK=self.top_k,
+                        permuted_output=self.permuted_output,
                     )
                     compiled_gemm = cute.compile(
                         gemm.wrapper,
@@ -16872,7 +16970,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         n,
                         k,
                         l,
-                        num_tokens,
+                        c_rows,
                         self.top_k,
                         tile_size=self.tile_size,
                         scaling_vector_size=self.scaling_vector_size,
@@ -16900,7 +16998,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     n,
                     k,
                     l,
-                    num_tokens,
+                    c_rows,
                     self.top_k,
                     stream=stream,
                     c_stride_row=c_stride_row_val,
@@ -16957,6 +17055,91 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 best_tactic = ast.literal_eval(precomputed_tactic)
 
             runner(inputs, tactic=best_tactic)
+
+        @torch.library.custom_op(
+            "trtllm::cute_dsl_nvfp4_grouped_gemm_permuted_rubin",
+            mutates_args=(),
+            device_types="cuda")
+        def cute_dsl_nvfp4_grouped_gemm_permuted_rubin(
+            input: torch.Tensor,
+            weight: torch.Tensor,
+            input_scale: torch.Tensor,
+            weight_scale: torch.Tensor,
+            alpha: torch.Tensor,
+            tile_idx_to_group_idx: torch.Tensor,
+            tile_idx_to_mn_limit: torch.Tensor,
+            permuted_idx_to_expanded_idx: torch.Tensor,
+            num_non_exiting_tiles: torch.Tensor,
+            token_final_scales: torch.Tensor,
+            num_experts: int,
+            top_k: int,
+            num_local_experts: int,
+            local_expert_offset: int,
+            tile_size: int,
+            output_dtype: torch.dtype,
+            scaling_vector_size: int = 16,
+            precomputed_tactic: Optional[str] = None,
+        ) -> torch.Tensor:
+            """FC2 without the fused scatter-add: returns [m, n] with row r =
+            ``alpha * (input_r @ weight^T)`` for every valid permuted row r (other rows
+            are unwritten). Reduce the top-k with ``moe_unpermute(_inplace)``, which
+            sums in a fixed order: unlike the fused finalize, deterministic."""
+            tuner = AutoTuner.get()
+            runner = Sm107BlockScaledContiguousGroupedGemmFinalizeFusionRunner(
+                num_experts,
+                top_k,
+                num_local_experts,
+                local_expert_offset,
+                tile_size,
+                output_dtype,
+                scaling_vector_size,
+                permuted_output=True)
+            output = torch.empty(input.size(0),
+                                 weight.size(1),
+                                 dtype=output_dtype,
+                                 device=input.device)
+            inputs = [
+                input, weight, input_scale, weight_scale, alpha, output,
+                tile_idx_to_group_idx, tile_idx_to_mn_limit,
+                permuted_idx_to_expanded_idx, num_non_exiting_tiles,
+                token_final_scales
+            ]
+            if precomputed_tactic is None:
+                _, best_tactic = tuner.choose_one(
+                    "trtllm::cute_dsl_nvfp4_grouped_gemm_permuted_rubin",
+                    [runner],
+                    runner.get_tuning_config(),
+                    inputs,
+                )
+            else:
+                best_tactic = ast.literal_eval(precomputed_tactic)
+            runner(inputs, tactic=best_tactic)
+            return output
+
+        @torch.library.register_fake(
+            "trtllm::cute_dsl_nvfp4_grouped_gemm_permuted_rubin")
+        def _(
+            input: torch.Tensor,
+            weight: torch.Tensor,
+            input_scale: torch.Tensor,
+            weight_scale: torch.Tensor,
+            alpha: torch.Tensor,
+            tile_idx_to_group_idx: torch.Tensor,
+            tile_idx_to_mn_limit: torch.Tensor,
+            permuted_idx_to_expanded_idx: torch.Tensor,
+            num_non_exiting_tiles: torch.Tensor,
+            token_final_scales: torch.Tensor,
+            num_experts: int,
+            top_k: int,
+            num_local_experts: int,
+            local_expert_offset: int,
+            tile_size: int,
+            output_dtype: torch.dtype,
+            scaling_vector_size: int = 16,
+            precomputed_tactic: Optional[str] = None,
+        ) -> torch.Tensor:
+            return input.new_empty((input.size(0), weight.size(1)),
+                                   dtype=output_dtype)
 
         @torch.library.custom_op(
             "trtllm::cute_dsl_nvfp4_grouped_gemm_finalize_rubin",

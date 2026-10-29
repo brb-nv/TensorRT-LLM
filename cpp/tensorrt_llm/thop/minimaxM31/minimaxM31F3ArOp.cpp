@@ -43,14 +43,17 @@ bool f3PdlEnabled()
 
 //! F3 attention boundary (TP2 decode): the one-shot Lamport all-reduce + residual + RMSNorm over the rows the o_proj's
 //! F3 GEMM epilogue already pushed into the AllReduce workspace's data slots (no push loop), + optionally the MXFP8 of
-//! norm_out (mx_out e4m3 [rows, hidden], mx_sf swizzled UE8M0 of pad128(rows) rows). allreduce_in is shape-only (its
-//! bytes are not read). Bitwise to the stock one-shot allreduce_fusion RESIDUAL_RMS_NORM (+ mxfp8_quantize).
+//! norm_out (mx_out e4m3 [rows, hidden], mx_sf swizzled UE8M0 of pad128(rows) rows), + optionally the NVFP4 of norm_out
+//! (fp4_out [rows, hidden / 2], fp4_sf linear e4m3 [rows, hidden / 16], global scale fp4_scale). allreduce_in is
+//! shape-only (its bytes are not read). Bitwise to the stock one-shot allreduce_fusion RESIDUAL_RMS_NORM
+//! (+ mxfp8_quantize / fp4_quantize(norm_out, fp4_scale, 16, false, false)).
 void minimaxM31F3ArPrepushed(int64_t rank, torch::Tensor workspace, torch::Tensor allreduceIn, torch::Tensor residualIn,
     torch::Tensor residualOut, torch::Tensor normOut, torch::Tensor gamma, double eps, bool triggerCompletionAtEnd,
-    std::optional<torch::Tensor> mxOut, std::optional<torch::Tensor> mxSf)
+    std::optional<torch::Tensor> mxOut, std::optional<torch::Tensor> mxSf, std::optional<torch::Tensor> fp4Out,
+    std::optional<torch::Tensor> fp4Sf, std::optional<torch::Tensor> fp4Scale)
 {
     TORCH_CHECK(allreduceIn.scalar_type() == at::kBFloat16 && allreduceIn.is_contiguous());
-    tensorrt_llm::kernels::minimaxM31::F3ArParams p;
+    tensorrt_llm::kernels::minimaxM31::F3ArParams p{};
     p.rank = static_cast<int>(rank);
     p.size = static_cast<int>(allreduceIn.numel());
     p.hidden_dim = static_cast<int>(allreduceIn.size(-1));
@@ -72,6 +75,23 @@ void minimaxM31F3ArPrepushed(int64_t rank, torch::Tensor workspace, torch::Tenso
             "mx_sf must be the swizzled [pad128(rows), H / 32] UE8M0 scales");
         p.mx_out = mxOut->data_ptr();
         p.mx_sf = mxSf->data_ptr();
+    }
+    p.fp4_out = nullptr;
+    p.fp4_sf = nullptr;
+    p.fp4_scale = nullptr;
+    if (fp4Out.has_value())
+    {
+        TORCH_CHECK(fp4Sf.has_value() && fp4Scale.has_value() && fp4Out->is_contiguous() && fp4Sf->is_contiguous());
+        TORCH_CHECK(p.hidden_dim % 16 == 0, "the NVFP4 output needs hidden_dim % 16 == 0");
+        int64_t const rows = p.size / p.hidden_dim;
+        TORCH_CHECK(
+            fp4Out->numel() * fp4Out->element_size() == rows * p.hidden_dim / 2, "fp4_out must be [rows, H / 2]");
+        TORCH_CHECK(fp4Sf->numel() * fp4Sf->element_size() == rows * (p.hidden_dim / 16),
+            "fp4_sf must be the linear [rows, H / 16] e4m3 scales");
+        TORCH_CHECK(fp4Scale->scalar_type() == at::kFloat && fp4Scale->numel() >= 1, "fp4_scale must be float32");
+        p.fp4_out = fp4Out->data_ptr();
+        p.fp4_sf = fp4Sf->data_ptr();
+        p.fp4_scale = fp4Scale->data_ptr<float>();
     }
     TORCH_CHECK(p.size % p.hidden_dim == 0 && p.hidden_dim % 8 == 0);
     at::cuda::CUDAGuard const guard(allreduceIn.device());
@@ -98,7 +118,8 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
     m.def(
         "minimax_m31_f3_ar_prepushed(int rank, Tensor workspace, Tensor allreduce_in, Tensor residual_in, "
         "Tensor(a!) residual_out, Tensor(b!) norm_out, Tensor gamma, float eps, bool trigger_completion_at_end, "
-        "Tensor(c!)? mx_out, Tensor(d!)? mx_sf) -> ()");
+        "Tensor(c!)? mx_out, Tensor(d!)? mx_sf, Tensor(e!)? fp4_out=None, Tensor(f!)? fp4_sf=None, "
+        "Tensor? fp4_scale=None) -> ()");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)

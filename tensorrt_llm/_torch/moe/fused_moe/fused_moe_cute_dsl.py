@@ -22,6 +22,7 @@ import torch
 import torch.nn.functional as F
 
 from tensorrt_llm._utils import get_sm_version, is_sm_100f
+from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 
 from ...autotuner import (AutoTuner, ConstraintSpec, DynamicTensorSpec,
@@ -708,10 +709,17 @@ class CuteDslFusedMoE(MoEImplBase):
     # resolve away to CUTLASS with "CuteDslFusedMoE kernels take no activation
     # alpha". Safe for the other two kinds because neither supplies the pair:
     # ``SwigluActivation.constants()`` fills only ``limit`` and Relu2 fills
-    # nothing. ``SwigluBias`` is the kind that does, and it is not in ``kinds``.
+    # nothing. ``SwigluBias`` fills all three; the SM100 / SM103 / SM107 NVFP4
+    # gather act-fusion epilogues consume them and ``can_implement`` refuses every other path.
+    # Probe for callers that must only route an activation here on a build that has the
+    # SwigluBias epilogue (e.g. the MiniMax-M3.1 tp2ctx fork's CUTEDSL routed experts).
+    SUPPORTS_SWIGLU_BIAS = True
+
     activation_support = MoEActivationSupport(
-        kinds=frozenset(
-            {ActivationType.Swiglu, ActivationType.Relu2, ActivationType.SiTu}),
+        kinds=frozenset({
+            ActivationType.Swiglu, ActivationType.SwigluBias,
+            ActivationType.Relu2, ActivationType.SiTu
+        }),
         alpha_beta=ActivationParamShape.UNIFORM_SCALAR,
         limit=ActivationParamShape.UNIFORM_SCALAR,
         limit_when_absent=float("inf"),
@@ -783,12 +791,27 @@ class CuteDslFusedMoE(MoEImplBase):
                 f"CuteDslFusedMoE only supports bfloat16 activation (output is hardcoded to bfloat16), "
                 f"got {p.dtype_act}")
 
-        # CuteDslFusedMoE does NOT support swiglu_gptoss_style
-        if p.swiglu_gptoss_style:
-            return _reject(
-                MoERejectReason.ACTIVATION_UNSUPPORTED,
-                "CuteDslFusedMoE does not support swiglu_gptoss_style (bias/swiglu with custom alpha/beta/limit)"
-            )
+        # gpt-oss / MiniMax SwiGLU (SwigluBias: gate_sigmoid_scale / linear_offset / clamp). Only the
+        # SM100 / SM103 / SM107 NVFP4 gather act-fusion epilogues implement it, and only without an expert
+        # bias (MiniMax); every other path of this backend would drop the constants, so refuse.
+        if p.swiglu_gptoss_style or p.activation == ActivationType.SwigluBias.name:
+            if p.bias:
+                return _reject(
+                    MoERejectReason.ACTIVATION_UNSUPPORTED,
+                    "CuteDslFusedMoE implements SwigluBias without an expert bias only"
+                )
+            if sm_version not in (100, 103,
+                                  107) or quant_algo != QuantAlgo.NVFP4:
+                return _reject(
+                    MoERejectReason.ACTIVATION_UNSUPPORTED,
+                    "CuteDslFusedMoE implements SwigluBias on SM100 / SM103 / SM107 NVFP4 only, "
+                    f"got SM{sm_version} {quant_algo}")
+            if d.locality_domain_requested and d.env.has_dep(
+                    MoEDep.LOCALITY_DOMAIN):
+                return _reject(
+                    MoERejectReason.ACTIVATION_UNSUPPORTED,
+                    "CuteDslFusedMoE locality-domain kernels do not implement SwigluBias"
+                )
 
         # Localized weight shards are built once from the loaded weights, so
         # they cannot follow EPLB expert migration.
@@ -798,9 +821,10 @@ class CuteDslFusedMoE(MoEImplBase):
                 MoERejectReason.EPLB_UNSUPPORTED,
                 "locality domain MoE cannot follow EPLB expert migration")
 
-        # SM107 has no unfused FC2: NVFP4 has no plain grouped GEMM there, and
-        # the BF16 op always fuses finalize.
-        if sm_version == 107 and not d.fused_finalize_enabled:
+        # The SM107 BF16 FC2 op always fuses finalize. NVFP4 runs unfused through
+        # the permuted-output FC2 + moe_unpermute (deterministic top-k reduction).
+        if (sm_version == 107 and not d.fused_finalize_enabled
+                and quant_algo != QuantAlgo.NVFP4):
             return _reject(
                 MoERejectReason.FINALIZE_FUSION_REQUIRED,
                 "CuteDslFusedMoE on SM107 only has a fused-finalize FC2")
@@ -939,6 +963,14 @@ class CuteDslFusedMoE(MoEImplBase):
         if self._locality_domain_plan.enabled:
             self._locality_domain_runtime = LocalityDomainRuntime(
                 self._locality_domain_plan.num_partitions)
+        if self.activation_type == ActivationType.SwigluBias:
+            assert self._locality_domain_runtime is None, (
+                "SwigluBias has no locality-domain epilogue")
+            logger.info_once(
+                "CuteDslFusedMoE: SwigluBias epilogue (gate_sigmoid_scale="
+                f"{float(self.act_alpha)}, linear_offset={float(self.act_beta)}, "
+                f"clamp={float(self.act_clamp)})",
+                key="cute_dsl_moe_swiglu_bias")
         if not model_config.skip_create_weights_in_init:
             self.create_weights()
 
@@ -1083,10 +1115,11 @@ class CuteDslFusedMoE(MoEImplBase):
         assert self.has_nvfp4
         assert weight_view is not None
         if self.activation_type not in (ActivationType.Swiglu,
+                                        ActivationType.SwigluBias,
                                         ActivationType.Relu2,
                                         ActivationType.SiTu):
             raise NotImplementedError(
-                "CuteDSL NVFP4 FC1 supports only SwiGLU, Relu2 and SiTU; "
+                "CuteDSL NVFP4 FC1 supports only SwiGLU, SwigluBias, Relu2 and SiTU; "
                 f"got {self.activation_type.name}")
         output_dtype = torch.bfloat16
 
@@ -1321,8 +1354,13 @@ class CuteDslFusedMoE(MoEImplBase):
         # The clamp is a SwiGLU-only constant: Relu2 layers materialize
         # act_clamp as +inf, and the kernels reject a finite limit on any
         # other activation, so only SwiGLU layers forward it.
-        if self.activation_type == ActivationType.Swiglu:
+        if self.activation_type in (ActivationType.Swiglu,
+                                    ActivationType.SwigluBias):
             gather_act_kwargs["swiglu_limit_scalar"] = self.act_clamp
+        if self.activation_type == ActivationType.SwigluBias:
+            # can_implement admits SwigluBias only on SM100 / SM103 / SM107 NVFP4 without locality domain.
+            gather_act_kwargs["swiglu_sigmoid_scale"] = float(self.act_alpha)
+            gather_act_kwargs["swiglu_linear_offset"] = float(self.act_beta)
 
         x, x_sf = gather_act_op(**gather_act_kwargs)
 
@@ -1395,28 +1433,49 @@ class CuteDslFusedMoE(MoEImplBase):
 
             finalize_inplace_op(**finalize_inplace_kwargs)
         else:
+            # Unfused FC2: every permuted row is written once and moe_unpermute
+            # reduces each token's top-k in a fixed order (fp32 accumulate, one
+            # bf16 rounding), so the result does not depend on the order in which
+            # CTAs finish -- unlike the fused finalize's scatter-add.
             if use_rubin:
-                # Rubin does not have a basic grouped GEMM kernel (without
-                # fused finalize) yet. Force use_fused_finalize=True for Rubin.
-                raise NotImplementedError(
-                    "Rubin (SM107) MOE requires use_fused_finalize=True. "
-                    "Basic grouped GEMM without finalize fusion is not yet "
-                    "supported on Rubin.")
-            x = torch.ops.trtllm.cute_dsl_nvfp4_grouped_gemm_blackwell(
-                input=x.view(torch.float4_e2m1fn_x2),
-                weight=weight_view.w2_weight.view(torch.float4_e2m1fn_x2),
-                input_scale=x_sf.view(torch.uint8),
-                weight_scale=weight_view.fc2_weight_scale.view(torch.uint8),
-                alpha=weight_view.fc2_global_scale,
-                tile_idx_to_group_idx=tile_idx_to_expert_idx,
-                num_non_exiting_tiles=num_non_exiting_tiles,
-                num_experts=self.num_slots,
-                top_k=effective_top_k,
-                num_local_experts=esp,
-                local_expert_offset=slot_start,
-                tile_size=tile_size,
-                output_dtype=output_dtype,
-            )
+                if use_count_native_expert_metadata:
+                    raise NotImplementedError(
+                        "Count-native DeepEP expert metadata is not supported "
+                        "by the Rubin (SM107) permuted-output grouped GEMM.")
+                x = torch.ops.trtllm.cute_dsl_nvfp4_grouped_gemm_permuted_rubin(
+                    input=x.view(torch.float4_e2m1fn_x2),
+                    weight=weight_view.w2_weight.view(torch.float4_e2m1fn_x2),
+                    input_scale=x_sf.view(torch.uint8),
+                    weight_scale=weight_view.fc2_weight_scale.view(torch.uint8),
+                    alpha=weight_view.fc2_global_scale,
+                    tile_idx_to_group_idx=tile_idx_to_expert_idx,
+                    tile_idx_to_mn_limit=tile_idx_to_mn_limit,
+                    permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
+                    num_non_exiting_tiles=num_non_exiting_tiles,
+                    token_final_scales=token_final_scales,
+                    num_experts=self.num_slots,
+                    top_k=effective_top_k,
+                    num_local_experts=esp,
+                    local_expert_offset=slot_start,
+                    tile_size=tile_size,
+                    output_dtype=output_dtype,
+                )
+            else:
+                x = torch.ops.trtllm.cute_dsl_nvfp4_grouped_gemm_blackwell(
+                    input=x.view(torch.float4_e2m1fn_x2),
+                    weight=weight_view.w2_weight.view(torch.float4_e2m1fn_x2),
+                    input_scale=x_sf.view(torch.uint8),
+                    weight_scale=weight_view.fc2_weight_scale.view(torch.uint8),
+                    alpha=weight_view.fc2_global_scale,
+                    tile_idx_to_group_idx=tile_idx_to_expert_idx,
+                    num_non_exiting_tiles=num_non_exiting_tiles,
+                    num_experts=self.num_slots,
+                    top_k=effective_top_k,
+                    num_local_experts=esp,
+                    local_expert_offset=slot_start,
+                    tile_size=tile_size,
+                    output_dtype=output_dtype,
+                )
             torch.ops.trtllm.moe_unpermute_inplace(
                 permuted_input=x,
                 output=moe_output,

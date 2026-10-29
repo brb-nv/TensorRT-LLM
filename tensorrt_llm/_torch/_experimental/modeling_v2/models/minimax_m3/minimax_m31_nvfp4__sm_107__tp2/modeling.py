@@ -317,6 +317,11 @@ ROUTER_F32 = not m31_disabled("TP2AGG_ROUTER_F32")
 # TRTLLM_M31_F3_CHECK=1: each F3 boundary also runs the stock GEMM + AR + quantize in the graph and counts byte
 # mismatches on the device (reported at exit / on eager steps).
 TP2_F3 = not m31_disabled("F3")
+# F3_FP4 (P4 FC1 fold): before a MoE layer the F3 boundary also writes the norm's NVFP4 (the routed experts' FC1
+# input: fp4_quantize(x, fc31_input_scale, 16, False, False)'s device functions, linear scales) and the layer's
+# routed experts take it instead of quantizing (_F3_FP4). Bitwise to the stock quantize. Kill switch:
+# TRTLLM_M31_DISABLE_F3_FP4=1. TRTLLM_M31_F3_CHECK=1 also compares it with the stock quantize.
+TP2_F3_FP4 = TP2_F3 and not m31_disabled("F3_FP4")
 # Native CUDA ops for the SwiGLU-OAI activation and the MoE finalize, bit for bit the Triton kernels they replace on
 # every band. NATIVE_SWIGLU: trtllm::minimax_m31_swiglu_oai_vec (16-byte vectors, the in-tree swigluOai pair sequence
 # verbatim); kill switch TRTLLM_M31_DISABLE_NATIVE_SWIGLU=1. NATIVE_FINALIZE: trtllm::minimax_m31_moe_finalize (the
@@ -5603,6 +5608,8 @@ class PrefillTarget:
 
 # F3: the attention boundary's MXFP8 norm for the next pinned GENERIC MXFP8 linear (shared / dense gate_up).
 _F3_MX = m3_prequant.PrequantSlot()
+# F3_FP4: the norm's NVFP4 for that layer's routed experts; taken only by the layer in _F3_STATE["fp4_layer"].
+_F3_FP4 = m3_prequant.PrequantSlot()
 _F3_STATE: dict = {}
 
 
@@ -5732,9 +5739,10 @@ def _f3_init(core) -> None:
         logger.info(f"[M3.1] TP2_F3 not taken rank={core.mapping.tp_rank}: {why}")
 
 
-def _f3_check(core, f3, residual, norm_w, normed, updated, q, sf) -> None:
+def _f3_check(core, f3, residual, norm_w, normed, updated, q, sf, fp4=(None, None, None)) -> None:
     """F3_CHECK: the stock GEMM + AR + quantize on the same operands (one more collective round, in the graph), byte
-    mismatches added on the device."""
+    mismatches added on the device. ``fp4`` (F3_FP4 output, its scales, the global scale): also against the routed
+    experts' stock fp4_quantize of the norm."""
     if f3.ref is None:
         _F3_STATE["bad"].add_(1)
         torch._assert_async(_F3_STATE["bad"] == 0, "TP2_F3 check: missing stock reference")
@@ -5746,6 +5754,13 @@ def _f3_check(core, f3, residual, norm_w, normed, updated, q, sf) -> None:
     bad = bad + (updated.view(torch.int16) != rr.view(torch.int16)).sum()
     bad = bad + (q.view(torch.uint8) != rq.view(torch.uint8)).sum()
     bad = bad + (sf.view(torch.uint8).reshape(-1) != rsf.view(torch.uint8).reshape(-1)).sum()
+    x4, x4_sf, g4 = fp4
+    if x4 is not None:
+        r4, r4_sf = fp4_quantize(normed, g4, 16, False, False)
+        bad = bad + (x4.view(torch.uint8) != r4.view(torch.uint8)).sum()
+        bad = (
+            bad + (x4_sf.view(torch.uint8).reshape(-1) != r4_sf.view(torch.uint8).reshape(-1)).sum()
+        )
     _F3_STATE["bad"].add_(bad)
     _F3_STATE["checked"].add_(1)
     # A device-side assert on every checked boundary, replays included (capture-safe). A mismatch on
@@ -5763,7 +5778,8 @@ def _f3_report(core, final: bool = False) -> None:
         torch.cuda.synchronize(_F3_STATE["bad"].device)
     msg = (
         f"[M3.1] TP2_F3 {'final ' if final else ''}report rank={core.mapping.tp_rank}: captured boundaries "
-        f"{_F3_STATE.get('taken', 0)}, slot taken {_F3_STATE.get('consumed', 0)}"
+        f"{_F3_STATE.get('taken', 0)}, slot taken {_F3_STATE.get('consumed', 0)}, "
+        f"fp4 taken {_F3_STATE.get('fp4_consumed', 0)}"
     )
     if F3_CHECK:
         msg += f", check boundaries {int(_F3_STATE['checked'].item())} mismatched bytes {int(_F3_STATE['bad'].item())}"
@@ -6080,9 +6096,11 @@ class DecodeTarget:
             return None
         return F3Push(launcher, tactic, num_tokens, F3_N, residual.device)
 
-    def _f3_boundary(self, f3: F3Push, residual, norm_w):
+    def _f3_boundary(self, f3: F3Push, residual, norm_w, moe_layer=None):
         """The attention boundary after an F3 o_proj: the one-shot AR without its push loop + residual + RMSNorm, and
-        the norm's MXFP8 (published in _F3_MX for the next pinned GENERIC MXFP8 linear)."""
+        the norm's MXFP8 (published in _F3_MX for the next pinned GENERIC MXFP8 linear). Before MoE layer
+        ``moe_layer`` (F3_FP4) also the norm's NVFP4 with its routed experts' FC1 input scale (published in
+        _F3_FP4)."""
         core = self.core
         rows, hidden = f3.rows, F3_N
         normed = torch.empty_like(residual)
@@ -6091,6 +6109,11 @@ class DecodeTarget:
         sf = torch.empty(
             ((rows + 127) // 128 * 128) * (hidden // 32), dtype=torch.uint8, device=residual.device
         )
+        x4 = x4_sf = g4 = None
+        if TP2_F3_FP4 and moe_layer is not None:
+            g4 = core.moe[moe_layer].fc31_input_scale
+            x4 = torch.empty((rows, hidden // 2), dtype=torch.uint8, device=residual.device)
+            x4_sf = torch.empty(rows * (hidden // 16), dtype=torch.uint8, device=residual.device)
         _f3_op()(
             core.mapping.tp_rank,
             core.allreduce.workspace,
@@ -6103,10 +6126,16 @@ class DecodeTarget:
             False,
             q,
             sf,
+            x4,
+            x4_sf,
+            g4,
         )
         if F3_CHECK:
-            _f3_check(core, f3, residual, norm_w, normed, updated, q, sf)
+            _f3_check(core, f3, residual, norm_w, normed, updated, q, sf, (x4, x4_sf, g4))
         _F3_MX.publish(normed, q, sf)
+        if x4 is not None:
+            _F3_FP4.publish(normed, x4, x4_sf)
+            _F3_STATE["fp4_layer"] = moe_layer
         _record("m31_f3_boundary", rows)
         cnt = _F3_STATE["taken"] = _F3_STATE.get("taken", 0) + 1
         if cnt & (cnt - 1) == 0:
@@ -6142,12 +6171,16 @@ class DecodeTarget:
         )
         if not decode_graph and i == 0:
             _f3_report(core)
+        # Only this layer's boundary may hand its routed experts an NVFP4 input.
+        _F3_FP4.clear()
         hidden, attn_pushed = self._attention(
             i, position_ids, hidden, step, armed if f3 is None else f3
         )
         post_norm = core.w[f"l{i}_post_norm"]
         if f3 is not None and attn_pushed:
-            hidden, residual = self._f3_boundary(f3, residual, post_norm)
+            hidden, residual = self._f3_boundary(
+                f3, residual, post_norm, i if i in core.moe_layers else None
+            )
         elif armed is not None and attn_pushed:
             taken(ATTN_PUSH.path, num_tokens)
             hidden, residual = self._prepushed(i, hidden, residual, post_norm, False, AR_PUSH_MODE)
@@ -6346,13 +6379,16 @@ class DecodeTarget:
                 act = m3_silu_and_mul(gu, core.swiglu_limit, core.swiglu_alpha, core.swiglu_beta)
         return _linear(core, act, f"{prefix}_dn_w", f"{prefix}_dn_s", low_m_gemm, push)
 
-    def _routed_chunks(self, i: int, x, router_logits, topk=None):
+    def _routed_chunks(self, i: int, x, router_logits, topk=None, fp4=None):
         """The routed experts from the bf16 activation over at most ``moe_max_num_tokens`` rows per runner call: the MoE
-        scheduler's even split, even chunks on the MoE chunking stream. ``topk`` (S1B_FOLD) splits with the rows."""
+        scheduler's even split, even chunks on the MoE chunking stream. ``topk`` (S1B_FOLD) splits with the rows.
+        ``fp4`` (F3_FP4): the boundary's NVFP4 of ``x``, taken on a one-chunk call."""
         core = self.core
         rows = x.shape[0]
         num_chunks = (rows + core.moe_max_num_tokens - 1) // core.moe_max_num_tokens
         if num_chunks <= 1:
+            if fp4 is not None:
+                return _routed_experts(core, i, fp4[0], fp4[1], router_logits, True, topk)
             return _routed_experts(core, i, x, None, router_logits, True, topk)
         sizes = _split_chunk(rows, num_chunks)
         xs = x.split(sizes)
@@ -6408,9 +6444,25 @@ class DecodeTarget:
             ref = self._routed_chunks(i, h, ref_logits)
             _S1bCheck.record(got, ref, _s1b_ident(core, i, h, True))
             return ref
+        fp4 = self._f3_fp4(i, h)
         if not do_finalize:
+            if fp4 is not None:
+                return _routed_experts(core, i, fp4[0], fp4[1], router_logits, False, topk)
             return _routed_experts(core, i, h, None, router_logits, False, topk)
-        return self._routed_chunks(i, h, router_logits, topk)
+        return self._routed_chunks(i, h, router_logits, topk, fp4)
+
+    def _f3_fp4(self, i: int, h):
+        """F3_FP4: (NVFP4 of ``h``, its linear scales) when layer ``i``'s F3 boundary wrote them, else None."""
+        fp4 = _F3_FP4.take(h)
+        if fp4 is None or _F3_STATE.get("fp4_layer") != i:
+            return None
+        _F3_STATE["fp4_consumed"] = _F3_STATE.get("fp4_consumed", 0) + 1
+        taken(
+            "F3_FP4 routed input",
+            h.shape[0],
+            "the F3 boundary's NVFP4 norm consumed by the routed experts",
+        )
+        return fp4
 
     def _moe(
         self, i: int, h: torch.Tensor, *, return_parts: bool, do_finalize: bool = True, push=None
@@ -6484,6 +6536,7 @@ class DecodeTarget:
         collective fused with the residual add and the norm. An Eagle3 capture layer captures the boundary's reduced
         residual sum."""
         core = self.core
+        _F3_FP4.clear()
         if residual is None:
             residual = hidden
             hidden = flashinfer_rmsnorm(hidden, core.w[f"l{i}_in_norm"], core.rms_eps)

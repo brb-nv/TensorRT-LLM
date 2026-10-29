@@ -166,6 +166,7 @@ def silu_f32(
 
 SUPPORTED_ACTIVATION_TYPES = (
     ActivationType.Swiglu,
+    ActivationType.SwigluBias,
     ActivationType.SiTu,
     ActivationType.Relu2,
 )
@@ -278,6 +279,7 @@ class Sm107BlockScaledContiguousGatherGroupedGemmActFusionKernel:
         situ_beta: Optional[float] = None,
         situ_linear_beta: Optional[float] = None,
         swiglu_limit: float = float("inf"),
+        swiglu_bias: Optional[Tuple[float, float]] = None,
     ):
         self.a_path = a_path
         # locality domain half-GEMM: two partitions write their N-half into a shared
@@ -303,6 +305,14 @@ class Sm107BlockScaledContiguousGatherGroupedGemmActFusionKernel:
             )
         self.situ_beta = None if situ_beta is None else float(situ_beta)
         self.situ_linear_beta = None if situ_linear_beta is None else float(situ_linear_beta)
+        # gpt-oss / MiniMax SwiGLU (SwigluBiasAdaptor): (gate_sigmoid_scale, linear_offset), for
+        # g * sigmoid(gate_sigmoid_scale * g) * (l + linear_offset) on the clamped halves.
+        if (self.activation_type == ActivationType.SwigluBias) != (swiglu_bias is not None):
+            raise ValueError(
+                "swiglu_bias is required for -- and only valid with -- "
+                f"ActivationType.SwigluBias, got {self.activation_type.name} / {swiglu_bias}."
+            )
+        self.swiglu_bias = None if swiglu_bias is None else tuple(float(v) for v in swiglu_bias)
         # DS-V4 / GPT-OSS style SwiGLU clamp: gate is capped at +limit, up is clipped
         # to [-limit, limit] before the activation. ``+inf`` (or any negative value,
         # the op-level "disabled" sentinel) means no clamp and generates no code.
@@ -310,9 +320,12 @@ class Sm107BlockScaledContiguousGatherGroupedGemmActFusionKernel:
             swiglu_limit = float("inf")
         self.swiglu_limit = float(swiglu_limit)
         self.has_swiglu_limit = self.swiglu_limit != float("inf")
-        if self.has_swiglu_limit and self.activation_type != ActivationType.Swiglu:
+        if self.has_swiglu_limit and self.activation_type not in (
+            ActivationType.Swiglu,
+            ActivationType.SwigluBias,
+        ):
             raise ValueError(
-                "swiglu_limit applies to ActivationType.Swiglu only; "
+                "swiglu_limit applies to ActivationType.Swiglu / SwigluBias only; "
                 f"got {self.activation_type.name} with swiglu_limit={self.swiglu_limit}."
             )
         self.is_gated = is_gated_activation(self.activation_type)
@@ -3193,7 +3206,10 @@ class Sm107BlockScaledContiguousGatherGroupedGemmActFusionKernel:
 
                         acc_vec_up = tTR_rAcc_up.load()
                         tCompute = cute.make_rmem_tensor(acc_vec_up.shape, self.acc_dtype)
-                        if cutlass.const_expr(self.activation_type == ActivationType.Swiglu):
+                        if cutlass.const_expr(
+                            self.activation_type
+                            in (ActivationType.Swiglu, ActivationType.SwigluBias)
+                        ):
                             acc_vec_gate = tTR_rAcc_gate.load()
                             self._apply_swiglu_epilogue(
                                 acc_vec_up, acc_vec_gate, alpha_val, tCompute
@@ -3426,6 +3442,8 @@ class Sm107BlockScaledContiguousGatherGroupedGemmActFusionKernel:
 
         With ``has_swiglu_limit`` the scaled gate is capped at ``+swiglu_limit`` and
         the scaled up is clipped to ``[-swiglu_limit, swiglu_limit]`` first.
+        With ``swiglu_bias = (s, b)`` (SwigluBias) it is ``g * sigmoid(s * g) * (u + b)``
+        on those clamped halves ``u`` / ``g``.
         """
         if cutlass.const_expr(self.vectorized_f32):
             LOG2_E = cutlass.Float32(1.4426950408889634)
@@ -3447,9 +3465,19 @@ class Sm107BlockScaledContiguousGatherGroupedGemmActFusionKernel:
                         fclip_xorsign(acc_vec_up_alpha[0], self.swiglu_limit),
                         fclip_xorsign(acc_vec_up_alpha[1], self.swiglu_limit),
                     )
+                neg_log2e = -LOG2_E
+                if cutlass.const_expr(self.swiglu_bias is not None):
+                    acc_vec_up_alpha = cute.arch.add_packed_f32x2(
+                        (acc_vec_up_alpha[0], acc_vec_up_alpha[1]),
+                        (
+                            cutlass.Float32(self.swiglu_bias[1]),
+                            cutlass.Float32(self.swiglu_bias[1]),
+                        ),
+                    )
+                    neg_log2e = -LOG2_E * cutlass.Float32(self.swiglu_bias[0])
                 tCompute_log2e = cute.arch.mul_packed_f32x2(
                     (acc_vec_gate_alpha[0], acc_vec_gate_alpha[1]),
-                    (-LOG2_E, -LOG2_E),
+                    (neg_log2e, neg_log2e),
                 )
                 (
                     tCompute[i],
@@ -3484,7 +3512,16 @@ class Sm107BlockScaledContiguousGatherGroupedGemmActFusionKernel:
                 if cutlass.const_expr(self.has_swiglu_limit):
                     acc_vec_gate_alpha = fmin(acc_vec_gate_alpha, self.swiglu_limit, nan=True)
                     acc_vec_up_alpha = fclip_xorsign(acc_vec_up_alpha, self.swiglu_limit)
-                tCompute[i] = acc_vec_up_alpha * silu_f32(acc_vec_gate_alpha, fastmath=True)
+                if cutlass.const_expr(self.swiglu_bias is not None):
+                    tCompute[i] = (
+                        (acc_vec_up_alpha + cutlass.Float32(self.swiglu_bias[1]))
+                        * acc_vec_gate_alpha
+                        * sigmoid_f32(
+                            acc_vec_gate_alpha * cutlass.Float32(self.swiglu_bias[0]), fastmath=True
+                        )
+                    )
+                else:
+                    tCompute[i] = acc_vec_up_alpha * silu_f32(acc_vec_gate_alpha, fastmath=True)
 
     @cute.jit
     def _apply_situ_epilogue(

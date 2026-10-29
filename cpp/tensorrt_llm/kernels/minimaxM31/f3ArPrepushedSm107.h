@@ -33,7 +33,9 @@ namespace minimaxM31
 //! because the producer (the o_proj GEMM's epilogue fork, kernels/m31_f3_gemm.py) already stored its rows into this
 //! rank's section of every rank's Lamport data slot. Optionally also the MXFP8 of norm_out (mx_out e4m3 [rows, hidden],
 //! mx_sf the 128x4-swizzled UE8M0 scales of pad128(rows) rows; pad rows get 0 scale bytes) with the stock MXFP8
-//! quantize's device functions. Bitwise to the stock push + all-reduce (+ mxfp8_quantize of the norm).
+//! quantize's device functions. Optionally also the NVFP4 of norm_out (fp4_out e2m1x2 [rows, hidden / 2], fp4_sf the
+//! linear e4m3 scales [rows, hidden / 16], global scale fp4_scale[0]) with fp4_quantize's device functions. Bitwise to
+//! the stock push + all-reduce (+ mxfp8_quantize / fp4_quantize of the norm).
 struct F3ArParams
 {
     int rank;
@@ -46,8 +48,11 @@ struct F3ArParams
     void* norm_out;
     void* rms_gamma;
     float rms_eps;
-    void* mx_out; //!< nullptr: no MXFP8 output
+    void* mx_out;  //!< nullptr: no MXFP8 output
     void* mx_sf;
+    void* fp4_out; //!< nullptr: no NVFP4 output
+    void* fp4_sf;
+    float const* fp4_scale;
 };
 
 //! The stock allreduce_fusion_kernel_launcher's one-shot shape (cluster launch). size % hidden_dim == 0 and

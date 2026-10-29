@@ -292,9 +292,11 @@ def route(
             from ...catalog.spec_decode.m31_draft_bf16 import arm_draft_bf16
 
             arm_draft_bf16()
-            from .minimax_m31_nvfp4__sm_107__tp2.modeling import ModelingV2MiniMaxM31Nvfp4Sm107Tp2
+            from .minimax_m31_nvfp4__sm_107__tp2 import modeling as tp2_model
+            from .r1a_runtime import arm as arm_r1a
 
-            return ModelingV2MiniMaxM31Nvfp4Sm107Tp2
+            arm_r1a(tp2_model)
+            return tp2_model.ModelingV2MiniMaxM31Nvfp4Sm107Tp2
         if parallel == "tp4":
             from .minimax_m31_nvfp4__sm_107__tp4.modeling import ModelingV2MiniMaxM31Nvfp4Sm107Tp4
 

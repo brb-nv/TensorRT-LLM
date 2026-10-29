@@ -118,6 +118,24 @@ def blk_reduce_fp32(dst_gemm, src_smem, size, loc=None, ip=None):
 
 
 @dsl_user_op
+def blk_store(dst_gemm, src_smem, size, loc=None, ip=None):
+    """Plain (non-reducing) bulk copy smem -> gmem using cp.async.bulk (permuted_output)."""
+    llvm.inline_asm(
+        None,
+        [
+            dst_gemm.iterator.llvm_ptr,
+            src_smem.iterator.llvm_ptr,
+            size.ir_value(),
+        ],
+        "cp.async.bulk.global.shared::cta.bulk_group [$0], [$1], $2;",
+        "l,l,r",
+        has_side_effects=True,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
 def blk_reduce_fp16(dst_gemm, src_smem, size, loc=None, ip=None):
     """Block reduce for FP16 using cp.reduce.async.bulk."""
     llvm.inline_asm(
@@ -171,8 +189,14 @@ class Sm107BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         cluster_shape_mn: Tuple[int, int],
         raster_along_m: bool = False,
         topK: int = 1,
+        permuted_output: bool = False,
     ):
         self.sf_vec_size = sf_vec_size
+        # permuted_output: each permuted row's ``alpha * acc`` is STORED to row ``permuted_row`` of C
+        # (C is [m, n]) instead of being scaled by its top-k weight and scatter-ADDED into its token's
+        # row. The top-k reduction then runs in a fixed order outside (moe_unpermute), so the result
+        # does not depend on the order in which CTAs finish: deterministic.
+        self.permuted_output = permuted_output
         self.acc_dtype = cutlass.Float32
         self.mma_inst_shape = mma_inst_shape
         self.mma_tiler = mma_tiler
@@ -1587,11 +1611,12 @@ class Sm107BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                     # Compute token info and scaled alpha for this row
                     token_idx = cutlass.Int32(0)
                     alpha_val_iter = alpha_val
-                    if is_valid_row:
-                        token_idx = expanded_idx // self.topK
-                        topk_idx = expanded_idx % self.topK
-                        token_scale = token_final_scales[(token_idx, topk_idx)]
-                        alpha_val_iter = alpha_val * token_scale
+                    if cutlass.const_expr(not self.permuted_output):
+                        if is_valid_row:
+                            token_idx = expanded_idx // self.topK
+                            topk_idx = expanded_idx % self.topK
+                            token_scale = token_final_scales[(token_idx, topk_idx)]
+                            alpha_val_iter = alpha_val * token_scale
 
                     for n_iter_idx in cutlass.range(n_subtile_cnt):
                         # Load accumulator from tensor memory buffer to register
@@ -1628,32 +1653,38 @@ class Sm107BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                     is_valid_row = permuted_row < tile_info[4]
 
                     if is_valid_row:
-                        expanded_idx = permuted_idx_to_expanded_idx[permuted_row]
-                        token_idx = expanded_idx // self.topK
                         coord_n = mma_tile_coord_mnl[1] * self.cta_tile_shape_mnk[1]
-                        scatter_out_offset = cute.domain_offset((token_idx, coord_n, 0), c)
-
                         # sC row index: m_iter_idx * 128 + epi_tidx
                         sC_row = m_iter_idx * 128 + epi_tidx
 
-                        if cutlass.const_expr(self.c_dtype == cutlass.BFloat16):
-                            blk_reduce_bf16(
-                                scatter_out_offset,
+                        if cutlass.const_expr(self.permuted_output):
+                            blk_store(
+                                cute.domain_offset((permuted_row, coord_n, 0), c),
                                 sC[sC_row, None, 0],
                                 cutlass.Int32(self.copy_size),
                             )
-                        elif cutlass.const_expr(self.c_dtype == cutlass.Float32):
-                            blk_reduce_fp32(
-                                scatter_out_offset,
-                                sC[sC_row, None, 0],
-                                cutlass.Int32(self.copy_size),
-                            )
-                        elif cutlass.const_expr(self.c_dtype == cutlass.Float16):
-                            blk_reduce_fp16(
-                                scatter_out_offset,
-                                sC[sC_row, None, 0],
-                                cutlass.Int32(self.copy_size),
-                            )
+                        else:
+                            expanded_idx = permuted_idx_to_expanded_idx[permuted_row]
+                            token_idx = expanded_idx // self.topK
+                            scatter_out_offset = cute.domain_offset((token_idx, coord_n, 0), c)
+                            if cutlass.const_expr(self.c_dtype == cutlass.BFloat16):
+                                blk_reduce_bf16(
+                                    scatter_out_offset,
+                                    sC[sC_row, None, 0],
+                                    cutlass.Int32(self.copy_size),
+                                )
+                            elif cutlass.const_expr(self.c_dtype == cutlass.Float32):
+                                blk_reduce_fp32(
+                                    scatter_out_offset,
+                                    sC[sC_row, None, 0],
+                                    cutlass.Int32(self.copy_size),
+                                )
+                            elif cutlass.const_expr(self.c_dtype == cutlass.Float16):
+                                blk_reduce_fp16(
+                                    scatter_out_offset,
+                                    sC[sC_row, None, 0],
+                                    cutlass.Int32(self.copy_size),
+                                )
 
                 cute.arch.cp_async_bulk_commit_group()
                 cute.arch.cp_async_bulk_wait_group(0, read=True)

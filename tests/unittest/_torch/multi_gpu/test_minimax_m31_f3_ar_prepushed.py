@@ -1,7 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """trtllm::minimax_m31_f3_ar_prepushed (MiniMax-M3.1 TP2 F3 boundary) is bit for bit the stock one-shot Lamport
-AllReduce(RESIDUAL_RMS_NORM) (+ mxfp8_quantize of the norm) when the producer has pre-pushed its rows.
+AllReduce(RESIDUAL_RMS_NORM) (+ mxfp8_quantize and the routed experts' fp4_quantize of the norm) when the producer has
+pre-pushed its rows.
 
 The serving producer is the o_proj GEMM's epilogue fork (kernels/m31_f3_gemm.py). Here a test producer does exactly
 the stock push loop: the rank's allreduce input, with every 32-bit word 0x80000000 (-0, the Lamport "empty" marker)
@@ -117,6 +118,10 @@ def _run(rows_list, kinds):
                 ),
             )[:2]
             q_s, sf_s = trtllm_ops.mxfp8_quantize(n_s, True)
+            # the routed experts' FC1 input scale is per checkpoint; the amax one puts the scales near e4m3 max
+            amax = n_s.float().abs().amax().clamp(min=1e-6)
+            g4 = (448.0 * 6.0 / amax).reshape(1).to(torch.float32)
+            x4_s, x4sf_s = trtllm_ops.fp4_quantize(n_s, g4, 16, False, False)
             torch.cuda.synchronize()
             comm.Barrier()
             # the test producer: the stock push loop
@@ -135,8 +140,10 @@ def _run(rows_list, kinds):
             sf_f = torch.empty(
                 (rows + 127) // 128 * 128 * (H // 32), dtype=torch.uint8, device="cuda"
             )
+            x4_f = torch.empty(rows, H // 2, dtype=torch.uint8, device="cuda")
+            x4sf_f = torch.empty(rows * (H // 16), dtype=torch.uint8, device="cuda")
             trtllm_ops.minimax_m31_f3_ar_prepushed(
-                rank, ws, x, r0, r_f, n_f, nw, EPS, False, q_f, sf_f
+                rank, ws, x, r0, r_f, n_f, nw, EPS, False, q_f, sf_f, x4_f, x4sf_f, g4
             )
             torch.cuda.synchronize()
 
@@ -152,6 +159,8 @@ def _run(rows_list, kinds):
                 "residual": neq(r_f, r_s),
                 "mxfp8": neq(q_f, q_s),
                 "mx_sf": neq(sf_f, sf_s),
+                "nvfp4": neq(x4_f, x4_s),
+                "nvfp4_sf": neq(x4sf_f, x4sf_s),
             }
             if any(cell.values()):
                 bad[f"r{rows}_{kind}"] = cell
