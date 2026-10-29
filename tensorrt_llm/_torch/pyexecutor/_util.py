@@ -46,7 +46,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import AttentionReusePolicy
 
 from ..attention.backends import get_sparse_attn_kv_cache_manager
 from ..disaggregation.draft_kv import (model_ships_disagg_draft_window,
-                                      select_disagg_draft_kv_cache_manager)
+                                       select_disagg_draft_kv_cache_manager)
 from ..disaggregation.kv_cache_transceiver import (
     AttentionTypeCpp, create_kv_cache_transceiver,
     maybe_enable_fabric_memory_for_python_transceiver)
@@ -2366,6 +2366,14 @@ class KvCacheCreator:
         if self._ships_disagg_draft_window():
             # The disagg draft-window transfer ships an unpaired draft pool
             # (select_disagg_draft_kv_cache_manager).
+            return False
+        from .kv_cache import kv_cache_manager_v2
+        if kv_cache_manager_v2.m31_unpaired_draft_pool():
+            # UNPAIRED_DRAFT_POOL (MiniMax-M3.1 on Blackwell).
+            logger.info_once(
+                "Separate draft KV cache left unpaired: UNPAIRED_DRAFT_POOL "
+                "(TRTLLM_M31_DISABLE_UNPAIRED_DRAFT_POOL=1 keeps the pairing).",
+                key="m31_unpaired_draft_pool")
             return False
         return True
 

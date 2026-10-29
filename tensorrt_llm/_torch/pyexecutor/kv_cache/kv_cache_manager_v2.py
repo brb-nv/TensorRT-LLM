@@ -708,6 +708,27 @@ def arm_draft_kv_reserve_guard() -> None:
     _DRAFT_KV_GUARD = not _m31_killed("TRTLLM_M31_DISABLE_DRAFT_KV_GUARD")
 
 
+# UNPAIRED_DRAFT_POOL: MiniMax-M3.1 with DSpark on Blackwell-family GPUs keeps a separate DSpark draft pool unpaired
+# (no joint draft / target prefix reuse, KvCacheCreator._joint_reuse_supported), aggregated and disaggregated serving
+# alike. It applies where a separate draft pool remains: the sm_107 targets ship its window (RuntimeHooks
+# disagg_draft_kv), so the unified target + drafter manager does not take them; elsewhere it is a no-op. VR TP2 agg K7:
+# decode step synth (22 requests, D176, same node) 16.78 vs 17.32 ms; c56 forced-AL E2E X_P90 +3.0%; agentic natural
+# AL within the check's band. Armed process-wide before the KV cache managers are built (m31_kv_defaults
+# .arm_minimax_m31 -> arm_m31_unpaired_draft_pool). Kill switch TRTLLM_M31_DISABLE_UNPAIRED_DRAFT_POOL=1 (joint reuse
+# pairing kept).
+_M31_UNPAIRED_DRAFT_POOL = False
+
+
+def arm_m31_unpaired_draft_pool() -> None:
+    """Keep a separate draft pool unpaired in this process (MiniMax-M3.1), unless the kill switch is set."""
+    global _M31_UNPAIRED_DRAFT_POOL
+    _M31_UNPAIRED_DRAFT_POOL = not _m31_killed("TRTLLM_M31_DISABLE_UNPAIRED_DRAFT_POOL")
+
+
+def m31_unpaired_draft_pool() -> bool:
+    return _M31_UNPAIRED_DRAFT_POOL
+
+
 def _get_shared_draft_block_width(
     spec_config, layer_specs, shared_draft_block_width: Optional[int] = None
 ) -> int:

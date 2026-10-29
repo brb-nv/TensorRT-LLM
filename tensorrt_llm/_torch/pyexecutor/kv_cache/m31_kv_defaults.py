@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import torch
 
-from . import kv_layerwise_onboard
+from . import kv_cache_manager_v2, kv_layerwise_onboard
 
 #: Blackwell-family compute capability major (sm_100 / sm_103 / sm_107): where arm_minimax_m31 arms.
 BLACKWELL_MAJOR = 10
@@ -34,7 +34,8 @@ BLACKWELL_MAJOR = 10
 def arm_minimax_m31(capability=None) -> None:
     """Arm the MiniMax-M3.1 KV defaults in this process for a Blackwell-family device (``capability``: the
     (major, minor) compute capability, default the current device's): whole-migration host-KV onboarding
-    (kv_layerwise_onboard KVLO_OFF). Other devices arm nothing."""
+    (kv_layerwise_onboard KVLO_OFF) and an unpaired separate draft pool (kv_cache_manager_v2 UNPAIRED_DRAFT_POOL).
+    Other devices arm nothing."""
     if capability is None:
         if not torch.cuda.is_available():
             return
@@ -42,3 +43,4 @@ def arm_minimax_m31(capability=None) -> None:
     if tuple(capability)[0] != BLACKWELL_MAJOR:
         return
     kv_layerwise_onboard.arm_m31_layerwise_onboard_off()
+    kv_cache_manager_v2.arm_m31_unpaired_draft_pool()

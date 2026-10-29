@@ -1684,6 +1684,30 @@ class TestDraftPoolPageSize:
         creator._speculative_config = DSparkDecodingConfig(max_draft_len=4)
         assert creator._joint_reuse_supported() is expected
 
+    @pytest.mark.parametrize("armed, expected", [(False, True), (True, False)])
+    def test_m31_unpaired_draft_pool_keeps_agg_unpaired(self, monkeypatch, armed, expected):
+        from tensorrt_llm._torch.pyexecutor.kv_cache import kv_cache_manager_v2
+
+        monkeypatch.setattr(kv_cache_manager_v2, "_M31_UNPAIRED_DRAFT_POOL", armed)
+        # Aggregated, same page size on both pools: only UNPAIRED_DRAFT_POOL decides.
+        creator = _page_size_creator(64, _dflash_draft_model(True, "TRTLLM"))
+        creator._is_kv_cache_manager_v2 = True
+        creator._kv_cache_manager_cls = KVCacheManagerV2
+        creator._speculative_config = DSparkDecodingConfig(max_draft_len=4)
+        assert creator._joint_reuse_supported() is expected
+
+    def test_m31_unpaired_draft_pool_default_on_with_kill_switch(self, monkeypatch):
+        from tensorrt_llm._torch.pyexecutor.kv_cache import kv_cache_manager_v2
+
+        monkeypatch.setattr(kv_cache_manager_v2, "_M31_UNPAIRED_DRAFT_POOL", False)
+        assert not kv_cache_manager_v2.m31_unpaired_draft_pool()  # off until armed
+        monkeypatch.delenv("TRTLLM_M31_DISABLE_UNPAIRED_DRAFT_POOL", raising=False)
+        kv_cache_manager_v2.arm_m31_unpaired_draft_pool()
+        assert kv_cache_manager_v2.m31_unpaired_draft_pool()
+        monkeypatch.setenv("TRTLLM_M31_DISABLE_UNPAIRED_DRAFT_POOL", "1")
+        kv_cache_manager_v2.arm_m31_unpaired_draft_pool()
+        assert not kv_cache_manager_v2.m31_unpaired_draft_pool()
+
     @pytest.mark.parametrize(
         "is_disagg, opts_in, kill_switch, expected",
         [
