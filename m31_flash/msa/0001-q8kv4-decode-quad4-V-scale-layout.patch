@@ -1,0 +1,206 @@
+From 5bbff126fbfe24ce76422ee19a643468492da1ef Mon Sep 17 00:00:00 2001
+Date: Mon, 26 Oct 2026 20:09:28 -0700
+Subject: [PATCH] q8kv4 decode: quad4 V-scale layout
+ (MINIMAX_MSA_Q8KV4_V_SCALE_LAYOUT)
+
+Adds an opt-in V block-scale layout for the SM100 Q8KV4 sparse decode,
+quad4 = [token // 4][scale_col][token % 4] per (page, KV head), the 4x4
+token-quad order TensorRT-LLM's and vLLM's NVFP4 cache writers use. K scales
+stay token-major. jit.py exposes V_SCALE_LAYOUTS and builds a separate
+module (cache dir/URI tag _vquad4) with MINIMAX_MSA_Q8KV4_V_SCALE_QUAD4=1;
+the kernel then loads each lane's two pre-transposed scale words with one
+8-byte shared load instead of four 2-byte loads and a prmt pair. The default
+token_major build is unchanged.
+
+---
+ ..._fmha_kv_transform_tma_warpspecialized.hpp | 21 +++++++-
+ .../msa_v1/attention/decode/q8kv4/jit.py      | 52 +++++++++++++++++--
+ 2 files changed, 67 insertions(+), 6 deletions(-)
+
+diff --git a/inference/msa_v1/attention/decode/q8kv4/csrc/include/sm100/collective/sm100_fmha_kv_transform_tma_warpspecialized.hpp b/inference/msa_v1/attention/decode/q8kv4/csrc/include/sm100/collective/sm100_fmha_kv_transform_tma_warpspecialized.hpp
+index 42f51fc..c51ce4c 100644
+--- a/inference/msa_v1/attention/decode/q8kv4/csrc/include/sm100/collective/sm100_fmha_kv_transform_tma_warpspecialized.hpp
++++ b/inference/msa_v1/attention/decode/q8kv4/csrc/include/sm100/collective/sm100_fmha_kv_transform_tma_warpspecialized.hpp
+@@ -10,6 +10,12 @@
+ #include "sm100_fmha_q8kv4_traits.hpp"
+ #include "sm100_fmha_storage.hpp"
+ 
++// V block-scale byte order within a (page, KV head): 0 = token-major [token][col] (default),
++// 1 = quad4 [token / 4][col][token % 4]. Set by jit.py from MINIMAX_MSA_Q8KV4_V_SCALE_LAYOUT.
++#ifndef MINIMAX_MSA_Q8KV4_V_SCALE_QUAD4
++#define MINIMAX_MSA_Q8KV4_V_SCALE_QUAD4 0
++#endif
++
+ namespace cutlass::fmha::collective {
+ 
+ template <class Traits> struct Sm100FmhaKvTransformTmaWarpspecialized {
+@@ -218,15 +224,26 @@ template <class Traits> struct Sm100FmhaKvTransformTmaWarpspecialized {
+     int const token_quad = warp_group_lane & 3;
+ #endif
+     int const loop_offset = (warp_group_lane >> 4) & 7;
++    uint32_t packed0;
++    uint32_t packed1;
++#if MINIMAX_MSA_Q8KV4_V_SCALE_QUAD4
++    // quad4 V-scale layout (TensorRT-LLM / vLLM NVFP4 cache writers): byte (token, col) of a page
++    // sits at (token / 4) * 32 + col * 4 + token % 4. Tokens 4 * (4 * loop_offset + token_quad) + 0..3
++    // of columns 2 * scale_pair and 2 * scale_pair + 1 are then the 8 contiguous bytes below, already
++    // in the {col 2p: t0..t3}, {col 2p + 1: t0..t3} order pack_scale_pairs builds from token-major.
++    uint2 const quad_words = *reinterpret_cast<uint2 const *>(
++        scale_stage_base + loop_offset * 128 + token_quad * 32 + scale_pair * 8);
++    packed0 = quad_words.x;
++    packed1 = quad_words.y;
++#else
+     uint8_t const *scale_src =
+         scale_stage_base + loop_offset * 128 + token_quad * 32 + scale_pair * 2;
+     uint32_t const h0 = *reinterpret_cast<uint16_t const *>(scale_src + 0);
+     uint32_t const h1 = *reinterpret_cast<uint16_t const *>(scale_src + 8);
+     uint32_t const h2 = *reinterpret_cast<uint16_t const *>(scale_src + 16);
+     uint32_t const h3 = *reinterpret_cast<uint16_t const *>(scale_src + 24);
+-    uint32_t packed0;
+-    uint32_t packed1;
+     pack_scale_pairs(packed0, packed1, h0, h1, h2, h3);
++#endif
+ #if MINIMAX_MSA_Q8KV4_HAS_QMUL4
+     int const scale_dst_offset = loop_offset * 128 + token_quad * 32 + scale_pair * 8;
+     *reinterpret_cast<uint32_t *>(scale_scratch_base + scale_dst_offset) = packed0;
+diff --git a/inference/msa_v1/attention/decode/q8kv4/jit.py b/inference/msa_v1/attention/decode/q8kv4/jit.py
+index a533d9e..9c7c496 100644
+--- a/inference/msa_v1/attention/decode/q8kv4/jit.py
++++ b/inference/msa_v1/attention/decode/q8kv4/jit.py
+@@ -33,6 +33,13 @@ _SPARSE_VARIANTS = {
+     False: "decode_attention_q8kv4_topk16",
+     True: "decode_attention_q8kv4_topk16_split",
+ }
++# V block-scale byte order within one (page, KV head) of the scale cache. "token_major" is
++# [token][col] (MSA's own cache writers). "quad4" is [token // 4][col][token % 4], the 4x4
++# token-quad order of the TensorRT-LLM and vLLM NVFP4 cache writers. K scales are token-major in
++# both. Selected per process with MINIMAX_MSA_Q8KV4_V_SCALE_LAYOUT (default token_major).
++V_SCALE_LAYOUT_ENV = "MINIMAX_MSA_Q8KV4_V_SCALE_LAYOUT"
++V_SCALE_LAYOUTS = ("token_major", "quad4")
++_DEFAULT_V_SCALE_LAYOUT = "token_major"
+ _QMUL4_DEQUANT = "qmul4"
+ _FP16_DEQUANT = "fp16_fallback"
+ _QMUL4_PROBE_SOURCE = r"""
+@@ -51,6 +58,28 @@ __global__ void qmul4_probe(uint32_t* output) {
+ """.lstrip()
+ 
+ 
++@lru_cache(maxsize=1)
++def v_scale_layout() -> str:
++    """Return the V-scale layout selected by MINIMAX_MSA_Q8KV4_V_SCALE_LAYOUT.
++
++    Read once per process (set it before the first plan or run): the C++ host API caches one
++    kernel per (device, GQA, top-k, output mode, split) and does not key on the layout.
++    """
++    layout = os.environ.get(V_SCALE_LAYOUT_ENV, "").strip().lower() or _DEFAULT_V_SCALE_LAYOUT
++    if layout == "token":  # alias
++        layout = _DEFAULT_V_SCALE_LAYOUT
++    if layout not in V_SCALE_LAYOUTS:
++        raise ValueError(
++            f"{V_SCALE_LAYOUT_ENV}={layout!r} is not one of {V_SCALE_LAYOUTS}"
++        )
++    return layout
++
++
++def _layout_tag(layout: str) -> str:
++    # The default layout keeps the original cache names and URIs.
++    return "" if layout == _DEFAULT_V_SCALE_LAYOUT else f"_v{layout}"
++
++
+ def _write_text_if_changed(path: Path, content: str) -> None:
+     if path.is_file() and path.read_text(encoding="utf-8") == content:
+         return
+@@ -199,7 +228,12 @@ def _cache_dir(component: str, arch: str, dequant_mode: str) -> Path:
+     return _cache_root() / f"{component}_{dequant_mode}_{arch}_{_source_digest()}"
+ 
+ 
+-def _nvcc_flags(cache_dir: Path, dequant_mode: str, arch: str) -> str:
++def _nvcc_flags(
++    cache_dir: Path,
++    dequant_mode: str,
++    arch: str,
++    v_layout: str = _DEFAULT_V_SCALE_LAYOUT,
++) -> str:
+     include_dirs = [
+         _SM100_INCLUDE,
+         _SM100_INCLUDE / "common",
+@@ -234,6 +268,7 @@ def _nvcc_flags(cache_dir: Path, dequant_mode: str, arch: str) -> str:
+         "-DNDEBUG",
+         f"-DMINIMAX_MSA_Q8KV4_HAS_QMUL4={int(dequant_mode == _QMUL4_DEQUANT)}",
+         f"-DMINIMAX_MSA_Q8KV4_RAW_KV_STAGES={12 if arch == '107a' else 8}",
++        f"-DMINIMAX_MSA_Q8KV4_V_SCALE_QUAD4={int(v_layout == 'quad4')}",
+         "-Xptxas",
+         "-O3",
+         "-Xcompiler",
+@@ -266,6 +301,7 @@ def _write_ninja(
+     sources: list[Path],
+     dequant_mode: str,
+     arch: str,
++    v_layout: str = _DEFAULT_V_SCALE_LAYOUT,
+ ) -> None:
+     nvcc = _cuda_home() / "bin/nvcc"
+     objects = [cache_dir / f"source_{index}.o" for index in range(len(sources))]
+@@ -276,7 +312,7 @@ def _write_ninja(
+     content = f"""ninja_required_version = 1.5
+ 
+ nvcc = {nvcc}
+-nvcc_flags = {_nvcc_flags(cache_dir, dequant_mode, arch)}
++nvcc_flags = {_nvcc_flags(cache_dir, dequant_mode, arch, v_layout)}
+ 
+ rule nvcc_compile
+   command = $nvcc $nvcc_flags -MMD -MF $out.d -c $in -o $out
+@@ -304,17 +340,20 @@ class JitSpec:
+     target_arch: str
+     gqa_ratio: int = 16
+     output_mode: str = "bf16"
++    v_scale_layout: str = _DEFAULT_V_SCALE_LAYOUT
+ 
+     @property
+     def uri(self) -> str:
+         return (
+-            f"{self.variant_name}_gqa{self.gqa_ratio}_{self.output_mode}_{self.dequant_mode}_"
++            f"{self.variant_name}_gqa{self.gqa_ratio}_{self.output_mode}"
++            f"{_layout_tag(self.v_scale_layout)}_{self.dequant_mode}_"
+             f"{self.target_arch}_{_source_digest()}"
+         )
+ 
+     def build_and_load(self):
+         cache_dir = _cache_dir(
+-            f"{self.variant_name}_gqa{self.gqa_ratio}_{self.output_mode}",
++            f"{self.variant_name}_gqa{self.gqa_ratio}_{self.output_mode}"
++            f"{_layout_tag(self.v_scale_layout)}",
+             self.target_arch,
+             self.dequant_mode,
+         )
+@@ -354,6 +393,7 @@ class JitSpec:
+             [inst_cu, run_cu],
+             self.dequant_mode,
+             self.target_arch,
++            self.v_scale_layout,
+         )
+         _run_ninja(cache_dir, f"{self.variant_name} JIT module")
+ 
+@@ -391,6 +431,7 @@ def gen_jit_spec(
+         arch,
+         gqa_ratio,
+         output_mode,
++        v_scale_layout(),
+     )
+ 
+ 
+@@ -508,9 +549,12 @@ def _clear_loaded_extensions() -> None:
+ 
+ 
+ __all__ = [
++    "V_SCALE_LAYOUTS",
++    "V_SCALE_LAYOUT_ENV",
+     "JitSpec",
+     "gen_jit_spec",
+     "get_fmha_fwd_variant",
+     "get_plan_fn",
+     "get_reduction_module",
++    "v_scale_layout",
+ ]
+-- 
+2.43.0
+

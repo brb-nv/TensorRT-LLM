@@ -98,7 +98,7 @@ which is site-specific: Slurm account, pyxis, and the user's CI images):
 2. **MSA layer**: `build-image-msa.sbatch` installs MiniMax MSA into the wheel image. MSA is
    [github.com/MiniMax-AI/MSA](https://github.com/MiniMax-AI/MSA) (MIT), an **external library** and not part of
    TensorRT-LLM. It goes in at `minimax-msa@1e7bf76f`, with its CUTLASS submodule at the pin. It is installed as
-   `pip install --no-deps -e /opt/minimax-msa` on top of the wheel, after the msa-quad4 patch series is applied.
+   `pip install --no-deps -e /opt/minimax-msa` on top of the wheel, after the msa-quad4 patch series (`m31_flash/msa/`) is applied.
    That series is one patch (sha256 `a20552d3…`): the quad4 Q8KV4 V-scale layout
    (`MINIMAX_MSA_Q8KV4_V_SCALE_LAYOUT=quad4`) that TRT-LLM's `msa_v1_decode` needs. Every image with MSA used exactly
    this series (tag `pa20552d`). MSA has no AOT kernels: it JIT-compiles at first use into `$TORCH_EXTENSIONS_DIR`.
