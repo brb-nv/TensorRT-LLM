@@ -87,6 +87,7 @@ FLAGS = (
     (dflash, "_HOST_CTX_ALLOC_ARMED", True),
     (perf_metrics_manager, "_GPU_TIMESTAMPS", True),
     (kv_layerwise_onboard, "_M31_DEFAULT_OFF", True),
+    (kv_cache_manager_v2, "_M31_UNPAIRED_DRAFT_POOL", True),
 )
 KILL_SWITCHES = (
     "TRTLLM_M31_DISABLE_DRAFT_KV_RESERVE",
@@ -97,6 +98,7 @@ KILL_SWITCHES = (
     "TRTLLM_DFLASH_DISABLE_HOST_CTX_ALLOC",
     "TRTLLM_M31_DISABLE_GPU_TIMESTAMPS",
     "TRTLLM_M31_DISABLE_KVLO_OFF",
+    "TRTLLM_M31_DISABLE_UNPAIRED_DRAFT_POOL",
 )
 
 

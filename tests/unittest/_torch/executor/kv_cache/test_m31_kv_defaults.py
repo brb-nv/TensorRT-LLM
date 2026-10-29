@@ -1,8 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""MiniMax-M3.1 KV defaults (m31_kv_defaults.arm_minimax_m31): armed on Blackwell-family GPUs only, from the sm_107 and
-sm_103 routing and from the built-in MiniMaxM3ForCausalLM with DSpark, and without touching the CuTe AOT keys. CPU
-only."""
+"""MiniMax-M3.1 KV defaults (m31_kv_defaults.arm_minimax_m31: KVLO_OFF and UNPAIRED_DRAFT_POOL): armed on
+Blackwell-family GPUs only, from the sm_107 and sm_103 routing and from the built-in MiniMaxM3ForCausalLM with DSpark,
+and without touching the CuTe AOT keys. CPU only."""
 
 import ast
 from pathlib import Path
@@ -12,13 +12,19 @@ import pytest
 import tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3 as _family
 import tensorrt_llm._torch.models as models
 from tensorrt_llm._torch import cute_aot
-from tensorrt_llm._torch.pyexecutor.kv_cache import kv_layerwise_onboard, m31_kv_defaults
+from tensorrt_llm._torch.pyexecutor.kv_cache import (
+    kv_cache_manager_v2,
+    kv_layerwise_onboard,
+    m31_kv_defaults,
+)
 
 
 @pytest.fixture
 def unarmed(monkeypatch):
     monkeypatch.setattr(kv_layerwise_onboard, "_M31_DEFAULT_OFF", False)
     monkeypatch.delenv("TRTLLM_M31_DISABLE_KVLO_OFF", raising=False)
+    monkeypatch.setattr(kv_cache_manager_v2, "_M31_UNPAIRED_DRAFT_POOL", False)
+    monkeypatch.delenv("TRTLLM_M31_DISABLE_UNPAIRED_DRAFT_POOL", raising=False)
 
 
 @pytest.mark.parametrize(
@@ -34,6 +40,7 @@ def unarmed(monkeypatch):
 def test_armed_on_blackwell_only(unarmed, capability, armed):
     m31_kv_defaults.arm_minimax_m31(capability)
     assert kv_layerwise_onboard._M31_DEFAULT_OFF is armed
+    assert kv_cache_manager_v2._M31_UNPAIRED_DRAFT_POOL is armed
 
 
 def test_arming_leaves_the_cute_aot_keys_unchanged(unarmed):
