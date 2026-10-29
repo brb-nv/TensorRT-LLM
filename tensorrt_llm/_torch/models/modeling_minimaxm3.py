@@ -975,7 +975,9 @@ class MiniMaxM3MoE(nn.Module):
         if backend.w2_weight.shape[1] != self.hidden_dim:
             return f"expert hidden size padded ({backend.w2_weight.shape[1]} != {self.hidden_dim})"
         if backend.w3_w1_weight.shape[-1] * 2 != self.hidden_dim:
-            return f"expert input padded ({backend.w3_w1_weight.shape[-1] * 2} != {self.hidden_dim})"
+            return (
+                f"expert input padded ({backend.w3_w1_weight.shape[-1] * 2} != {self.hidden_dim})"
+            )
         if need_unfinalized and not backend.supports_unfinalized_output():
             return f"backend {type(backend).__name__} finalizes in the kernel"
         if (
@@ -1004,7 +1006,11 @@ class MiniMaxM3MoE(nn.Module):
     ) -> Optional[torch.Tensor]:
         """The routed experts' static NVFP4 input scale when this forward can take an NVFP4 input quantized upstream
         (linear scale factors), else None. Shapes and configuration only, so every TP rank decides alike."""
-        if is_torch_compiling() or hidden_states.dim() != 2 or hidden_states.dtype != torch.bfloat16:
+        if (
+            is_torch_compiling()
+            or hidden_states.dim() != 2
+            or hidden_states.dtype != torch.bfloat16
+        ):
             return None
         if self._m31_routed_input_scale_reason is None:
             reason = self._m31_backend_reason(need_unfinalized=False)
@@ -1135,7 +1141,8 @@ class MiniMaxM3MoE(nn.Module):
             self._m31_unfinalized_ok = reason is None
             if reason is not None:
                 logger.info_once(
-                    f"M31 decode fusion off for MiniMax-M3 MoE: {reason}", key="m31_decode_fusion_off"
+                    f"M31 decode fusion off for MiniMax-M3 MoE: {reason}",
+                    key="m31_decode_fusion_off",
                 )
         if not self._m31_unfinalized_ok:
             return False
@@ -3059,7 +3066,8 @@ class MiniMaxM3DecoderLayer(DecoderLayer):
             and self.block_sparse_moe is not None
             and self.post_feed_forward_fusion
             and self.allreduce is not None
-            and model_config.allreduce_strategy in (AllReduceStrategy.AUTO, AllReduceStrategy.ONESHOT)
+            and model_config.allreduce_strategy
+            in (AllReduceStrategy.AUTO, AllReduceStrategy.ONESHOT)
             and self.mapping.tp_size in (2, 4, 8)
             and not self.mapping.is_multi_node()
         ):
@@ -3301,7 +3309,9 @@ class MiniMaxM3DecoderLayer(DecoderLayer):
             or getattr(self.allreduce, "mnnvl_allreduce", None) is not None
         ):
             return False
-        return self.block_sparse_moe.m31_unfinalized_applies(hidden_states, attn_metadata, lora_params)
+        return self.block_sparse_moe.m31_unfinalized_applies(
+            hidden_states, attn_metadata, lora_params
+        )
 
     def _m31_moe_finalize_allreduce_norm(
         self,
@@ -3343,7 +3353,9 @@ class MiniMaxM3DecoderLayer(DecoderLayer):
         )
         if mxfp8_out:
             normed, act_e4m3, act_sf, residual = outputs
-            MXFP8LinearMethod.offer_quantized_input(self.next_layer_qkv_proj, normed, act_e4m3, act_sf)
+            MXFP8LinearMethod.offer_quantized_input(
+                self.next_layer_qkv_proj, normed, act_e4m3, act_sf
+            )
             return normed, residual
         normed, residual = outputs
         return normed, residual
@@ -3632,6 +3644,13 @@ class MiniMaxM3ForCausalLM(SpecDecOneEngineForCausalLM[MiniMaxM3Model, Pretraine
             # representation while the target remains NVFP4.
             model_config.extra_attrs["draft_kv_cache_quant_algo_override"] = QuantAlgo.FP8
         super().__init__(MiniMaxM3Model(model_config), model_config)
+        from ..pyexecutor.kv_cache import m31_kv_defaults
+        from ..speculative.dspark import DSparkWorker
+
+        if isinstance(self.spec_worker, DSparkWorker):
+            # The MiniMax-M3.1 KV defaults on Blackwell-family GPUs, armed before the KV cache managers are built;
+            # each keeps its switch (pyexecutor/kv_cache/m31_kv_defaults.arm_minimax_m31).
+            m31_kv_defaults.arm_minimax_m31()
 
     def load_weights(
         self,
