@@ -1295,6 +1295,9 @@ def test_estimation_temporarily_uses_inferred_pool_sizing(
     # None unless the model opted into MM item scheduling.
     model_engine.mm_encoder_output_budget_bytes = None
     model_engine.mm_encoder_cache = None
+    # Real models without runtime hooks leave the attribute unset (the all-off default); a bare Mock attribute is
+    # not a RuntimeHooks and runtime_hooks_of rejects it.
+    model_engine.model.runtime_hooks = None
     llm_args = Mock(cache_transceiver_config=None, enable_chunked_prefill=chunked_prefill)
 
     with patch.object(
