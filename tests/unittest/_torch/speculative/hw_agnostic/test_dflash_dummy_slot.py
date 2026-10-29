@@ -17,8 +17,8 @@
 Dummy rows add their accepted tokens to the dummy slot's length like any request, while a padding row's page-table row
 maps past the padding request's own pages to page 0, which another request owns. A dummy length that kept growing
 would put the padding rows' context K / V on that page. The drafting step's ``DFlashWorker._advance_ctx_len`` empties
-the slot right after the add, inside the captured step, so ``DFlashSpecMetadata.prepare`` writes slot lengths only for
-evicted requests.
+the slot right after the add, inside the captured step, so ``DFlashSpecMetadata.prepare`` writes no slot lengths for
+requests that hold a slot.
 """
 
 from functools import partial
@@ -111,7 +111,7 @@ def test_dummy_slot_reset_replays_in_a_cuda_graph():
         assert worker._ctx_len.tolist() == [40 + 2 * step, 300 + 3 * step, 7, 0, 0], step
 
 
-def test_prepare_resets_only_evicted_slots():
+def test_a_context_only_step_keeps_the_generation_slots():
     worker = _worker([40, 300, 7, 0, 96])
     written = []
     write = worker._write_ctx_len
@@ -122,10 +122,11 @@ def test_prepare_resets_only_evicted_slots():
 
     worker._write_ctx_len = record
     _prepare(worker, [11, 12, 13, FLOOR + 1], num_generations=4)
-    _prepare(worker, [11, 13, FLOOR + 1], num_generations=3)  # request 12 left
-    assert written == [{}, {1: 0}]
-    assert worker._ctx_len.tolist() == [40, 0, 7, 0, 96]
-    assert 1 in worker._free_slots and 12 not in worker._req_to_slot
+    _prepare(worker, [14], num_generations=0)  # a context-only step (M31 NO_MIX): 11-13 sit it out
+    _prepare(worker, [11, 12, 13, FLOOR + 1], num_generations=4)
+    assert written == []
+    assert worker._ctx_len.tolist() == [40, 300, 7, 0, 96]
+    assert worker._req_to_slot == {11: 0, 12: 1, 13: 2}
 
 
 def test_attention_dp_dummy_generation_row_takes_the_dummy_slot():

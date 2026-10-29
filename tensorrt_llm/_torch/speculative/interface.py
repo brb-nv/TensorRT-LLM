@@ -1821,6 +1821,15 @@ def _padded_gen_draft_tokens(spec_metadata: SpecMetadata, num_gens: int,
     ).to(torch.int32)
 
 
+def _fused_filters(temperatures, top_ks, top_ps, min_ps):
+    """The fused sampler's filters, a None one given its disable sentinel."""
+    return (torch.full_like(temperatures,
+                            torch.iinfo(torch.int32).max,
+                            dtype=torch.int32) if top_ks is None else top_ks,
+            torch.ones_like(temperatures) if top_ps is None else top_ps,
+            torch.zeros_like(temperatures) if min_ps is None else min_ps)
+
+
 # Context one-hot draft-prob rows are written with index_fill_ (non-blocking) instead
 # of an advanced-index put that synchronizes the host with the GPU. A model opt-in
 # (RuntimeHooks.context_onehot_index_fill), armed by the executor
@@ -2515,21 +2524,20 @@ class SpecWorkerBase(nn.Module, ABC):
         advanced_sampling_mode: AdvancedSamplingMode,
         logits: torch.Tensor,
         temperatures: torch.Tensor,
-        top_ks: torch.Tensor,
-        top_ps: torch.Tensor,
+        top_ks: Optional[torch.Tensor],
+        top_ps: Optional[torch.Tensor],
         min_ps: Optional[torch.Tensor],
         *,
         seed: Optional[torch.Tensor] = None,
         offset: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if advanced_sampling_mode.is_fused:
-            return fused_sampling.fused_sample_from_logits(logits,
-                                                           temperatures,
-                                                           top_ks,
-                                                           top_ps,
-                                                           min_ps,
-                                                           seed=seed,
-                                                           offset=offset)
+            return fused_sampling.fused_sample_from_logits(
+                logits,
+                temperatures,
+                *_fused_filters(temperatures, top_ks, top_ps, min_ps),
+                seed=seed,
+                offset=offset)
         top_ks, top_ps = flashinfer_sampling.resolve_advanced_sampling_filters(
             advanced_sampling_mode, top_ks, top_ps)
         return flashinfer_sampling.sample_from_logits_op(logits,
@@ -2544,8 +2552,8 @@ class SpecWorkerBase(nn.Module, ABC):
         advanced_sampling_mode: AdvancedSamplingMode,
         logits: torch.Tensor,
         temperatures: torch.Tensor,
-        top_ks: torch.Tensor,
-        top_ps: torch.Tensor,
+        top_ks: Optional[torch.Tensor],
+        top_ps: Optional[torch.Tensor],
         min_ps: Optional[torch.Tensor],
         *,
         seed: Optional[torch.Tensor] = None,
@@ -2555,9 +2563,7 @@ class SpecWorkerBase(nn.Module, ABC):
             return fused_sampling.fused_sample_from_logits_with_probs(
                 logits,
                 temperatures,
-                top_ks,
-                top_ps,
-                min_ps,
+                *_fused_filters(temperatures, top_ks, top_ps, min_ps),
                 seed=seed,
                 offset=offset)
         top_ks, top_ps = flashinfer_sampling.resolve_advanced_sampling_filters(
@@ -2702,14 +2708,10 @@ class SpecWorkerBase(nn.Module, ABC):
 
     @staticmethod
     def _temperature_only_params(
-        temperatures: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Sampler arguments for ``temperatures`` without filters (device-side fills, graph-safe)."""
-        return (temperatures,
-                torch.full_like(temperatures,
-                                torch.iinfo(torch.int32).max,
-                                dtype=torch.int32),
-                torch.ones_like(temperatures), torch.zeros_like(temperatures))
+            temperatures: torch.Tensor
+    ) -> tuple[torch.Tensor, None, None, None]:
+        """Sampler arguments for ``temperatures`` without filters: no filter kernel runs."""
+        return temperatures, None, None, None
 
     def advanced_sample_draft(self,
                               logits: torch.Tensor,

@@ -54,12 +54,17 @@ def test_a_returning_generation_request_resumes_its_stored_context():
     slot = worker._assign_slot(11)
     worker._write_ctx_len({slot: 500}, {slot: 3})
 
-    # Request 11 sits one iteration out (e.g. suspended by the scheduler), then returns.
-    _prepare(worker, [12])
-    assert dict(worker._parked_ctx_base) == {11: 3}
+    # Request 11 sits out an iteration whose new requests need its slot, then returns.
+    _prepare(worker, [12, 13])
+    # Request 14's context store takes 11's slot and defers its length writes.
+    new_slot = worker._assign_slot(14, updates={})
+    assert dict(worker._parked_ctx_base) == {11: 3} and worker._ctx_base_host[new_slot] == 0
     _prepare(worker, [12, 11])
 
     slot = worker._req_to_slot[11]
     assert worker._ctx_stored_host[slot] and bool(worker._ctx_stored[slot])
     assert worker._ctx_base_host[slot] == 3 and int(worker._ctx_base_pages[slot]) == 3
     assert not worker._parked_ctx_base
+    # A restarted prefill takes its own slot back without its old base pages.
+    assert worker._assign_slot(11, reset=True, updates={}) == slot
+    assert worker._ctx_base_host[slot] == 0
