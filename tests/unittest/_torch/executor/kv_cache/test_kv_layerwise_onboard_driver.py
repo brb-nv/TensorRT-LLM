@@ -54,10 +54,31 @@ def _driver(impl, last=3, offsets=None):
 
 
 def test_on_by_default_with_a_temporary_off_switch(monkeypatch):
+    monkeypatch.setattr(lw, "_M31_DEFAULT_OFF", False)
     monkeypatch.delenv("TRTLLM_KV_LAYERWISE_ONBOARD", raising=False)
     assert lw.layerwise_onboard_requested()
     monkeypatch.setenv("TRTLLM_KV_LAYERWISE_ONBOARD", "0")
     assert not lw.layerwise_onboard_requested()
+
+
+def test_m31_default_off_and_the_explicit_switch_wins(monkeypatch):
+    monkeypatch.setattr(lw, "_M31_DEFAULT_OFF", False)
+    monkeypatch.delenv("TRTLLM_M31_DISABLE_KVLO_OFF", raising=False)
+    lw.arm_m31_layerwise_onboard_off()
+    monkeypatch.delenv("TRTLLM_KV_LAYERWISE_ONBOARD", raising=False)
+    assert not lw.layerwise_onboard_requested()
+    monkeypatch.setenv("TRTLLM_KV_LAYERWISE_ONBOARD", "1")
+    assert lw.layerwise_onboard_requested()
+    monkeypatch.setenv("TRTLLM_KV_LAYERWISE_ONBOARD", "0")
+    assert not lw.layerwise_onboard_requested()
+
+
+def test_m31_default_off_kill_switch(monkeypatch):
+    monkeypatch.setattr(lw, "_M31_DEFAULT_OFF", False)
+    monkeypatch.delenv("TRTLLM_KV_LAYERWISE_ONBOARD", raising=False)
+    monkeypatch.setenv("TRTLLM_M31_DISABLE_KVLO_OFF", "1")
+    lw.arm_m31_layerwise_onboard_off()
+    assert lw.layerwise_onboard_requested()
 
 
 def test_one_event_per_layer():

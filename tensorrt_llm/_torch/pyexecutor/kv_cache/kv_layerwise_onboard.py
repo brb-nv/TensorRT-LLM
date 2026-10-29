@@ -29,7 +29,9 @@ attention does not wait per layer), so a draft forward that runs after the
 target forward sees complete pages.
 
 ``TRTLLM_KV_LAYERWISE_ONBOARD=0`` is a temporary A/B switch back to
-whole-migration waits.
+whole-migration waits; any other non-empty value turns layer-wise onboarding on.
+Unset, it is on, except where MiniMax-M3.1 armed its default off
+(:func:`arm_m31_layerwise_onboard_off`).
 """
 
 from __future__ import annotations
@@ -45,8 +47,30 @@ _consumer_registered = False
 _armed: "weakref.WeakSet[LayerwiseOnboard]" = weakref.WeakSet()
 
 
+# KVLO_OFF: MiniMax-M3.1 with DSpark on Blackwell-family GPUs defaults to whole-migration waits. VR TP2 agg K7 c56
+# decode step synth (22 requests, D176, same node): 16.99 vs 17.40 ms with layer-wise onboarding; c56 E2E flat.
+# Armed process-wide before the KV cache managers are built (m31_kv_defaults.arm_minimax_m31 ->
+# arm_m31_layerwise_onboard_off); TRTLLM_KV_LAYERWISE_ONBOARD, when set, still wins. Kill switch
+# TRTLLM_M31_DISABLE_KVLO_OFF=1 (layer-wise on).
+_M31_DEFAULT_OFF = False
+
+
+def arm_m31_layerwise_onboard_off() -> None:
+    """Default this process to whole-migration waits (MiniMax-M3.1), unless KVLO_OFF's kill switch is set."""
+    global _M31_DEFAULT_OFF
+    _M31_DEFAULT_OFF = os.environ.get("TRTLLM_M31_DISABLE_KVLO_OFF", "0").strip().lower() not in (
+        "1",
+        "true",
+        "on",
+        "yes",
+    )
+
+
 def layerwise_onboard_requested() -> bool:
-    return os.environ.get("TRTLLM_KV_LAYERWISE_ONBOARD") != "0"
+    value = os.environ.get("TRTLLM_KV_LAYERWISE_ONBOARD", "")
+    if value != "":
+        return value != "0"
+    return not _M31_DEFAULT_OFF
 
 
 # One event per layer: the first layer's readers wait for the least data.

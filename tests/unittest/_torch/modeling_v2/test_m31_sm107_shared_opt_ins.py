@@ -34,7 +34,7 @@ from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.m3ax_msa_prewarm i
     hook as msa_prewarm_hook,
 )
 from tensorrt_llm._torch.pyexecutor import llm_request, perf_metrics_manager, py_executor
-from tensorrt_llm._torch.pyexecutor.kv_cache import kv_cache_manager_v2
+from tensorrt_llm._torch.pyexecutor.kv_cache import kv_cache_manager_v2, kv_layerwise_onboard
 from tensorrt_llm._torch.pyexecutor.runtime_hooks import RuntimeHooks
 from tensorrt_llm._torch.pyexecutor.sampler.ops import flashinfer as flashinfer_ops
 from tensorrt_llm._torch.speculative import dflash, interface
@@ -62,6 +62,7 @@ ARM_CALLS = (
     "arm_sm107_spec_paths",
     "arm_host_ctx_alloc",
     "arm_gpu_timestamps",
+    "arm_minimax_m31",  # m31_kv_defaults
 )
 # (module, flag, value once armed) for every process-wide flag the helper sets.
 FLAGS = (
@@ -85,6 +86,7 @@ FLAGS = (
     (dflash, "_HOST_CTX_ALLOC_DISABLED", False),
     (dflash, "_HOST_CTX_ALLOC_ARMED", True),
     (perf_metrics_manager, "_GPU_TIMESTAMPS", True),
+    (kv_layerwise_onboard, "_M31_DEFAULT_OFF", True),
 )
 KILL_SWITCHES = (
     "TRTLLM_M31_DISABLE_DRAFT_KV_RESERVE",
@@ -94,6 +96,7 @@ KILL_SWITCHES = (
     "TRTLLM_M31_DISABLE_ONEHOT_INDEX_FILL",
     "TRTLLM_DFLASH_DISABLE_HOST_CTX_ALLOC",
     "TRTLLM_M31_DISABLE_GPU_TIMESTAMPS",
+    "TRTLLM_M31_DISABLE_KVLO_OFF",
 )
 
 
