@@ -16,7 +16,7 @@
 import os
 from collections import OrderedDict, deque
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Sequence, Tuple
 
 import torch
 from torch import nn
@@ -731,16 +731,12 @@ class DFlashSpecMetadata(SpecMetadata):
         # Update slot mapping for DFlash context buffers
         worker = getattr(self, "_dflash_worker", None)
         if worker is not None and worker._ctx_buf_inited:
-            current = set(self.request_ids)
-            evicted = {}
-            for rid in list(worker._req_to_slot.keys()):
-                if rid not in current:
-                    slot = worker._req_to_slot.pop(rid)
-                    worker._park_ctx(rid, slot)
-                    evicted[slot] = 0
-                    worker._req_ctx_pos.pop(rid, None)
-                    worker._free_slots.append(slot)
-            worker._write_ctx_len(evicted)
+            # A request keeps its slot while out of the batch; _assign_slot reclaims the least recently batched one.
+            worker._batch_request_ids = self.request_ids
+            for rid in self.request_ids:
+                slot = worker._req_to_slot.pop(rid, None)
+                if slot is not None:
+                    worker._req_to_slot[rid] = slot
 
             # A disagg generation worker receives prompt KV instead of
             # prefilling, so _store_prefill_context -- the only other assigner --
@@ -748,8 +744,7 @@ class DFlashSpecMetadata(SpecMetadata):
             num_contexts = max(0, len(self.request_ids) - self.num_generations)
             # A disagg generation request's drafter context lengths (seed_disagg_draft_ctx: the
             # window received with the prompt KV, or an empty window at the prompt end), applied
-            # when the request first holds a real slot: a slot taken earlier would have been
-            # evicted above, and the dummy slot is never seeded.
+            # when the request first holds a real slot; the dummy slot is never seeded.
             seeds = getattr(worker, "_disagg_draft_ctx_seeds", None)
             seeded_lens, seeded_bases, seeded_rids = {}, {}, []
             unified = getattr(worker, "_ctx_unified_cache", False)
@@ -905,6 +900,8 @@ class DFlashWorker(SpecWorkerBase):
     # The map DFlashSpecMetadata.prepare last uploaded into _batch_to_slot[:len(map)] under batch_map_changed_only, or
     # None when unknown. Every other writer of _batch_to_slot (its allocation, the context-step rebuild) resets it.
     _batch_to_slot_uploaded: Optional[List[int]] = None
+    # The request ids DFlashSpecMetadata.prepare last mapped; _assign_slot never reclaims their slots.
+    _batch_request_ids: Sequence[int] = ()
     # Disaggregated serving with the drafter context window shipped (disaggregation/draft_kv.py),
     # engaged by the cache transceiver only. Class-level so workers built without __init__ stay off.
     _disagg_draft_kv_engaged: bool = False
@@ -1708,7 +1705,7 @@ class DFlashWorker(SpecWorkerBase):
             self._ctx_kv_manager.mark_unwritten_prefix(req_id, float("inf"))
 
     def _assign_slot(self, req_id: int, reset: bool = False, updates: Optional[dict] = None):
-        """Get (or refresh) this request's context slot; None when none is free.
+        """Get (or refresh) this request's context slot; None when this batch holds every slot.
 
         ``reset`` recycles an existing slot, which is how a reused request id is
         told apart from a continuation. Pass ``updates`` to defer the length
@@ -1724,11 +1721,20 @@ class DFlashWorker(SpecWorkerBase):
 
         if reset and req_id in self._req_to_slot:
             old_slot = self._req_to_slot.pop(req_id)
-            clear(old_slot)
+            # Reset at once: a slot handed back out in the caller's deferred batch would keep its base pages.
+            self._write_ctx_len({old_slot: 0})
             self._free_slots.append(old_slot)
         if req_id not in self._req_to_slot:
             if not self._free_slots:
-                return None
+                # prepare() keeps _req_to_slot in batch order, so the first holder is the least recently batched.
+                lru = next(iter(self._req_to_slot), None)
+                if lru is None or lru in self._batch_request_ids:
+                    return None
+                lru_slot = self._req_to_slot.pop(lru)
+                self._park_ctx(lru, lru_slot)
+                self._req_ctx_pos.pop(lru, None)
+                self._write_ctx_len({lru_slot: 0})
+                self._free_slots.append(lru_slot)
             slot = self._free_slots.popleft()
             self._req_to_slot[req_id] = slot
             clear(slot)
