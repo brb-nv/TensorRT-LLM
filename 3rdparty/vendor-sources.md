@@ -320,6 +320,19 @@ the upstream LICENSE and NOTICE beside it. The E4M3X forward is built ahead of
 time against CUTLASS 4.8 from the private `cutlass_msa` fetch, which only that
 build rule includes.
 
+The `msa-v1-q8kv4` entry takes the MSA-v1 SM100 Q8KV4 sparse decode attention and
+Q8KV4 decode indexer from MiniMax-AI/MSA (`nv_dev`, MIT, Copyright (c) 2026
+MiniMax): the `inference/msa_v1` modules they import (`attention/decode/q8kv4`,
+`indexer/decode` with its plan and `q8kv4`, `indexer/_common/topk_select`, and
+the shared build and cache-layout helpers) materialize as
+`msa_kernels/msa_v1`. Its persistent patch makes the package imports relative,
+finds CUTLASS in the package's `cutlass/` directory (`CUTLASS_ROOT` still
+overrides it), and adds the opt-in quad4 V block-scale layout
+(`MINIMAX_MSA_Q8KV4_V_SCALE_LAYOUT=quad4`) the MiniMax-M3 NVFP4 cache needs. Both
+kernels compile at run time from the shipped sources; `scripts/build_wheel.py`
+stages the `cutlass_msa` (CUTLASS 4.8) headers beside them. The upstream
+LICENSE and NOTICE sit beside the tree.
+
 ## PrimTS
 
 The `flashinfer-prims-ts` entry selects the complete Python tree under

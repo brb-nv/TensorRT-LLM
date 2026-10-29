@@ -5,7 +5,7 @@
 Covers the page layout, the context-row dequantization the fmha_sm100 proxy reads, the step
 staging prepare() does for it, the Q8KV4 selection contract and its agreement with the E4M3
 CuTe DSL scorer over the same (dequantized) keys, CUDA graph replay, the cache manager
-geometry, and the config validation. Q8KV4 tests skip unless MiniMax MSA is importable.
+geometry, and the config validation. Q8KV4 tests skip unless the vendored MSA-v1 indexer is importable.
 """
 
 import math
@@ -41,7 +41,7 @@ blackwell = pytest.mark.skipif(
 @pytest.fixture
 def q8kv4():
     if not msa_v1_indexer.q8kv4_available():
-        pytest.skip("MiniMax MSA (inference.msa_v1) is not importable.")
+        pytest.skip("The vendored MSA-v1 Q8KV4 indexer is not importable.")
 
 
 def _reference_dequant(data, scale):

@@ -2,17 +2,16 @@
 # SPDX-License-Identifier: Apache-2.0
 """MiniMax MSA-v1 Q8KV4 sparse decode attention for MiniMax-M3 generation rows (opt-in).
 
-With ``TRTLLM_M3_MSA_V1_DECODE=1``, MsaDecodeFmha hands each sparse generation phase to
-``inference.msa_v1.attention.decode.q8kv4`` (MiniMax MSA, MIT) before the Triton/CuTe sparse
-decode. The kernel reads the M3 NVFP4 pool in place: packed E2M1 K/V pages of 128 tokens and
-their E4M3 block scales, through the same page table, sequence lengths and top-k pages the
-Triton kernel takes, and writes the BF16 output directly (no split partials or merge).
+With ``TRTLLM_M3_MSA_V1_DECODE=1``, MsaDecodeFmha hands each sparse generation phase to MiniMax MSA's
+``msa_v1.attention.decode.q8kv4`` (MIT), vendored at ``fmha/msa_kernels/msa_v1`` (vendor entry msa-v1-q8kv4 in
+3rdparty/vendor_sources.lock.yaml), before the Triton/CuTe sparse decode. The kernel reads the M3 NVFP4 pool in
+place: packed E2M1 K/V pages of 128 tokens and their E4M3 block scales, through the same page table, sequence
+lengths and top-k pages the Triton kernel takes, and writes the BF16 output directly (no split partials or merge).
 
 The M3 cache writer stores V block scales in the 4x4 token-quad order
-(``[token // 4, scale_col, token % 4]``) while upstream MSA reads them token-major, so this
-path needs an MSA build that accepts ``MINIMAX_MSA_Q8KV4_V_SCALE_LAYOUT=quad4`` (it exposes
-``jit.V_SCALE_LAYOUTS``); this module sets that variable before the first JIT build and refuses
-an MSA package without it.
+(``[token // 4, scale_col, token % 4]``) while upstream MSA reads them token-major; the vendored copy carries the
+quad4 V-scale layout option (``MINIMAX_MSA_Q8KV4_V_SCALE_LAYOUT=quad4``, listed in ``jit.V_SCALE_LAYOUTS``), and this
+module sets that variable before the first JIT build.
 
 Anything outside the kernel's contract falls back to the existing kernels, call by call: FP8 Q,
 GQA 8 or 16, top-k 16, unit K/V per-tensor dequantization scales, contiguous operands, and a
@@ -20,11 +19,9 @@ plan built outside CUDA graph capture. Plans are cached in the attention metadat
 ``fmha_plan_caches``, one per (batch, query length, metadata buffers), so each captured batch
 size reuses the plan it built during its eager warmup.
 
-Installing MSA in the TRT-LLM container (CUDA 13.4 nvcc selects the QMUL4 dequant path)::
-
-    pip install --no-deps <patched MSA checkout>     # or put it on PYTHONPATH
-    export CUTLASS_ROOT=<CUTLASS checkout at the MSA submodule commit>
-    export TORCH_EXTENSIONS_DIR=<shared JIT cache>   # optional; cold builds take minutes
+The kernel JIT-compiles on first use with the container's nvcc (CUDA 13.4 selects the QMUL4 dequant path) against
+the CUTLASS headers the wheel ships beside it (``CUTLASS_ROOT`` overrides them), into ``$TORCH_EXTENSIONS_DIR``
+(optional; cold builds take minutes).
 """
 
 from __future__ import annotations
@@ -61,7 +58,7 @@ def _log_once(key: str, message: str) -> None:
 
 @functools.lru_cache(maxsize=1)
 def _wrapper_class():
-    """Return MSA's Q8KV4 decode wrapper class, or None when the path is off or unusable."""
+    """Return the vendored MSA Q8KV4 decode wrapper class, or None when the path is off or unusable."""
     if not _ENABLED:
         return None
     configured = os.environ.setdefault(_V_SCALE_LAYOUT_ENV, _V_SCALE_LAYOUT)
@@ -72,24 +69,19 @@ def _wrapper_class():
         )
         return None
     try:
-        from inference.msa_v1.attention.decode.q8kv4 import (
+        from tensorrt_llm._torch.attention.backends.fmha.msa_kernels.msa_v1.attention.decode.q8kv4 import (
             BatchDecodeWithPagedKVCacheWrapper,
         )
-        from inference.msa_v1.attention.decode.q8kv4 import jit as msa_jit
     except ImportError as err:
-        logger.warning(f"{ENV_VAR}=1 ignored: MiniMax MSA is not importable ({err}).")
-        return None
-    if _V_SCALE_LAYOUT not in getattr(msa_jit, "V_SCALE_LAYOUTS", ()):
         logger.warning(
-            f"{ENV_VAR}=1 ignored: this MiniMax MSA build reads V scales token-major only; "
-            "it needs the quad4 V-scale layout option."
+            f"{ENV_VAR}=1 ignored: the vendored MSA-v1 decode is not importable ({err})."
         )
         return None
     return BatchDecodeWithPagedKVCacheWrapper
 
 
 def is_enabled() -> bool:
-    """Whether the opt-in is set and a compatible MSA package is importable."""
+    """Whether the opt-in is set and the vendored MSA-v1 decode is importable."""
     return _wrapper_class() is not None
 
 

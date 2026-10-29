@@ -5,8 +5,8 @@
 Both read one NVFP4 pool written by the production cache writer (K scales token-major, V scales
 in 4x4 token quads) through the same page table, lengths and top-k pages. Q8KV4 rounds the
 dequantized K/V and the softmax probabilities to E4M3, so the comparison is by relative L2
-error rather than element-wise. Skipped unless a MiniMax MSA build with the quad4 V-scale
-layout is importable on SM100/SM103.
+error rather than element-wise. Runs the vendored MSA-v1 copy (fmha/msa_kernels/msa_v1, with
+the quad4 V-scale layout) on SM100/SM103.
 """
 
 import pytest
@@ -37,7 +37,7 @@ def msa_enabled(monkeypatch):
     msa_v1_decode._wrapper_class.cache_clear()
     if not msa_v1_decode.is_enabled():
         msa_v1_decode._wrapper_class.cache_clear()
-        pytest.skip("MiniMax MSA with the quad4 V-scale layout is not importable.")
+        pytest.skip("The vendored MSA-v1 Q8KV4 decode is not importable.")
     yield
     msa_v1_decode._wrapper_class.cache_clear()
 
@@ -63,8 +63,16 @@ def _make_case(seq_lens, *, num_kv_heads, group, q_len, seed):
     unit = torch.ones(3, dtype=torch.float32, device="cuda")
     slots = torch.arange(num_slots, dtype=torch.int32, device="cuda")
     assert fused_write_layer_caches_nvfp4(
-        data_pool[:, 0], data_pool[:, 1], scale_pool[:, 0], scale_pool[:, 1],
-        None, slots, k, v, None, unit,
+        data_pool[:, 0],
+        data_pool[:, 1],
+        scale_pool[:, 0],
+        scale_pool[:, 1],
+        None,
+        slots,
+        k,
+        v,
+        None,
+        unit,
     )
     block_table = (
         torch.randperm(num_pages, device="cuda", generator=gen)[: batch * max_blocks]
@@ -86,8 +94,14 @@ def _make_case(seq_lens, *, num_kv_heads, group, q_len, seed):
     )
     one = torch.ones(1, dtype=torch.float32, device="cuda")
     return dict(
-        args=(q, data_pool[:, 0], data_pool[:, 1], topk, block_table,
-              torch.tensor(seq_lens, dtype=torch.int32, device="cuda")),
+        args=(
+            q,
+            data_pool[:, 0],
+            data_pool[:, 1],
+            topk,
+            block_table,
+            torch.tensor(seq_lens, dtype=torch.int32, device="cuda"),
+        ),
         kwargs=dict(
             sm_scale=HEAD_DIM**-0.5,
             decode_query_len=q_len,
@@ -111,8 +125,13 @@ def _rel_l2(a, b):
 @pytest.mark.parametrize("num_kv_heads,group", [(2, 16), (1, 16), (2, 8)])
 @pytest.mark.parametrize("q_len", [1, 4, 8])
 def test_msa_v1_decode_matches_triton(msa_enabled, num_kv_heads, group, q_len):
-    case = _make_case([300, 2049, 9000, 20000], num_kv_heads=num_kv_heads, group=group,
-                      q_len=q_len, seed=11 + q_len)
+    case = _make_case(
+        [300, 2049, 9000, 20000],
+        num_kv_heads=num_kv_heads,
+        group=group,
+        q_len=q_len,
+        seed=11 + q_len,
+    )
     expected = _out(case)
     minimax_m3_sparse_attn_decode(*case["args"], output=expected, **case["kwargs"])
     out = _out(case)
@@ -126,12 +145,14 @@ def test_msa_v1_decode_cuda_graph_replay_tracks_inputs(msa_enabled):
     plan_cache = {}
     out = _out(case)
     # The eager call plans; the capture reuses the plan and copies the live top-k table.
-    assert msa_v1_decode.try_decode(*case["args"], output=out, plan_cache=plan_cache,
-                                    **case["kwargs"])
+    assert msa_v1_decode.try_decode(
+        *case["args"], output=out, plan_cache=plan_cache, **case["kwargs"]
+    )
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        assert msa_v1_decode.try_decode(*case["args"], output=out, plan_cache=plan_cache,
-                                        **case["kwargs"])
+        assert msa_v1_decode.try_decode(
+            *case["args"], output=out, plan_cache=plan_cache, **case["kwargs"]
+        )
     topk = case["args"][3]
     topk[:, :, 0] = torch.where(topk[:, :, 0] > 0, topk[:, :, 0] - 1, topk[:, :, 0])
     graph.replay()
@@ -144,21 +165,26 @@ def test_msa_v1_decode_declines_outside_contract(msa_enabled):
     case = _make_case([3000], num_kv_heads=2, group=16, q_len=4, seed=3)
     q = case["args"][0]
     bf16_args = (q.to(torch.bfloat16),) + case["args"][1:]
-    assert not msa_v1_decode.try_decode(*bf16_args, output=_out(case), plan_cache={},
-                                        **case["kwargs"])
-    kwargs = dict(case["kwargs"], k_global_scale=torch.full_like(case["kwargs"]["k_global_scale"], 0.5))
+    assert not msa_v1_decode.try_decode(
+        *bf16_args, output=_out(case), plan_cache={}, **case["kwargs"]
+    )
+    kwargs = dict(
+        case["kwargs"], k_global_scale=torch.full_like(case["kwargs"]["k_global_scale"], 0.5)
+    )
     assert not msa_v1_decode.try_decode(*case["args"], output=_out(case), plan_cache={}, **kwargs)
     # No plan may be built under capture: a block table the eager call never planned for
     # leaves the graph on the Triton kernel.
     plan_cache = {}
     out = _out(case)
-    assert msa_v1_decode.try_decode(*case["args"], output=out, plan_cache=plan_cache,
-                                    **case["kwargs"])
+    assert msa_v1_decode.try_decode(
+        *case["args"], output=out, plan_cache=plan_cache, **case["kwargs"]
+    )
     unplanned = case["args"][:4] + (case["args"][4].clone(),) + case["args"][5:]
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        ran = msa_v1_decode.try_decode(*unplanned, output=out, plan_cache=plan_cache,
-                                       **case["kwargs"])
+        ran = msa_v1_decode.try_decode(
+            *unplanned, output=out, plan_cache=plan_cache, **case["kwargs"]
+        )
     assert not ran
 
 

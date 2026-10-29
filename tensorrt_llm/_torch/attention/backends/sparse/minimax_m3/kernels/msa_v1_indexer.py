@@ -8,7 +8,8 @@ token instead of the 128 of E4M3:
 * ``[0, 8192)``: packed E2M1 rows ``[128, 64]``, two elements per byte, low nibble first;
 * ``[8192, 9216)``: their E4M3 block scales ``[128, 8]``, one per 16 elements, token-major.
 
-The global scale is 1. This is the layout ``inference.msa_v1.indexer.decode.q8kv4`` reads and
+The global scale is 1. This is the layout MiniMax MSA's ``msa_v1.indexer.decode.q8kv4`` reads (vendored at
+``fmha/msa_kernels/msa_v1``, vendor entry msa-v1-q8kv4) and
 the fused NVFP4 horizontal producer writes.
 
 Generation rows (decode and verify) are scored by the Q8KV4 decode indexer straight from that
@@ -47,10 +48,14 @@ _E4M3_MAX = 448.0
 
 @functools.lru_cache(maxsize=1)
 def _msa_q8kv4_classes():
-    """(Q8KV4 decode wrapper class, shared plan class), or None when MiniMax MSA is missing."""
+    """(Q8KV4 decode wrapper class, shared plan class), or None when the vendored indexer is not importable."""
     try:
-        from inference.msa_v1.indexer.decode import BatchDecodeIndexerPlan
-        from inference.msa_v1.indexer.decode.q8kv4 import BatchDecodeIndexerWithPagedKVCacheWrapper
+        from tensorrt_llm._torch.attention.backends.fmha.msa_kernels.msa_v1.indexer.decode import (
+            BatchDecodeIndexerPlan,
+        )
+        from tensorrt_llm._torch.attention.backends.fmha.msa_kernels.msa_v1.indexer.decode.q8kv4 import (
+            BatchDecodeIndexerWithPagedKVCacheWrapper,
+        )
     except ImportError:
         return None
     return BatchDecodeIndexerWithPagedKVCacheWrapper, BatchDecodeIndexerPlan
@@ -66,8 +71,8 @@ def require_q8kv4() -> None:
     if not q8kv4_available():
         raise ImportError(
             "MiniMax-M3 indexer_kv_dtype='nvfp4' scores decode with the MiniMax MSA-v1 Q8KV4 "
-            "indexer, but inference.msa_v1.indexer.decode.q8kv4 is not importable. Install "
-            "the MiniMax MSA package or use indexer_kv_dtype='fp8'."
+            "indexer, but the vendored msa_kernels.msa_v1.indexer.decode.q8kv4 is not importable "
+            "(its CuTe DSL, tvm_ffi or jinja2 dependency is missing); use indexer_kv_dtype='fp8'."
         )
 
 

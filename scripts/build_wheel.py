@@ -1492,6 +1492,20 @@ def main(*,
             install_tree(cutlass_src / relative_dir, msa_cutlass / relative_dir)
         install_file(cutlass_src / "LICENSE.txt", msa_cutlass)
 
+    # The vendored MSA-v1 Q8KV4 decode attention and decode indexer (msa_kernels/msa_v1) compile
+    # at run time; their _build_utils.cutlass_root() looks in the package's cutlass/, staged here
+    # from the cutlass_msa fetch (the CUTLASS release those kernels target).
+    cutlass_msa_src = build_dir / "_deps" / "cutlass_msa-src"
+    if cutlass_msa_src.is_dir():
+        msa_v1_cutlass = (pkg_dir / "_torch" / "attention" / "backends" /
+                          "fmha" / "msa_kernels" / "msa_v1" / "cutlass")
+        for relative_dir in ("include", "tools/util/include"):
+            (msa_v1_cutlass / relative_dir).parent.mkdir(parents=True,
+                                                         exist_ok=True)
+            install_tree(cutlass_msa_src / relative_dir,
+                         msa_v1_cutlass / relative_dir)
+        install_file(cutlass_msa_src / "LICENSE.txt", msa_v1_cutlass)
+
     # The MSA CuTe DSL objects harvested from a reference run (minimaxM3Msa/pack_cute_aot.py), read before any compile.
     msa_cute_aot = get_source_dir(
     ) / "tensorrt_llm/kernels/minimaxM3Msa/cute_aot/msa_cute_aot.txz"

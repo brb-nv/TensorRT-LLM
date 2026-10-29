@@ -218,6 +218,14 @@ package_data += [
     '_torch/attention/backends/fmha/msa_kernels/fmha_sm100_q8kv8/NOTICE',
     '_torch/attention/backends/fmha/msa_kernels/prefill_bf16x/LICENSE',
     '_torch/attention/backends/fmha/msa_kernels/prefill_bf16x/NOTICE',
+    # The MSA-v1 Q8KV4 decode attention and decode indexer compile at run time from these
+    # sources and the cutlass_msa headers scripts/build_wheel.py stages beside them.
+    '_torch/attention/backends/fmha/msa_kernels/msa_v1/LICENSE',
+    '_torch/attention/backends/fmha/msa_kernels/msa_v1/NOTICE',
+    '_torch/attention/backends/fmha/msa_kernels/msa_v1/attention/decode/q8kv4/csrc/**/*',
+    '_torch/attention/backends/fmha/msa_kernels/msa_v1/indexer/_common/topk_select/csrc/**/*',
+    '_torch/attention/backends/fmha/msa_kernels/msa_v1/indexer/decode/q8kv4/csrc/**/*',
+    '_torch/attention/backends/fmha/msa_kernels/msa_v1/cutlass/**/*',
 ]
 
 
@@ -248,7 +256,7 @@ def should_skip_precompiled_package_data(filename: str) -> bool:
 
     Precompiled wheels own native bits. Source owns telemetry schemas, the
     OpenEngine contract and the vendored MSA kernel sources (all but the CUTLASS
-    headers build_wheel.py stages). Skip those wheel files so Python-only edits
+    headers build_wheel.py stages for fmha_sm100 and msa_v1). Skip those wheel files so Python-only edits
     layer over old wheels and tracked files from the current checkout remain
     authoritative.
     """
@@ -257,7 +265,8 @@ def should_skip_precompiled_package_data(filename: str) -> bool:
         return filename.endswith(".json")
     msa = "tensorrt_llm/_torch/attention/backends/fmha/msa_kernels/"
     if filename.startswith(msa):
-        return not filename.startswith(msa + "fmha_sm100/cutlass/")
+        return not filename.startswith(
+            (msa + "fmha_sm100/cutlass/", msa + "msa_v1/cutlass/"))
     return filename.startswith((
         "tensorrt_llm/grpc/openengine/_generated/",
         "tensorrt_llm/grpc/openengine/proto/",

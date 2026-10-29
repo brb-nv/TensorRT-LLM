@@ -3,20 +3,26 @@
 
 # MiniMax MSA patches for MiniMax-M3.1-Flash
 
-[MiniMax MSA](https://github.com/MiniMax-AI/MSA) (MIT) is an external library, not part of TensorRT-LLM. The
-MiniMax-M3.1-Flash recipes that use MSA-v1 sparse decode (`TRTLLM_M3_MSA_V1_DECODE=1`) and NVFP4 index-K
-(`sparse_attention_config.indexer_kv_dtype: nvfp4`) need MSA built with the patch in this directory. Upstream MSA does
-not carry it.
+TensorRT-LLM vendors the parts of [MiniMax MSA](https://github.com/MiniMax-AI/MSA) (MIT) the MiniMax-M3.1-Flash
+recipes use: the MSA-v1 Q8KV4 sparse decode (`TRTLLM_M3_MSA_V1_DECODE=1`) and the Q8KV4 decode indexer for NVFP4
+index-K (`sparse_attention_config.indexer_kv_dtype: nvfp4`). They live at
+`tensorrt_llm/_torch/attention/backends/fmha/msa_kernels/msa_v1`, managed by `scripts/vendor_sources.py` as the
+`msa-v1-q8kv4` entry of `3rdparty/vendor_sources.lock.yaml` (MSA `1e7bf76f`). The wheel ships their sources and the
+CUTLASS headers they JIT-compile against, so **no separate MSA install is needed**; TensorRT-LLM no longer imports
+the external `inference.msa_v1` package.
+
+The quad4 change below is part of the vendored tree: its hunks are in the entry's persistent patch,
+`3rdparty/vendor_patches/msa-v1-q8kv4.patch`, which is what TensorRT-LLM builds from. The standalone patch stays here
+for building an external MSA with the same layout (for example for the images that predate the vendoring, or another
+engine); TensorRT-LLM does not read it.
 
 | Patch | What it does |
 |---|---|
 | `0001-q8kv4-decode-quad4-V-scale-layout.patch` | Adds an opt-in "quad4" V block-scale layout to MSA's SM100 Q8KV4 sparse decode: `[token // 4][scale_col][token % 4]` per (page, KV head), the order TensorRT-LLM's NVFP4 cache writer uses. The default `token_major` build is unchanged. |
 
 TensorRT-LLM selects the layout itself: when MSA-v1 decode is on it sets `MINIMAX_MSA_Q8KV4_V_SCALE_LAYOUT=quad4`.
-Without the patch, MSA rejects that layout and the MSA-v1 decode / NVFP4 index-K recipes fail; recipes that do not
-use them still run.
 
-## Build
+## Building an external MSA with the patch (not needed by TensorRT-LLM)
 
 Install MSA at commit `1e7bf76f` on top of the TensorRT-LLM wheel, with the patch applied:
 
@@ -30,12 +36,13 @@ pip install --no-deps -e /opt/minimax-msa
 ```
 
 MSA has no ahead-of-time kernels: it JIT-compiles on first use into `$TORCH_EXTENSIONS_DIR`. The quad4 variant is a
-separate JIT module (cache tag `_vquad4`), so it does not collide with a cached default build.
+separate JIT module (cache tag `_vquad4`), so it does not collide with a cached default build. The vendored copy
+behaves the same way.
 
 ## Check
 
 ```python
-from inference.msa_v1.attention.decode.q8kv4 import jit
+from tensorrt_llm._torch.attention.backends.fmha.msa_kernels.msa_v1.attention.decode.q8kv4 import jit
 assert "quad4" in jit.V_SCALE_LAYOUTS
 ```
 

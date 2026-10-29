@@ -60,6 +60,38 @@ vendors:
     patch: 3rdparty/vendor_patches/msa-q8kv8-indexer.patch
     patch_digest: sha256:03368f643ba9955ace15cf8d03499d5fe35ea5fa91637208572d42b8e5810148
     digest: sha256-tree-v1:f44a628375aabd6c5d4f057bd49c67fe0dce510ea34fd73c6b0a8c0c0fdf3417
+  msa-v1-q8kv4:
+    url: https://github.com/MiniMax-AI/MSA.git
+    branch: nv_dev
+    commit: 1e7bf76f26a5f53cfc2d4d297e1ec2e40955e431
+    source: inference/msa_v1
+    destination: tensorrt_llm/_torch/attention/backends/fmha/msa_kernels/msa_v1
+    include:
+    - __init__.py
+    - _build_utils.py
+    - _cache_layout.py
+    - attention/__init__.py
+    - attention/decode/__init__.py
+    - attention/decode/q8kv4/__init__.py
+    - attention/decode/q8kv4/interface.py
+    - attention/decode/q8kv4/jit.py
+    - attention/decode/q8kv4/csrc/**/*
+    - indexer/__init__.py
+    - indexer/_common/__init__.py
+    - indexer/_common/topk_select/__init__.py
+    - indexer/_common/topk_select/build.py
+    - indexer/_common/topk_select/interface.py
+    - indexer/_common/topk_select/csrc/**/*
+    - indexer/decode/__init__.py
+    - indexer/decode/plan.py
+    - indexer/decode/plan_kernel.py
+    - indexer/decode/q8kv4/__init__.py
+    - indexer/decode/q8kv4/interface.py
+    - indexer/decode/q8kv4/jit.py
+    - indexer/decode/q8kv4/csrc/**/*
+    patch: 3rdparty/vendor_patches/msa-v1-q8kv4.patch
+    patch_digest: sha256:acd66babd0274c79b695c5ddfb6a4f6ab56c6222efaba8db49bf1b317a666c89
+    digest: sha256-tree-v1:db2f9a531c31b3b9d3c862648de69cedcb470b626b60d784f008131cd9eb7bdb
   openengine-proto:
     url: https://github.com/ai-dynamo/openengine.git
     tag: v0.1.0

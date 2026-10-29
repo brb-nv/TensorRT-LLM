@@ -1,0 +1,456 @@
+diff --git a/_build_utils.py b/_build_utils.py
+index 2a1238b8a737213620d4922ebccac875fca80a76..2ca7ba05de4c57d32f0ee54b1d58b13779737d5e 100644
+--- a/_build_utils.py
++++ b/_build_utils.py
+@@ -1,3 +1,6 @@
++# SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
++# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
++# SPDX-License-Identifier: MIT
+ """Shared public-toolchain discovery for MSA v1 JIT extensions."""
+ 
+ from __future__ import annotations
+@@ -9,7 +12,9 @@ import subprocess
+ from functools import lru_cache
+ from pathlib import Path
+ 
+-_REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
++# TensorRT-LLM: the vendored tree has no CUTLASS submodule; scripts/build_wheel.py stages the
++# cutlass_msa headers (3rdparty/fetch_content.json) into this package's cutlass/ directory.
++_PACKAGE_CUTLASS = Path(__file__).resolve().parent / "cutlass"
+ MM_SPARSE_TARGET_ARCH = "MM_SPARSE_TARGET_ARCH"
+ 
+ 
+@@ -162,13 +167,13 @@ def require_cuda_version(
+ 
+ @lru_cache(maxsize=1)
+ def cutlass_root() -> Path:
+-    """Locate public CUTLASS headers from the environment or repository submodule."""
++    """Locate public CUTLASS headers from the environment or the headers shipped with the package."""
+ 
+     candidates = []
+     for variable in ("CUTLASS_ROOT", "CUTLASS_PATH"):
+         if value := os.environ.get(variable):
+             candidates.append(Path(value))
+-    candidates.append(_REPOSITORY_ROOT / "third_party/cutlass")
++    candidates.append(_PACKAGE_CUTLASS)
+ 
+     attempted = []
+     for candidate in _unique_paths(candidates):
+@@ -176,7 +181,7 @@ def cutlass_root() -> Path:
+         if (candidate / "include/cutlass/cutlass.h").is_file():
+             return candidate
+     raise RuntimeError(
+-        "CUTLASS headers were not found. Initialize third_party/cutlass or set "
++        "CUTLASS headers were not found. Install a TensorRT-LLM wheel that ships them or set "
+         f"CUTLASS_ROOT. Tried: {attempted}"
+     )
+ 
+diff --git a/attention/decode/q8kv4/csrc/api/decode_attention_api.cpp b/attention/decode/q8kv4/csrc/api/decode_attention_api.cpp
+index 54398bb55d739191e3c2a573df389078f15e557e..c4ebb71c61967511d9dc27daf49137e1a3349a18 100644
+--- a/attention/decode/q8kv4/csrc/api/decode_attention_api.cpp
++++ b/attention/decode/q8kv4/csrc/api/decode_attention_api.cpp
+@@ -1,3 +1,6 @@
++// SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
++// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
++// SPDX-License-Identifier: MIT
+ // C++ implementation of the Q8KV4 decode attention API.
+ //
+ // Kernel calls go through tvm_ffi; tensor management uses ATen (libtorch).
+@@ -38,10 +41,13 @@ void initialize() {
+     }
+     PyGILState_STATE gstate = PyGILState_Ensure();
+     PyObject *modules = PySys_GetObject("modules");
+-    constexpr char kModuleName[] = "inference.msa_v1.attention.decode.q8kv4";
++    // TensorRT-LLM: the package is vendored under tensorrt_llm (msa_kernels/msa_v1).
++    constexpr char kModuleName[] =
++        "tensorrt_llm._torch.attention.backends.fmha.msa_kernels.msa_v1.attention.decode.q8kv4";
+     if (!modules || !PyDict_GetItemString(modules, kModuleName)) {
+-      int const status = PyRun_SimpleString("import inference.msa_v1.attention.decode.q8kv4");
+-      TORCH_CHECK(status == 0, "failed to import inference.msa_v1.attention.decode.q8kv4");
++      int const status = PyRun_SimpleString(
++          "import tensorrt_llm._torch.attention.backends.fmha.msa_kernels.msa_v1.attention.decode.q8kv4");
++      TORCH_CHECK(status == 0, "failed to import ", kModuleName);
+     }
+     PyGILState_Release(gstate);
+     g_initialized = true;
+diff --git a/attention/decode/q8kv4/csrc/include/sm100/collective/sm100_fmha_kv_transform_tma_warpspecialized.hpp b/attention/decode/q8kv4/csrc/include/sm100/collective/sm100_fmha_kv_transform_tma_warpspecialized.hpp
+index 42f51fc626b5ecd75b703b0937b398fff42877c6..ba170eeffc2ea0fd19a81dce55e988ef314fb207 100644
+--- a/attention/decode/q8kv4/csrc/include/sm100/collective/sm100_fmha_kv_transform_tma_warpspecialized.hpp
++++ b/attention/decode/q8kv4/csrc/include/sm100/collective/sm100_fmha_kv_transform_tma_warpspecialized.hpp
+@@ -1,3 +1,6 @@
++// SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
++// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
++// SPDX-License-Identifier: MIT
+ #pragma once
+ 
+ #include <climits>
+@@ -10,6 +13,12 @@
+ #include "sm100_fmha_q8kv4_traits.hpp"
+ #include "sm100_fmha_storage.hpp"
+ 
++// V block-scale byte order within a (page, KV head): 0 = token-major [token][col] (default),
++// 1 = quad4 [token / 4][col][token % 4]. Set by jit.py from MINIMAX_MSA_Q8KV4_V_SCALE_LAYOUT.
++#ifndef MINIMAX_MSA_Q8KV4_V_SCALE_QUAD4
++#define MINIMAX_MSA_Q8KV4_V_SCALE_QUAD4 0
++#endif
++
+ namespace cutlass::fmha::collective {
+ 
+ template <class Traits> struct Sm100FmhaKvTransformTmaWarpspecialized {
+@@ -218,15 +227,26 @@ template <class Traits> struct Sm100FmhaKvTransformTmaWarpspecialized {
+     int const token_quad = warp_group_lane & 3;
+ #endif
+     int const loop_offset = (warp_group_lane >> 4) & 7;
++    uint32_t packed0;
++    uint32_t packed1;
++#if MINIMAX_MSA_Q8KV4_V_SCALE_QUAD4
++    // quad4 V-scale layout (TensorRT-LLM / vLLM NVFP4 cache writers): byte (token, col) of a page
++    // sits at (token / 4) * 32 + col * 4 + token % 4. Tokens 4 * (4 * loop_offset + token_quad) + 0..3
++    // of columns 2 * scale_pair and 2 * scale_pair + 1 are then the 8 contiguous bytes below, already
++    // in the {col 2p: t0..t3}, {col 2p + 1: t0..t3} order pack_scale_pairs builds from token-major.
++    uint2 const quad_words = *reinterpret_cast<uint2 const *>(
++        scale_stage_base + loop_offset * 128 + token_quad * 32 + scale_pair * 8);
++    packed0 = quad_words.x;
++    packed1 = quad_words.y;
++#else
+     uint8_t const *scale_src =
+         scale_stage_base + loop_offset * 128 + token_quad * 32 + scale_pair * 2;
+     uint32_t const h0 = *reinterpret_cast<uint16_t const *>(scale_src + 0);
+     uint32_t const h1 = *reinterpret_cast<uint16_t const *>(scale_src + 8);
+     uint32_t const h2 = *reinterpret_cast<uint16_t const *>(scale_src + 16);
+     uint32_t const h3 = *reinterpret_cast<uint16_t const *>(scale_src + 24);
+-    uint32_t packed0;
+-    uint32_t packed1;
+     pack_scale_pairs(packed0, packed1, h0, h1, h2, h3);
++#endif
+ #if MINIMAX_MSA_Q8KV4_HAS_QMUL4
+     int const scale_dst_offset = loop_offset * 128 + token_quad * 32 + scale_pair * 8;
+     *reinterpret_cast<uint32_t *>(scale_scratch_base + scale_dst_offset) = packed0;
+diff --git a/attention/decode/q8kv4/interface.py b/attention/decode/q8kv4/interface.py
+index 2be9c678f3b195c45b7f955cdc8ec7ed4152b590..712a8ffe6299713b23e91dac194bbafdf6e0e749 100644
+--- a/attention/decode/q8kv4/interface.py
++++ b/attention/decode/q8kv4/interface.py
+@@ -1,3 +1,6 @@
++# SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
++# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
++# SPDX-License-Identifier: MIT
+ """FlashInfer-style wrapper for SM100 Q8KV4 paged sparse decode."""
+ 
+ from __future__ import annotations
+@@ -10,11 +13,11 @@ from dataclasses import dataclass
+ 
+ import torch
+ 
+-from inference.msa_v1._cache_layout import check_cache_layout
++from ...._cache_layout import check_cache_layout
+ 
+ logger = logging.getLogger(__name__)
+ 
+-from inference.msa_v1._build_utils import cuda_home
++from ...._build_utils import cuda_home
+ 
+ __all__ = ["BatchDecodeWithPagedKVCacheWrapper"]
+ 
+diff --git a/attention/decode/q8kv4/jit.py b/attention/decode/q8kv4/jit.py
+index a533d9ee6958c2505e838d41d726e9cad6cd9622..7c0003fba57b27e7c6aa854d03e5f2ebef9a28bb 100644
+--- a/attention/decode/q8kv4/jit.py
++++ b/attention/decode/q8kv4/jit.py
+@@ -1,3 +1,6 @@
++# SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
++# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
++# SPDX-License-Identifier: MIT
+ """Op-local JIT for the SM100 Q8KV4 sparse decode attention kernels."""
+ 
+ from __future__ import annotations
+@@ -17,10 +20,10 @@ from pathlib import Path
+ 
+ import jinja2
+ 
+-from inference.msa_v1._build_utils import cuda_home as _cuda_home
+-from inference.msa_v1._build_utils import cutlass_root as _cutlass_root
+-from inference.msa_v1._build_utils import require_cuda_version
+-from inference.msa_v1._build_utils import target_arch as _resolve_target_arch
++from ...._build_utils import cuda_home as _cuda_home
++from ...._build_utils import cutlass_root as _cutlass_root
++from ...._build_utils import require_cuda_version
++from ...._build_utils import target_arch as _resolve_target_arch
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -33,6 +36,13 @@ _SPARSE_VARIANTS = {
+     False: "decode_attention_q8kv4_topk16",
+     True: "decode_attention_q8kv4_topk16_split",
+ }
++# V block-scale byte order within one (page, KV head) of the scale cache. "token_major" is
++# [token][col] (MSA's own cache writers). "quad4" is [token // 4][col][token % 4], the 4x4
++# token-quad order of the TensorRT-LLM and vLLM NVFP4 cache writers. K scales are token-major in
++# both. Selected per process with MINIMAX_MSA_Q8KV4_V_SCALE_LAYOUT (default token_major).
++V_SCALE_LAYOUT_ENV = "MINIMAX_MSA_Q8KV4_V_SCALE_LAYOUT"
++V_SCALE_LAYOUTS = ("token_major", "quad4")
++_DEFAULT_V_SCALE_LAYOUT = "token_major"
+ _QMUL4_DEQUANT = "qmul4"
+ _FP16_DEQUANT = "fp16_fallback"
+ _QMUL4_PROBE_SOURCE = r"""
+@@ -51,6 +61,28 @@ __global__ void qmul4_probe(uint32_t* output) {
+ """.lstrip()
+ 
+ 
++@lru_cache(maxsize=1)
++def v_scale_layout() -> str:
++    """Return the V-scale layout selected by MINIMAX_MSA_Q8KV4_V_SCALE_LAYOUT.
++
++    Read once per process (set it before the first plan or run): the C++ host API caches one
++    kernel per (device, GQA, top-k, output mode, split) and does not key on the layout.
++    """
++    layout = os.environ.get(V_SCALE_LAYOUT_ENV, "").strip().lower() or _DEFAULT_V_SCALE_LAYOUT
++    if layout == "token":  # alias
++        layout = _DEFAULT_V_SCALE_LAYOUT
++    if layout not in V_SCALE_LAYOUTS:
++        raise ValueError(
++            f"{V_SCALE_LAYOUT_ENV}={layout!r} is not one of {V_SCALE_LAYOUTS}"
++        )
++    return layout
++
++
++def _layout_tag(layout: str) -> str:
++    # The default layout keeps the original cache names and URIs.
++    return "" if layout == _DEFAULT_V_SCALE_LAYOUT else f"_v{layout}"
++
++
+ def _write_text_if_changed(path: Path, content: str) -> None:
+     if path.is_file() and path.read_text(encoding="utf-8") == content:
+         return
+@@ -199,7 +231,12 @@ def _cache_dir(component: str, arch: str, dequant_mode: str) -> Path:
+     return _cache_root() / f"{component}_{dequant_mode}_{arch}_{_source_digest()}"
+ 
+ 
+-def _nvcc_flags(cache_dir: Path, dequant_mode: str, arch: str) -> str:
++def _nvcc_flags(
++    cache_dir: Path,
++    dequant_mode: str,
++    arch: str,
++    v_layout: str = _DEFAULT_V_SCALE_LAYOUT,
++) -> str:
+     include_dirs = [
+         _SM100_INCLUDE,
+         _SM100_INCLUDE / "common",
+@@ -234,6 +271,7 @@ def _nvcc_flags(cache_dir: Path, dequant_mode: str, arch: str) -> str:
+         "-DNDEBUG",
+         f"-DMINIMAX_MSA_Q8KV4_HAS_QMUL4={int(dequant_mode == _QMUL4_DEQUANT)}",
+         f"-DMINIMAX_MSA_Q8KV4_RAW_KV_STAGES={12 if arch == '107a' else 8}",
++        f"-DMINIMAX_MSA_Q8KV4_V_SCALE_QUAD4={int(v_layout == 'quad4')}",
+         "-Xptxas",
+         "-O3",
+         "-Xcompiler",
+@@ -266,6 +304,7 @@ def _write_ninja(
+     sources: list[Path],
+     dequant_mode: str,
+     arch: str,
++    v_layout: str = _DEFAULT_V_SCALE_LAYOUT,
+ ) -> None:
+     nvcc = _cuda_home() / "bin/nvcc"
+     objects = [cache_dir / f"source_{index}.o" for index in range(len(sources))]
+@@ -276,7 +315,7 @@ def _write_ninja(
+     content = f"""ninja_required_version = 1.5
+ 
+ nvcc = {nvcc}
+-nvcc_flags = {_nvcc_flags(cache_dir, dequant_mode, arch)}
++nvcc_flags = {_nvcc_flags(cache_dir, dequant_mode, arch, v_layout)}
+ 
+ rule nvcc_compile
+   command = $nvcc $nvcc_flags -MMD -MF $out.d -c $in -o $out
+@@ -304,17 +343,20 @@ class JitSpec:
+     target_arch: str
+     gqa_ratio: int = 16
+     output_mode: str = "bf16"
++    v_scale_layout: str = _DEFAULT_V_SCALE_LAYOUT
+ 
+     @property
+     def uri(self) -> str:
+         return (
+-            f"{self.variant_name}_gqa{self.gqa_ratio}_{self.output_mode}_{self.dequant_mode}_"
++            f"{self.variant_name}_gqa{self.gqa_ratio}_{self.output_mode}"
++            f"{_layout_tag(self.v_scale_layout)}_{self.dequant_mode}_"
+             f"{self.target_arch}_{_source_digest()}"
+         )
+ 
+     def build_and_load(self):
+         cache_dir = _cache_dir(
+-            f"{self.variant_name}_gqa{self.gqa_ratio}_{self.output_mode}",
++            f"{self.variant_name}_gqa{self.gqa_ratio}_{self.output_mode}"
++            f"{_layout_tag(self.v_scale_layout)}",
+             self.target_arch,
+             self.dequant_mode,
+         )
+@@ -354,6 +396,7 @@ class JitSpec:
+             [inst_cu, run_cu],
+             self.dequant_mode,
+             self.target_arch,
++            self.v_scale_layout,
+         )
+         _run_ninja(cache_dir, f"{self.variant_name} JIT module")
+ 
+@@ -391,6 +434,7 @@ def gen_jit_spec(
+         arch,
+         gqa_ratio,
+         output_mode,
++        v_scale_layout(),
+     )
+ 
+ 
+@@ -508,9 +552,12 @@ def _clear_loaded_extensions() -> None:
+ 
+ 
+ __all__ = [
++    "V_SCALE_LAYOUTS",
++    "V_SCALE_LAYOUT_ENV",
+     "JitSpec",
+     "gen_jit_spec",
+     "get_fmha_fwd_variant",
+     "get_plan_fn",
+     "get_reduction_module",
++    "v_scale_layout",
+ ]
+diff --git a/indexer/_common/topk_select/__init__.py b/indexer/_common/topk_select/__init__.py
+index 8822025a37a50619ad26521ed942e065beedf028..1a016c3c055cc839a78706fa03bb78b67fa86da2 100644
+--- a/indexer/_common/topk_select/__init__.py
++++ b/indexer/_common/topk_select/__init__.py
+@@ -1,5 +1,8 @@
++# SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
++# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
++# SPDX-License-Identifier: MIT
+ """Private per-row forced-tail TopK selection."""
+ 
+-from inference.msa_v1.indexer._common.topk_select.interface import _topk_select
++from ....indexer._common.topk_select.interface import _topk_select
+ 
+ __all__ = ["_topk_select"]
+diff --git a/indexer/_common/topk_select/build.py b/indexer/_common/topk_select/build.py
+index 0d4490a480c1e3645615e3a56616b8f8765c2a84..5763f75dd13ec82cefd0faa9dff530f18bfdf58a 100644
+--- a/indexer/_common/topk_select/build.py
++++ b/indexer/_common/topk_select/build.py
+@@ -1,3 +1,6 @@
++# SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
++# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
++# SPDX-License-Identifier: MIT
+ """Lazy JIT builder for the internal SM100-family indexer TopK."""
+ 
+ from __future__ import annotations
+@@ -11,7 +14,7 @@ from pathlib import Path
+ import torch
+ from torch.utils import cpp_extension
+ 
+-from inference.msa_v1._build_utils import cuda_home
++from ...._build_utils import cuda_home
+ 
+ _LOGGER = logging.getLogger(__name__)
+ _ROOT = Path(__file__).resolve().parent
+diff --git a/indexer/_common/topk_select/interface.py b/indexer/_common/topk_select/interface.py
+index 778bab2f7aebb2f3046f53e41718d4c231f2c9ad..753eb2cf8c8812668a2ae87bbe17a480c327316f 100644
+--- a/indexer/_common/topk_select/interface.py
++++ b/indexer/_common/topk_select/interface.py
+@@ -1,10 +1,13 @@
++# SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
++# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
++# SPDX-License-Identifier: MIT
+ """Internal PyTorch interface for SM100-family forced-tail TopK."""
+ 
+ from __future__ import annotations
+ 
+ import torch
+ 
+-from inference.msa_v1.indexer._common.topk_select.build import load_extension
++from ....indexer._common.topk_select.build import load_extension
+ 
+ _TOP_K = 16
+ MAXIMUM_COLUMNS = 16384
+diff --git a/indexer/decode/plan.py b/indexer/decode/plan.py
+index 345f929f1aeec3418859e44538686835d14e96e2..79c32a5196ad0b5dd1254bb9d3c7615467794907 100644
+--- a/indexer/decode/plan.py
++++ b/indexer/decode/plan.py
+@@ -1,3 +1,6 @@
++# SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
++# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
++# SPDX-License-Identifier: MIT
+ """Shared, graph-capturable metadata updates for decode indexers."""
+ 
+ import logging
+@@ -9,7 +12,7 @@ import cutlass.cute as cute  # noqa: PLR0402
+ import torch
+ from cutlass.cute.runtime import from_dlpack
+ 
+-from inference.msa_v1.indexer._common.topk_select.interface import MAXIMUM_COLUMNS
++from ...indexer._common.topk_select.interface import MAXIMUM_COLUMNS
+ 
+ from .plan_kernel import DecodeIndexerPlanSm100
+ 
+diff --git a/indexer/decode/q8kv4/__init__.py b/indexer/decode/q8kv4/__init__.py
+index 41da08bb26c8c18e9cf5f38ade635ceb1ec86e70..a3583f80d6f2ea4a94ba8e096a97b9526d10b0ce 100644
+--- a/indexer/decode/q8kv4/__init__.py
++++ b/indexer/decode/q8kv4/__init__.py
+@@ -1,6 +1,9 @@
++# SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
++# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
++# SPDX-License-Identifier: MIT
+ """SM100-family Q8KV4 paged decode indexer."""
+ 
+-from inference.msa_v1.indexer.decode.q8kv4.interface import (
++from ....indexer.decode.q8kv4.interface import (
+     BatchDecodeIndexerWithPagedKVCacheWrapper,
+ )
+ 
+diff --git a/indexer/decode/q8kv4/interface.py b/indexer/decode/q8kv4/interface.py
+index 4850a0f3e82cff2db7bbb26dbc0f2739ab41fb2d..64b7914e3f5626529017c4c4337138d5ce08703f 100644
+--- a/indexer/decode/q8kv4/interface.py
++++ b/indexer/decode/q8kv4/interface.py
+@@ -1,15 +1,18 @@
++# SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
++# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
++# SPDX-License-Identifier: MIT
+ """FlashInfer-style Q8KV4 paged decode indexer wrapper."""
+ 
+ from __future__ import annotations
+ 
+ import torch
+ 
+-from inference.msa_v1.indexer._common.topk_select import _topk_select
+-from inference.msa_v1.indexer._common.topk_select.interface import (
++from ....indexer._common.topk_select import _topk_select
++from ....indexer._common.topk_select.interface import (
+     MAXIMUM_COLUMNS as _MAXIMUM_PAGES,
+ )
+-from inference.msa_v1.indexer.decode.plan import BatchDecodeIndexerPlan
+-from inference.msa_v1.indexer.decode.q8kv4.jit import load_extension
++from ....indexer.decode.plan import BatchDecodeIndexerPlan
++from ....indexer.decode.q8kv4.jit import load_extension
+ 
+ _PAGE_SIZE = 128
+ _TOP_K = 16
+diff --git a/indexer/decode/q8kv4/jit.py b/indexer/decode/q8kv4/jit.py
+index 6102d610740223aa7d0ffdb683cbadce9e80de11..ecbfa6a750be61c361d9bff4d5dd0f9ca9982d88 100644
+--- a/indexer/decode/q8kv4/jit.py
++++ b/indexer/decode/q8kv4/jit.py
+@@ -1,3 +1,6 @@
++# SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
++# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
++# SPDX-License-Identifier: MIT
+ """Op-local JIT for the SM100 Q8KV4 decode indexer GEMM."""
+ 
+ from __future__ import annotations
+@@ -15,11 +18,11 @@ from pathlib import Path
+ import jinja2
+ from torch.utils import cpp_extension
+ 
+-from inference.msa_v1._build_utils import cuda_home as _cuda_home
+-from inference.msa_v1._build_utils import cutlass_root as _cutlass_root
+-from inference.msa_v1._build_utils import require_cuda_version
+-from inference.msa_v1._build_utils import target_arch as _resolve_target_arch
+-from inference.msa_v1._build_utils import torch_cuda_arch as _resolve_torch_arch
++from ...._build_utils import cuda_home as _cuda_home
++from ...._build_utils import cutlass_root as _cutlass_root
++from ...._build_utils import require_cuda_version
++from ...._build_utils import target_arch as _resolve_target_arch
++from ...._build_utils import torch_cuda_arch as _resolve_torch_arch
+ 
+ logger = logging.getLogger(__name__)
+ 
