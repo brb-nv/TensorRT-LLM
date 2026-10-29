@@ -2151,10 +2151,9 @@ class KvCacheCreator:
         if (self._kv_cache_manager_cls is not KVCacheManagerV2
                 and not hosts_draft_layers):
             return False
-        # Such a manager keeps its agg drafter in the separate pool paired with
-        # block reuse; a model shipping that pool's window itself keeps it too.
-        if hosts_draft_layers and (not self._is_disagg or runtime_hooks_of(
-                self._model_engine.model).disagg_draft_kv):
+        # A model shipping the separate pool's window itself keeps that pool.
+        if hosts_draft_layers and runtime_hooks_of(
+                self._model_engine.model).disagg_draft_kv:
             return False
         target_layout = self._dflash_kv_layout(
             self._model_engine.model.model_config,
