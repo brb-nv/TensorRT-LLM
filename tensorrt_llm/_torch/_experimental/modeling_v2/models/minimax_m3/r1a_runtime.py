@@ -10,7 +10,7 @@ from collections import Counter
 from pathlib import Path
 
 VERSION = "r1a-p4-brb-v1"
-MODEL_MD5 = "d2b420481832f350b86b2bc226bc8f76"
+MODEL_MD5 = "64009206b8f1bbc9d9c35ff3947e27d7"
 
 
 def _folded_fp4_reason(model, layer, hidden):

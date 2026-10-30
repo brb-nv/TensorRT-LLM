@@ -210,7 +210,8 @@ from .kernels.m3_moe_finalize import m3_moe_finalize
 from .kernels.m3_nvfp4_index_decode import Nvfp4IndexDecodeScorer
 from .kernels.mx_gemv import op as mx_gemv
 from .kernels.triton_sparse_decode import MERGE_MXFP8, MERGE_MXFP8_MIN_TOKENS
-from .m31_switches import m31_disabled, m31_enabled
+from .m31_switches import M31_SM103_TP2_FORCED_OFF as M31_SM103_FORCED_OFF
+from .m31_switches import m31_sm103_tp2, m31_disabled, m31_enabled
 from .ops import gqamix_sparse_decode as _gqamix_kernel
 from .ops.activation.m3_silu_and_mul import m3_silu_and_mul
 from .ops.activation.m3_swq import m3_swq
@@ -282,6 +283,14 @@ from .ops.spec.m3_spec_offsets import m3_spec_offsets
 from .ops.spec.m3_step_prologue import m3_step_prologue
 
 _SM = (10, 7)  # capacity: fixed: the device capability, not a size
+# M31 H84 (TRTLLM_M31_SM103_TP2_TARGET=1, routing.py): this target also serves GB300 (sm_103) TP2. There the NVFP4
+# index-K is the built-in path's: the C++ NVFP4 QKV insert writes it (m3_producer and its fold write E4M3 index-K into
+# the AGG sink, so they stand down), a pure decode step selects with the MSA-v1 Q8KV4 decode indexer under the plan the
+# MSA metadata staged, and attends with the MSA-v1 Q8KV4 decode (TRTLLM_M3_MSA_V1_DECODE=1, quad4), the kernels
+# MsaDecodeFmha runs on the built-in path; identity-selection steps keep m3_sparse_decode. The sm_107 tactic bundle
+# (m31_pins) is not installed, and the non-bitwise / Rubin-only items are off (m31_switches.M31_SM103_TP2_FORCED_OFF).
+_SM_M31 = (10, 3)  # capacity: fixed: the device capability, not a size
+M31_SM103 = m31_sm103_tp2()
 # PROXYPB: compile the MSA indexer proxy's fmha_sm100 variants before warmup (``_prebuild_msa_proxy``). Compile and
 # load only, no numerics change. TRTLLM_M31_DISABLE_PROXYPB=1: each variant compiles on its first call instead (which
 # can be after the server is ready).
@@ -1752,8 +1761,11 @@ ACT_SWIGLU = int(ActType_TrtllmGen.SwiGlu)
 
 # --------------------------------------------------------------------------------------------------------------------
 # Streaming: also emit a response on decoding iterations 2..FIRST_CONTENT_EMIT_ITERS (RuntimeHooks), so a request's
-# first content leaves one step after its first token. 1: the stock schedule.
-FIRST_CONTENT_EMIT_ITERS = 2
+# first content leaves one step after its first token. 1: the stock schedule. M31 H84 (sm_103): the stock schedule,
+# as the built-in model streams, unless TRTLLM_M31_SM103_TP2_FIRST_EMIT_ITERS sets another bound.
+FIRST_CONTENT_EMIT_ITERS = (
+    int(os.environ.get("TRTLLM_M31_SM103_TP2_FIRST_EMIT_ITERS", "1")) if M31_SM103 else 2
+)
 
 # The runtime-value dump (TRTLLM_MODELING_V2_VALUE_DUMP=1): the metadata of every fast-path and entry decision a step
 # takes, recorded on eager steps and captures (replay runs no Python), printed once at exit.
@@ -3613,6 +3625,86 @@ def _producer_miss(covered: bool, rows: Optional[int], reason: str) -> None:
     return None
 
 
+_M31_INSERT_LOGGED: list = []
+_M31_SELECT_LOGGED: set = set()
+# M31 H84: the MSA-v1 decode takes pure decode steps of at least this many query rows; smaller ones keep this
+# target's m3_sparse_decode on the Q8KV4 table (fixed per CUDA graph). 0: every step (the built-in path's choice).
+M31_MSA_V1_MIN_TOKENS = (
+    int(os.environ.get("TRTLLM_M31_SM103_TP2_MSA_V1_MIN_TOKENS", "0")) if M31_SM103 else 0
+)
+_M31_V1_DECODE_LOGGED = [False, set()]
+
+
+def _m31_msa_v1_decode(*args, plan_cache: dict, **kwargs) -> bool:
+    """M31 H84: the MSA-v1 Q8KV4 sparse decode MsaDecodeFmha runs on the built-in path (TRTLLM_M3_MSA_V1_DECODE=1);
+    False when it is off or declines the call, and the caller's kernel runs."""
+    from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels import msa_v1_decode
+
+    if not msa_v1_decode.is_enabled():
+        if not _M31_V1_DECODE_LOGGED[0]:
+            _M31_V1_DECODE_LOGGED[0] = True
+            logger.warning("[M31 h84] MSA-v1 decode is off (TRTLLM_M3_MSA_V1_DECODE); m3_sparse_decode runs")
+        return False
+    ran = msa_v1_decode.try_decode(
+        *args, plan_cache=plan_cache.setdefault(msa_v1_decode.PLAN_CACHE_KEY, {}), **kwargs
+    )
+    rows = int(args[0].shape[0])
+    if rows not in _M31_V1_DECODE_LOGGED[1]:
+        _M31_V1_DECODE_LOGGED[1].add(rows)
+        logger.info(f"[M31 h84] pure decode attention: MSA-v1 Q8KV4 decode {'taken' if ran else 'declined'}, "
+                    f"{rows} rows, rank {mpi_rank()}")  # fmt: skip
+    return ran
+
+
+def _m31_nvfp4_qkv_insert(
+    core, i: int, packed, position_ids, manager, index_k_cache, out_cache_loc, deferred
+):
+    """M31 H84 (sm_103): the built-in path's NVFP4 producer, ``minimax_m3_nvfp4_qkv_indexer_norm_rope_kv_insert``:
+    Q / index-Q (FP8) out, NVFP4 K / V and the NVFP4 index-K page ([pages, 1, 128, 72] uint8, quantized from the bf16
+    row) written in place, as ``MiniMaxM3Attention`` runs it. ``m3_producer`` and its fold write E4M3 index-K (the AGG
+    sink), so they stand down (uncovered, not a miss)."""
+    rows = int(packed.shape[0])
+    if not _nvfp4_layer(manager, i) or out_cache_loc is None or out_cache_loc.numel() < rows:
+        raise RuntimeError(
+            f"MiniMax-M3 layer {i}: NVFP4 index-K needs an NVFP4 main KV layer and the step's cache slots; the C++ "
+            "NVFP4 QKV insert is its only writer"
+        )
+    uncovered(PRODUCER.path, "NVFP4 index-K (M31 H84 on sm_103): the C++ NVFP4 QKV insert writes it")
+    if deferred is not None:
+        packed = deferred.materialize()
+    buffers = manager.get_buffers(i, kv_layout="HND")
+    scale_buffers = manager.get_block_scale_buffers(i, kv_layout="HND")
+    w = core.w
+    _record("m31_nvfp4_qkv_insert", rows)
+    q, index_q = m3_qkv_insert(
+        packed.contiguous(),
+        buffers.view(torch.uint8),
+        scale_buffers,
+        index_k_cache,
+        out_cache_loc[:rows],
+        core.inv_kv_scales[i],
+        core.heads,
+        core.kv_heads,
+        core.index_heads,
+        core.head_dim,
+        core.rotary_dim,
+        core.rms_eps,
+        w[f"l{i}_q_norm"],
+        w[f"l{i}_k_norm"],
+        w[f"l{i}_idx_q_norm"],
+        w[f"l{i}_idx_k_norm"],
+        core.rotary_cos_sin,
+        position_ids.reshape(-1).contiguous().to(torch.int32),
+    )
+    if not _M31_INSERT_LOGGED:
+        _M31_INSERT_LOGGED.append(True)
+        logger.info(
+            f"[M31 h84] NVFP4 index-K writer: C++ NVFP4 QKV insert (built-in producer), rank {mpi_rank()}, "
+            f"{rows} rows"
+        )
+    return q.flatten(1), index_q.flatten(1)
+
+
 def _sparse_qkv_producer(
     core,
     i: int,
@@ -3650,6 +3742,10 @@ def _sparse_qkv_producer(
     # AGG_NVFP4_INDEXK: the producer writes E4M3 index-K into the cache manager's FP8 sink (the main pool's pages, one
     # for every layer); the layer's NVFP4 index-K pages are packed from it right after (_pack_nvfp4_index_k).
     nvfp4_index_cache = None
+    if M31_SM103 and _nvfp4_index_k.is_nvfp4_index_cache(index_k_cache):
+        return _m31_nvfp4_qkv_insert(
+            core, i, packed, position_ids, manager, index_k_cache, out_cache_loc, deferred
+        )
     if _nvfp4_index_k.is_nvfp4_index_cache(index_k_cache):
         sink = getattr(manager, "get_nvfp4_index_k_sink", lambda: None)()
         if sink is None:
@@ -4630,41 +4726,53 @@ class MiniMaxM3Tp2ModelingV2(DecoderModel):
             self._prebuild_engines(i)
         torch.cuda.synchronize()
         times["moe_s"] = time.perf_counter() - start
-        start = time.perf_counter()
-        times["scorer_keys"] = self._prebuild_index_scorer(
-            self.decode_query_lens(), self.w["embed"].device
+        m31_nvfp4 = (
+            M31_SM103
+            and bool(self.sparse_layers)
+            and self.attn[min(self.sparse_layers)].indexer_kv_dtype == "nvfp4"
         )
-        times["scorer_t2sc_keys"] = self._prebuild_index_scorer_t2sc(
-            self.decode_query_lens(), self.w["embed"].device
-        )
-        times["scorer_intree_keys"] = self._prebuild_index_scorer_intree(
-            self.decode_query_lens(), self.w["embed"].device
-        )
-        if self.sparse_layers and self.attn[min(self.sparse_layers)].indexer_kv_dtype == "nvfp4":
-            # AGG_NVFP4_INDEXK: the Q8KV4 decode reader at every decode query length (DecodeTarget scores through it).
-            reader = Nvfp4IndexDecodeScorer(self.index_heads)
-            if not reader.available():
-                raise RuntimeError(
-                    "indexer_kv_dtype='nvfp4' needs the vendored fmha_sm100_q8kv8 package with run_scores_hpr (v3h); "
-                    "TRTLLM_M31_DISABLE_AGG_NVFP4_INDEXK=1 falls back to FP8 index-K"
+        if m31_nvfp4:
+            # M31 H84 (sm_103): decode selects with the MSA-v1 Q8KV4 indexer (the built-in path's); this target's
+            # scorers, NVFP4 reader and long-row select never run.
+            times["scorer_keys"] = times["select_keys"] = []
+            times["scorer_s"] = times["select_s"] = 0.0
+            logger.info("[M31 h84] prebuild: index scorers / long-row select skipped (MSA-v1 Q8KV4 indexer)")
+        else:
+            start = time.perf_counter()
+            times["scorer_keys"] = self._prebuild_index_scorer(
+                self.decode_query_lens(), self.w["embed"].device
+            )
+            times["scorer_t2sc_keys"] = self._prebuild_index_scorer_t2sc(
+                self.decode_query_lens(), self.w["embed"].device
+            )
+            times["scorer_intree_keys"] = self._prebuild_index_scorer_intree(
+                self.decode_query_lens(), self.w["embed"].device
+            )
+            if self.sparse_layers and self.attn[min(self.sparse_layers)].indexer_kv_dtype == "nvfp4":
+                # AGG_NVFP4_INDEXK: the Q8KV4 decode reader at every decode query length (DecodeTarget scores through it).
+                reader = Nvfp4IndexDecodeScorer(self.index_heads)
+                if not reader.available():
+                    raise RuntimeError(
+                        "indexer_kv_dtype='nvfp4' needs the vendored fmha_sm100_q8kv8 package with run_scores_hpr (v3h); "
+                        "TRTLLM_M31_DISABLE_AGG_NVFP4_INDEXK=1 falls back to FP8 index-K"
+                    )
+                times["nvfp4_reader_qlens"] = reader.prebuild(
+                    self.w["embed"].device, self.decode_query_lens()
                 )
-            times["nvfp4_reader_qlens"] = reader.prebuild(
-                self.w["embed"].device, self.decode_query_lens()
-            )
-            logger.info(
-                f"[M3 prebuild] AGG_NVFP4_INDEXK decode reader compiled: qlen {times['nvfp4_reader_qlens']}"
-            )
-        torch.cuda.synchronize()
-        times["scorer_s"] = time.perf_counter() - start
-        start = time.perf_counter()
-        times["select_keys"] = []
-        if long_select_dsl_keys():
-            # The 384-thread long-row select (LONG_SELECT_DSL): one kernel per launch key.
-            times["select_keys"] = _select_long_dsl_kernel.prebuild(
-                long_select_dsl_keys(), self.w["embed"].device
-            )
+                logger.info(
+                    f"[M3 prebuild] AGG_NVFP4_INDEXK decode reader compiled: qlen {times['nvfp4_reader_qlens']}"
+                )
             torch.cuda.synchronize()
-        times["select_s"] = time.perf_counter() - start
+            times["scorer_s"] = time.perf_counter() - start
+            start = time.perf_counter()
+            times["select_keys"] = []
+            if long_select_dsl_keys():
+                # The 384-thread long-row select (LONG_SELECT_DSL): one kernel per launch key.
+                times["select_keys"] = _select_long_dsl_kernel.prebuild(
+                    long_select_dsl_keys(), self.w["embed"].device
+                )
+                torch.cuda.synchronize()
+            times["select_s"] = time.perf_counter() - start
         start = time.perf_counter()
         times["fullctx_plans"] = 0
         if FULLCTX_DECODE.keys:
@@ -6787,6 +6895,34 @@ class DecodeTarget:
         )
         return output
 
+    def _m31_q8kv4_select(self, i: int, idx_q, step, num_tokens: int) -> torch.Tensor:
+        """M31 H84 (sm_103): the top-16 table of a pure decode step over NVFP4 index-K, [kv heads, tokens, 16] (a
+        head-major view), from the MSA-v1 Q8KV4 decode indexer under the plan the MSA metadata staged for these rows,
+        as the built-in backend's ``_select_nvfp4`` runs it for generation rows."""
+        from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels import msa_v1_indexer
+
+        md = step["metadata"]
+        plan = md.msa_q8kv4_plan
+        buffers = md.msa_idx_k_nvfp4(i)
+        if plan is None or buffers is None:
+            raise RuntimeError(
+                f"MiniMax-M3 layer {i}: NVFP4 index-K but the metadata staged no Q8KV4 indexer plan or buffers"
+            )
+        data, scale = buffers
+        config = self.core.attn[i].m3_config
+        _record("m31_q8kv4_indexer", num_tokens)
+        table = msa_v1_indexer.run_q8kv4(
+            plan,
+            idx_q.view(num_tokens, config.num_index_heads, config.sparse_index_dim),
+            data,
+            scale,
+            layer_idx=i,
+        )
+        if num_tokens not in _M31_SELECT_LOGGED:
+            _M31_SELECT_LOGGED.add(num_tokens)
+            logger.info(f"[M31 h84] pure decode select: MSA-v1 Q8KV4 indexer, {num_tokens} rows, rank {mpi_rank()}")
+        return table.permute(1, 0, 2)
+
     @property
     def _nvfp4_index_scorer(self) -> Nvfp4IndexDecodeScorer:
         scorer = getattr(self, "_nvfp4_index_scorer_obj", None)
@@ -6818,6 +6954,8 @@ class DecodeTarget:
             topk = step["msa_short_table"][: num_kv_heads * num_tokens * MSA_REQUIRED_TOPK].view(
                 num_kv_heads, num_tokens, MSA_REQUIRED_TOPK
             )
+        elif M31_SM103 and _nvfp4_index_k.is_nvfp4_index_cache(step["msa_idx_k_cache"](i)):
+            topk = self._m31_q8kv4_select(i, idx_q, step, num_tokens)
         else:
             idx_q_view = idx_q.view(num_tokens, config.num_index_heads, config.sparse_index_dim)
             idx_k_cache = step["msa_idx_k_cache"](i)
@@ -7005,6 +7143,23 @@ class DecodeTarget:
                 k_global_scale=k_scale,
                 v_global_scale=v_scale,
             )
+        if M31_SM103 and not identity and nvfp4 and num_tokens >= M31_MSA_V1_MIN_TOKENS:
+            # The MSA-v1 Q8KV4 decode (quad4) the built-in MsaDecodeFmha runs; it declines outside its contract.
+            m3_prequant.SLOT.clear()
+            if _m31_msa_v1_decode(
+                q.view(num_tokens, core.heads, core.head_dim),
+                k_paged,
+                v_paged,
+                topk,
+                block_table,
+                seq_lens,
+                sm_scale=core.sm_scale(i),
+                output=output.view(num_tokens, core.heads, core.head_dim),
+                decode_query_len=qlen,
+                plan_cache=step["metadata"].fmha_plan_caches,
+                **nvfp4,
+            ):
+                return
         _record("m3_sparse_decode", num_tokens, qlen, identity)
         # The long-context decode (if it runs: TP2WIDE_LC2) takes the layer's N1 id buffer; any other route (the Triton
         # producer + merge, every step of at most 32 rows) leaves the slot unused, and it is cleared after the call
@@ -8847,8 +9002,9 @@ def _runtime_hooks(spec_fold: Optional[M3SpecStepFold]) -> RuntimeHooks:
         msa_kv_cache_fixes=True,
         draft_pool_fixes=True,
         persist_flashinfer_mxfp8_tactics=True,
-        # Bundled name-keyed tactic pins (m31_pins); kill: TRTLLM_M31_DISABLE_BUNDLED_PINS=1.
-        install_tactic_pins=lambda rank: m31_pins.install("tp2", rank),
+        # Bundled name-keyed tactic pins (m31_pins); kill: TRTLLM_M31_DISABLE_BUNDLED_PINS=1. The bundle is sm_107's
+        # (M31 H84 on sm_103: none; the AutoTuner tunes as on the built-in path).
+        install_tactic_pins=None if M31_SM103 else (lambda rank: m31_pins.install("tp2", rank)),
         disagg_draft_kv=True,  # kill: TRTLLM_M31_DISABLE_DISAGG_DRAFT_KV=1
         first_content_emit_iters=FIRST_CONTENT_EMIT_ITERS,
         mxfp8_pinned_tactics=True,
@@ -9034,7 +9190,7 @@ class ModelingV2MiniMaxM31Nvfp4Sm107Tp2(
     """
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig]) -> None:
-        assert torch.cuda.get_device_capability() == _SM, (
+        assert torch.cuda.get_device_capability() == (_SM_M31 if M31_SM103 else _SM), (
             f"this target is built for sm_{_SM[0]}{_SM[1]}, the device is sm_"
             f"{''.join(map(str, torch.cuda.get_device_capability()))}"
         )

@@ -140,6 +140,19 @@ def _m31_tp2_routed() -> bool:
     return not m31_disabled("TP2")
 
 
+def _m31_sm103_tp2_routed() -> bool:
+    """Whether GB300 (sm_103) TP2 takes the sm_107 TP2 target (M31 H84). Off by default;
+    ``TRTLLM_M31_SM103_TP2_TARGET=1`` opts in. Read from the target's switch module, which applies the GB300 item
+    overrides at its import."""
+    import os
+
+    if os.environ.get("TRTLLM_M31_SM103_TP2_TARGET", "").strip().lower() not in ("1", "true", "on", "yes"):
+        return False
+    from .minimax_m31_nvfp4__sm_107__tp2.m31_switches import m31_sm103_tp2
+
+    return m31_sm103_tp2()
+
+
 def _m31_speculation_mismatch(spec_config: Optional[Any]) -> Optional[str]:
     """Why the speculation is not one the M3.1 targets serve, or None when it is (none, or a standalone MiniMax DSpark
     drafter). Read from the drafter checkpoint's ``config.json``."""
@@ -266,6 +279,37 @@ def route(
         from .minimax_m31_nvfp4__sm_103__tp8.modeling import ModelingV2MiniMaxM31Nvfp4Sm103Tp8
 
         return ModelingV2MiniMaxM31Nvfp4Sm103Tp8
+
+    # M31 H84 (opt-in, TRTLLM_M31_SM103_TP2_TARGET=1): the same export on 2 GB300 GPUs (sm_103), TP2 with moe_tp 2,
+    # served by the sm_107 TP2 target with its GB300 substitutions (minimax_m31_nvfp4__sm_107__tp2/m31_switches.py and
+    # the M31_SM103 branches of its modeling.py). Only the GB300 KV defaults are armed, as on the TP4 route; the sm_107
+    # shared runtime opt-ins, the router half pin and R1A are not. Unset, sm_103 TP2 keeps the built-in model.
+    if (
+        compute_capability == _SM
+        and shape == _SHAPE
+        and m31_miss is None
+        and parallel == "tp2"
+        and _m31_sm103_tp2_routed()
+        and m31_spec_miss is None
+        and kv_cache
+    ):
+        from tensorrt_llm._torch.pyexecutor.kv_cache import m31_kv_defaults
+
+        m31_kv_defaults.arm_minimax_m31(compute_capability)
+        from .fake_ops import register
+
+        register()
+        from ...catalog.spec_decode.m31_draft_bf16 import arm_draft_bf16
+
+        arm_draft_bf16()
+        from .minimax_m31_nvfp4__sm_107__tp2 import modeling as tp2_model
+
+        logger.info(
+            "[M31 h84] TRTLLM_M31_SM103_TP2_TARGET=1: sm_103 TP2 routed to the modeling_v2 target "
+            f"{tp2_model.ModelingV2MiniMaxM31Nvfp4Sm107Tp2.__name__} (GB300 substitutions; forced off: "
+            f"{','.join(sorted(tp2_model.M31_SM103_FORCED_OFF))})"
+        )
+        return tp2_model.ModelingV2MiniMaxM31Nvfp4Sm107Tp2
 
     # The same export on 2, 4 or 8 Rubin GPUs (sm_107), on the same terms (TP2: moe_tp 2, every expert on both ranks).
     if (
