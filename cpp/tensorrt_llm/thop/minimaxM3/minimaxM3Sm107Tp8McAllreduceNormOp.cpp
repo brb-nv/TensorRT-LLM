@@ -68,7 +68,8 @@ std::vector<torch::Tensor> minimaxM3Sm107Tp8McAllreduceNorm(torch::Tensor const&
     std::optional<torch::Tensor> const& capW, double capEps)
 {
     int const sm = tensorrt_llm::common::getSMVersion();
-    TORCH_CHECK(sm == 107, "minimax_m3_sm107_tp8_mc_allreduce_norm requires SM107, got SM", sm);
+    TORCH_CHECK(
+        sm == 103 || sm == 107, "minimax_m3_sm107_tp8_mc_allreduce_norm requires SM103 or SM107, got SM", sm);
     TORCH_CHECK(cluster == kCluster, "minimax_m3_sm107_tp8_mc_allreduce_norm: only cluster 8 is built, got ", cluster);
     TORCH_CHECK(tensorrt_llm::kernels::isMinimaxM3Sm107Tp8McAllreduceNormSupported(
                     static_cast<int32_t>(maxt), static_cast<int32_t>(opts)),
