@@ -45,6 +45,7 @@ namespace
 
 constexpr int kMaxM = 16;
 
+#if MINIMAX_M3_KERNELS_ENABLED
 __device__ __forceinline__ uint32_t smem_u32(void const* p)
 {
     return static_cast<uint32_t>(__cvta_generic_to_shared(p));
@@ -118,6 +119,7 @@ __device__ __forceinline__ void quant_block16(__nv_bfloat16 const* src, float sf
     *q = make_uint2(e2m1x8(lo), e2m1x8(hi));
     *sf = tmp.__x;
 }
+#endif // MINIMAX_M3_KERNELS_ENABLED
 
 // grid: E / ROWS; block: 256 threads. smem: ROWS * K fp32 weights + M * K bf16 activations.
 // With q_out, the CTAs also emit the NVFP4 activation ([M, K / 2] packed, [M, K / 16] E4M3 scales) for the MoE.
@@ -266,6 +268,7 @@ constexpr int kTcExperts = 16;
 constexpr int kTcSlices = 16;
 constexpr int kTcMaxM = 48;
 
+#if MINIMAX_M3_KERNELS_ENABLED
 __device__ __forceinline__ uint32_t f2tf32(float f)
 {
     uint32_t r;
@@ -279,6 +282,7 @@ __device__ __forceinline__ uint32_t mapa_u32(void const* p, uint32_t rank)
     asm volatile("mapa.shared::cluster.u32 %0, %1, %2;\n" : "=r"(r) : "r"(smem_u32(p)), "r"(rank));
     return r;
 }
+#endif // MINIMAX_M3_KERNELS_ENABLED
 
 template <int CL>
 __global__ void __launch_bounds__(256) m3_router_tc_kernel(__nv_bfloat16 const* __restrict__ x, int ldx,

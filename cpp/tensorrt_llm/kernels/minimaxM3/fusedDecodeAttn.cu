@@ -419,7 +419,7 @@ __device__ __forceinline__ void mbar_wait_cta(uint32_t bar, uint32_t parity)
 #ifndef M3FA_EPI_SPIN
 #define M3FA_EPI_SPIN 1
 #endif
-__device__ __forceinline__ void mbar_wait_epi(uint32_t bar, uint32_t parity)
+[[maybe_unused]] __device__ __forceinline__ void mbar_wait_epi(uint32_t bar, uint32_t parity)
 {
     if (!M3FA_EPI_SPIN)
     {
@@ -476,19 +476,20 @@ __device__ __forceinline__ void ldsm_x4(uint32_t addr, uint32_t (&r)[4])
                  : "r"(addr));
 }
 
-__device__ __forceinline__ void ldsm_x2(uint32_t addr, uint32_t (&r)[2])
+[[maybe_unused]] __device__ __forceinline__ void ldsm_x2(uint32_t addr, uint32_t (&r)[2])
 {
     asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];\n" : "=r"(r[0]), "=r"(r[1]) : "r"(addr));
 }
 
-__device__ __forceinline__ void ldsm_x2_trans(uint32_t addr, uint32_t (&r)[2])
+[[maybe_unused]] __device__ __forceinline__ void ldsm_x2_trans(uint32_t addr, uint32_t (&r)[2])
 {
     asm volatile("ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0, %1}, [%2];\n"
                  : "=r"(r[0]), "=r"(r[1])
                  : "r"(addr));
 }
 
-__device__ __forceinline__ void mma_f16_16816(float (&d)[4], uint32_t const (&a)[4], uint32_t const (&b)[2])
+[[maybe_unused]] __device__ __forceinline__ void mma_f16_16816(
+    float (&d)[4], uint32_t const (&a)[4], uint32_t const (&b)[2])
 {
     asm volatile(
         "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, "
@@ -698,14 +699,14 @@ constexpr int kOpSfBytes = kOpKTiles * 512;                    // one parity of 
       // with the QKV weight stream for HBM behind the MoE)
 #endif
 // o_proj TMEM columns (after the QKV unit's MMAs completed): accumulator, A / B scale atoms, A (8 tiles x 32)
-constexpr int kOAcc = 0;
+[[maybe_unused]] constexpr int kOAcc = 0;
 constexpr int kOSfa = 16;
 constexpr int kOSfb = kOSfa + 4 * kOpTiles;
 constexpr int kOA = 128;
 static_assert(kOA + 32 * kOpTiles <= kTmemAll && kOSfb + 4 * kOpTiles <= kOA, "o_proj TMEM columns");
 constexpr int kQkvMbStride = kMaxTok + 4; // mailbox row pitch (fp32 words)
 
-__host__ __device__ constexpr int qkv_tile0(int s)
+[[maybe_unused]] __host__ __device__ constexpr int qkv_tile0(int s)
 {
     return s * kQkvKTiles / kQkvSplits;
 }
@@ -726,8 +727,11 @@ struct SmemX : Smem<QLEN, QG, BPC>
     static constexpr int kRingSf = kRingW + kQkvRing * kQkvWTile; // [ring][512 B]
     static constexpr int kRingEnd = kRingSf + kQkvRing * kQkvSfAtom;
     // The activation tiles overlay the ring: written after the PDL wait, once every weight tile went on into TMEM.
+// Only the FQKV instantiations use the next two members.
+#pragma nv_diag_suppress 177
     static constexpr int kXt = kRingW;                     // [tile][8][128 B]
     static constexpr int kXsf = kXt + kQkvMaxTiles * 1024; // [tile][512 B]
+#pragma nv_diag_default 177
     static constexpr int kXsc = (kRingEnd + 127) / 128 * 128;
     // Peers push into recv at any time (an empty CTA right away), so it stays clear of the ring.
     static constexpr int kRecv = FQKV ? kXsc : B::kRecv;
@@ -758,17 +762,17 @@ struct SmemX : Smem<QLEN, QG, BPC>
     static_assert(kBytes <= 227 * 1024, "shared memory budget");
 };
 
-__device__ __forceinline__ void mbar_init(uint32_t bar, uint32_t count)
+[[maybe_unused]] __device__ __forceinline__ void mbar_init(uint32_t bar, uint32_t count)
 {
     asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;\n" ::"r"(bar), "r"(count) : "memory");
 }
 
-__device__ __forceinline__ void mbar_expect_tx(uint32_t bar, uint32_t bytes)
+[[maybe_unused]] __device__ __forceinline__ void mbar_expect_tx(uint32_t bar, uint32_t bytes)
 {
     asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;\n" ::"r"(bar), "r"(bytes) : "memory");
 }
 
-__device__ __forceinline__ void bulk_g2s(void* dst, void const* src, uint32_t bytes, uint32_t bar)
+[[maybe_unused]] __device__ __forceinline__ void bulk_g2s(void* dst, void const* src, uint32_t bytes, uint32_t bar)
 {
     asm volatile(
         "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint [%0], [%1], %2, [%3], "
@@ -777,7 +781,8 @@ __device__ __forceinline__ void bulk_g2s(void* dst, void const* src, uint32_t by
         : "memory");
 }
 
-__device__ __forceinline__ void tma_load_2d(uint32_t dst, void const* map, int c0, int c1, uint32_t bar)
+[[maybe_unused]] __device__ __forceinline__ void tma_load_2d(
+    uint32_t dst, void const* map, int c0, int c1, uint32_t bar)
 {
     asm volatile(
         "cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes.L2::cache_hint"
@@ -787,29 +792,29 @@ __device__ __forceinline__ void tma_load_2d(uint32_t dst, void const* map, int c
 }
 
 // K-major operand in the 128-byte swizzle: rows of 128 bytes, 8-row groups 1024 bytes apart.
-__device__ __forceinline__ uint64_t umma_desc_sw128(uint32_t addr)
+[[maybe_unused]] __device__ __forceinline__ uint64_t umma_desc_sw128(uint32_t addr)
 {
     return umma_desc(addr, 16, 1024) | (2ull << 61);
 }
 
-__device__ __forceinline__ void tmem_cp_128x256b(uint32_t taddr, uint64_t desc)
+[[maybe_unused]] __device__ __forceinline__ void tmem_cp_128x256b(uint32_t taddr, uint64_t desc)
 {
     asm volatile("tcgen05.cp.cta_group::1.128x256b [%0], %1;\n" ::"r"(taddr), "l"(desc));
 }
 
-__device__ __forceinline__ void tmem_cp_sf(uint32_t taddr, uint32_t saddr)
+[[maybe_unused]] __device__ __forceinline__ void tmem_cp_sf(uint32_t taddr, uint32_t saddr)
 {
     asm volatile("tcgen05.cp.cta_group::1.32x128b.warpx4 [%0], %1;\n" ::"r"(taddr), "l"(umma_desc(saddr, 16, 128)));
 }
 
 // Block-scaled MXFP8 instruction descriptor: E4M3 x E4M3, UE8M0 scales, M = 128, N = 8, scale byte kb.
-__host__ __device__ constexpr uint32_t qkv_idesc(int kb)
+[[maybe_unused]] __host__ __device__ constexpr uint32_t qkv_idesc(int kb)
 {
     return (static_cast<uint32_t>(kb) << 4) | ((8u >> 3) << 17) | (1u << 23) | ((128u >> 7) << 27)
         | (static_cast<uint32_t>(kb) << 29);
 }
 
-__device__ __forceinline__ void umma_mx(
+[[maybe_unused]] __device__ __forceinline__ void umma_mx(
     uint32_t tmem_d, uint32_t tmem_a, uint64_t bdesc, uint32_t idesc, uint32_t sfa, uint32_t sfb, int accumulate)
 {
     asm volatile(
@@ -819,7 +824,7 @@ __device__ __forceinline__ void umma_mx(
         "r"(tmem_a), "l"(bdesc), "r"(idesc), "r"(sfa), "r"(sfb), "r"(accumulate));
 }
 
-__device__ __forceinline__ float pow2_from_ue8m0(uint32_t e)
+[[maybe_unused]] __device__ __forceinline__ float pow2_from_ue8m0(uint32_t e)
 {
     return __uint_as_float(e == 0 ? 0x00400000u : (e << 23));
 }
@@ -827,7 +832,7 @@ __device__ __forceinline__ float pow2_from_ue8m0(uint32_t e)
 // Unscaled E4M3 x E4M3 MMA, FP32 accumulator: M = 128, N = 8, K = 32, a fresh accumulator.
 constexpr uint32_t kQkvIdescF8 = (1u << 4) | ((8u >> 3) << 17) | ((128u >> 4) << 24);
 
-__device__ __forceinline__ void umma_f8_ss(uint32_t tmem_d, uint64_t adesc, uint64_t bdesc)
+[[maybe_unused]] __device__ __forceinline__ void umma_f8_ss(uint32_t tmem_d, uint64_t adesc, uint64_t bdesc)
 {
     asm volatile(
         "{\n .reg .pred p;\n setp.ne.b32 p, 0, 0;\n tcgen05.mma.cta_group::1.kind::f8f6f4 [%0], %1, %2, %3, p;\n}\n" ::
@@ -835,7 +840,7 @@ __device__ __forceinline__ void umma_f8_ss(uint32_t tmem_d, uint64_t adesc, uint
         "l"(adesc), "l"(bdesc), "r"(kQkvIdescF8));
 }
 
-__device__ __forceinline__ void tmem_ld16_nowait(uint32_t addr, float* v)
+[[maybe_unused]] __device__ __forceinline__ void tmem_ld16_nowait(uint32_t addr, float* v)
 {
     uint32_t r[16];
     asm volatile(
@@ -851,7 +856,7 @@ __device__ __forceinline__ void tmem_ld16_nowait(uint32_t addr, float* v)
     }
 }
 
-__device__ __forceinline__ void umma_mx_ss(
+[[maybe_unused]] __device__ __forceinline__ void umma_mx_ss(
     uint32_t tmem_d, uint64_t adesc, uint64_t bdesc, uint32_t idesc, uint32_t sfa, uint32_t sfb, int accumulate)
 {
     asm volatile(
@@ -868,7 +873,7 @@ __device__ __forceinline__ bool elect_one()
     return pred != 0;
 }
 
-__device__ __forceinline__ int qkv_parity(Params const& p)
+[[maybe_unused]] __device__ __forceinline__ int qkv_parity(Params const& p)
 {
     int v;
     asm volatile("ld.relaxed.gpu.global.s32 %0, [%1];\n" : "=r"(v) : "l"(p.counters) : "memory");
@@ -1004,7 +1009,7 @@ __device__ __forceinline__ void qkv_stream_lane(
     umma_commit(a_ready);
 }
 
-__device__ __forceinline__ bool mbar_test(uint32_t bar, uint32_t parity)
+[[maybe_unused]] __device__ __forceinline__ bool mbar_test(uint32_t bar, uint32_t parity)
 {
     uint32_t ready;
     asm volatile(
@@ -1434,7 +1439,6 @@ __device__ __forceinline__ void qkv_epilogue(
         // buffer, last read by the previous call (complete: this grid passed its PDL wait), is reset to the marker.
         uint16_t* cur = reinterpret_cast<uint16_t*>(p.qkv_out) + (calls & 1u) * kMaxTok * kQkvN;
         uint16_t* nxt = reinterpret_cast<uint16_t*>(p.qkv_out) + ((calls & 1u) ^ 1u) * kMaxTok * kQkvN;
-#pragma unroll
         float qsum[kMaxTok];
 #pragma unroll
         for (int g = 0; g < kMaxTok / 4; ++g)
@@ -1840,7 +1844,8 @@ __device__ __forceinline__ void op_epilogue(Params const& p, uint8_t* smem, uint
 
 // Packed-QKV element group [token][col * 128 + 4 * lane, +4): the split partials, polled until every one is stored,
 // summed in split order and rounded to BF16.
-__device__ __forceinline__ void qkv_load(Params const& p, int par, int tok, int col, int lane, float (&e)[4])
+[[maybe_unused]] __device__ __forceinline__ void qkv_load(
+    Params const& p, int par, int tok, int col, int lane, float (&e)[4])
 {
     float const* base = p.part + par * kQkvPartStride + static_cast<int64_t>(tok) * kQkvN + col * kHeadDim + lane * 4;
     uint4 pr[kQkvSplits];
@@ -1881,7 +1886,7 @@ __device__ __forceinline__ void qkv_load(Params const& p, int par, int tok, int 
 }
 
 // Every CTA once it has read the call parity and the partials it needs: the last one flips the parity.
-__device__ __forceinline__ void qkv_done(Params const& p)
+[[maybe_unused]] __device__ __forceinline__ void qkv_done(Params const& p)
 {
     if (atomicAdd(p.counters + 1, 1) == kQkvGrid - 1)
     {
@@ -2424,7 +2429,7 @@ __global__ void __launch_bounds__(kThreads, 1) m3_fused_decode_attn_kernel(__gri
         // whose position falls in this CTA's blocks go straight into the fp16 tiles; the CTA writes the caches, and
         // the index-K, only for its own tokens.
         uint2 raw[kMaxT];
-        float fq[FQKV ? kMaxT : 1][4];
+        [[maybe_unused]] float fq[FQKV ? kMaxT : 1][4];
         bool act[kMaxT];
 #pragma unroll
         for (int k = 0; k < kMaxT; ++k)

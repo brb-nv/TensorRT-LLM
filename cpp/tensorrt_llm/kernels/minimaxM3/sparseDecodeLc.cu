@@ -46,7 +46,7 @@ constexpr int kPage = 128;
 constexpr int kTopk = 16;
 constexpr int kThreads = 128;
 constexpr int kPitch = kDim + 8; // halves per smem row: 272 B, conflict-free ldmatrix
-constexpr float kNegInf = -__builtin_huge_valf();
+[[maybe_unused]] constexpr float kNegInf = -__builtin_huge_valf();
 
 using Params = MinimaxM3SparseDecodeLcParams;
 

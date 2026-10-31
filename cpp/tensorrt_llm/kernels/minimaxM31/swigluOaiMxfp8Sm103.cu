@@ -31,6 +31,7 @@ namespace minimaxM31
 namespace
 {
 
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
 // swigluOaiSm103.cu's swigluOaiBf16x2, instruction for instruction (the Triton silu_and_mul sequence at limit 7,
 // alpha 1.702, beta 1): one packed bf16 pair of gate and up values -> its two bf16 results.
 __device__ __forceinline__ uint32_t swigluOaiBf16x2(uint32_t gate, uint32_t up)
@@ -54,6 +55,7 @@ __device__ __forceinline__ uint32_t swigluOaiBf16x2(uint32_t gate, uint32_t up)
         : "r"(gate), "r"(up));
     return r;
 }
+#endif // defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
 
 //! One row per CTA iteration (rows strided over the grid), one 8-column chunk per thread: the 8 gate and 8 up values
 //! (16 B each) -> 8 bf16 activations -> cvt_warp_fp16_to_mxfp8<bf16, 32> over the 4 lanes that share a K32 scale.

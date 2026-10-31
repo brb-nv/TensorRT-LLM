@@ -47,13 +47,14 @@ namespace
 {
 
 constexpr int kHeadDim = 128;
-constexpr int kRotaryDim = 64;
-constexpr int kPageSize = 128;
-constexpr int kElems = kHeadDim / 32;
+[[maybe_unused]] constexpr int kRotaryDim = 64;
+[[maybe_unused]] constexpr int kPageSize = 128;
+[[maybe_unused]] constexpr int kElems = kHeadDim / 32;
 constexpr int kHeadsKV = 1;
 constexpr int kHeadsIndex = 1;
 constexpr int kBlock = 256;
 
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
 __device__ __forceinline__ float rcp_approx_ftz(float a)
 {
     float b;
@@ -125,6 +126,7 @@ __device__ __forceinline__ uint16_t quantize_fp4x4(float const (&e)[4], float se
         q[i] = __bfloat162float(rounded[i]) * outputScale;
     return static_cast<uint16_t>(fp32x8_to_e2m1(q));
 }
+#endif // defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
 
 template <int kHeadsQ, bool kEarly>
 __global__ void __launch_bounds__(kBlock) m3_producer_kernel(Params p)

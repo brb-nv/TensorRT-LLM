@@ -62,6 +62,7 @@ struct Args
     long long units; // tiles * ks / kUnit
 };
 
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
 __device__ __forceinline__ void cp_async16(void* smem, void const* gmem)
 {
     uint32_t const sa = static_cast<uint32_t>(__cvta_generic_to_shared(smem));
@@ -162,6 +163,7 @@ __device__ __forceinline__ uint32_t decode_pair(uint32_t sm_word, int byte0, uin
     // Code 15 (an exception, sign/mantissa byte 0) decodes to +0.
     return ((b & 0x007f007fu) | ((b << 8) & 0x80008000u) | e) & __vcmpne2(q, 0x000f000fu);
 }
+#endif // defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
 
 // WARPS warps per CTA, each with a cp.async ring of S units (1536 bytes each). The range is walked tile segment by
 // tile segment, so the inner loop has no boundary checks; k16 steps alternate between two accumulators (added at the

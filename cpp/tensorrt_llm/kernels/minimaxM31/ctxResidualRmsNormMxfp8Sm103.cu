@@ -28,7 +28,7 @@ namespace
 {
 
 constexpr int kPackedSize = 8; // BF16 elements per 16-byte access, = CVT_ELTS_PER_THREAD
-constexpr int kWarpSize = 32;
+[[maybe_unused]] constexpr int kWarpSize = 32;
 
 union PackedBf16
 {
@@ -36,6 +36,7 @@ union PackedBf16
     __nv_bfloat162 unpacked[4];
 };
 
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
 // The helpers below are customAllReduceKernels.cu's (reduce_fusion::warp_reduce_sum / block_reduce_sum,
 // accumulate, rms_norm<T, Affine = true>, add128b): the same arithmetic in the same order, so the norm is bitwise
 // rms_norm_rows_kernel's.
@@ -99,6 +100,7 @@ __device__ __forceinline__ int4 rmsNorm(float denom, PackedBf16& vec, PackedBf16
     }
     return ret.packed;
 }
+#endif // defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
 
 //! rms_norm_rows_kernel<bf16, Bias = false, Residual = true, Affine = true> (persistent rows, next row prefetched,
 //! one 8-element chunk per thread) whose per-row output also goes through quantize_mxfp8_rows' per-element math

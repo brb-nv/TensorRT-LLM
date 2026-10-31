@@ -42,11 +42,12 @@ namespace cg = cooperative_groups;
 namespace f3
 {
 using DType = __nv_bfloat16;
-constexpr int NRanks = 2;
+[[maybe_unused]] constexpr int NRanks = 2;
 constexpr int kElemsPerAccess = 8;
 
 using Params = F3ArParams;
 
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
 template <typename T, int NUM>
 __inline__ __device__ T warpReduceSumV2(T* val)
 {
@@ -345,12 +346,14 @@ struct IndexHelper
     int access_stride;
     int tot_access;
 };
+#endif // defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
 
 // allreduce_fusion_kernel_oneshot_lamport<kARResidualRMSNorm, bf16, 2, Fp32Acc true, TriggerCompletionAtEnd> without
 // the push loop: the data slots were filled by the producer.
 template <bool TriggerCompletionAtEnd>
 __global__ void __launch_bounds__(1024) f3_ar_prepushed(Params params)
 {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
     IndexHelper index_helper(params);
     int token_id = index_helper.token_id;
     int access_id_in_token = index_helper.access_id_in_token;
@@ -410,6 +413,7 @@ __global__ void __launch_bounds__(1024) f3_ar_prepushed(Params params)
     {
         cudaTriggerProgrammaticLaunchCompletion();
     }
+#endif // defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
 }
 
 int smCount()

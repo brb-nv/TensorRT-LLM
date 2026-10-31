@@ -52,7 +52,7 @@ constexpr int kPage = 128;
 constexpr int kTopk = 16;
 constexpr int kThreads = 128;
 constexpr int kPitch = kDim + 8; // halves per smem row: 272 B, conflict-free ldmatrix
-constexpr float kNegInf = -__builtin_huge_valf();
+[[maybe_unused]] constexpr float kNegInf = -__builtin_huge_valf();
 constexpr int kHeads8 = 8;
 constexpr int kHalfDim = kDim / 2;
 constexpr int kBtCap = 8192; // block-table entries staged in shared memory (8192 x 128 = 1M tokens)

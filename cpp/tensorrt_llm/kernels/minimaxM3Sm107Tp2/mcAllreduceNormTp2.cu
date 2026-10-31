@@ -185,7 +185,7 @@ __device__ __forceinline__ uint32_t mxfp8_e4m3x2(float lo, float hi, float inv)
     return pair;
 }
 
-__device__ __forceinline__ float rcp_approx_ftz(float a)
+[[maybe_unused]] __device__ __forceinline__ float rcp_approx_ftz(float a)
 {
     float b;
     asm volatile("rcp.approx.ftz.f32 %0, %1;\n" : "=f"(b) : "f"(a));

@@ -43,21 +43,21 @@ namespace kernels
 namespace
 {
 
-constexpr int kTopK = 16;
+[[maybe_unused]] constexpr int kTopK = 16;
 constexpr int kBlockK = 128;
 constexpr int kHeadDim = 128;
 constexpr int kStageBytes = kBlockK * kHeadDim; // fp8
 constexpr int kConsumerWarps = 8;
 constexpr int kConsumerThreads = kConsumerWarps * 32;
 constexpr int kThreads = kConsumerThreads + 32; // + producer warp
-constexpr int kMaxDql = 4;                      // B-operand column = head * kMaxDql + query row
+[[maybe_unused]] constexpr int kMaxDql = 4;     // B-operand column = head * kMaxDql + query row
 constexpr int kCols = 8;                        // one n8 tile: heads * kMaxDql <= 8
-constexpr int kMaxRows = 8;                     // kv_heads * dql
+[[maybe_unused]] constexpr int kMaxRows = 8;    // kv_heads * dql
 constexpr int kMaxLocal = 128;                  // blocks per CTA
-constexpr int kCandCap = 256;
+[[maybe_unused]] constexpr int kCandCap = 256;
 constexpr int kEpiBytes = kMaxLocal * 4 * kCols * 4;
-constexpr float kInitScore = 1.0e30F;
-constexpr float kLocalScore = 1.0e29F;
+[[maybe_unused]] constexpr float kInitScore = 1.0e30F;
+[[maybe_unused]] constexpr float kLocalScore = 1.0e29F;
 constexpr int kNStage = 12; // TMA stage ring depth (pages in flight per CTA)
 
 using Params = MinimaxM3Tp8FusedScoreSelectParams;

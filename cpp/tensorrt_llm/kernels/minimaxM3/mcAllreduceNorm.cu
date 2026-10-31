@@ -47,9 +47,10 @@ namespace cg = cooperative_groups;
 namespace
 {
 
-constexpr int kEmpty = static_cast<int>(0x80000000u);
-constexpr int kFinMaxTopk = 8; // MoE finalize: top-k rows loaded together up to this k
+[[maybe_unused]] constexpr int kEmpty = static_cast<int>(0x80000000u);
+[[maybe_unused]] constexpr int kFinMaxTopk = 8; // MoE finalize: top-k rows loaded together up to this k
 
+#if MINIMAX_M3_KERNELS_ENABLED
 __device__ __forceinline__ uint32_t canon_bf16x2(uint32_t w)
 {
     if ((w & 0xFFFFu) == 0x8000u)
@@ -85,6 +86,7 @@ __device__ __forceinline__ int4 ld_volatile_v4(int const* p)
                  : "memory");
     return v;
 }
+#endif // MINIMAX_M3_KERNELS_ENABLED
 
 struct FinalizeArgs
 {

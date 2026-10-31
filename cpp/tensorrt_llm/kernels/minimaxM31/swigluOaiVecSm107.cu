@@ -33,6 +33,7 @@ namespace
 {
 constexpr int kThreads = 256;
 
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
 __device__ __forceinline__ uint32_t swigluOaiBf16x2(uint32_t gate, uint32_t up)
 {
     uint32_t r;
@@ -54,11 +55,13 @@ __device__ __forceinline__ uint32_t swigluOaiBf16x2(uint32_t gate, uint32_t up)
         : "r"(gate), "r"(up));
     return r;
 }
+#endif // defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
 
 template <bool kPdl, int NV>
 __global__ void __launch_bounds__(kThreads) swigluOaiVecKernel(
     uint4 const* __restrict__ x, uint4* __restrict__ out, uint32_t rows, uint32_t vecs, uint32_t span)
 {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
     if constexpr (kPdl)
     {
         asm volatile("griddepcontrol.wait;" ::: "memory");
@@ -95,12 +98,14 @@ __global__ void __launch_bounds__(kThreads) swigluOaiVecKernel(
             out[i] = r;
         }
     }
+#endif // defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
 }
 
 template <bool kPdl>
 __global__ void __launch_bounds__(kThreads)
     swigluOaiPairKernel(uint32_t const* __restrict__ x, uint32_t* __restrict__ out, int64_t rows, int64_t halfD)
 {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
     if constexpr (kPdl)
     {
         asm volatile("griddepcontrol.wait;" ::: "memory");
@@ -115,6 +120,7 @@ __global__ void __launch_bounds__(kThreads)
     int64_t const col = i - row * halfD;
     uint32_t const* xr = x + row * 2 * halfD;
     out[i] = swigluOaiBf16x2(xr[col], xr[halfD + col]);
+#endif // defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
 }
 
 template <typename K, typename... A>

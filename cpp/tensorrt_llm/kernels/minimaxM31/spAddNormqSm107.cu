@@ -36,7 +36,7 @@ namespace
 {
 
 constexpr int kPackedSize = 8;
-constexpr int kWarpSize = 32;
+[[maybe_unused]] constexpr int kWarpSize = 32;
 
 union PackedBf16
 {
@@ -44,6 +44,7 @@ union PackedBf16
     __nv_bfloat162 unpacked[4];
 };
 
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
 // ctxResidualRmsNormMxfp8Sm103.cu's helpers, unchanged.
 __device__ __forceinline__ float warpReduceSum(float val)
 {
@@ -122,6 +123,7 @@ __device__ __forceinline__ int4 peerSum(int4 const x, int4 const y)
     }
     return r;
 }
+#endif // defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
 
 //! ctxResidualRmsNormMxfp8Kernel<kWriteNorm, kFp4, kF32> with inter = peerSum(local row, peer row); interOut gets
 //! inter + residual (the NORMQ kernel's in-place inter update).

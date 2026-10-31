@@ -47,9 +47,9 @@ namespace cg = cooperative_groups;
 namespace
 {
 
-constexpr int kMaxM = 48;
+[[maybe_unused]] constexpr int kMaxM = 48;
 constexpr int kRowPad = 32;
-constexpr int kEmptyWord = static_cast<int>(0x80000000u);
+[[maybe_unused]] constexpr int kEmptyWord = static_cast<int>(0x80000000u);
 
 // Layer-boundary reduction inputs of the AR prologue (see m3_ar_fused.py); unused otherwise.
 struct ArArgs
@@ -93,6 +93,7 @@ struct PreqArgs
     int sf_k_tiles; // ceil(K / 128)
 };
 
+#if MINIMAX_M3_KERNELS_ENABLED
 __device__ __forceinline__ void prefetch_kv_pages(PfArgs const& pf)
 {
     if (pf.block_table == nullptr)
@@ -167,6 +168,7 @@ __device__ __forceinline__ void mbar_wait(uint64_t* bar, uint32_t parity)
         "r"(parity)
         : "memory");
 }
+#endif // MINIMAX_M3_KERNELS_ENABLED
 
 // grid: (N / (16 * RT) * CLUSTER_K); cluster (CLUSTER_K, 1, 1); block WARPS warps.
 // RT: 16-row weight tiles per CTA (amortizes the activation fetch + quantization over more rows).

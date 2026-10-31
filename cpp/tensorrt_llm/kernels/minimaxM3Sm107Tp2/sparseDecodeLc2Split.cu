@@ -117,7 +117,7 @@ __device__ __forceinline__ void mma(float (&c)[4], uint32_t const (&a)[4], uint3
         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
 }
 
-__device__ __forceinline__ uint32_t map_cluster(void const* local, uint32_t rank)
+[[maybe_unused]] __device__ __forceinline__ uint32_t map_cluster(void const* local, uint32_t rank)
 {
     uint32_t remote;
     asm volatile("mapa.shared::cluster.u32 %0, %1, %2;" : "=r"(remote) : "r"(smem_u32(local)), "r"(rank));
@@ -125,14 +125,14 @@ __device__ __forceinline__ uint32_t map_cluster(void const* local, uint32_t rank
 }
 
 // Posted DSMEM stores that complete_tx on the receiving CTA's mbarrier `bar`.
-__device__ __forceinline__ void st_async_v2(uint32_t addr, float a, float b, uint32_t bar)
+[[maybe_unused]] __device__ __forceinline__ void st_async_v2(uint32_t addr, float a, float b, uint32_t bar)
 {
     asm volatile("st.async.shared::cluster.mbarrier::complete_tx::bytes.v2.f32 [%0], {%1, %2}, [%3];" ::"r"(addr),
                  "f"(a), "f"(b), "r"(bar)
                  : "memory");
 }
 
-__device__ __forceinline__ void st_async_f32(uint32_t addr, float a, uint32_t bar)
+[[maybe_unused]] __device__ __forceinline__ void st_async_f32(uint32_t addr, float a, uint32_t bar)
 {
     asm volatile("st.async.shared::cluster.mbarrier::complete_tx::bytes.b32 [%0], %1, [%2];" ::"r"(addr),
                  "r"(__float_as_uint(a)), "r"(bar)

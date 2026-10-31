@@ -54,8 +54,8 @@ namespace draftStep
 {
 namespace
 {
-constexpr int kUnroll = 8;       // k16 chunks in flight per warp
-constexpr int kChunkBytes = 512; // one tile's k16 step: 32 lanes x 16 bytes
+[[maybe_unused]] constexpr int kUnroll = 8; // k16 chunks in flight per warp
+constexpr int kChunkBytes = 512;            // one tile's k16 step: 32 lanes x 16 bytes
 
 // Coded units (4 k16 steps, 3 x 16 bytes per lane) in flight per warp: 3 up to 4 rows, 2 at 8 rows.
 template <int MP>
@@ -64,6 +64,7 @@ constexpr int codedUnroll()
     return MP >= 8 ? 2 : 3;
 }
 
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
 __device__ __forceinline__ void mma_bf16(
     float (&d)[4], uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t b0, uint32_t b1)
 {
@@ -222,6 +223,7 @@ __device__ __forceinline__ void flush_tile(
         db[e] = 0.f;
     }
 }
+#endif // defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
 
 // Balanced streaming GEMV over the fragment-ordered weight, persistent grid of 16-warp CTAs. CTA c owns tiles
 // [t_begin, t_end); its (tile, chunk) space is split into 16 equal contiguous ranges, one per warp, so every warp

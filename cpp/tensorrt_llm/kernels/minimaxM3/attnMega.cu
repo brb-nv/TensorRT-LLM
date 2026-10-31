@@ -470,19 +470,20 @@ __device__ __forceinline__ void ldsm_x4(uint32_t addr, uint32_t (&r)[4])
                  : "r"(addr));
 }
 
-__device__ __forceinline__ void ldsm_x2(uint32_t addr, uint32_t (&r)[2])
+[[maybe_unused]] __device__ __forceinline__ void ldsm_x2(uint32_t addr, uint32_t (&r)[2])
 {
     asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];\n" : "=r"(r[0]), "=r"(r[1]) : "r"(addr));
 }
 
-__device__ __forceinline__ void ldsm_x2_trans(uint32_t addr, uint32_t (&r)[2])
+[[maybe_unused]] __device__ __forceinline__ void ldsm_x2_trans(uint32_t addr, uint32_t (&r)[2])
 {
     asm volatile("ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0, %1}, [%2];\n"
                  : "=r"(r[0]), "=r"(r[1])
                  : "r"(addr));
 }
 
-__device__ __forceinline__ void mma_f16_16816(float (&d)[4], uint32_t const (&a)[4], uint32_t const (&b)[2])
+[[maybe_unused]] __device__ __forceinline__ void mma_f16_16816(
+    float (&d)[4], uint32_t const (&a)[4], uint32_t const (&b)[2])
 {
     asm volatile(
         "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, "
@@ -862,7 +863,7 @@ __device__ __forceinline__ bool elect_one()
     return pred != 0;
 }
 
-__device__ __forceinline__ int qkv_parity(Params const& p)
+[[maybe_unused]] __device__ __forceinline__ int qkv_parity(Params const& p)
 {
     int v;
     asm volatile("ld.relaxed.gpu.global.s32 %0, [%1];\n" : "=r"(v) : "l"(p.counters) : "memory");
@@ -1419,7 +1420,6 @@ __device__ __forceinline__ void qkv_epilogue(
         // buffer, last read by the previous call (complete: this grid passed its PDL wait), is reset to the marker.
         uint16_t* cur = reinterpret_cast<uint16_t*>(p.qkv_out) + (calls & 1u) * kMaxTok * kQkvN;
         uint16_t* nxt = reinterpret_cast<uint16_t*>(p.qkv_out) + ((calls & 1u) ^ 1u) * kMaxTok * kQkvN;
-#pragma unroll
         float qsum[kMaxTok];
 #pragma unroll
         for (int g = 0; g < kMaxTok / 4; ++g)
@@ -1825,7 +1825,8 @@ __device__ __forceinline__ void op_epilogue(Params const& p, uint8_t* smem, uint
 
 // Packed-QKV element group [token][col * 128 + 4 * lane, +4): the split partials, polled until every one is stored,
 // summed in split order and rounded to BF16.
-__device__ __forceinline__ void qkv_load(Params const& p, int par, int tok, int col, int lane, float (&e)[4])
+[[maybe_unused]] __device__ __forceinline__ void qkv_load(
+    Params const& p, int par, int tok, int col, int lane, float (&e)[4])
 {
     float const* base = p.part + par * kQkvPartStride + static_cast<int64_t>(tok) * kQkvN + col * kHeadDim + lane * 4;
     uint4 pr[kQkvSplits];
@@ -1866,7 +1867,7 @@ __device__ __forceinline__ void qkv_load(Params const& p, int par, int tok, int 
 }
 
 // Every CTA once it has read the call parity and the partials it needs: the last one flips the parity.
-__device__ __forceinline__ void qkv_done(Params const& p)
+[[maybe_unused]] __device__ __forceinline__ void qkv_done(Params const& p)
 {
     if (atomicAdd(p.counters + 1, 1) == kQkvGrid - 1)
     {
@@ -2388,7 +2389,7 @@ __global__ void __launch_bounds__(kThreads, 1) m3_fused_decode_attn_kernel(__gri
         // whose position falls in this CTA's blocks go straight into the fp16 tiles; the CTA writes the caches, and
         // the index-K, only for its own tokens.
         uint2 raw[kMaxT];
-        float fq[FQKV ? kMaxT : 1][4];
+        [[maybe_unused]] float fq[FQKV ? kMaxT : 1][4];
         bool act[kMaxT];
 #pragma unroll
         for (int k = 0; k < kMaxT; ++k)

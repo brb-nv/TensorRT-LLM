@@ -149,7 +149,7 @@ namespace cg = cooperative_groups;
 
 constexpr int kThreads = 1024;
 constexpr int kBuckets = fa::NUM_BUCKETS; // 2048
-constexpr int kSmemBytes = 32768;
+[[maybe_unused]] constexpr int kSmemBytes = 32768;
 
 // Privatized pass histograms per CTA: kCopies (a kernel template parameter) copies, one per group of warps; 8 (V4K8,
 // default) or 4 (TRTLLM_M31_DISABLE_TOPPDET_K8).
@@ -166,7 +166,7 @@ constexpr int kCandMax = 4096;
 // V4 list path: pass 0 also lists the elements >= 2^-12 (a pass-0 bucket edge; probabilities summing to 1 hold at most
 // 4096 of them) with their indices; pass-0 histograms and lists are double-buffered by launch parity.
 constexpr int kListMax = 4096;
-constexpr float kListMin = 0.000244140625f; // 2^-12
+[[maybe_unused]] constexpr float kListMin = 0.000244140625f; // 2^-12
 
 // One row's persistent state. Zero once; every launch leaves it zeroed except the arrival counters, which only grow.
 struct RowWorkspace
@@ -445,6 +445,7 @@ template <bool kPdl, bool kCandList, bool kList, int kCopies, bool kChainPf>
 __global__ void __launch_bounds__(kThreads, 1) toppRenormDetV3Kernel(
     float const* __restrict__ probs, float* __restrict__ out, float const* topP, int d, RowWorkspace* ws, int* keptOut)
 {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
     __shared__ __align__(16) unsigned char smem[kSmemBytes];
     // Privatized pass histograms: kCopies copies, one per group of warps (dynamic shared memory).
     extern __shared__ __align__(16) unsigned char dyn[];
@@ -868,6 +869,7 @@ __global__ void __launch_bounds__(kThreads, 1) toppRenormDetV3Kernel(
         r.w = (v.w >= thr) ? v.w * norm : 0.0f;
         o4[j] = r;
     }
+#endif // defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
 }
 
 } // namespace toppv3

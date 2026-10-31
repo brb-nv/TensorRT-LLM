@@ -477,19 +477,20 @@ __device__ __forceinline__ void ldsm_x4(uint32_t addr, uint32_t (&r)[4])
                  : "r"(addr));
 }
 
-__device__ __forceinline__ void ldsm_x2(uint32_t addr, uint32_t (&r)[2])
+[[maybe_unused]] __device__ __forceinline__ void ldsm_x2(uint32_t addr, uint32_t (&r)[2])
 {
     asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];\n" : "=r"(r[0]), "=r"(r[1]) : "r"(addr));
 }
 
-__device__ __forceinline__ void ldsm_x2_trans(uint32_t addr, uint32_t (&r)[2])
+[[maybe_unused]] __device__ __forceinline__ void ldsm_x2_trans(uint32_t addr, uint32_t (&r)[2])
 {
     asm volatile("ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0, %1}, [%2];\n"
                  : "=r"(r[0]), "=r"(r[1])
                  : "r"(addr));
 }
 
-__device__ __forceinline__ void mma_f16_16816(float (&d)[4], uint32_t const (&a)[4], uint32_t const (&b)[2])
+[[maybe_unused]] __device__ __forceinline__ void mma_f16_16816(
+    float (&d)[4], uint32_t const (&a)[4], uint32_t const (&b)[2])
 {
     asm volatile(
         "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, "
@@ -546,11 +547,14 @@ struct Smem
     static constexpr int kRecv = kRecvAlias ? 0 : kStatsEnd;
     static constexpr int kMbar = kRecvAlias ? kStatsEnd : kStatsEnd + kRecvBytes; // merge, MMA mbarriers, TMEM addr
     static constexpr int kBytes = kMbar + 32;
+// Some instantiations leave this member unused.
+#pragma nv_diag_suppress 177
     static constexpr int kTmemCols = BPC * 2 * kRows <= 32 ? 32
         : BPC * 2 * kRows <= 64                            ? 64
         : BPC * 2 * kRows <= 128                           ? 128
         : BPC * 2 * kRows <= 256                           ? 256
                                                            : 512;
+#pragma nv_diag_default 177
     static_assert(BPC * 2 * kRows <= 512, "TMEM columns");
     static_assert(!kRecvAlias || kRecvBytes <= kRawV, "aliased partials must fit in the tiles, Q and P");
     static_assert(kRows * kPage * 2 <= kTileBytes, "P^T fits in the K tiles");
@@ -708,7 +712,7 @@ constexpr int kOA = 128;
 static_assert(kOA + 32 * kOpTiles <= kTmemAll && kOSfb + 4 * kOpTiles <= kOA, "o_proj TMEM columns");
 constexpr int kQkvMbStride = kMaxTok + 4; // mailbox row pitch (fp32 words)
 
-__host__ __device__ constexpr int qkv_tile0(int s)
+[[maybe_unused]] __host__ __device__ constexpr int qkv_tile0(int s)
 {
     return s * kQkvKTiles / kQkvSplits;
 }
@@ -729,8 +733,11 @@ struct SmemX : Smem<QLEN, QG, BPC>
     static constexpr int kRingSf = kRingW + kQkvRing * kQkvWTile; // [ring][512 B]
     static constexpr int kRingEnd = kRingSf + kQkvRing * kQkvSfAtom;
     // The activation tiles overlay the ring: written after the PDL wait, once every weight tile went on into TMEM.
+// Only the FQKV instantiations use the next two members.
+#pragma nv_diag_suppress 177
     static constexpr int kXt = kRingW;                     // [tile][8][128 B]
     static constexpr int kXsf = kXt + kQkvMaxTiles * 1024; // [tile][512 B]
+#pragma nv_diag_default 177
     static constexpr int kXsc = (kRingEnd + 127) / 128 * 128;
     // Peers push into recv at any time (an empty CTA right away), so it stays clear of the ring.
     static constexpr int kRecv = FQKV ? kXsc : B::kRecv;
@@ -753,7 +760,10 @@ struct SmemX : Smem<QLEN, QG, BPC>
     static_assert(!FQKV || kOMailbox + kOpSplits * kOpOwnRows * kQkvMbStride * 4 <= kRingW + kQkvRing * kQkvWTile,
         "o_proj activation and mailbox fit behind its ring");
     static constexpr int kBytes = FQKV ? kMailbox + kQkvSplits * kQkvOwnRows * kQkvMbStride * 4 : B::kBytes;
+// Some instantiations leave this member unused.
+#pragma nv_diag_suppress 177
     static constexpr int kTmemCols = FQKV ? kTmemAll : B::kTmemCols;
+#pragma nv_diag_default 177
     static constexpr bool kRecvAlias = !FQKV && B::kRecvAlias;
     // The epilogue reads the weight scale atoms while the attention already writes its tiles.
     static_assert(!FQKV || kQkvScaled || B::kRecv <= kRingSf, "attention regions overlap the scale atoms");
@@ -845,7 +855,7 @@ __device__ __forceinline__ void umma_mx(
         "r"(tmem_a), "l"(bdesc), "r"(idesc), "r"(sfa), "r"(sfb), "r"(accumulate));
 }
 
-__device__ __forceinline__ float pow2_from_ue8m0(uint32_t e)
+[[maybe_unused]] __device__ __forceinline__ float pow2_from_ue8m0(uint32_t e)
 {
     return __uint_as_float(e == 0 ? 0x00400000u : (e << 23));
 }
@@ -853,7 +863,7 @@ __device__ __forceinline__ float pow2_from_ue8m0(uint32_t e)
 // Unscaled E4M3 x E4M3 MMA, FP32 accumulator: M = 128, N = 8, K = 32, a fresh accumulator.
 constexpr uint32_t kQkvIdescF8 = (1u << 4) | ((8u >> 3) << 17) | ((128u >> 4) << 24);
 
-__device__ __forceinline__ void umma_f8_ss(uint32_t tmem_d, uint64_t adesc, uint64_t bdesc)
+[[maybe_unused]] __device__ __forceinline__ void umma_f8_ss(uint32_t tmem_d, uint64_t adesc, uint64_t bdesc)
 {
     asm volatile(
         "{\n .reg .pred p;\n setp.ne.b32 p, 0, 0;\n tcgen05.mma.cta_group::1.kind::f8f6f4 [%0], %1, %2, %3, p;\n}\n" ::
@@ -861,7 +871,7 @@ __device__ __forceinline__ void umma_f8_ss(uint32_t tmem_d, uint64_t adesc, uint
         "l"(adesc), "l"(bdesc), "r"(kQkvIdescF8));
 }
 
-__device__ __forceinline__ void tmem_ld16_nowait(uint32_t addr, float* v)
+[[maybe_unused]] __device__ __forceinline__ void tmem_ld16_nowait(uint32_t addr, float* v)
 {
     uint32_t r[16];
     asm volatile(
@@ -877,7 +887,7 @@ __device__ __forceinline__ void tmem_ld16_nowait(uint32_t addr, float* v)
     }
 }
 
-__device__ __forceinline__ void umma_mx_ss(
+[[maybe_unused]] __device__ __forceinline__ void umma_mx_ss(
     uint32_t tmem_d, uint64_t adesc, uint64_t bdesc, uint32_t idesc, uint32_t sfa, uint32_t sfb, int accumulate)
 {
     asm volatile(
@@ -894,7 +904,7 @@ __device__ __forceinline__ bool elect_one()
     return pred != 0;
 }
 
-__device__ __forceinline__ int qkv_parity(Params const& p)
+[[maybe_unused]] __device__ __forceinline__ int qkv_parity(Params const& p)
 {
     int v;
     asm volatile("ld.relaxed.gpu.global.s32 %0, [%1];\n" : "=r"(v) : "l"(p.counters) : "memory");
@@ -1030,7 +1040,7 @@ __device__ __forceinline__ void qkv_stream_lane(
     umma_commit(a_ready);
 }
 
-__device__ __forceinline__ bool mbar_test(uint32_t bar, uint32_t parity)
+[[maybe_unused]] __device__ __forceinline__ bool mbar_test(uint32_t bar, uint32_t parity)
 {
     uint32_t ready;
     asm volatile(
@@ -1460,7 +1470,6 @@ __device__ __forceinline__ void qkv_epilogue(
         // buffer, last read by the previous call (complete: this grid passed its PDL wait), is reset to the marker.
         uint16_t* cur = reinterpret_cast<uint16_t*>(p.qkv_out) + (calls & 1u) * kMaxTok * kQkvN;
         uint16_t* nxt = reinterpret_cast<uint16_t*>(p.qkv_out) + ((calls & 1u) ^ 1u) * kMaxTok * kQkvN;
-#pragma unroll
         float qsum[kMaxTok];
 #pragma unroll
         for (int g = 0; g < kMaxTok / 4; ++g)
@@ -1866,7 +1875,8 @@ __device__ __forceinline__ void op_epilogue(Params const& p, uint8_t* smem, uint
 
 // Packed-QKV element group [token][col * 128 + 4 * lane, +4): the split partials, polled until every one is stored,
 // summed in split order and rounded to BF16.
-__device__ __forceinline__ void qkv_load(Params const& p, int par, int tok, int col, int lane, float (&e)[4])
+[[maybe_unused]] __device__ __forceinline__ void qkv_load(
+    Params const& p, int par, int tok, int col, int lane, float (&e)[4])
 {
     float const* base = p.part + par * kQkvPartStride + static_cast<int64_t>(tok) * kQkvN + col * kHeadDim + lane * 4;
     uint4 pr[kQkvSplits];
@@ -1907,7 +1917,7 @@ __device__ __forceinline__ void qkv_load(Params const& p, int par, int tok, int 
 }
 
 // Every CTA once it has read the call parity and the partials it needs: the last one flips the parity.
-__device__ __forceinline__ void qkv_done(Params const& p)
+[[maybe_unused]] __device__ __forceinline__ void qkv_done(Params const& p)
 {
     if (atomicAdd(p.counters + 1, 1) == kQkvGrid - 1)
     {
@@ -2481,7 +2491,7 @@ __global__ void __launch_bounds__(kThreads, 1) m3_fused_decode_attn_kernel(__gri
         // whose position falls in this CTA's blocks go straight into the fp16 tiles; the CTA writes the caches, and
         // the index-K, only for its own tokens.
         uint2 raw[kMaxT];
-        float fq[FQKV ? kMaxT : 1][4];
+        [[maybe_unused]] float fq[FQKV ? kMaxT : 1][4];
         bool act[kMaxT];
 #pragma unroll
         for (int k = 0; k < kMaxT; ++k)
