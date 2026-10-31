@@ -28,7 +28,9 @@ count the kernels that compiled in-process.
 
 ``TRTLLM_M31_CUTE_AOT_DIR`` replaces the shipped directory. ``TRTLLM_M31_CUTE_AOT_EXPORT_DIR`` exports every kernel this
 process compiles there (``<toolchain>/<digest>.o`` + ``.h``, and ``<digest>.key`` holding the key and the source
-digests), the layout to copy into ``cute_aot_data``. ``TRTLLM_M31_CUTE_AOT_DISABLE=1`` always compiles.
+digests). An exported object is committed as the git-LFS archive ``cute_aot_data/<toolchain>/<digest>.cubin.tar.zst``
+(``cmake -E tar cf <digest>.cubin.tar.zst --zstd --mtime=1970-01-01UTC -- <digest>.o``), which scripts/build_wheel.py
+unpacks beside it for the wheel. ``TRTLLM_M31_CUTE_AOT_DISABLE=1`` always compiles.
 
 The served object is the exported compile of the same kernel source under the same key and toolchain, so its device
 code is that of the in-process compile. A kernel compiled with TVM-FFI is exported and loaded as a TVM-FFI function

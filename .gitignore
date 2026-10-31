@@ -134,3 +134,6 @@ trtllm_generated/
 # CUTLASS headers scripts/build_wheel.py stages for the vendored MSA run-time compiles
 /tensorrt_llm/_torch/attention/backends/fmha/msa_kernels/fmha_sm100/cutlass/
 /tensorrt_llm/_torch/attention/backends/fmha/msa_kernels/msa_v1/cutlass/
+
+# CuTe DSL objects scripts/build_wheel.py unpacks from the *.cubin.tar.zst archives beside them
+/tensorrt_llm/_torch/cute_aot_data/**/*.o

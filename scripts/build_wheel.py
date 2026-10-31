@@ -1517,6 +1517,23 @@ def main(*,
         with tarfile.open(msa_cute_aot) as tar:
             tar.extractall(lib_dir / "msa_cute_aot", filter="data")
 
+    # The CuTe DSL objects tensorrt_llm/_torch/cute_aot.py loads are committed as git-LFS
+    # cute_aot_data/<toolchain>/<digest>.cubin.tar.zst archives, each holding <digest>.o;
+    # the wheel ships the objects, unpacked beside their archives.
+    cute_aot_data = pkg_dir / "_torch" / "cute_aot_data"
+    for stale in cute_aot_data.glob("*/*.o"):
+        stale.unlink()
+    for archive in sorted(cute_aot_data.glob("*/*.cubin.tar.zst")):
+        obj = archive.name[:-len(".cubin.tar.zst")] + ".o"
+        members = build_run(f'cmake -E tar tf "{archive.name}"',
+                            cwd=archive.parent,
+                            capture_output=True,
+                            text=True).stdout.split()
+        if members != [obj]:
+            raise RuntimeError(
+                f"{archive} must hold exactly {obj}, not {members}")
+        build_run(f'cmake -E tar xf "{archive.name}"', cwd=archive.parent)
+
     if not skip_stubs:
         with working_directory(pkg_dir):
             if on_windows:
