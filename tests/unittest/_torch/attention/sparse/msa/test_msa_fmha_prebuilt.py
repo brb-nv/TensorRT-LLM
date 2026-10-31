@@ -150,12 +150,15 @@ def test_k2q_builder_is_prebuilt(caplog):
 
 
 def test_e4m3x_prefill_and_index_reader_are_vendored():
-    """The E4M3X sparse-prefill forward loads its prebuilt module; the NVFP4 index-K reader imports in-tree."""
+    """The E4M3X sparse-prefill forward loads its prebuilt module (the build does not import it); the NVFP4 index-K
+    reader imports in-tree."""
     _prebuilt_or_skip()
     bf16x = _import("tensorrt_llm._torch.attention.backends.fmha.msa_kernels.prefill_bf16x.jit")
     if torch.cuda.get_device_capability() != (10, 7):
         pytest.skip("the prebuilt E4M3X forward is the sm_107a module")
     assert bf16x.prebuilt_available()
+    module = bf16x.load_extension()
+    assert (module.data_path(), module.block_scale_shift()) == (0, 0)
     reader = _import(
         "tensorrt_llm._torch.attention.backends.fmha.msa_kernels.fmha_sm100_q8kv8.q8_indexer_interface"
     )

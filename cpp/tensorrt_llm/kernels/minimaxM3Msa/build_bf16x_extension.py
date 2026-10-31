@@ -5,13 +5,15 @@
 The vendored package compiled it on first use (prefill_bf16x/jit.py, JitSpec) with torch.utils.cpp_extension.load; this
 runs the same load at build time for the one spec the MiniMax-M3.1 targets serve: the E4M3 data path as the E4M3X
 transcription, block-scale shift 0, the packed-FP16 dequant, sm_107a. The library lands where prefill_bf16x/jit.py's
-AOT loader looks for it.
+AOT loader looks for it. The load builds the library but does not import it: the library links libcuda, which build
+machines without a GPU driver do not have (test_msa_fmha_prebuilt.py imports it on SM107).
 usage: build_bf16x_extension.py <prefill_bf16x dir> <CUTLASS root> <output dir> <build dir>
 """
 
 import shutil
 import sys
 from pathlib import Path
+from unittest import mock
 
 import jinja2
 from torch.utils.cpp_extension import load
@@ -63,26 +65,28 @@ def main() -> None:
     )
     import torch.utils.cpp_extension as ext
 
-    load(
-        name=MODULE,
-        sources=[
-            str(csrc / "api/prefill_attention_api.cpp"),
-            str(csrc / "api/prefill_attention_binding.cpp"),
-            str(csrc / "api/locality_domains.cu"),
-            str(build / "prefill_attention_inst.cu"),
-        ],
-        extra_include_paths=[
-            str(csrc / "api"),
-            str(csrc / "include"),
-            str(cutlass / "include"),
-            str(cutlass / "tools/util/include"),
-        ],
-        build_directory=str(build),
-        verbose=False,
-        with_cuda=True,
-        is_python_module=False,
-        **flags(Path(ext.CUDA_HOME)),
-    )
+    # load()'s last step imports the library, which needs the CUDA driver; build without it.
+    with mock.patch.object(ext, "_import_module_from_library"):
+        load(
+            name=MODULE,
+            sources=[
+                str(csrc / "api/prefill_attention_api.cpp"),
+                str(csrc / "api/prefill_attention_binding.cpp"),
+                str(csrc / "api/locality_domains.cu"),
+                str(build / "prefill_attention_inst.cu"),
+            ],
+            extra_include_paths=[
+                str(csrc / "api"),
+                str(csrc / "include"),
+                str(cutlass / "include"),
+                str(cutlass / "tools/util/include"),
+            ],
+            build_directory=str(build),
+            verbose=False,
+            with_cuda=True,
+            is_python_module=False,
+            **flags(Path(ext.CUDA_HOME)),
+        )
     shutil.copy2(build / f"{MODULE}.so", output / f"{MODULE}.so")
 
 
