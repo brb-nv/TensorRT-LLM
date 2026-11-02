@@ -2427,6 +2427,7 @@ class _StubADPExecutor:
 
         kv_cache_manager.add_dummy_requests.side_effect = _add_dummy
         self.kv_cache_manager = kv_cache_manager
+        self.draft_kv_cache_manager = None
 
         self.resource_manager = Mock()
         self.resource_manager.get_resource_manager.return_value = None
@@ -2884,6 +2885,7 @@ def test_pad_dummy_spec_allocation_failure_rolls_back_kv_candidate():
 
 def test_adp_dummy_peer_empty_rolls_back_and_retry_succeeds():
     stub = _StubADPExecutor()
+    stub.draft_kv_cache_manager = Mock()
     spec_resource_manager = Mock()
     stub.resource_manager.get_resource_manager.return_value = spec_resource_manager
     terminal_request = _make_adp_request(_STATE_GENERATION_TO_COMPLETE)
@@ -2902,6 +2904,7 @@ def test_adp_dummy_peer_empty_rolls_back_and_retry_succeeds():
     assert stub.active_requests == [terminal_request]
     spec_resource_manager.free_resources.assert_called_once_with(first_dummy)
     stub.kv_cache_manager.free_resources.assert_called_once_with(first_dummy)
+    stub.draft_kv_cache_manager.free_resources.assert_called_once_with(first_dummy)
 
     stub.dist.tp_allgather_int64 = Mock(return_value=np.array([[1], [1]]))
     _run_pad(stub)
