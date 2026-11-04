@@ -170,9 +170,9 @@ def _paired_draft_kv_cache_manager(executor):
 
 
 def _free_pad_dummy_kv(executor, dummy_request: LlmRequest) -> None:
-    """Free a pad dummy's KV caches in the target and a paired draft pool."""
+    """Free a pad dummy's KV caches in the target and any draft pool."""
     executor.kv_cache_manager.free_resources(dummy_request)
-    draft_kv_cache_manager = _paired_draft_kv_cache_manager(executor)
+    draft_kv_cache_manager = executor.draft_kv_cache_manager
     if draft_kv_cache_manager is not None:
         draft_kv_cache_manager.free_resources(dummy_request)
 
