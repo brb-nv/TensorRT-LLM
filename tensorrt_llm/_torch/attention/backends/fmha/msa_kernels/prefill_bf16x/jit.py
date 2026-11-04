@@ -408,7 +408,7 @@ def _load_aot_extension(arch: str, block_scale_shift: int, data_path: str):
     import hashlib
 
     library = found[0]
-    digest = hashlib.md5(library.read_bytes()).hexdigest()[:8]
+    digest = hashlib.md5(library.read_bytes(), usedforsecurity=False).hexdigest()[:8]
     module = _import_extension(library.name[: -len(".so")], library)
     print(f"E4M3X_AOT loaded {library.name[len('_fmha_sm100_'):-len('.so')]} {digest}", file=sys.stderr, flush=True)
     return module

@@ -3271,7 +3271,7 @@ index 99fd0b4da4ddb6fba21bcb18c924f5e9e8b583e6..834e0ec83e6b740538e36cf315087ea8
      func_name = str(key[0])
 diff --git a/cute/src/common/cuda_toolchain.py b/cute/src/common/cuda_toolchain.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..e7a7cc113dbabc4855d95bc1b1991a7274cc6025
+index 0000000000000000000000000000000000000000..5c76253230c1eafd07792ec319aeee751a87aead
 --- /dev/null
 +++ b/cute/src/common/cuda_toolchain.py
 @@ -0,0 +1,170 @@
@@ -3304,7 +3304,7 @@ index 0000000000000000000000000000000000000000..e7a7cc113dbabc4855d95bc1b1991a72
 +import functools
 +import os
 +import shutil
-+import subprocess
++import subprocess  # nosec B404
 +import tempfile
 +
 +__all__ = [
@@ -8925,7 +8925,7 @@ index 21c777e1e7f9285fdbd1f9e23a53c90a0085e4f9..913b0e224733f826f657e4c44f56dbc0
              v_q.global_scale,
              k2q_row_ptr,
 diff --git a/jit.py b/jit.py
-index fa63a02628c20e1ab1324ba52cc4497adcbfe7cd..61259d571a835d84209b37b9d4fc1ea2afee61eb 100644
+index fa63a02628c20e1ab1324ba52cc4497adcbfe7cd..f853d6955fe53d64c791c6b4551f7eaf89822e83 100644
 --- a/jit.py
 +++ b/jit.py
 @@ -1,4 +1,5 @@
@@ -8934,7 +8934,7 @@ index fa63a02628c20e1ab1324ba52cc4497adcbfe7cd..61259d571a835d84209b37b9d4fc1ea2
  # SPDX-License-Identifier: MIT
  
  """Per-variant lazy JIT compilation for FMHA varlen kernels.
-@@ -6,11 +7,12 @@
+@@ -6,15 +7,16 @@
  Each FMHA variant (dtype x tile x sparse x page x split_kv x pack_factor) is compiled
  independently on first use and cached to ~/.cache/minfer/fmha_sm100/.
  
@@ -8948,6 +8948,11 @@ index fa63a02628c20e1ab1324ba52cc4497adcbfe7cd..61259d571a835d84209b37b9d4fc1ea2
  import logging
  import os
  import shutil
+-import subprocess
++import subprocess  # nosec B404
+ import threading
+ from pathlib import Path
+ 
 @@ -22,11 +24,101 @@ import jinja2
  
  logger = logging.getLogger(__name__)
@@ -9195,6 +9200,15 @@ index fa63a02628c20e1ab1324ba52cc4497adcbfe7cd..61259d571a835d84209b37b9d4fc1ea2
          logger.info(f"JIT compiling FMHA variant: {variant_name}")
          cache_dir.mkdir(parents=True, exist_ok=True)
  
+@@ -362,7 +510,7 @@ build {so_path}: nvcc_link {inst_obj} {run_obj}
+         (cache_dir / "build.ninja").write_text(ninja_content)
+ 
+     def _run_ninja(self, cache_dir):
+-        result = subprocess.run(
++        result = subprocess.run(  # nosec B607
+             ["ninja", "-j1"],
+             cwd=str(cache_dir),
+             capture_output=True,
 @@ -403,6 +551,7 @@ def _do_compile_plan():
      if so_path.exists():
          return
@@ -9203,6 +9217,15 @@ index fa63a02628c20e1ab1324ba52cc4497adcbfe7cd..61259d571a835d84209b37b9d4fc1ea2
      logger.info("JIT compiling FMHA plan module")
      cache_dir.mkdir(parents=True, exist_ok=True)
  
+@@ -434,7 +583,7 @@ build {so_path}: nvcc_link {obj}
+ """
+     (cache_dir / "build.ninja").write_text(ninja_content)
+ 
+-    result = subprocess.run(
++    result = subprocess.run(  # nosec B607
+         ["ninja", "-j1"],
+         cwd=str(cache_dir),
+         capture_output=True,
 @@ -474,6 +623,11 @@ def get_plan_fn():
      with _plan_lock:
          if _plan_module is not None:
@@ -9223,6 +9246,15 @@ index fa63a02628c20e1ab1324ba52cc4497adcbfe7cd..61259d571a835d84209b37b9d4fc1ea2
      logger.info("JIT compiling sparse_topk_select module")
      cache_dir.mkdir(parents=True, exist_ok=True)
  
+@@ -530,7 +685,7 @@ build {so_path}: nvcc_link {obj}
+ """
+     (cache_dir / "build.ninja").write_text(ninja_content)
+ 
+-    result = subprocess.run(
++    result = subprocess.run(  # nosec B607
+         ["ninja", "-j1"],
+         cwd=str(cache_dir),
+         capture_output=True,
 @@ -553,6 +708,11 @@ def get_sparse_topk_module():
      with _sparse_topk_lock:
          if _sparse_topk_module is not None:
@@ -9243,6 +9275,15 @@ index fa63a02628c20e1ab1324ba52cc4497adcbfe7cd..61259d571a835d84209b37b9d4fc1ea2
      logger.info("JIT compiling fmha_sm100_reduction module")
      cache_dir.mkdir(parents=True, exist_ok=True)
  
+@@ -615,7 +776,7 @@ build {so_path}: nvcc_link {obj}
+ """
+     (cache_dir / "build.ninja").write_text(ninja_content)
+ 
+-    result = subprocess.run(
++    result = subprocess.run(  # nosec B607
+         ["ninja", "-j1"],
+         cwd=str(cache_dir),
+         capture_output=True,
 @@ -638,6 +799,11 @@ def get_reduction_module():
      with _reduction_lock:
          if _reduction_module is not None:

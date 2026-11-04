@@ -2443,7 +2443,7 @@ index bb5fa95636be775e0b86730335d37db5c58b0aea..3b2da90112533a2d5352b1fb6fb6cd70
          batch = cu_seqlens_q.numel() - 1
          _check_page_table(page_table, kv_indptr, batch=batch)
 diff --git a/jit.py b/jit.py
-index e19e1676e9bbfb8c0fee215b8f2cbedf50a1cb63..680e8e0dd9e417d329383224c692beb052e9d6b8 100644
+index e19e1676e9bbfb8c0fee215b8f2cbedf50a1cb63..4a3be874771b7a65c7eaf64c1d38c739f58d13b9 100644
 --- a/jit.py
 +++ b/jit.py
 @@ -1,7 +1,8 @@
@@ -2753,7 +2753,7 @@ index e19e1676e9bbfb8c0fee215b8f2cbedf50a1cb63..680e8e0dd9e417d329383224c692beb0
 +    import hashlib
 +
 +    library = found[0]
-+    digest = hashlib.md5(library.read_bytes()).hexdigest()[:8]
++    digest = hashlib.md5(library.read_bytes(), usedforsecurity=False).hexdigest()[:8]
 +    module = _import_extension(library.name[: -len(".so")], library)
 +    print(f"E4M3X_AOT loaded {library.name[len('_fmha_sm100_'):-len('.so')]} {digest}", file=sys.stderr, flush=True)
 +    return module

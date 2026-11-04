@@ -228,7 +228,10 @@ def _arm(model, multi, disabled):
 
 
 def arm(model):
-    if hashlib.md5(Path(model.__file__).read_bytes()).hexdigest() != MODEL_MD5:
+    if (
+        hashlib.md5(Path(model.__file__).read_bytes(), usedforsecurity=False).hexdigest()
+        != MODEL_MD5
+    ):
         raise RuntimeError("R1A requires the pinned TP2 source")
     from tensorrt_llm._torch.modules import multi_stream_utils
 

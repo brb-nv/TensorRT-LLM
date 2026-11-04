@@ -9,7 +9,7 @@ import fcntl
 import hashlib
 import logging
 import os
-import subprocess
+import subprocess  # nosec B404
 import sys
 import threading
 import time
@@ -282,7 +282,7 @@ def _nvcc_flags(
 
 def _run_ninja(cache_dir: Path, label: str) -> None:
     started_at = time.time()
-    result = subprocess.run(
+    result = subprocess.run(  # nosec B607
         ["ninja", "-j1"],
         cwd=cache_dir,
         capture_output=True,

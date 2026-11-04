@@ -144,7 +144,7 @@ def _native_guard() -> Dict[str, Optional[str]]:
         for name in _NATIVE_LIBS:
             path = libs / name
             if path.is_file():
-                digest = hashlib.md5()
+                digest = hashlib.md5(usedforsecurity=False)
                 with open(path, "rb") as f:
                     for block in iter(lambda: f.read(1 << 24), b""):
                         digest.update(block)

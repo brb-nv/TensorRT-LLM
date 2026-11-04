@@ -74,7 +74,7 @@ def select(max_score_kv, n_valid_blocks, init_blocks, local_blocks):
         )
         if not torch.equal(out, ref):
             raise AssertionError(
-                f"TP2CTX_TSEL check: tile select table differs from minimax_m3_select_blocks "
+                f"TP2CTX_TSEL check: tile select table differs from minimax_m3_select_blocks "  # nosec B608
                 f"({int((out != ref).any(dim=-1).sum())} rows; {num_blocks} blocks, {total_q} rows)"
             )
         _STATE["checked"] = _STATE.get("checked", 0) + 1
