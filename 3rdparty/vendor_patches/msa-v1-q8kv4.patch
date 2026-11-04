@@ -1,5 +1,5 @@
 diff --git a/_build_utils.py b/_build_utils.py
-index 2a1238b8a737213620d4922ebccac875fca80a76..2ca7ba05de4c57d32f0ee54b1d58b13779737d5e 100644
+index 2a1238b8a737213620d4922ebccac875fca80a76..578302e9fcdbad7f621385b8d5b9c8c4e91abefb 100644
 --- a/_build_utils.py
 +++ b/_build_utils.py
 @@ -1,3 +1,6 @@
@@ -9,7 +9,12 @@ index 2a1238b8a737213620d4922ebccac875fca80a76..2ca7ba05de4c57d32f0ee54b1d58b137
  """Shared public-toolchain discovery for MSA v1 JIT extensions."""
  
  from __future__ import annotations
-@@ -9,7 +12,9 @@ import subprocess
+@@ -5,11 +8,13 @@ from __future__ import annotations
+ import os
+ import re
+ import shutil
+-import subprocess
++import subprocess  # nosec B404
  from functools import lru_cache
  from pathlib import Path
  
@@ -152,7 +157,7 @@ index 2be9c678f3b195c45b7f955cdc8ec7ed4152b590..712a8ffe6299713b23e91dac194bbafd
  __all__ = ["BatchDecodeWithPagedKVCacheWrapper"]
  
 diff --git a/attention/decode/q8kv4/jit.py b/attention/decode/q8kv4/jit.py
-index a533d9ee6958c2505e838d41d726e9cad6cd9622..7c0003fba57b27e7c6aa854d03e5f2ebef9a28bb 100644
+index a533d9ee6958c2505e838d41d726e9cad6cd9622..0a59a519ed9f116164310f8a5b3876172b847477 100644
 --- a/attention/decode/q8kv4/jit.py
 +++ b/attention/decode/q8kv4/jit.py
 @@ -1,3 +1,6 @@
@@ -162,6 +167,15 @@ index a533d9ee6958c2505e838d41d726e9cad6cd9622..7c0003fba57b27e7c6aa854d03e5f2eb
  """Op-local JIT for the SM100 Q8KV4 sparse decode attention kernels."""
  
  from __future__ import annotations
+@@ -6,7 +9,7 @@ import fcntl
+ import hashlib
+ import logging
+ import os
+-import subprocess
++import subprocess  # nosec B404
+ import sys
+ import threading
+ import time
 @@ -17,10 +20,10 @@ from pathlib import Path
  
  import jinja2
@@ -242,6 +256,15 @@ index a533d9ee6958c2505e838d41d726e9cad6cd9622..7c0003fba57b27e7c6aa854d03e5f2eb
          "-Xptxas",
          "-O3",
          "-Xcompiler",
+@@ -244,7 +282,7 @@ def _nvcc_flags(cache_dir: Path, dequant_mode: str, arch: str) -> str:
+ 
+ def _run_ninja(cache_dir: Path, label: str) -> None:
+     started_at = time.time()
+-    result = subprocess.run(
++    result = subprocess.run(  # nosec B607
+         ["ninja", "-j1"],
+         cwd=cache_dir,
+         capture_output=True,
 @@ -266,6 +304,7 @@ def _write_ninja(
      sources: list[Path],
      dequant_mode: str,
@@ -427,7 +450,7 @@ index 4850a0f3e82cff2db7bbb26dbc0f2739ab41fb2d..64b7914e3f5626529017c4c4337138d5
  _PAGE_SIZE = 128
  _TOP_K = 16
 diff --git a/indexer/decode/q8kv4/jit.py b/indexer/decode/q8kv4/jit.py
-index 6102d610740223aa7d0ffdb683cbadce9e80de11..ecbfa6a750be61c361d9bff4d5dd0f9ca9982d88 100644
+index 6102d610740223aa7d0ffdb683cbadce9e80de11..2d80b1a0e05a747f5bdcc17750e65835c1cca9bb 100644
 --- a/indexer/decode/q8kv4/jit.py
 +++ b/indexer/decode/q8kv4/jit.py
 @@ -1,3 +1,6 @@
@@ -437,6 +460,15 @@ index 6102d610740223aa7d0ffdb683cbadce9e80de11..ecbfa6a750be61c361d9bff4d5dd0f9c
  """Op-local JIT for the SM100 Q8KV4 decode indexer GEMM."""
  
  from __future__ import annotations
+@@ -5,7 +8,7 @@ from __future__ import annotations
+ import hashlib
+ import logging
+ import os
+-import subprocess
++import subprocess  # nosec B404
+ import sys
+ import time
+ from dataclasses import dataclass
 @@ -15,11 +18,11 @@ from pathlib import Path
  import jinja2
  from torch.utils import cpp_extension

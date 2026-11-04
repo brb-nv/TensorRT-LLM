@@ -27,8 +27,8 @@ vendors:
     - cute/*.py
     - cute/src/**/*
     patch: 3rdparty/vendor_patches/msa-fmha-sm100.patch
-    patch_digest: sha256:2483fad8d5020310e6026e1e885282ffb8f5d56dbea3af5a374972b204c3683e
-    digest: sha256-tree-v1:6a6252a7cb8b91977daa6e3242e14fc1a87efed6a7d928b31bd81359b2b1de20
+    patch_digest: sha256:93fc9e8745bded80dc1731cf0169dd0b2665eec03703f72f318a1b53a401ebd3
+    digest: sha256-tree-v1:8fcd5b5c52a2929b763dfb14afd34967fadba6fb3cede1b819d480c3147e2648
   msa-prefill-bf16x:
     url: https://github.com/vllm-project/MSA.git
     branch: dev
@@ -38,8 +38,8 @@ vendors:
     include:
     - '**/*'
     patch: 3rdparty/vendor_patches/msa-prefill-bf16x.patch
-    patch_digest: sha256:1c2423ec3df158f26481fdae53701c4e2166a0b914c20058d1ef1da1975ef6ba
-    digest: sha256-tree-v1:3b6324a263685c1600f1f102d26c1450a1ebc90cca39178902cdeaa83d154a35
+    patch_digest: sha256:33077778cf789e64e1f99bbfaa0942eb7578ba0addf52a0587b3d7e0bfca9988
+    digest: sha256-tree-v1:512c5fe8b38483e3a772d0f7e6896f0942750e300d44f3ca81fd60a21a9173e7
   msa-q8kv8-indexer:
     url: https://github.com/vllm-project/MSA.git
     branch: dev
@@ -90,8 +90,8 @@ vendors:
     - indexer/decode/q8kv4/jit.py
     - indexer/decode/q8kv4/csrc/**/*
     patch: 3rdparty/vendor_patches/msa-v1-q8kv4.patch
-    patch_digest: sha256:acd66babd0274c79b695c5ddfb6a4f6ab56c6222efaba8db49bf1b317a666c89
-    digest: sha256-tree-v1:db2f9a531c31b3b9d3c862648de69cedcb470b626b60d784f008131cd9eb7bdb
+    patch_digest: sha256:f110d2a67267ecfc11248663661f1743e5031cd6f157d7944e87de50c8307fcc
+    digest: sha256-tree-v1:f37865a18b3dab52c554f6df3ff79e9b0379307ebce9ce42d738845bebdb9cda
   openengine-proto:
     url: https://github.com/ai-dynamo/openengine.git
     tag: v0.1.0
