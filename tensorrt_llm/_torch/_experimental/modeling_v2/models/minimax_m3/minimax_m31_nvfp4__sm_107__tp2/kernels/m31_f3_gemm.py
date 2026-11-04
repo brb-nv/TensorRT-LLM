@@ -1772,7 +1772,7 @@ def fi_base_ok() -> bool:
             "kernels",
             "dense_blockscaled_gemm_sm100.py",
         )
-        return _hashlib.md5(open(p, "rb").read()).hexdigest() == FI_BASE_MD5
+        return _hashlib.md5(open(p, "rb").read(), usedforsecurity=False).hexdigest() == FI_BASE_MD5
     except Exception:  # noqa: BLE001
         return False
 

@@ -8,7 +8,7 @@ from __future__ import annotations
 import os
 import re
 import shutil
-import subprocess
+import subprocess  # nosec B404
 from functools import lru_cache
 from pathlib import Path
 

@@ -16,7 +16,7 @@ import hashlib
 import logging
 import os
 import shutil
-import subprocess
+import subprocess  # nosec B404
 import threading
 from pathlib import Path
 
@@ -510,7 +510,7 @@ build {so_path}: nvcc_link {inst_obj} {run_obj}
         (cache_dir / "build.ninja").write_text(ninja_content)
 
     def _run_ninja(self, cache_dir):
-        result = subprocess.run(
+        result = subprocess.run(  # nosec B607
             ["ninja", "-j1"],
             cwd=str(cache_dir),
             capture_output=True,
@@ -583,7 +583,7 @@ build {so_path}: nvcc_link {obj}
 """
     (cache_dir / "build.ninja").write_text(ninja_content)
 
-    result = subprocess.run(
+    result = subprocess.run(  # nosec B607
         ["ninja", "-j1"],
         cwd=str(cache_dir),
         capture_output=True,
@@ -685,7 +685,7 @@ build {so_path}: nvcc_link {obj}
 """
     (cache_dir / "build.ninja").write_text(ninja_content)
 
-    result = subprocess.run(
+    result = subprocess.run(  # nosec B607
         ["ninja", "-j1"],
         cwd=str(cache_dir),
         capture_output=True,
@@ -776,7 +776,7 @@ build {so_path}: nvcc_link {obj}
 """
     (cache_dir / "build.ninja").write_text(ninja_content)
 
-    result = subprocess.run(
+    result = subprocess.run(  # nosec B607
         ["ninja", "-j1"],
         cwd=str(cache_dir),
         capture_output=True,
