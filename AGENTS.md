@@ -120,6 +120,7 @@ Encoder and LLM forward Params are execution views.
 | `tensorrt_llm/_torch/attention/ATTENTION_DEVELOPER_GUIDE.md` | Attention, MLA, backend families, sparse backends, metadata contracts, and KV-cache behavior - **read before modifying anything under `tensorrt_llm/_torch/attention/`** |
 | `tensorrt_llm/_torch/moe/fused_moe/MOE_DEVELOPER_GUIDE.md` | MoE architecture, backends, communication, development patterns — **read before modifying MoE code** |
 | `tensorrt_llm/_torch/pyexecutor/kv_cache/REGIONS_DEVELOPER_GUIDE.md` | KV cache regions: persistent state declared with a life cycle of its own and laid out as native regions — **read before adding model- or backend-specific state to the KV cache managers** |
+| `tensorrt_llm/_torch/pyexecutor/kv_cache/mamba_cache_manager/RECURRENT_STATE_DEVELOPER_GUIDE.md` | Recurrent state (Mamba2, GDN, KDA): the state a model declares, how shared runtime code finds the declaration, and what a family provides to its cache manager — **read before adding a recurrent family or a check on a recurrent model or cache manager** |
 | `CODING_GUIDELINES.md` | C++ and Python coding standards (referenced throughout, must read before contributing) |
 
 ## Design Patterns
@@ -208,8 +209,8 @@ Jenkins runs a full-project check with path/module and symbol exclusions.
 Whole-project checks always return success; file-list checks can opt into
 `--strict`. Jenkins and pre-commit checks are advisory. The `[tool.pyrefly]`
 section in `pyproject.toml` defines product roots, diagnostics, and native exclusions.
-`[tool.pyrefly-tests]` in the same file defines test roots, helper search paths,
-and diagnostic overrides. The wrapper generates a temporary test configuration
+`[tool.pyrefly-tests]` in the same file defines test roots and helper search paths.
+The wrapper generates a temporary test configuration
 that inherits shared rules and exclusions, runs each scope separately, and
 combines the diagnostics into one report. Temporary configurations are removed
 after the check. Mixed file
@@ -221,14 +222,15 @@ PyTorch, generated bindings, and configured third-party libraries. In test file-
 mode, missing imports of declared dependencies that are not installed are also
 filtered; full-project scans retain them. Release-Check installs pytest so that
 `pytest.skip()` remains recognizable as a terminating call.
-The test configuration disables `missing-argument`, `unexpected-keyword`, and
-`bad-argument-count`; these diagnostics remain enabled for product code. Other
-configured diagnostics, including `unbound-name` and `missing-import`, remain
-enabled for tests. Product import resolution uses only the project root as its
-search path, with fallback resolution disabled. The broader helper search paths
+Tests use the same diagnostics as product code, including `missing-argument`,
+`unexpected-keyword`, and `bad-argument-count`. The wrapper reads literal
+`__extra_import_path__` lists or tuples under `tests/` without running test code and adds
+existing directories to the shared search path for all test files. Ancestors of
+the declaring file are skipped because fallback searches them per file. Product
+checks use only the project root, with fallback disabled. The broader helper search paths
 and fallback resolution apply only to the test pass. `--no-path-module-filter`
 disables exclusions in both passes while preserving their separate search paths
-and diagnostic settings.
+and shared diagnostics.
 
 New C++ unit tests should use `add_tllm_gtest` with explicit `SOURCES`,
 `LINK_LIBRARIES`, `OWNER`, and scheduling `LABELS`. Request `FULL_STACK` explicitly

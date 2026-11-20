@@ -1037,6 +1037,7 @@ class TestKVCacheV2SchedulerCrossParam:
         mgr.enable_block_reuse = False
         mgr.block_reuse_policy = BlockReusePolicy.PER_REQUEST
         mgr.can_share_inflight_prefix = False
+        mgr.max_beam_width = 1
         return mgr
 
     def test_default_cross_is_none(self):
@@ -1326,6 +1327,7 @@ class TestCrossCacheV2Lifecycle:
         manager.block_reuse_policy = BlockReusePolicy.ALL_REUSABLE
         manager.conversation_manager = None
         manager.is_draft = False
+        manager._retained_generation_allocations = {}
         manager._allocated_draft_lens = {}
         manager.kv_compression_manages_history = False
         manager._has_cp_helix = False

@@ -26,8 +26,9 @@ from tensorrt_llm._torch.modules.dwdp.dense.manager import (
 from tensorrt_llm._torch.modules.dwdp.dense.types import DenseMode
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
     BaseResourceManager, ResourceManagerType)
-from tensorrt_llm._utils import get_sm_version
-from tensorrt_llm.llmapi.llm_args import (CapacitySchedulerPolicy,
+from tensorrt_llm._utils import get_sm_version, normalize_disagg_role
+from tensorrt_llm.llmapi.llm_args import (CacheTransceiverConfig,
+                                          CapacitySchedulerPolicy,
                                           ContextChunkingPolicy,
                                           ExecutorMemoryType,
                                           GuidedDecodingConfig, KvCacheConfig,
@@ -43,6 +44,8 @@ from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
 if TYPE_CHECKING:
     from tensorrt_llm.executor.ipc import IpcQueue
 
+    from ..models.checkpoints.base_checkpoint_loader import BaseCheckpointLoader
+
 from ..attention.backends.interface import AttentionRuntimeFeatures
 from ..attention.backends.utils import get_attention_backend
 from ..distributed import Distributed
@@ -53,7 +56,8 @@ from ..speculative import (get_num_extra_kv_tokens, get_spec_drafter,
 from ..virtual_memory import scope as virtual_memory_scope
 from ._util import (KvCacheCreator, _adjust_torch_mem_fraction,
                     create_py_executor_instance, create_py_executor_resources,
-                    instantiate_sampler, is_disagg_enabled, is_mla)
+                    instantiate_sampler, is_agg_helix, is_disagg_enabled,
+                    is_mla, kv_cache_manager_v2_incompatible_features)
 from .config_utils import (is_decode_only, is_hybrid_linear, is_minimax_m3,
                            resolve_cache_transceiver_config,
                            uses_fp4_mla_attention, uses_vswa_kv_cache_layout)
@@ -67,6 +71,8 @@ from .kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from .model_engine import ModelEngine
 from .model_loader import ModelLoader, construct_checkpoint_loader
 from .py_executor import PyExecutor
+from .runtime_hooks import runtime_hooks_of
+from .scheduled_encoder_executor import ScheduledEncoderExecutor
 from .scheduler import gen_preemption
 
 _MLA_KV_CACHE_REUSE_SUPPORTED_SM_VERSIONS = (90, 100, 103, 107, 120, 121)
@@ -278,6 +284,35 @@ def _check_dense_dwdp_launch(llm_args: TorchLlmArgs) -> Optional[DenseMode]:
     return None
 
 
+_AGG_HELIX_SPARSE_ERROR = (
+    "Aggregated Helix context parallelism supports dense MLA only. Every sparse "
+    "attention algorithm is rejected, including skip_softmax: it keeps dense MLA "
+    "but is not yet supported with aggregated Helix. Helix with sparse attention "
+    "requires disaggregated serving.")
+
+
+def _validate_agg_helix_args(llm_args: TorchLlmArgs) -> None:
+    """Reject aggregated Helix settings that are known before weights load.
+
+    The checks that need the loaded model (MLA architecture, sparse attention
+    supplied by the checkpoint, and the engine's chunked-prefill and KV cache
+    manager choices) run again after the model engine is built.
+    """
+    if get_sm_version() < 100:
+        raise NotImplementedError(
+            "Aggregated Helix context parallelism requires SM100 or newer.")
+    if getattr(llm_args.sparse_attention_config, "algorithm", None) is not None:
+        raise NotImplementedError(_AGG_HELIX_SPARSE_ERROR)
+    if not llm_args.enable_chunked_prefill:
+        raise ValueError(
+            "Aggregated Helix context parallelism requires chunked prefill; "
+            "set enable_chunked_prefill=True.")
+    if llm_args.kv_cache_config.use_kv_cache_manager_v2 is False:
+        raise ValueError(
+            "Aggregated Helix context parallelism requires KVCacheManagerV2; "
+            "set kv_cache_config.use_kv_cache_manager_v2=True.")
+
+
 def _flashinfer_one_engine_spec_supported(attn_backend: str,
                                           spec_config) -> bool:
     """Whether this speculation is qualified on the FlashInfer target backend.
@@ -294,6 +329,131 @@ def _flashinfer_one_engine_spec_supported(attn_backend: str,
     if spec_config.spec_dec_mode.is_dflash():
         return False
     return not should_use_separate_draft_kv_cache(spec_config)
+
+
+def _connector_runs_speculative_prefill_only(
+        spec_config: Optional[SpeculativeConfig], worker_cls: type,
+        scheduler_cls: Optional[type],
+        cache_transceiver_config: Optional[CacheTransceiverConfig],
+        use_kv_cache_manager_v2: bool | str) -> bool:
+    """Whether a KV connector may run next to this speculative decoding.
+
+    Rejected draft tokens shrink a request's page list underneath the
+    connector, which is why speculative decoding is refused next to one. A
+    context-only request on a disaggregated context server never rejects a
+    draft token, so the append-only page deltas the connector receives stay
+    valid there. One-model MTP and EAGLE3 keep their draft KV in the target
+    pool, which is registered with the connector. Generation work is refused
+    at admission and at the connector boundary
+    (`KvCacheConnectorManager.speculative_prefill_only`).
+
+    Args:
+        spec_config: The resolved speculative config, or None.
+        worker_cls: The connector worker class.
+        scheduler_cls: The connector scheduler class.
+        cache_transceiver_config: The cache transceiver config; a backend
+            marks a disaggregated server.
+        use_kv_cache_manager_v2: The tri-state
+            `kv_cache_config.use_kv_cache_manager_v2` (True, False or "auto").
+
+    Returns:
+        True when the connector runs in the speculative-prefill-only mode.
+    """
+    if use_kv_cache_manager_v2 is False:
+        # V1 has no speculative-prefill mode; this helper only selects V2 modes.
+        return False
+    if spec_config is None or (spec_config.max_draft_len or 0) <= 0:
+        return False
+    mode = spec_config.spec_dec_mode
+    if not (mode.is_mtp_one_model() or mode.is_eagle3_one_model()):
+        return False
+    return (is_disagg_enabled(cache_transceiver_config)
+            and KvCacheConnectorManager.declares_speculative_prefill(
+                worker_cls, scheduler_cls))
+
+
+def _refuse_speculation_next_to_connector(
+        spec_config: Optional[SpeculativeConfig],
+        use_kv_cache_manager_v2: bool | str, speculative_prefill_only: bool,
+        connector: KvCacheConnectorManager) -> None:
+    """Refuse speculative decoding next to a connector that moves KV.
+
+    Rejected draft tokens shrink a request's page list, and the freed slot
+    goes to whichever request allocates next. The connector is only told about
+    pages appended since the last report, so it would keep addressing a slot
+    another request now owns. Context-only requests never reject a draft token,
+    which is what the speculative-prefill-only mode relies on. A capacity_only
+    worker registers no KV pages, so it is exempt.
+
+    Args:
+        spec_config: The resolved speculative config, or None.
+        use_kv_cache_manager_v2: The tri-state
+            `kv_cache_config.use_kv_cache_manager_v2` (True, False or "auto").
+        speculative_prefill_only: Whether the connector runs in that mode.
+        connector: The constructed connector manager.
+
+    Raises:
+        NotImplementedError: If speculation would run next to a KV-moving
+            connector outside the speculative-prefill-only mode.
+    """
+    if (spec_config is None or (spec_config.max_draft_len or 0) <= 0
+            or use_kv_cache_manager_v2 is not True or speculative_prefill_only
+            or connector.capacity_only):
+        return
+    raise NotImplementedError(
+        "KV connector is not supported with speculative decoding. "
+        "One-model MTP or EAGLE3 is supported on a disaggregated "
+        "context server when the connector scheduler and worker "
+        "both declare supports_speculative_prefill=True. Otherwise "
+        "disable speculative decoding to run a connector.")
+
+
+def _validate_speculative_connector(spec_config: Optional[SpeculativeConfig],
+                                    use_kv_cache_manager_v2: bool | str,
+                                    speculative_prefill_only: bool,
+                                    connector: KvCacheConnectorManager) -> None:
+    """Validate the connector against speculative decoding, or shut it down and re-raise.
+
+    The connector's worker and scheduler already exist when these checks run,
+    so a refusal must release them before the error leaves the creator.
+
+    Args:
+        spec_config: The resolved speculative config, or None.
+        use_kv_cache_manager_v2: The tri-state
+            `kv_cache_config.use_kv_cache_manager_v2` (True, False or "auto").
+        speculative_prefill_only: Whether the connector runs in that mode.
+        connector: The constructed connector manager.
+
+    Raises:
+        NotImplementedError: From `_refuse_speculation_next_to_connector`.
+        ValueError: From `_validate_speculative_connector_role`.
+    """
+    try:
+        _validate_speculative_connector_role(connector)
+        _refuse_speculation_next_to_connector(spec_config,
+                                              use_kv_cache_manager_v2,
+                                              speculative_prefill_only,
+                                              connector)
+    except (NotImplementedError, ValueError):
+        connector.shutdown()
+        raise
+
+
+def _validate_speculative_connector_role(
+        connector: KvCacheConnectorManager) -> None:
+    """Reject a speculative KV-moving connector on a known generation server."""
+    if not connector.speculative_prefill_only or connector.capacity_only:
+        return
+    role = normalize_disagg_role(os.environ.get("TRTLLM_DISAGG_ROLE"))
+    if role == "generation":
+        raise ValueError(
+            "A generation server cannot use a speculative-prefill-only KV connector; "
+            "use a capacity_only connector role or disable the connector.")
+    if role != "context":
+        logger.warning(
+            "KV connector speculative-prefill-only mode has an unknown server role; "
+            "only context-only requests can be admitted. Set TRTLLM_DISAGG_ROLE=context."
+        )
 
 
 ALLOW_UNCORRECTED_OVERLAP_SPEC_ENV_VAR = "TRTLLM_ALLOW_UNCORRECTED_OVERLAP_SPEC"
@@ -451,6 +611,66 @@ def _check_no_kv_execution(llm_args: TorchLlmArgs, mapping: Mapping,
             "max_num_tokens are rejected.")
 
 
+def _check_scheduled_encoder_support(llm_args: TorchLlmArgs,
+                                     mapping: Mapping) -> None:
+    """Reject the settings ScheduledEncoderExecutor cannot serve a non-generation model with."""
+    _check_no_kv_execution(llm_args, mapping, is_generation=False)
+    if mapping.cp_size > 1:
+        raise ValueError(
+            "Context parallelism is not supported for non-generation models; "
+            "set context_parallel_size=1.")
+    checks = (
+        ("lora_config", llm_args.lora_config is not None),
+        ("speculative_config", llm_args.speculative_config is not None),
+        ("cache_transceiver_config",
+         is_disagg_enabled(llm_args.cache_transceiver_config)),
+        ("kv_connector_config", llm_args.kv_connector_config is not None),
+        ("dwdp_config", llm_args.dwdp_config is not None),
+        ("moe_config.load_balancer", llm_args.moe_config.load_balancer
+         is not None),
+        ("enable_resource_governor", llm_args.enable_resource_governor),
+        ("sleep_config", llm_args.sleep_config is not None),
+        ("orchestrator_type='ray'", llm_args.orchestrator_type == "ray"),
+    )
+    settings = [name for name, used in checks if used]
+    if settings:
+        message = (
+            f"Non-generation models do not support {', '.join(settings)}; "
+            "remove these settings.")
+        if llm_args.orchestrator_type == "ray":
+            message += (
+                " AsyncLLM and TLLM_DISABLE_MPI=1 select orchestrator_type='ray' "
+                "themselves; serve these models with LLM and MPI enabled.")
+        raise ValueError(message)
+
+
+def _create_scheduled_encoder_executor(
+        llm_args: TorchLlmArgs, checkpoint_dir: Optional[str],
+        checkpoint_loader: "BaseCheckpointLoader", startup_timer: _StartupTimer,
+        creation_metrics: dict[str, float]) -> ScheduledEncoderExecutor:
+    mapping = _get_mapping(llm_args.parallel_config.to_mapping())
+    _check_scheduled_encoder_support(llm_args, mapping)
+    dist = Distributed.get(mapping)
+    startup_timer.mark_initialization("configuration_and_distributed_init")
+    with startup_timer.phase("scheduled_encoder_creation",
+                             metrics=creation_metrics,
+                             metric_name="scheduled_encoder_creation_seconds"):
+        executor = ScheduledEncoderExecutor.create(
+            llm_args,
+            model_path=checkpoint_dir,
+            checkpoint_loader=checkpoint_loader,
+            mapping=mapping,
+            dist=dist,
+        )
+    if mapping.rank == 0:
+        logger.info(f"LLM Args:\n{llm_args}")
+    with startup_timer.phase("executor_start_worker",
+                             metrics=creation_metrics,
+                             metric_name="worker_start_seconds"):
+        executor.start_worker()
+    return executor
+
+
 def _get_mapping(_mapping: Mapping) -> Mapping:
     if _mapping is None:
         mapping = Mapping(world_size=tensorrt_llm.mpi_world_size(),
@@ -508,7 +728,9 @@ def get_guided_decoding_config(guided_decoding_backend: str,
 
 
 def _load_config_and_create_checkpoint_loader(
-        llm_args: TorchLlmArgs, checkpoint_dir: Optional[str] = None):
+    llm_args: TorchLlmArgs,
+    checkpoint_dir: Optional[str] = None
+) -> tuple[TorchLlmArgs, "BaseCheckpointLoader", bool]:
     torch.cuda.set_per_process_memory_fraction(1.0)
     checkpoint_loader = construct_checkpoint_loader(
         llm_args.checkpoint_loader,
@@ -518,9 +740,9 @@ def _load_config_and_create_checkpoint_loader(
         load_format=llm_args.load_format,
         partial_model_loading=llm_args.is_partial_model_loading,
     )
-    llm_args = ModelLoader.load_config_and_apply_defaults(
+    llm_args, config = ModelLoader.load_config_with_defaults(
         checkpoint_dir, llm_args, checkpoint_loader)
-    return llm_args, checkpoint_loader
+    return llm_args, checkpoint_loader, config.is_generation
 
 
 def create_encoder_executor(
@@ -543,7 +765,7 @@ def create_encoder_executor(
     """
     from .encoder_executor import EncoderExecutor
 
-    llm_args, checkpoint_loader = _load_config_and_create_checkpoint_loader(
+    llm_args, checkpoint_loader, _ = _load_config_and_create_checkpoint_loader(
         llm_args, checkpoint_dir)
 
     mapping = _get_mapping(llm_args.parallel_config.to_mapping())
@@ -587,7 +809,7 @@ def _create_py_executor_impl(
     tokenizer: Optional[TokenizerBase] = None,
     profiling_stage_data: Optional[dict] = None,
     resource_governor_queue: "Optional[IpcQueue]" = None,
-) -> PyExecutor:
+) -> PyExecutor | ScheduledEncoderExecutor:
     """Create and initialize a PyExecutor instance from the given LLM arguments.
 
     Loads model configuration, applies model-specific defaults, constructs the
@@ -631,15 +853,21 @@ def _create_py_executor(
     tokenizer: Optional[TokenizerBase] = None,
     profiling_stage_data: Optional[dict] = None,
     resource_governor_queue=None,
-) -> PyExecutor:
+) -> PyExecutor | ScheduledEncoderExecutor:
     """Create and initialize a PyExecutor while recording scoped metrics."""
     initial_model_engine_metrics: dict[str, float | dict[str, float]] = {}
 
     skip_est = os.environ.get("TRTLLM_SKIP_KV_CACHE_ESTIMATION", '0') == '1'
     with timing_metric("config_and_checkpoint_loader_initialization_seconds",
                        creation_metrics):
-        llm_args, checkpoint_loader = _load_config_and_create_checkpoint_loader(
+        llm_args, checkpoint_loader, is_generation = _load_config_and_create_checkpoint_loader(
             llm_args, checkpoint_dir)
+
+    if not llm_args.mm_encoder_only and not is_generation:
+        return _create_scheduled_encoder_executor(llm_args, checkpoint_dir,
+                                                  checkpoint_loader,
+                                                  _startup_timer,
+                                                  creation_metrics)
 
     garbage_collection_gen0_threshold = llm_args.garbage_collection_gen0_threshold
     lora_config = llm_args.lora_config
@@ -697,18 +925,6 @@ def _create_py_executor(
     ) = llm_args.get_runtime_sizes()
 
     tokens_per_block = kv_cache_config.tokens_per_block
-
-    # RocketKV's Vanilla path keeps its landmark (KT) cache in a single block per
-    # sequence: RocketVanillaAttention writes the whole sequence into
-    # kt_cache_block_offsets[0], and kt_tokens_per_block is derived from
-    # tokens_per_block. It does not support a paged KT cache, so force one block
-    # per sequence for it. Plain Vanilla attention supports paged KV cache and is
-    # left untouched.
-    sparse_config = llm_args.sparse_attention_config
-    if (llm_args.attn_backend == "VANILLA" and sparse_config is not None
-            and getattr(sparse_config, "algorithm", None) == "rocket"):
-        tokens_per_block = max_num_tokens
-        kv_cache_config.tokens_per_block = tokens_per_block
 
     # The MSA kernels require a page size of 128; the Triton reference uses TRT-LLM's default
     # of 32.
@@ -794,15 +1010,6 @@ def _create_py_executor(
     enable_sleep = sleep_config is not None
 
     cache_transceiver_config = llm_args.cache_transceiver_config
-    # TODO(TRTLLM-17127): remove once aggregated helix is validated end to end.
-    if (mapping.has_cp_helix()
-            and not is_disagg_enabled(cache_transceiver_config)
-            and os.environ.get("TRTLLM_HELIX_AGG_EXPERIMENTAL", "0") != "1"):
-        raise NotImplementedError(
-            "Helix context parallelism is supported only on disaggregated "
-            "generation servers; aggregated serving with Helix is not "
-            "supported yet (set TRTLLM_HELIX_AGG_EXPERIMENTAL=1 for "
-            "development only).")
     if (is_decode_only(llm_args.sparse_attention_config)
             and not is_disagg_enabled(cache_transceiver_config)):
         raise NotImplementedError(
@@ -810,6 +1017,8 @@ def _create_py_executor(
             "servers: it admits one input token per request per step, so it "
             "cannot serve context requests. Set cache_transceiver_config, or "
             "disable sparse_attention_config.enable_kv_cache_offload.")
+    if is_agg_helix(mapping, cache_transceiver_config):
+        _validate_agg_helix_args(llm_args)
 
     has_spec_drafter = False
     if spec_config is not None:
@@ -1004,6 +1213,16 @@ def _create_py_executor(
     # Resolve this before cache reuse and cache manager selection consume it.
     resolve_cache_transceiver_config(cache_transceiver_config)
 
+    if is_agg_helix(mapping, cache_transceiver_config):
+        if not is_mla(model_engine.model.model_config.pretrained_config):
+            raise NotImplementedError(
+                "Aggregated Helix context parallelism supports MLA models only."
+            )
+        # The checkpoint can supply a sparse attention config that llm_args
+        # does not carry.
+        if getattr(sparse_attention_config, "algorithm", None) is not None:
+            raise NotImplementedError(_AGG_HELIX_SPARSE_ERROR)
+
     config = model_engine.model.model_config.pretrained_config
     max_num_seq_slots = model_engine.max_num_seq_slots
     if is_mla(config):
@@ -1182,23 +1401,9 @@ def _create_py_executor(
         logger.info(
             f"Initializing kv connector with config: {kv_connector_config}")
 
-        # `use_kv_cache_manager_v2` is tri-state and under "auto" the manager is
-        # not chosen until model loading, so the manager-dependent
-        # rejections below fire here when the config selects a boolean value,
-        # including the default True, sparing it a model load it cannot use.
-        # `_maybe_init_kv_connector_manager` repeats them against the
-        # manager that was actually built.
+        # Model loading has resolved "auto". Executor initialization checks
+        # the actual manager too, since incompatible features can select V1.
         v2_selection = kv_cache_config.use_kv_cache_manager_v2
-
-        # Rejected draft tokens shrink a request's page list, and the freed slot
-        # goes to whichever request allocates next. The connector is only told
-        # about pages appended since the last report, so it would keep
-        # addressing a slot another request now owns.
-        if (spec_config is not None and spec_config.max_draft_len > 0
-                and v2_selection is True):
-            raise NotImplementedError(
-                "KV connector is not supported with speculative decoding. "
-                "Disable speculative decoding to run a connector.")
 
         # V1 registers a single pool. V2 checks its resolved layer groups
         # during executor initialization.
@@ -1216,21 +1421,25 @@ def _create_py_executor(
                 "KV connector attention data parallelism requires KVCacheManagerV2. "
                 "Set kv_cache_config.use_kv_cache_manager_v2=True.")
 
+        module = importlib.import_module(kv_connector_config.connector_module)
+        worker_cls = getattr(module, kv_connector_config.connector_worker_class)
+        scheduler_cls = getattr(module,
+                                kv_connector_config.connector_scheduler_class)
+
+        if mapping.enable_attention_dp:
+            KvCacheConnectorManager.validate_attention_dp(
+                worker_cls,
+                scheduler_cls,
+                pp_size=mapping.pp_size,
+                cp_size=mapping.cp_size)
+
+        # The mode follows the classes' declarations. The speculation refusal
+        # runs after construction, because capacity_only is a worker property.
+        speculative_prefill_only = _connector_runs_speculative_prefill_only(
+            spec_config, worker_cls, scheduler_cls, cache_transceiver_config,
+            v2_selection)
+
         try:
-            module = importlib.import_module(
-                kv_connector_config.connector_module)
-            worker_cls = getattr(module,
-                                 kv_connector_config.connector_worker_class)
-            scheduler_cls = getattr(
-                module, kv_connector_config.connector_scheduler_class)
-
-            if mapping.enable_attention_dp:
-                KvCacheConnectorManager.validate_attention_dp(
-                    worker_cls,
-                    scheduler_cls,
-                    pp_size=mapping.pp_size,
-                    cp_size=mapping.cp_size)
-
             rank = tensorrt_llm.mpi_rank()
             # Some connector API implementations may need to establish out-of-band communication between the scheduler and workers.
             # In this case, the worker may be dependent on the scheduler, or vice-versa.
@@ -1257,11 +1466,25 @@ def _create_py_executor(
             kv_connector_manager = KvCacheConnectorManager(
                 connector_worker,
                 connector_scheduler,
-                enable_attention_dp=mapping.enable_attention_dp)
-
+                enable_attention_dp=mapping.enable_attention_dp,
+                speculative_prefill_only=speculative_prefill_only)
         except Exception as e:
             logger.error(f"Error instantiating connector: {e}")
-            raise e
+            raise
+
+        _validate_speculative_connector(spec_config, v2_selection,
+                                        speculative_prefill_only,
+                                        kv_connector_manager)
+
+        if not kv_connector_manager.capacity_only and (
+                mapping.enable_attention_dp or speculative_prefill_only):
+            incompatible = kv_cache_manager_v2_incompatible_features(
+                llm_args.max_beam_width, enable_sleep=enable_sleep)
+            if incompatible:
+                raise ValueError(
+                    "KV connector attention-DP/speculative-prefill mode requires KVCacheManagerV2; "
+                    f"disable {', '.join(incompatible)} to prevent fallback to V1."
+                )
 
         if not kv_connector_manager.capacity_only:
             if (scheduler_config.capacity_scheduler_policy
@@ -1526,7 +1749,8 @@ def _create_py_executor(
             py_executor.shutdown()
             raise
 
-    _adjust_torch_mem_fraction()
+    _adjust_torch_mem_fraction(
+        runtime_hooks_of(model_engine.model).torch_mem_safety_margin)
 
     if mapping.rank == 0:
         logger.info(f"LLM Args:\n{llm_args}")
@@ -1561,7 +1785,7 @@ def create_py_executor(
     tokenizer: Optional[TokenizerBase] = None,
     profiling_stage_data: Optional[dict] = None,
     resource_governor_queue=None,
-) -> PyExecutor:
+) -> PyExecutor | ScheduledEncoderExecutor:
     """Create a PyExecutor and roll back a partially initialized DWDP runtime.
 
     On an error, a DWDP manager and a dense DWDP manager registered during the

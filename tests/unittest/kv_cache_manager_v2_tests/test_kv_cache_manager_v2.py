@@ -6900,7 +6900,10 @@ class TestNoBatching(TestKVCacheManagerV2):
         self.assertEqual(kv2.num_committed_tokens, len(prompt))
         kv2.close()
 
-    def test_reuse_match_backoff_trims_the_tail_of_every_match(self) -> None:
+    @parameterized.expand([("tokens", 1, True), ("blocks", 8, False)])
+    def test_reuse_match_backoff_trims_the_tail_of_every_match(
+        self, _case: str, alignment: int, partial_reuse: bool
+    ) -> None:
         """A pool holding state that reads D tokens ahead cannot use the last D.
 
         Set for a one-model speculative decoding draft pool, whose KV at position
@@ -6908,6 +6911,9 @@ class TestNoBatching(TestKVCacheManagerV2):
         the first m - D positions. Applied inside match(), so probe_reuse and the
         claim agree and neither needs a second tree walk. Commit is untouched --
         the blocks are stored in full; only what a later match may use shrinks.
+
+        A whole-block KV connector also needs the trimmed match aligned to a
+        block boundary, which reuse_match_alignment applies after the backoff.
         """
         tokens_per_block = 8
         backoff = 3
@@ -6926,6 +6932,8 @@ class TestNoBatching(TestKVCacheManagerV2):
                     )
                 ],
                 reuse_match_backoff=backoff,
+                reuse_match_alignment=alignment,
+                enable_partial_reuse=partial_reuse,
             )
         )
 
@@ -6941,16 +6949,66 @@ class TestNoBatching(TestKVCacheManagerV2):
 
         # Every other test in this file runs with the default backoff of 0 and
         # matches the full prompt, so the delta here is the backoff alone. The
-        # trim crosses a block boundary rather than stopping at one.
-        self.assertEqual(self.manager.probe_reuse(None, prompt), len(prompt) - backoff)
+        # trim crosses a block boundary rather than stopping at one. Alignment
+        # is applied after the backoff, never in its place.
+        expected = (len(prompt) - backoff) // alignment * alignment
+        self.assertEqual(self.manager.probe_reuse(None, prompt), expected)
 
         # A match shorter than the backoff collapses to nothing, not negative.
         self.assertEqual(self.manager.probe_reuse(None, prompt[: backoff - 1]), 0)
 
+        # The first block a connector would be asked about is the one holding the
+        # first token past the trimmed and aligned match.
+        keys = list(sequence_to_blockchain_keys(tokens_per_block, ReuseScope(), prompt))
+        self.assertEqual(
+            self.manager.probe_first_new_block_key(None, prompt),
+            keys[expected // tokens_per_block + 1][1],
+        )
+
         # The claim agrees with the probe: same trim, no second tree walk.
         kv2 = self.manager.create_kv_cache(input_tokens=prompt)
-        self.assertEqual(kv2.num_committed_tokens, len(prompt) - backoff)
+        self.assertEqual(kv2.num_committed_tokens, expected)
         kv2.close()
+
+    def test_reuse_match_alignment_must_divide_tokens_per_block(self) -> None:
+        """An alignment the block size is not a multiple of is refused at construction."""
+        for alignment in (3, 0, -8):
+            with self.subTest(alignment=alignment), self.assertRaises(AssertionError):
+                KVCacheManagerConfig(
+                    tokens_per_block=8,
+                    cache_tiers=[GpuCacheTierConfig(quota=16 << 20)],
+                    layers=[
+                        AttentionLayerConfig(
+                            layer_id=LayerId(0),
+                            buffers=[BufferConfig(role=Role.KEY, size=1024)],
+                        )
+                    ],
+                    reuse_match_alignment=alignment,
+                )
+
+    def test_replace_preserves_reuse_match_alignment(self) -> None:
+        """dataclasses.replace() on a config must carry reuse_match_alignment over.
+
+        KVCacheManagerV2 rebuilds its config with replace(config, layers=...). The
+        C++ binding replaces the Python dataclass, so replace() is keyed on the
+        field spec in tensorrt_llm/runtime/kv_cache_manager_v2/__init__.py: a field
+        missing from it is silently reset to its constructor default.
+        """
+        layers = [
+            AttentionLayerConfig(
+                layer_id=LayerId(0),
+                buffers=[BufferConfig(role=Role.KEY, size=1024)],
+            )
+        ]
+        config = KVCacheManagerConfig(
+            tokens_per_block=8,
+            cache_tiers=[GpuCacheTierConfig(quota=16 << 20)],
+            layers=layers,
+            reuse_match_alignment=8,
+        )
+        self.assertEqual(config.reuse_match_alignment, 8)
+        self.assertEqual(replace(config, layers=config.layers).reuse_match_alignment, 8)
+        self.assertEqual(replace(config).reuse_match_alignment, 8)
 
     @parameterized.expand([("backoff_0", 0), ("backoff_1", 1)])
     def test_planned_drop_handle(self, _case: str, reuse_match_backoff: int) -> None:
@@ -7050,6 +7108,52 @@ class TestNoBatching(TestKVCacheManagerV2):
         self.assertEqual(self.manager.probe_reuse(None, prompt_np), 0)
         commit_prompt(prompt)
         self.assertEqual(self.manager.probe_reuse(None, prompt_np), len(prompt))
+
+    def test_token_scan_walk_matches_exact_prefixes(self) -> None:
+        """Digest-free walks match exactly the committed blocks, by token scan or by key.
+
+        Nodes of up to eight children are scanned by tokens; wider nodes are looked up by key.
+        """
+        import numpy as np
+
+        tpb = 8
+        self.prepare(16 << 20, 0, 0, 2, None, 0, tokens_per_block=tpb)
+        prompt = np.arange(1000, 1000 + 16 * tpb, dtype=np.int32)
+
+        def commit_prompt(tokens: "np.ndarray") -> None:
+            kv_cache = self.manager.create_kv_cache(None, tokens)
+            with TemporaryCudaStream([]) as stream_holder:
+                self.assertTrue(kv_cache.resume(cast(CudaStream, stream_holder.handle)))
+                self.assertTrue(kv_cache.resize(len(tokens)))
+                if kv_cache.num_committed_tokens < len(tokens):
+                    kv_cache.commit(tokens[kv_cache.num_committed_tokens :])
+                kv_cache.stop_committing()
+            _ = stream_holder.take_finish_event()
+            kv_cache.close()
+
+        def probe(tokens: "np.ndarray") -> int:
+            return self.manager.probe_reuse(None, tokens)
+
+        commit_prompt(prompt)
+        changed = prompt.copy()
+        changed[10 * tpb] = 7
+        self.assertEqual(probe(changed), 10 * tpb)
+        self.assertEqual(probe(prompt[: 9 * tpb]), 9 * tpb)
+        self.assertEqual(probe(np.concatenate([prompt, prompt[:tpb]])), len(prompt))
+
+        # Ten more children after block 4 put that node past the scan limit.
+        branches = [prompt.copy() for _ in range(10)]
+        for i, branch in enumerate(branches):
+            branch[4 * tpb :] += 100000 * (i + 1)
+            commit_prompt(branch)
+        for branch in [prompt, *branches]:
+            self.assertEqual(probe(branch), len(branch))
+        branches[3][6 * tpb] = 3
+        self.assertEqual(probe(branches[3]), 6 * tpb)
+        unseen = prompt.copy()
+        unseen[4 * tpb :] += 5000000
+        self.assertEqual(probe(unseen), 4 * tpb)
+        self.assertEqual(self.manager.probe_reuse(ReuseScope(lora_id=7, salt="11"), prompt), 0)
 
     def test_reuse_scope_isolates_reuse(self) -> None:
         self.prepare(16 << 20, 0, 0, 2, None, 0, tokens_per_block=8)
@@ -8762,6 +8866,81 @@ class TestSSMSupport(unittest.TestCase):
         self.assertTrue(claimed.resume(stream))
         claimed.close()
 
+    def test_reuse_match_alignment_applies_after_snapshot_pruning(self) -> None:
+        """Alignment trims the final, snapshot-pruned match and the attention-only diagnostic.
+
+        The tree holds a full block and a partial one ending at token 40, with an SSM
+        snapshot at each end, so both the attention prefix and the recurrent state
+        reach 40. Aligning to the block size cuts the match back to the snapshot at 32.
+        KvCacheManager copies its config, so every alignment needs its own manager.
+        The retry after an SSM snapshot truncation lands off the alignment is not
+        reached here.
+        """
+        tokens_per_block = 32
+        prompt = [self.next_token() for _ in range(64)]
+        for alignment, expected in ((1, 40), (tokens_per_block, 32)):
+            cfg = self._make_ssm_config(
+                tokens_per_block=tokens_per_block, enable_partial_reuse=True
+            )
+            cfg.reuse_match_alignment = alignment
+            self.manager = KVCacheManager(cfg)
+            stream_holder = CachedCudaStream()
+            stream = cast(CudaStream, stream_holder.handle)
+
+            seed = self.manager.create_kv_cache()
+            self.assertTrue(seed.resume(stream))
+            seed.capacity = 32
+            seed.commit(prompt[:32])
+            seed.capacity = 40
+            seed.commit(prompt[32:40])
+            seed.close()
+
+            kv = self.manager.create_kv_cache(input_tokens=prompt[:48])
+            self.assertEqual(kv.num_committed_tokens, expected, f"alignment {alignment}")
+            self.assertEqual(
+                kv._get_num_reusable_tokens_before_hybrid_pruning(),
+                expected,
+                f"alignment {alignment}",
+            )
+            self.assertTrue(kv.resume(stream))
+            kv.close()
+
+            del seed, kv
+            gc.collect()
+            stream_holder.synchronize()
+            self.manager.shutdown()
+            del self.manager
+
+    def test_reuse_alignment_retries_after_unaligned_snapshot(self) -> None:
+        """An aligned attention match pruned to an SSM snapshot must be aligned again."""
+        cfg = self._make_ssm_config(tokens_per_block=32, enable_partial_reuse=True)
+        cfg.reuse_match_alignment = 16
+        self.manager = KVCacheManager(cfg)
+        prompt = [self.next_token() for _ in range(96)]
+        stream_holder = CachedCudaStream()
+        stream = cast(CudaStream, stream_holder.handle)
+
+        seed = self.manager.create_kv_cache()
+        try:
+            self.assertTrue(seed.resume(stream))
+            for start, end in ((0, 32), (32, 40), (40, 96)):
+                seed.capacity = end
+                seed.commit(prompt[start:end])
+        finally:
+            seed.close()
+
+        # Attention reaches 48, but the last eligible SSM snapshot is at 40.
+        # Realigning that endpoint must select the preceding snapshot at 32.
+        kv = self.manager.create_kv_cache(input_tokens=prompt[:48])
+        try:
+            self.assertEqual(kv.num_committed_tokens, 32)
+            # The attention-only diagnostic excludes SSM snapshot pruning.
+            self.assertEqual(kv._get_num_reusable_tokens_before_hybrid_pruning(), 48)
+            self.assertTrue(kv.resume(stream))
+        finally:
+            kv.close()
+            stream_holder.synchronize()
+
     def test_reuse_match_reports_content_divergence_depth(self) -> None:
         """The raw walk depth locates the fork, even where pruning shortens reuse."""
         cfg = self._make_ssm_config(tokens_per_block=32, enable_partial_reuse=True)
@@ -9439,10 +9618,21 @@ class TestInitRatioConfig(unittest.TestCase):
             swa_scratch_reuse=(SwaScratchReuseConfig() if enable_swa_scratch_reuse else None),
         )
 
-    def _make_hybrid_config(self, gpu_quota: int = 128 << 20) -> KVCacheManagerConfig:
+    def _make_hybrid_config(
+        self,
+        gpu_quota: int = 128 << 20,
+        host_quota: int = 0,
+        typical_step: BatchDesc | None = None,
+        cold_typical_step: BatchDesc | None = None,
+    ) -> KVCacheManagerConfig:
+        cache_tiers: list = [GpuCacheTierConfig(quota=gpu_quota)]
+        if host_quota > 0:
+            cache_tiers.append(HostCacheTierConfig(quota=host_quota))
         return KVCacheManagerConfig(
             tokens_per_block=self.TOKENS_PER_BLOCK,
-            cache_tiers=[GpuCacheTierConfig(quota=gpu_quota)],
+            typical_step=typical_step,
+            cold_typical_step=cold_typical_step,
+            cache_tiers=cache_tiers,
             layers=[
                 SsmLayerConfig(
                     layer_id=LayerId(0),
@@ -9506,6 +9696,81 @@ class TestInitRatioConfig(unittest.TestCase):
         # Windowed layers (window=128) have many stale blocks, non-windowed keep all.
         self.assertLess(ratio[0], ratio[1])
         self.assertLess(ratio[0], 0.15)
+        manager.shutdown()
+
+    def _hybrid_slot_counts(self, manager: KVCacheManager, level: CacheLevel) -> tuple[int, int]:
+        """(SSM slots, attention slots) of a hybrid manager at one cache level."""
+        ssm_lc = _introspection.ssm_life_cycle_id(manager)
+        assert ssm_lc is not None
+        attn_lc = manager.get_layer_group_id(LayerId(1))
+        mapping = manager.get_life_cycle_pool_group_indices(level)
+        stats = manager.get_storage_statistics(level)
+        self.assertNotEqual(mapping[ssm_lc], mapping[attn_lc])
+        return stats[mapping[ssm_lc]].total, stats[mapping[attn_lc]].total
+
+    def test_cold_typical_step_sizes_cold_tier_only(self):
+        """cold_typical_step re-splits the host tier; the GPU tier is unchanged.
+
+        Without it the host tier keeps the GPU tier's slot proportions. With one state per typical
+        request instead of four, host bytes move from recurrent-state slots to attention pages.
+        """
+        capacity = 64 * self.TOKENS_PER_BLOCK
+        slice_desc = KVCacheDesc(capacity=capacity // 4, history_length=capacity // 4 - 1)
+        hot_step = BatchDesc(kv_caches=[slice_desc] * 4)
+        cold_step = BatchDesc(
+            kv_caches=[KVCacheDesc(capacity=capacity, history_length=capacity - 1)]
+        )
+        host_quota = 1 << 30
+
+        def build(cold):
+            return KVCacheManager(
+                self._make_hybrid_config(
+                    gpu_quota=512 << 20,
+                    host_quota=host_quota,
+                    typical_step=hot_step,
+                    cold_typical_step=cold,
+                )
+            )
+
+        default, resplit = build(None), build(cold_step)
+        gpu_ssm, gpu_attn = self._hybrid_slot_counts(default, GPU_LEVEL)
+        self.assertEqual(self._hybrid_slot_counts(resplit, GPU_LEVEL), (gpu_ssm, gpu_attn))
+        default_ssm, default_attn = self._hybrid_slot_counts(default, CacheLevel(1))
+        self.assertAlmostEqual(
+            default_attn / default_ssm, gpu_attn / gpu_ssm, delta=0.15 * gpu_attn / gpu_ssm
+        )
+        resplit_ssm, resplit_attn = self._hybrid_slot_counts(resplit, CacheLevel(1))
+        self.assertLess(resplit_ssm, default_ssm)
+        self.assertGreater(resplit_attn, default_attn)
+        # One SSM slot per `capacity` tokens of attention pages.
+        blocks_per_request = capacity // self.TOKENS_PER_BLOCK
+        self.assertAlmostEqual(
+            resplit_attn / resplit_ssm, blocks_per_request, delta=0.2 * blocks_per_request
+        )
+        stats = resplit.get_storage_statistics(CacheLevel(1))
+        self.assertLessEqual(sum(sum(s.slot_sizes) * s.total for s in stats), host_quota)
+        default.shutdown()
+        resplit.shutdown()
+
+    def test_cold_typical_step_config(self):
+        """cold_typical_step survives replace(), clears to None and rejects an empty step.
+
+        A step that gives a pool group no pages still leaves that group a share of the host tier.
+        """
+        cold_step = BatchDesc(kv_caches=[KVCacheDesc(capacity=128, history_length=127)])
+        cfg = replace(self._make_hybrid_config(host_quota=64 << 20), cold_typical_step=cold_step)
+        self.assertEqual(
+            replace(cfg, layers=cfg.layers).cold_typical_step.kv_caches[0].capacity, 128
+        )
+        cfg.cold_typical_step = None
+        self.assertIsNone(cfg.cold_typical_step)
+        with self.assertRaises(RuntimeError):
+            self._make_hybrid_config(host_quota=64 << 20, cold_typical_step=BatchDesc(kv_caches=[]))
+        no_pages = BatchDesc(kv_caches=[KVCacheDesc(capacity=0, history_length=0)])
+        manager = KVCacheManager(
+            self._make_hybrid_config(host_quota=64 << 20, cold_typical_step=no_pages)
+        )
+        self.assertTrue(all(s.total > 0 for s in manager.get_storage_statistics(CacheLevel(1))))
         manager.shutdown()
 
     def test_zero_capacity_request_reserves_only_an_ssm_slot(self):
@@ -10644,6 +10909,7 @@ class TestPartialCoverageReuse(TestKVCacheManagerV2):
         window_size: int | None = None,
         reuse_match_backoff: int = 0,
         event_manager=None,
+        reuse_match_alignment: int = 1,
     ) -> None:
         kv_buf_size = 8192
         window_size = self.WINDOW_SIZE if window_size is None else window_size
@@ -10670,6 +10936,7 @@ class TestPartialCoverageReuse(TestKVCacheManagerV2):
             enable_partial_reuse=True,
             commit_min_snapshot=True,
             reuse_match_backoff=reuse_match_backoff,
+            reuse_match_alignment=reuse_match_alignment,
         )
         self.engine = FakeEngine(self.cfg)
         self.manager = KVCacheManager(self.cfg, event_manager=event_manager)
@@ -10687,7 +10954,13 @@ class TestPartialCoverageReuse(TestKVCacheManagerV2):
     def _swa_lc_id(self) -> int:
         return _introspection.swa_life_cycle_ids(self.manager)[0]
 
-    def run_turn(self, prompt: list[TokenIdExt], refcheck: bool = False) -> int:
+    def run_turn(
+        self,
+        prompt: list[TokenIdExt],
+        refcheck: bool = False,
+        *,
+        initialize_full_attention: bool = False,
+    ) -> int:
         """Reuse what we can, prefill the rest, commit, close. Returns the reused count.
 
         `refcheck` runs FakeEngine, which validates the reused history KV against the
@@ -10697,6 +10970,8 @@ class TestPartialCoverageReuse(TestKVCacheManagerV2):
         window; without it the manager is told the final length up front and skips
         allocating out-of-window blocks -- which is exactly the situation that leaves a
         partial page behind, so the two cannot be combined in the same turn.
+        `initialize_full_attention` writes only full-attention pages while retaining
+        that partial SWA snapshot, for a later reference-checked rewind.
         """
         with TemporaryCudaStream([]) as s:
             stream = cast(CudaStream, s.handle)
@@ -10708,6 +10983,14 @@ class TestPartialCoverageReuse(TestKVCacheManagerV2):
             inp = list(prompt[num_reused:])
             if refcheck:
                 self.engine.execute([Step(kv_cache, inp, history)], stream)
+            elif initialize_full_attention:
+                full_attention = [
+                    layer
+                    for layer in self.cfg.layers
+                    if isinstance(layer, AttentionLayerConfig) and layer.sliding_window_size is None
+                ]
+                engine = FakeEngine(replace(self.cfg, layers=full_attention))
+                engine.execute([Step(kv_cache, inp, history)], stream)
             kv_cache.commit(inp)
             kv_cache.close()
         s.take_finish_event().synchronize()
@@ -10904,10 +11187,25 @@ class TestPartialCoverageReuse(TestKVCacheManagerV2):
         boundary = base + [TokenId(i) for i in range(1000, 1048)]
 
         self.assertEqual(self.run_turn(base, refcheck=True), 0)
-        self.run_turn(boundary)
+        self.run_turn(boundary, initialize_full_attention=True)
         self.assertEqual(self._tail_coverage(base, self._swa_lc_id), 16)
 
         # Backing off from 96 to 95 makes block 1's partial SWA page active, but
+        # it only covers 16 of the required 32 tokens. The maximal safe endpoint
+        # is the previously committed 48-token prefix.
+        self.assertEqual(self.manager.probe_reuse(input_tokens=boundary), len(base))
+        self.assertEqual(self.run_turn(boundary, refcheck=True), len(base))
+
+    def test_reuse_alignment_rechecks_swa_coverage_at_final_endpoint(self) -> None:
+        self.prepare_partial(window_size=33, reuse_match_backoff=1, reuse_match_alignment=16)
+        base = [TokenId(i) for i in range(48)]
+        boundary = base + [TokenId(i) for i in range(1000, 1048)]
+
+        self.assertEqual(self.run_turn(base, refcheck=True), 0)
+        self.run_turn(boundary, initialize_full_attention=True)
+        self.assertEqual(self._tail_coverage(base, self._swa_lc_id), 16)
+
+        # Backing off from 96 and aligning to 80 makes block 1's partial SWA page active, but
         # it only covers 16 of the required 32 tokens. The maximal safe endpoint
         # is the previously committed 48-token prefix.
         self.assertEqual(self.manager.probe_reuse(input_tokens=boundary), len(base))

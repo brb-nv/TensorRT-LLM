@@ -310,6 +310,11 @@ void _validateRegions(std::vector<LayerConfig> const& layers, std::vector<Region
 
 void KVCacheManagerConfig::validate() const
 {
+    if (reuseMatchAlignment <= 0 || tokensPerBlock % reuseMatchAlignment != 0)
+    {
+        throw AssertionError("KVCacheManagerConfig: reuse_match_alignment (" + std::to_string(reuseMatchAlignment)
+            + ") must be a positive divisor of tokens_per_block (" + std::to_string(tokensPerBlock) + ")");
+    }
     if (swaScratchReuse.has_value())
     {
         swaScratchReuse->validate();
@@ -321,6 +326,12 @@ void KVCacheManagerConfig::validate() const
     if (typicalStep.has_value())
     {
         typicalStep->validate();
+    }
+    if (coldTypicalStep.has_value())
+    {
+        coldTypicalStep->validate();
+        TLLM_CHECK_WITH_INFO(
+            !coldTypicalStep->kvCaches.empty(), "cold_typical_step must describe at least one KV cache");
     }
 
     poolRebalance.validate();

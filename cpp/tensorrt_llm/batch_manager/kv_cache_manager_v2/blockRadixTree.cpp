@@ -797,6 +797,29 @@ int numMatchedTokens(std::vector<BlockRadixTree::MatchResult> const& matched, in
 
 } // anonymous namespace
 
+namespace
+{
+
+//! Up to this many children, a digest-free walk compares tokens instead of hashing the next block.
+constexpr size_t kTokenScanMaxChildren = 8;
+
+//! The child of `next` whose tokens are exactly tokens[0, count), if any.
+Block* findChildByTokens(
+    std::unordered_map<BlockKey, SharedPtr<Block>> const& next, TokenIdExt const* tokens, size_t count)
+{
+    for (auto const& entry : next)
+    {
+        Block* child = entry.second.get();
+        if (child->tokens.size() == count && std::memcmp(child->tokens.data(), tokens, count * sizeof(TokenIdExt)) == 0)
+        {
+            return child;
+        }
+    }
+    return nullptr;
+}
+
+} // namespace
+
 std::vector<BlockRadixTree::MatchResult> BlockRadixTree::matchTokenPath(
     ReuseScope const& reuseScope, TokenSpan tokens, bool knownNoDigest, bool enablePartialMatch) const
 {
@@ -804,44 +827,54 @@ std::vector<BlockRadixTree::MatchResult> BlockRadixTree::matchTokenPath(
     // awaiting erasure is childless, so it yields no match.
     std::vector<MatchResult> results;
 
-    // Lazily compute one key per iteration — no wasted hashing on early miss.
-    auto gen = sequenceToBlockchainKeys(mTokensPerBlock, reuseScope, tokens.begin(), tokens.size(), knownNoDigest);
-
-    // First step is the root key (empty token range).
-    auto rootStep = gen();
-    if (!rootStep)
-        return results;
-    auto rootIt = mRoots.find(rootStep->key);
+    BlockKey const rootKey = RootBlock::makeKey(reuseScope);
+    auto rootIt = mRoots.find(rootKey);
     if (rootIt == mRoots.end())
         return results;
 
     RootBlock const& root = *rootIt->second;
-    std::unordered_map<BlockKey, SharedPtr<Block>> const* currentNext = &root.next;
+    NodeBase const* current = &root;
     // Token range of the first unmatched block, captured on miss for the partial pass.
     HalfOpenRange<size_t> missedRange;
     bool missed = false;
 
-    // Each step carries the block's key and its token range — no need to re-derive
-    // block boundaries here.
-    while (auto step = gen())
+    // A child's key is makeKey(parent key, child tokens), so the child holding the next block's tokens
+    // is the one a keyed lookup would find. Digest-bearing tokens name content held elsewhere and hash.
+    size_t const tpb = static_cast<size_t>(mTokensPerBlock);
+    size_t const numTokens = static_cast<size_t>(tokens.size());
+    for (size_t beg = 0; beg < numTokens; beg += tpb)
     {
-        auto blockIt = currentNext->find(step->key);
-        if (blockIt == currentNext->end())
+        size_t const end = std::min(beg + tpb, numTokens);
+        auto const& next = current->next;
+        Block* block = nullptr;
+        if (knownNoDigest && next.size() <= kTokenScanMaxChildren)
         {
-            missedRange = step->tokens;
+            block = findChildByTokens(next, tokens.begin() + beg, end - beg);
+        }
+        else
+        {
+            auto const key = Block::makeKey(current->key, tokens.begin() + beg, end - beg, knownNoDigest);
+            auto blockIt = next.find(key);
+            if (blockIt != next.end())
+            {
+                block = blockIt->second.get();
+            }
+        }
+        if (block == nullptr)
+        {
+            missedRange = {beg, end};
             missed = true;
             break;
         }
-        Block* block = blockIt->second.get();
-        results.push_back({block, static_cast<int>(step->tokens.length())});
-        currentNext = &block->next;
+        results.push_back({block, static_cast<int>(end - beg)});
+        current = block;
     }
 
     // Partial match in children of current node.
     if (missed && enablePartialMatch)
     {
         auto [best, bestMatch]
-            = findBestPartialMatchInNextNodes(*currentNext, tokens.begin() + missedRange.beg, missedRange.length());
+            = findBestPartialMatchInNextNodes(current->next, tokens.begin() + missedRange.beg, missedRange.length());
         if (best)
             results.push_back({best, bestMatch});
     }
@@ -849,8 +882,29 @@ std::vector<BlockRadixTree::MatchResult> BlockRadixTree::matchTokenPath(
     return results;
 }
 
+namespace
+{
+// Drop `backoff` tokens off the tail of a match, dropping whole blocks while the backoff
+// outruns them. Only the tail shrinks, so pruneMatch's "leading entries are full blocks"
+// invariant still holds.
+void backOffMatch(std::vector<BlockRadixTree::MatchResult>& matched, int backoff)
+{
+    while (backoff > 0 && !matched.empty())
+    {
+        auto& last = matched.back();
+        if (last.numMatchedTokens > backoff)
+        {
+            last.numMatchedTokens -= backoff;
+            return;
+        }
+        backoff -= last.numMatchedTokens;
+        matched.pop_back();
+    }
+}
+} // namespace
+
 std::vector<BlockRadixTree::MatchResult> BlockRadixTree::pruneMatch(
-    std::vector<MatchResult> matched, std::optional<LifeCycleId> ssmLcId) const
+    std::vector<MatchResult> matched, std::optional<LifeCycleId> ssmLcId, int alignment) const
 {
     // All blocks except the last must be fully matched (mirrors Python: matched[:-1]).
     TLLM_CHECK_DEBUG(matched.size() <= 1
@@ -864,6 +918,17 @@ std::vector<BlockRadixTree::MatchResult> BlockRadixTree::pruneMatch(
     // shortens the match, so the loop terminates.
     while (!matched.empty())
     {
+        // Align before validating pages: moving backwards can make stale SWA
+        // pages active. Snapshot and coverage trims retry through this boundary.
+        if (alignment > 1)
+        {
+            int const remainder = numMatchedTokens(matched, mTokensPerBlock) % alignment;
+            backOffMatch(matched, remainder);
+            if (matched.empty())
+            {
+                break;
+            }
+        }
         // Check SSM snapshot availability first: truncating to the last reusable SSM
         // snapshot changes the matched length that all the attention checks use.
         if (ssmLcId.has_value())
@@ -889,6 +954,10 @@ std::vector<BlockRadixTree::MatchResult> BlockRadixTree::pruneMatch(
                 break;
             }
             matched.back().numMatchedTokens = ssmMatchLen;
+            if (alignment > 1 && numMatchedTokens(matched, mTokensPerBlock) % alignment != 0)
+            {
+                continue;
+            }
         }
 
         // Only pages that are active at this candidate endpoint constrain attention
@@ -948,30 +1017,11 @@ std::vector<BlockRadixTree::MatchResult> BlockRadixTree::pruneMatch(
     return matched;
 }
 
-namespace
+BlockRadixTree::ReuseMatch BlockRadixTree::match(ReuseScope const& reuseScope, TokenSpan tokens, bool knownNoDigest,
+    bool enablePartialMatch, int backoff, int alignment) const
 {
-// Drop `backoff` tokens off the tail of a match, dropping whole blocks while the backoff
-// outruns them. Only the tail shrinks, so pruneMatch's "leading entries are full blocks"
-// invariant still holds.
-void backOffMatch(std::vector<BlockRadixTree::MatchResult>& matched, int backoff)
-{
-    while (backoff > 0 && !matched.empty())
-    {
-        auto& last = matched.back();
-        if (last.numMatchedTokens > backoff)
-        {
-            last.numMatchedTokens -= backoff;
-            return;
-        }
-        backoff -= last.numMatchedTokens;
-        matched.pop_back();
-    }
-}
-} // namespace
-
-BlockRadixTree::ReuseMatch BlockRadixTree::match(
-    ReuseScope const& reuseScope, TokenSpan tokens, bool knownNoDigest, bool enablePartialMatch, int backoff) const
-{
+    TLLM_CHECK_WITH_INFO(alignment > 0 && mTokensPerBlock % alignment == 0,
+        "match: alignment %d must be positive and divide tokens_per_block %d", alignment, mTokensPerBlock);
     auto rawMatched = matchTokenPath(reuseScope, tokens, knownNoDigest, enablePartialMatch);
     // Content-divergence depth is measured before page or recurrent-snapshot pruning.
     int const numReusableTokensBeforePruning = numMatchedTokens(rawMatched, mTokensPerBlock);
@@ -988,9 +1038,10 @@ BlockRadixTree::ReuseMatch BlockRadixTree::match(
     std::optional<int> numReusableTokensBeforeHybridPruning;
     if (ssmLcId.has_value())
     {
-        numReusableTokensBeforeHybridPruning = numMatchedTokens(pruneMatch(rawMatched, std::nullopt), mTokensPerBlock);
+        numReusableTokensBeforeHybridPruning
+            = numMatchedTokens(pruneMatch(rawMatched, std::nullopt, alignment), mTokensPerBlock);
     }
-    auto matched = pruneMatch(std::move(rawMatched), ssmLcId);
+    auto matched = pruneMatch(std::move(rawMatched), ssmLcId, alignment);
     ReuseMatch result{};
     result.numTokens = numMatchedTokens(matched, mTokensPerBlock);
     result.numLookupTokens = static_cast<int>(tokens.size());

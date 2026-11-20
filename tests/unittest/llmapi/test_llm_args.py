@@ -855,7 +855,8 @@ def test_context_parallelism_mapping_keeps_cp_config():
         "cp_type": CpType.HELIX,
         "tokens_per_block": 32
     }
-    assert not args._kv_cache_estimation_runs()
+    # Aggregated Helix (no cache transceiver) profiles a forward to size KV.
+    assert args._kv_cache_estimation_runs()
 
 
 @pytest.mark.cpu_only
@@ -963,6 +964,23 @@ kv_cache_config:
         llm_args = TorchLlmArgs.from_yaml(yaml_path)
 
         assert llm_args.kv_cache_config.mamba_state_config.periodic_snapshot_interval == 64
+
+    def test_from_yaml_enable_locality_domains(self, tmp_path):
+        assert TorchLlmArgs(
+            model=llama_model_path).enable_locality_domains is False
+
+        yaml_path = tmp_path / "locality_domains.yaml"
+        yaml_path.write_text(
+            yaml.safe_dump({
+                "model": str(llama_model_path),
+                "enable_locality_domains": True,
+            }),
+            encoding="utf-8",
+        )
+
+        llm_args = TorchLlmArgs.from_yaml(yaml_path)
+
+        assert llm_args.enable_locality_domains is True
 
     def test_from_yaml_empty_file_reports_missing_model(self, tmp_path):
         yaml_path = tmp_path / "empty.yaml"
@@ -1333,6 +1351,22 @@ def test_dspark_requires_positive_max_draft_len(tmp_path):
 
 
 @pytest.mark.cpu_only
+def test_dspark_ancestral_draft_sampling_rejects_embedded_drafter(tmp_path):
+    (tmp_path / "config.json").write_text('{"model_type": "deepseek_v4"}')
+    spec_cfg = DSparkDecodingConfig(max_draft_len=5,
+                                    speculative_model=str(tmp_path),
+                                    use_rejection_sampling=True,
+                                    use_ancestral_draft_sampling=True)
+
+    with pytest.raises(ValueError, match="drafter embedded in the target"):
+        TorchLlmArgs(
+            model="/tmp/dummy_model",
+            skip_tokenizer_init=True,
+            speculative_config=spec_cfg,
+        )
+
+
+@pytest.mark.cpu_only
 def test_post_processor_hook_rejected_with_skip_tokenizer_init():
     """post_processor_hook + skip_tokenizer_init must fail fast.
 
@@ -1374,6 +1408,106 @@ class TestModelDefaults:
         llm_args = TorchLlmArgs(model="/tmp/dummy_model")
         applied = apply_model_defaults_to_llm_args(llm_args, model_defaults)
         assert applied == model_defaults
+
+    def test_applied_defaults_leave_other_fields_unset(self):
+        llm_args = TorchLlmArgs(model="/tmp/dummy_model", max_batch_size=8)
+        before = set(llm_args.model_fields_set)
+        apply_model_defaults_to_llm_args(llm_args, {
+            "enable_chunked_prefill": False,
+            "max_batch_size": 4,
+        })
+        assert llm_args.max_batch_size == 8
+        assert not llm_args.enable_chunked_prefill
+        assert llm_args.model_fields_set == before | {"enable_chunked_prefill"}
+        assert "modeling_v2" not in llm_args.model_fields_set
+
+    def test_applied_defaults_leave_nested_fields_unset(self):
+        """Nested configs keep only the fields the user set or a default applied."""
+        llm_args = TorchLlmArgs(
+            model="/tmp/dummy_model",
+            kv_cache_config={"free_gpu_memory_fraction": 0.5},
+            sparse_attention_config={
+                "algorithm": "deepseek_v4",
+                "index_n_heads": 64,
+            },
+        )
+        sparse_before = set(llm_args.sparse_attention_config.model_fields_set)
+        assert "index_topk" not in sparse_before
+        scheduler_before = set(llm_args.scheduler_config.model_fields_set)
+        apply_model_defaults_to_llm_args(
+            llm_args, {
+                "kv_cache_config": {
+                    "tokens_per_block": 128,
+                    "free_gpu_memory_fraction": 0.9,
+                }
+            })
+        assert llm_args.kv_cache_config.free_gpu_memory_fraction == 0.5
+        assert llm_args.kv_cache_config.tokens_per_block == 128
+        assert llm_args.kv_cache_config.model_fields_set == {
+            "free_gpu_memory_fraction", "tokens_per_block"
+        }
+        assert llm_args.sparse_attention_config.model_fields_set == sparse_before
+        assert llm_args.scheduler_config.model_fields_set == scheduler_before
+
+    def test_applied_defaults_leave_configs_in_containers_unset(self):
+        """Configs held in a dict keep only the fields the user set."""
+        llm_args = TorchLlmArgs(model="/tmp/dummy_model",
+                                multimodal_config={
+                                    "encoder_side_stream_max_ahead": 0,
+                                    "encoder_cuda_graph": {
+                                        "image": {
+                                            "max_batch_size": 4
+                                        }
+                                    },
+                                })
+        apply_model_defaults_to_llm_args(llm_args,
+                                         {"enable_chunked_prefill": False})
+        image = llm_args.multimodal_config.encoder_cuda_graph["image"]
+        assert image.max_batch_size == 4
+        assert image.model_fields_set == {"max_batch_size"}
+
+    def test_config_object_default_keeps_its_nested_fields_set(self):
+        """A default given as a config object counts its nested fields as set."""
+        llm_args = TorchLlmArgs(model="/tmp/dummy_model")
+        apply_model_defaults_to_llm_args(
+            llm_args, {
+                "scheduler_config":
+                SchedulerConfig(gen_preemption={"tpot_budget": 0.1}),
+            })
+        scheduler_config = llm_args.scheduler_config
+        assert scheduler_config.gen_preemption.tpot_budget == 0.1
+        assert scheduler_config.model_fields_set == {"gen_preemption"}
+        assert scheduler_config.gen_preemption.model_fields_set == {
+            "tpot_budget"
+        }
+        assert llm_args.model_dump(exclude_unset=True)["scheduler_config"] == {
+            "gen_preemption": {
+                "tpot_budget": 0.1
+            }
+        }
+
+    def test_empty_nested_default_counts_as_set(self):
+        """An empty nested default still counts as set.
+
+        It constructs the config, so the field must survive
+        ``model_dump(exclude_unset=True)``.
+        """
+        llm_args = TorchLlmArgs(model="/tmp/dummy_model")
+        assert llm_args.attention_dp_config is None
+        applied = apply_model_defaults_to_llm_args(llm_args,
+                                                   {"attention_dp_config": {}})
+        assert applied == {"attention_dp_config": {}}
+        assert llm_args.attention_dp_config is not None
+        assert "attention_dp_config" in llm_args.model_fields_set
+        assert "attention_dp_config" in llm_args.model_dump(exclude_unset=True)
+
+    def test_empty_nested_default_under_a_user_setting_applies_nothing(self):
+        llm_args = TorchLlmArgs(model="/tmp/dummy_model",
+                                attention_dp_config={"enable_balance": True})
+        applied = apply_model_defaults_to_llm_args(llm_args,
+                                                   {"attention_dp_config": {}})
+        assert applied == {}
+        assert llm_args.attention_dp_config.enable_balance
 
     @pytest.mark.parametrize(
         "defaults_dict,should_raise,error_contains",
@@ -1828,7 +1962,7 @@ class TestKvCacheManagerV2AutoResolution:
 @pytest.mark.parametrize(
     "offload_field",
     ["cold_tier_offload_min_priority", "secondary_offload_min_priority"])
-def test_KvCacheConfig_declaration(offload_field):
+def test_KvCacheConfig_declaration(offload_field: str) -> None:
     assert KvCacheConfig().mamba_state_cache_interval is None
     assert KvCacheConfig().mamba_state_config.periodic_snapshot_interval == 0
     assert KvCacheConfig().kv_cache_event_hash_algo == "auto"
@@ -1936,6 +2070,37 @@ def test_KvCacheConfig_defer_generation_only_release():
                        match="defer_generation_only_release requires"):
         KvCacheConfig(defer_generation_only_release=True,
                       use_kv_cache_manager_v2=False)
+
+
+@pytest.mark.cpu_only
+def test_KvCacheConfig_disagg_completion_reservation() -> None:
+    assert KvCacheConfig().enable_disagg_completion_reservation is False
+    field = KvCacheConfig.model_fields["enable_disagg_completion_reservation"]
+    assert field.json_schema_extra["status"] == "prototype"
+
+    config = KvCacheConfig(host_cache_size=0,
+                           enable_disagg_completion_reservation=True)
+    assert config.enable_disagg_completion_reservation is True
+    assert KvCacheConfig.model_validate(
+        config.model_dump()).enable_disagg_completion_reservation is True
+    assert KvCacheConfig.model_validate_json(
+        config.model_dump_json()).enable_disagg_completion_reservation is True
+    # The C++ config has no such field, and the conversion leaves it out.
+    pybind_config = config._to_pybind()
+    assert pybind_config.host_cache_size == 0
+    assert not hasattr(pybind_config, "enable_disagg_completion_reservation")
+
+    # The deployment path: a YAML extra-options file merged into the LLM args.
+    merged = update_llm_args_with_extra_dict(
+        {"model": "dummy"},
+        yaml.safe_load("kv_cache_config:\n"
+                       "  host_cache_size: 0\n"
+                       "  enable_disagg_completion_reservation: true\n"))
+    assert merged[
+        "kv_cache_config"].enable_disagg_completion_reservation is True
+    with pytest.raises(ValidationError,
+                       match="enable_disagg_completion_reservation"):
+        KvCacheConfig(enable_disagg_completion_reservation="sometimes")
 
 
 @pytest.mark.cpu_only
@@ -6798,6 +6963,26 @@ class TestDSparkConfidenceScheduling:
                            match="confidence_min_predicted_gain"):
             self._scheduled(confidence_min_predicted_gain=-0.01)
 
+    @pytest.mark.parametrize("kw", [
+        {
+            "draft_len_schedule": {
+                4: 5,
+                8: 2
+            }
+        },
+        {
+            "max_concurrency": 8
+        },
+    ])
+    def test_scheduling_excludes_a_draft_len_schedule(self, kw):
+        with pytest.raises(ValueError,
+                           match="draft_len_schedule or max_concurrency"):
+            self._scheduled(**kw)
+
+    def test_draft_len_schedule_is_accepted_without_scheduling(self):
+        c = self._cfg(draft_len_schedule={8: 2, 4: 5})
+        assert c.draft_len_schedule == {4: 5, 8: 2}
+
     @pytest.mark.parametrize("field", [
         "validate_confidence_artifact_freshness",
         "confidence_sps_live_fingerprint_path",
@@ -7159,3 +7344,44 @@ class TestDwdpLaunch:
         assert message.startswith("Dense DWDP (dwdp_config.enable_dense) ")
         assert message.endswith("Change the launch configuration or set "
                                 "dwdp_config.enable_dense=False.")
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("overrides", [
+    {
+        "use_kv_cache_manager_v2": False
+    },
+    {
+        "host_cache_size": 1
+    },
+    {
+        "disk_cache_size": 1,
+        "disk_cache_path": "/tmp"
+    },
+])
+def test_completion_reservation_rejects_incompatible_config(
+        overrides: dict[str, bool | int | str]) -> None:
+    with pytest.raises(ValueError,
+                       match="enable_disagg_completion_reservation"):
+        KvCacheConfig(enable_disagg_completion_reservation=True, **overrides)
+
+
+@pytest.mark.cpu_only
+def test_auto_v1_warns_when_completion_reservation_cannot_take_effect() -> None:
+    args = TorchLlmArgs(
+        model="/tmp/dummy_model",
+        kv_cache_config=KvCacheConfig(
+            use_kv_cache_manager_v2="auto",
+            enable_disagg_completion_reservation=True,
+            host_cache_size=0,
+        ),
+        cache_transceiver_config=CacheTransceiverConfig(
+            backend="NIXL", transceiver_runtime="CPP"),
+    )
+    with patch("tensorrt_llm.llmapi.llm_utils.logger.warning") as warning:
+        _resolve_kv_cache_manager_v2_auto(
+            args, TestKvCacheManagerV2AutoResolution._PreferV2)
+    assert args.kv_cache_config.use_kv_cache_manager_v2 is False
+    assert any(
+        "enable_disagg_completion_reservation will not take effect" in str(item)
+        for item in warning.call_args_list)

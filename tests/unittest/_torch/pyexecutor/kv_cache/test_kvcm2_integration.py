@@ -193,6 +193,55 @@ def test_create_kv_cache_swa_endpoint_priority(
         assert kwargs["custom_priority_callback"](255, AttnLifeCycle(4096, 0)) == 70
 
 
+@pytest.mark.parametrize("rewind", [0, 1024])
+def test_create_kv_cache_forwards_custom_priority_callback(rewind: int) -> None:
+    """A caller's priority callback (a subclass's _context_priority_callback) reaches the backend.
+
+    With SWA endpoint priorities on, attention pages keep them and every other
+    page takes the caller's priority.
+    """
+    manager = object.__new__(KVCacheManagerV2)
+    manager._swa_endpoint_rewind = rewind
+    manager.block_reuse_policy = BlockReusePolicy.ALL_REUSABLE
+    manager.enable_block_reuse = True
+    manager.is_draft = False
+    manager.tokens_per_block = 32
+    manager.kv_cache_map = {}
+    manager.index_mapper = Mock()
+    manager.index_mapper.num_free_slots.return_value = 1
+    manager.max_beam_width = 1
+    manager.num_pools = 0
+    manager.impl = Mock()
+    manager.impl.create_kv_cache.return_value.beam_width = 1
+    manager.impl.create_kv_cache.return_value.batch_row = None
+
+    def callback(_ordinal, _life_cycle):
+        return 3
+
+    manager._create_kv_cache(
+        0,
+        None,
+        None,
+        is_dummy=False,
+        expected_prompt_length=8192,
+        custom_priority_callback=callback,
+    )
+
+    kwargs = manager.impl.create_kv_cache.call_args.kwargs
+    if rewind == 0:
+        assert kwargs["custom_priority_callback"] is callback
+    else:
+        priority = kwargs["custom_priority_callback"]
+        assert priority(255, AttnLifeCycle(4096, 0)) == 70
+        assert priority(255, object()) == 3
+
+
+def test_context_priority_callback_defaults_to_none() -> None:
+    """The base manager keeps the backend's default page priorities."""
+    manager = object.__new__(KVCacheManagerV2)
+    assert manager._context_priority_callback(Mock()) is None
+
+
 def _commit_released_prompt(core: KVCacheManager, prompt: list[int], priority_callback) -> None:
     """Run a prompt through a real cache and release it, leaving its pages reusable."""
     cache = core.create_kv_cache(None, prompt, custom_priority_callback=priority_callback)
@@ -370,6 +419,8 @@ def _make_cache_config_for_test(
     cache_manager = object.__new__(KVCacheManagerV2)
     cache_manager.layer_specs = None
     cache_manager._sparse_kv_offload = sparse_kv_offload
+
+    cache_manager.kv_connector_manager = None
     cache_manager.max_beam_width = 1
     cache_manager.kv_cache_type = kv_cache_type
     cache_manager.dtype = dtype
@@ -423,6 +474,7 @@ def _make_manager_for_cache_tier_test(
     layer_specs: list[KVCacheLayerSpec] | None = None,
     remote_donor: object | None = None,
     manager_cls: type = KVCacheManagerV2,
+    kv_connector_manager: object | None = None,
 ) -> tuple[KVCacheManagerV2, Mock]:
     impl_constructor = Mock(side_effect=impl_side_effect)
     if mapping is None:
@@ -493,6 +545,7 @@ def _make_manager_for_cache_tier_test(
             execution_stream=Mock(),
             cold_page_codec_provider=cold_page_codec_provider,
             remote_donor=remote_donor,
+            kv_connector_manager=kv_connector_manager,
         )
     return manager, impl_constructor
 
@@ -1611,6 +1664,101 @@ def test_one_model_prompt_lookahead_configures_reuse_backoff(
 
 
 @pytest.mark.parametrize(
+    (
+        "requires",
+        "drops",
+        "capacity_only",
+        "is_draft",
+        "expected_backoff",
+        "expected_alignment",
+        "expected_windows",
+    ),
+    [
+        (False, False, False, False, 1, 1, [6]),
+        (True, False, False, False, 1, TOKENS_PER_BLOCK, [6]),
+        # A dropped backoff has no rewind, so the SWA window is not widened.
+        (True, True, False, False, 0, 1, [5]),
+        (True, True, True, False, 1, 1, [6]),
+        # A paired draft pool keeps its backoff but aligns with the target.
+        (True, True, False, True, 1, TOKENS_PER_BLOCK, [6]),
+    ],
+    ids=["no_declaration", "align", "drop", "capacity_only", "joint_draft"],
+)
+@pytest.mark.parametrize(
+    "spec_config",
+    [
+        Eagle3DecodingConfig(
+            max_draft_len=1,
+            speculative_model="draft-model",
+        ),
+        MTPDecodingConfig(max_draft_len=1),
+    ],
+    ids=["eagle3_one_model", "mtp_eagle_one_model"],
+)
+@pytest.mark.parametrize("partial_reuse", [False, True])
+def test_kv_connector_reuse_declarations_shape_the_core_match(
+    partial_reuse: bool,
+    spec_config: Eagle3DecodingConfig | MTPDecodingConfig,
+    requires: bool,
+    drops: bool,
+    capacity_only: bool,
+    is_draft: bool,
+    expected_backoff: int,
+    expected_alignment: int,
+    expected_windows: list[int | None],
+) -> None:
+    """A whole-block connector's declarations reach the real core config."""
+    kv_cache_config = KvCacheConfig(
+        enable_block_reuse=True,
+        enable_partial_reuse=partial_reuse,
+        max_gpu_total_bytes=16 << 20,
+        max_attention_window=[5, MAX_SEQ_LEN, MAX_SEQ_LEN - 1],
+    )
+    connector = SimpleNamespace(
+        capacity_only=capacity_only,
+        requires_block_aligned_reuse=requires and not capacity_only,
+        drops_reuse_match_backoff=drops and not capacity_only,
+        requires_completion_reservation=False,
+        reports_failed_loads=False,
+    )
+    manager, _ = _make_manager_for_cache_tier_test(
+        kv_cache_config,
+        [Mock()],
+        spec_config=spec_config,
+        is_draft=is_draft,
+        joint_reuse=is_draft,
+        kv_connector_manager=connector,
+    )
+
+    assert manager.enable_partial_reuse == (partial_reuse and not (requires and not capacity_only))
+    assert manager.reuse_match_backoff == expected_backoff
+    # The raw lookahead stays for the lender and the public property.
+    assert manager.draft_prompt_lookahead == 1
+    assert manager.max_attention_window_vec == expected_windows
+    if expected_backoff == 0:
+        # Without the backoff the lookup stops one token short of the prompt,
+        # exactly as it does without a draft.
+        prompt = list(range(65))
+        request = SimpleNamespace(
+            multimodal_hashes=None,
+            multimodal_positions=None,
+            multimodal_lengths=None,
+        )
+        manager._reuse_token_source = lambda _: prompt
+        assert list(manager._context_reuse_tokens(request)) == prompt[:-1]
+
+    core_config = manager._build_base_config(
+        kv_cache_config,
+        tokens_per_block=TOKENS_PER_BLOCK,
+        cache_tiers=[GpuCacheTierConfig(quota=1 << 30)],
+    )
+    assert core_config.reuse_match_backoff == expected_backoff
+    assert core_config.reuse_match_alignment == expected_alignment
+    rebuilt = replace(core_config, commit_min_snapshot=True)
+    assert rebuilt.reuse_match_alignment == expected_alignment
+
+
+@pytest.mark.parametrize(
     ("fresh_cache", "expected_lookup_tokens"),
     [(True, 3), (False, None)],
     ids=["fresh_lookup", "resumed_cache"],
@@ -1630,6 +1778,7 @@ def test_prepare_context_cache_records_lookup_without_mutating_cursor(
         context_current_position=6,
         is_first_context_chunk=True,
         is_disagg_generation_init_state=False,
+        is_context_only_request=False,
     )
     kv_cache = Mock(num_committed_tokens=2)
     manager = object.__new__(KVCacheManagerV2)
@@ -2502,6 +2651,7 @@ def test_generation_allocation_reserves_dynamic_width() -> None:
     manager.is_draft = True
     manager._has_cp_helix = False
     manager.kv_cache_map = {request.py_request_id: kv_cache}
+    manager._retained_generation_allocations = {}
     manager._allocated_draft_lens = {}
     manager._inflight_draft_lens = {}
     manager._kv_reserve_draft_tokens = 4
@@ -2587,6 +2737,24 @@ def test_context_revert_shrinks_in_place_when_history_fits() -> None:
     assert request.context_chunk_size == 192
 
 
+@pytest.mark.cpu_only
+def test_drop_context_allocation_frees_and_rewinds() -> None:
+    """A failed connector load restarts the request from the start of its prompt."""
+    request = _revert_context_request(93)
+    manager = object.__new__(KVCacheManagerV2)
+    manager.tokens_per_block = 64
+    manager.free_resources = Mock()
+
+    manager.drop_context_allocation(request)
+
+    manager.free_resources.assert_called_once_with(request)
+    request.set_prepopulated_prompt_len.assert_called_once_with(0, 64)
+    assert request.context_current_position == 0
+    assert request.context_chunk_size == 512
+    assert request.estimated_reusable_tokens == 0
+    assert request.py_ctx_pre_resize_cap is None
+
+
 def test_draft_manager_keeps_shared_progress_across_context_and_generation() -> None:
     request = LlmRequest(
         request_id=39,
@@ -2624,6 +2792,7 @@ def test_draft_manager_keeps_shared_progress_across_context_and_generation() -> 
     assert request.context_current_position == 192
 
     request.state = LlmRequestState.GENERATION_IN_PROGRESS
+    manager._retained_generation_allocations = {}
     manager._allocated_draft_lens = {request.py_request_id: 3}
     manager._required_gen_capacity = Mock()
     batch = ScheduledRequests()
@@ -2758,6 +2927,7 @@ def test_unpaired_draft_mirror_that_cannot_grow_raises_with_the_pool_diagnostic(
     manager._mirror_uses_draft_view = False
     manager.num_extra_kv_tokens = 0
     manager.kv_cache_map = dict(caches)
+    manager._retained_generation_allocations = {}
     manager._allocated_draft_lens = set()
     manager._resume_and_restore = Mock(return_value=True)
     manager._required_gen_capacity = Mock(return_value=position + 1 + draft_len)
@@ -3276,7 +3446,7 @@ def test_disagg_generation_drafter_writes_stay_on_its_own_draft_pages(
         )
         worker._lazy_init_ctx_buffers(
             draft_model,
-            SimpleNamespace(max_num_requests=2),
+            SimpleNamespace(max_num_requests=2, num_seq_slots=2),
             attn_metadata,
             draft_kv_cache_manager=draft,
         )
@@ -3424,7 +3594,7 @@ def test_slot_from_zero_worker_refuses_a_disagg_windowed_draft_pool(
             """Bind the drafter's ctx cache to the draft pool."""
             worker._lazy_init_ctx_buffers(
                 draft_model,
-                SimpleNamespace(max_num_requests=2),
+                SimpleNamespace(max_num_requests=2, num_seq_slots=2),
                 attn_metadata,
                 draft_kv_cache_manager=draft,
             )
@@ -3498,7 +3668,7 @@ def test_trailing_drafter_slot_reads_only_pages_its_request_holds(
         )
         worker._lazy_init_ctx_buffers(
             draft_model,
-            SimpleNamespace(max_num_requests=2),
+            SimpleNamespace(max_num_requests=2, num_seq_slots=2),
             attn_metadata,
             draft_kv_cache_manager=draft,
         )
@@ -3961,6 +4131,7 @@ def _adp_dummy_executor(
     # Two attention-DP ranks: a single-rank group skips dummy padding.
     executor.dist = SimpleNamespace(tp_size=2)
     executor.kv_cache_transceiver = object() if transactional else None
+    executor.kv_connector_manager = None
     executor.adp_router = SimpleNamespace(exclude_retiring_requests=False)
     executor.active_requests = []
     executor.expected_num_active_requests = 1
@@ -6556,6 +6727,7 @@ def test_free_resources_releases_host_history() -> None:
     manager.kv_connector_manager = None
     manager.conversation_manager = None
     manager._allocated_draft_lens = {}
+    manager._retained_generation_allocations = {}
     manager._inflight_draft_lens = {}
     manager._request_stats_enabled_ids = set()
     manager._fresh_pages_filled = {}
@@ -8235,6 +8407,7 @@ class TestVetoedContextChunk:
             _is_kv_manager_v2=True,
             kv_cache_manager=manager,
             enable_joint_kv_cache_reuse=False,
+            _kv_connector_moves_kv=False,
             _num_skipped_forward_ctx_chunks=0,
             _num_reverted_ctx_tokens=0,
         )
@@ -8314,3 +8487,33 @@ class TestVetoedContextChunk:
         assert cache.capacity == cache.history_length == long_turn.context_current_position
         for request in (long_turn, short_turn):
             manager.free_resources(request)
+
+
+@pytest.mark.parametrize("prefetch_limit", [0, 2])
+def test_constructed_manager_supports_executor_disk_prefetch(prefetch_limit: int) -> None:
+    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+
+    manager, _ = _make_manager_for_cache_tier_test(
+        KvCacheConfig(
+            enable_block_reuse=True,
+            disk_prefetch_num_reqs=prefetch_limit,
+            max_gpu_total_bytes=16 << 20,
+        ),
+        [Mock()],
+    )
+    requests = [SimpleNamespace(is_first_context_chunk=True, py_request_id=i) for i in range(3)]
+    executor = SimpleNamespace(
+        _is_kv_manager_v2=True,
+        kv_cache_manager=manager,
+        active_requests=requests,
+        _prefetched_request_ids=set(),
+    )
+    with patch.object(manager, "prefetch_for_context_tokens") as prefetch:
+        PyExecutor._prefetch_for_context_requests(executor)
+        PyExecutor._prefetch_for_context_requests(executor)
+    if prefetch_limit:
+        assert prefetch.call_args_list == [call(requests[:2]), call(requests[2:])]
+        assert executor._prefetched_request_ids == {0, 1, 2}
+    else:
+        prefetch.assert_not_called()
+        assert not executor._prefetched_request_ids
