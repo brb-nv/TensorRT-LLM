@@ -67,6 +67,7 @@ def _manager() -> Mock:
     manager.kv_connector_manager = None
     manager.enable_block_reuse = False
     manager._has_cp_helix = False
+    manager.num_locality_domains = 1
     manager.num_extra_kv_tokens = 0
     manager._kv_alloc_extra_tokens = 0
     manager.kv_cache_map = {}
@@ -241,6 +242,7 @@ def test_cancelled_admission_releases_event() -> None:
     ready = Mock()
     manager._disagg_receive_ready[request.py_request_id] = ready
     manager.conversation_manager = None
+    manager._retained_generation_allocations = {}
     manager._allocated_draft_lens = {}
     manager._inflight_draft_lens = {}
     manager._request_stats_enabled_ids = set()

@@ -22,6 +22,8 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Union
 from tensorrt_llm.logger import logger
 
 from .enums import MetricNames
+from .perf import (FINISH_REASON_LABEL, PerfMetricsCollector, PerfMetricsRecord,
+                   kv_cache_utilization)
 
 if TYPE_CHECKING:
     from prometheus_client import CollectorRegistry, Counter
@@ -58,7 +60,7 @@ _PROCESSING_TIME_BUCKETS = (
 
 
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.10.0rc1/vllm/engine/metrics.py#L30
-class MetricsCollector:
+class PrometheusExposure:
     """Collects and logs metrics from TensorRT-LLM engine stats to Prometheus.
 
     Used by OpenAIServer in tensorrt_llm/serve/openai_server.py.
@@ -108,6 +110,8 @@ class MetricsCollector:
             trtllm_kv_cache_onboard_bytes_total
             trtllm_kv_cache_offload_bytes_total
             trtllm_kv_cache_disk_prefetch_blocks_total
+            trtllm_kv_cache_alignment_forfeited_connector_tokens_total
+            trtllm_kv_cache_alignment_forfeited_recomputed_tokens_total
             trtllm_kv_cache_intra_device_copy_bytes_total
             trtllm_num_requests_running
             trtllm_num_requests_waiting
@@ -144,7 +148,7 @@ class MetricsCollector:
             trtllm_speculative_config_info
             trtllm_kv_cache_config_info
     """
-    labelname_finish_reason = "finished_reason"
+    labelname_finish_reason = FINISH_REASON_LABEL
     labelname_cache_level = "cache_level"
     labelname_cache_tier = "cache_tier"
     labelname_dp_rank = "dp_rank"
@@ -219,6 +223,7 @@ class MetricsCollector:
                     f"{name} must be strictly increasing, got {buckets}.")
         self.last_log_time = time.time()
         self.labels = labels
+        self._last_rank_snapshots: dict[str, object] = {}
         iteration_labelnames = (*self.labels, self.labelname_dp_rank)
         self.metric_prefix = "trtllm_"
 
@@ -391,6 +396,26 @@ class MetricsCollector:
                 "Process-lifetime total V2 KV-cache blocks migrated from disk "
                 "to host by the prefetch mechanism. "
                 "Resets only when the serving process restarts."),
+            labelnames=iteration_labelnames)
+        self.kv_cache_alignment_forfeited_connector_tokens_total = Counter(
+            name=self.metric_prefix +
+            "kv_cache_alignment_forfeited_connector_tokens_total",
+            documentation=(
+                "Process-lifetime total locally reusable prompt tokens that a "
+                "whole-block KV connector's alignment gave up, and that the "
+                "connector then served. Reported only when a connector requires "
+                "block-aligned reuse. Resets only when the serving process "
+                "restarts."),
+            labelnames=iteration_labelnames)
+        self.kv_cache_alignment_forfeited_recomputed_tokens_total = Counter(
+            name=self.metric_prefix +
+            "kv_cache_alignment_forfeited_recomputed_tokens_total",
+            documentation=
+            ("Process-lifetime total locally reusable prompt tokens that a "
+             "whole-block KV connector's alignment gave up, and that were "
+             "recomputed because the connector did not serve them. Reported "
+             "only when a connector requires block-aligned reuse. Resets only "
+             "when the serving process restarts."),
             labelnames=iteration_labelnames)
         self.kv_cache_intra_device_copy_bytes_total = Counter(
             name=self.metric_prefix + "kv_cache_intra_device_copy_bytes_total",
@@ -930,7 +955,42 @@ class MetricsCollector:
             self._log_counter(counter, {self.labelname_dp_rank: rank}, delta)
         previous[rank] = value
 
+    def emit(self, record: PerfMetricsRecord) -> None:
+        """Expose collected observations through the legacy statistics adapters."""
+        if record.kind == "request":
+            self._expose_request_metrics(record.per_req)
+        elif record.kind == "loop":
+            self._expose_rank_snapshot(record)
+            self._expose_iteration_stats(
+                {"executorLoop": {
+                    "kind": "loop",
+                    "per_iter": record.per_iter
+                }})
+        elif record.kind == "rank":
+            self._expose_rank_snapshot(record)
+        else:
+            self._expose_iteration_stats(record.iteration_view())
+
+    def _expose_rank_snapshot(self, record: PerfMetricsRecord) -> None:
+        """A cached rank snapshot may accompany several loop records; observe it once."""
+        if not record.per_rank:
+            return
+        identity = str(
+            record.per_rank.get("globalRank", record.per_rank.get("rank", 0)))
+        if self._last_rank_snapshots.get(identity) is record.per_rank:
+            return
+        self._last_rank_snapshots[identity] = record.per_rank
+        self._expose_iteration_stats(record.per_rank)
+
     def log_request_metrics_dict(self, metrics_dict: dict) -> None:
+        """Compatibility adapter for legacy candidate dictionaries."""
+        self.emit(PerfMetricsCollector.collect_request(metrics_dict))
+
+    def log_iteration_stats(self, iteration_stats: dict) -> None:
+        """Compatibility adapter for legacy iteration dictionaries."""
+        self.emit(PerfMetricsCollector.collect_iteration(iteration_stats))
+
+    def _expose_request_metrics(self, metrics_dict: dict) -> None:
         """Log per-request metrics from TRTLLM engine responses.
 
         This method updates Prometheus metrics including:
@@ -1065,7 +1125,7 @@ class MetricsCollector:
             self.histogram_input_processing.labels(
                 **self.labels, stage=stage).observe(duration_seconds)
 
-    def log_iteration_stats(self, iteration_stats: dict) -> None:
+    def _expose_iteration_stats(self, iteration_stats: dict) -> None:
         """Log iteration-level statistics from TRTLLM engine.
 
         Updates Prometheus gauges/counters for queue load, memory usage, batch sizes,
@@ -1244,7 +1304,7 @@ class MetricsCollector:
             if "usedNumBlocks" in kv_stats and "maxNumBlocks" in kv_stats:
                 max_num_blocks = kv_stats["maxNumBlocks"]
                 if max_num_blocks:
-                    utilization = kv_stats["usedNumBlocks"] / max_num_blocks
+                    utilization = kv_cache_utilization(kv_stats)
                     self._log_gauge(self.kv_cache_utilization,
                                     utilization,
                                     labels=rank_labels)
@@ -1328,6 +1388,15 @@ class MetricsCollector:
             iteration_stats.get("kvCacheLevelTiers"), rank)
         self._log_connector_cached_tokens(
             iteration_stats.get("iterConnectorCachedTokens"), rank)
+        for key, counter in (
+            ("iterAlignmentForfeitedConnectorTokens",
+             self.kv_cache_alignment_forfeited_connector_tokens_total),
+            ("iterAlignmentForfeitedRecomputedTokens",
+             self.kv_cache_alignment_forfeited_recomputed_tokens_total),
+        ):
+            count = iteration_stats.get(key)
+            if count:
+                self._log_counter(counter, rank_labels, count)
 
         kv_iter = iteration_stats.get("kvCacheIterationStats")
         kv_iter_by_lifecycle = iteration_stats.get(
@@ -1430,3 +1499,7 @@ class MetricsCollector:
         """Increment the error counter, labeled by HTTP status code."""
         labels = {**self.labels, self.labelname_http_code: str(http_code)}
         self.counter_request_error.labels(**labels).inc(1)
+
+
+class MetricsCollector(PrometheusExposure):
+    """Compatibility name for the long-lived Prometheus exposure adapter."""

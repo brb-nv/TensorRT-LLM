@@ -16,6 +16,7 @@
  */
 
 #include "kvCacheManagerV2TestUtils.h"
+#include "kv_cache_manager_v2/exceptions.h"
 #include "kv_cache_manager_v2/lifeCycleRegistry.h"
 #include "kv_cache_manager_v2/storage/config.h"
 
@@ -115,6 +116,23 @@ TEST(KvCacheManagerV2ConfigTest, SparseCacheCapacityValidationRejectsNonPositive
     SparseCacheConfig const cache{.numSelectedBlocks = 2, .maxCachedUnits = 4, .unitTokens = 1};
     EXPECT_THROW(cache.validate(0), std::runtime_error);
     EXPECT_THROW(cache.validate(-1), std::runtime_error);
+}
+
+TEST(KvCacheManagerV2ConfigTest, ReuseMatchAlignmentMustDivideTokensPerBlock)
+{
+    auto config = makeConfig();
+    ASSERT_EQ(config.tokensPerBlock, 4);
+    EXPECT_EQ(config.reuseMatchAlignment, 1);
+    for (int const alignment : {1, 2, 4})
+    {
+        config.reuseMatchAlignment = alignment;
+        EXPECT_NO_THROW(config.validate()) << "alignment " << alignment;
+    }
+    for (int const alignment : {0, -4, 3, 8})
+    {
+        config.reuseMatchAlignment = alignment;
+        EXPECT_THROW(config.validate(), AssertionError) << "alignment " << alignment;
+    }
 }
 
 TEST(KvCacheManagerV2ConfigTest, OneLayerMayMixSparseAndDenseBuffers)
@@ -265,6 +283,7 @@ TEST(KvCacheManagerV2ConfigTest, SparseBuffersCoalesceBySize)
 TEST(KvCacheManagerV2ConfigTest, AttentionBufferPoliciesOverrideLayerDefault)
 {
     auto config = makeConfig();
+    std::get<AttentionLayerConfig>(config.layers.front()).slidingWindowSize = 8;
     auto& buffer = std::get<AttentionLayerConfig>(config.layers.front()).buffers.front();
     buffer.reusePolicy = ReusePolicy::REQUIRED;
     EXPECT_NO_THROW(config.validate());
@@ -278,6 +297,28 @@ TEST(KvCacheManagerV2ConfigTest, AttentionBufferPoliciesOverrideLayerDefault)
         auto const attr = storage.bufferAttributes().at(BufferId{0, buffer.role});
         EXPECT_EQ(std::get<AttnLifeCycle>(registry[attr.lifeCycleId]).reusePolicy, policy);
     }
+}
+
+TEST(KvCacheManagerV2ConfigTest, OptionalAttentionRequiresSlidingWindow)
+{
+    auto config = makeConfig();
+    auto& layer = std::get<AttentionLayerConfig>(config.layers.front());
+    layer.reusePolicy = ReusePolicy::OPTIONAL;
+    EXPECT_THROW(config.validate(), std::runtime_error);
+    layer.slidingWindowSize = 8;
+    EXPECT_NO_THROW(config.validate());
+
+    layer.slidingWindowSize.reset();
+    for (auto const policy : {ReusePolicy::REQUIRED, ReusePolicy::PRIVATE})
+    {
+        layer.buffers.front().reusePolicy = policy;
+        EXPECT_NO_THROW(config.validate());
+    }
+    layer.reusePolicy = ReusePolicy::REQUIRED;
+    layer.buffers.push_back(BufferConfig{.role = "value", .size = 4096, .reusePolicy = ReusePolicy::OPTIONAL});
+    EXPECT_THROW(config.validate(), std::runtime_error);
+    layer.slidingWindowSize = 8;
+    EXPECT_NO_THROW(config.validate());
 }
 
 TEST(KvCacheManagerV2ConfigTest, SsmBufferReusePoliciesSplitLayerLifecycles)

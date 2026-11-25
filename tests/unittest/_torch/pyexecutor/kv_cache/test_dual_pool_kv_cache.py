@@ -1037,6 +1037,7 @@ class TestKVCacheV2SchedulerCrossParam:
         mgr.enable_block_reuse = False
         mgr.block_reuse_policy = BlockReusePolicy.PER_REQUEST
         mgr.can_share_inflight_prefix = False
+        mgr.max_beam_width = 1
         return mgr
 
     def test_default_cross_is_none(self):
@@ -1308,7 +1309,12 @@ class TestCrossCacheV2Lifecycle:
     def _make_manager(encoder_length: int) -> tuple[KVCacheManagerV2, Mock]:
         cache = Mock(capacity=encoder_length, history_length=0, is_active=True)
 
-        def resize(capacity: int | None, history_length: int | None = None) -> bool:
+        def resize(
+            capacity: int | None,
+            history_length: int | None = None,
+            *,
+            complete_optional_recovery: bool = False,
+        ) -> bool:
             new_capacity = cache.capacity if capacity is None else capacity
             new_history = cache.history_length if history_length is None else history_length
             if not cache.history_length <= new_history <= new_capacity:
@@ -1326,6 +1332,7 @@ class TestCrossCacheV2Lifecycle:
         manager.block_reuse_policy = BlockReusePolicy.ALL_REUSABLE
         manager.conversation_manager = None
         manager.is_draft = False
+        manager._retained_generation_allocations = {}
         manager._allocated_draft_lens = {}
         manager.kv_compression_manages_history = False
         manager._has_cp_helix = False

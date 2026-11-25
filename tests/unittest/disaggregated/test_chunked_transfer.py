@@ -18,7 +18,7 @@ These tests validate the session state machine using the real
 TxSession/RxSession classes with lightweight stub sender/receiver objects.
 """
 
-from types import MethodType, SimpleNamespace
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import numpy as np
@@ -629,11 +629,11 @@ def test_python_transceiver_rejects_cpp_mamba_cache_manager():
         )
 
 
-def test_pipelined_transfer_requires_gen_first_flow():
+def test_pipelined_transfer_requires_gen_first_flow() -> None:
     """ValueError when a real request is not using gen-first flow."""
     from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 
-    executor = MagicMock(_is_kv_manager_v2=True, _decode_only=False)
+    executor = MagicMock(_is_kv_manager_v2=True, _decode_only=False, kv_connector_manager=None)
     executor.model_engine._dspark_confidence_enabled = False
     executor.is_warmup = False
     executor.kv_cache_transceiver.pipeline_transfer_enabled = True
@@ -657,11 +657,11 @@ def test_pipelined_transfer_requires_gen_first_flow():
         PyExecutor._validate_request(executor, request)
 
 
-def test_pipelined_transfer_requires_chunked_prefill():
+def test_pipelined_transfer_requires_chunked_prefill() -> None:
     """Pipelined context transfer requires chunked prefill."""
     from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 
-    executor = MagicMock(_is_kv_manager_v2=True, _decode_only=False)
+    executor = MagicMock(_is_kv_manager_v2=True, _decode_only=False, kv_connector_manager=None)
     executor.kv_cache_transceiver.pipeline_transfer_enabled = True
     executor.model_engine = SimpleNamespace(
         attn_runtime_features=SimpleNamespace(chunked_prefill=False)
@@ -680,11 +680,11 @@ def test_pipelined_transfer_requires_chunked_prefill():
         PyExecutor._validate_request(executor, request)
 
 
-def test_pipelined_transfer_rejects_pipeline_parallelism_for_context_request():
+def test_pipelined_transfer_rejects_pipeline_parallelism_for_context_request() -> None:
     """Context workers require all layers on one pipeline rank."""
     from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 
-    executor = MagicMock(_is_kv_manager_v2=True, _decode_only=False)
+    executor = MagicMock(_is_kv_manager_v2=True, _decode_only=False, kv_connector_manager=None)
     executor.model_engine._dspark_confidence_enabled = False
     executor.kv_cache_transceiver.pipeline_transfer_enabled = True
     executor.model_engine.attn_runtime_features.chunked_prefill = True
@@ -715,11 +715,11 @@ def test_pipelined_transfer_rejects_helix_receiver():
         sender._build_kv_write_meta(_make_projection_task(), _make_projection_req_info())
 
 
-def test_pipelined_transfer_requires_single_beam_for_context_request():
+def test_pipelined_transfer_requires_single_beam_for_context_request() -> None:
     """Context-side pipelining rejects beam search before scheduling."""
     from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 
-    executor = MagicMock(_is_kv_manager_v2=True, _decode_only=False)
+    executor = MagicMock(_is_kv_manager_v2=True, _decode_only=False, kv_connector_manager=None)
     executor.model_engine._dspark_confidence_enabled = False
     executor.kv_cache_transceiver.pipeline_transfer_enabled = True
     executor.model_engine.attn_runtime_features.chunked_prefill = True
@@ -736,11 +736,11 @@ def test_pipelined_transfer_requires_single_beam_for_context_request():
         PyExecutor._validate_request(executor, request)
 
 
-def test_pipelined_transfer_allows_non_disaggregated_request():
+def test_pipelined_transfer_allows_non_disaggregated_request() -> None:
     """Requests without disaggregated parameters do not transfer KV cache."""
     from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 
-    executor = MagicMock(_is_kv_manager_v2=True, _decode_only=False)
+    executor = MagicMock(_is_kv_manager_v2=True, _decode_only=False, kv_connector_manager=None)
     executor.model_engine._dspark_confidence_enabled = False
     executor.is_warmup = False
     executor.max_beam_width = 1
@@ -760,11 +760,11 @@ def test_pipelined_transfer_allows_non_disaggregated_request():
     executor.sampler.validate_request.assert_called_once_with(request)
 
 
-def test_pipelined_transfer_allows_generation_only_request():
+def test_pipelined_transfer_allows_generation_only_request() -> None:
     """Generation workers do not build prefill chunks or enforce sender-only limits."""
     from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 
-    executor = MagicMock(_is_kv_manager_v2=True, _decode_only=False)
+    executor = MagicMock(_is_kv_manager_v2=True, _decode_only=False, kv_connector_manager=None)
     executor.model_engine._dspark_confidence_enabled = False
     executor.is_warmup = False
     executor.max_beam_width = 2
@@ -1277,21 +1277,14 @@ def _make_transfer_state_transceiver(session=None, rid: int = 42):
     from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 
     sessions = {rid: session} if session is not None else {}
-    transceiver = SimpleNamespace(
-        _pending_rank_info_admissions=None,
-        _wait_reqs={},
-        _send_sessions=dict(sessions),
-        _send_reqs={rid: MagicMock()} if session is not None else {},
-        _recv_sessions={},
-        _recv_reqs={},
-    )
-    # Real teardown, so the predicate is checked against the actual bookkeeping.
-    transceiver._retire_send_session = MethodType(
-        KvCacheTransceiverV2._retire_send_session, transceiver
-    )
-    transceiver._retire_cancelled_receive_fence = MethodType(
-        KvCacheTransceiverV2._retire_cancelled_receive_fence, transceiver
-    )
+    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._pending_rank_info_admissions = None
+    transceiver._context_first_ownership = False
+    transceiver._wait_reqs = {}
+    transceiver._send_sessions = dict(sessions)
+    transceiver._send_reqs = {rid: MagicMock()} if session is not None else {}
+    transceiver._recv_sessions = {}
+    transceiver._recv_reqs = {}
     return transceiver
 
 
